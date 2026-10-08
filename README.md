@@ -4,7 +4,8 @@ DSH 原生 Minecraft Agent 插件：一台无头机器人（mineflayer）跑在 
 走路、挖建、合成、熔炼、存取箱子、打怪、用物品（扔眼睛/射箭/喝药水）、聊天、看第一人称截图。
 
 上游是 [whale-craft](https://github.com/yzi1b/whale-craft)（作者 yzi1b）；**本项目已改名为
-`dsh-mc-agent`** 并做了大量魔改，上游原版的完整插件说明在 [插件说明.md](插件说明.md)。
+`dsh-mc-agent`** 并做了大量魔改，本仓库在 <https://github.com/blueziii/dsh-mc-agent>，
+上游原版的完整插件说明在 [插件说明.md](插件说明.md)。
 
 | | |
 | --- | --- |
