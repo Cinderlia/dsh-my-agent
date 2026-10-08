@@ -35,7 +35,7 @@ const section = (t) => console.log(`\n${t}`)
 /** 补丁统一加的余量：8% + 60ms（服务端按自己的进度判定，STOP 到早了会被判"没挖掉"） */
 const withMargin = (ms) => Math.max(50, Math.round(ms * 1.08 + 60))
 
-const DSH_HOME = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? 'C:\\Users\\BLUE', '.dsh')
+const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const PROFILE = join(DSH_HOME, 'profiles', 'desktop')
 const req = (() => {
   const bases = [

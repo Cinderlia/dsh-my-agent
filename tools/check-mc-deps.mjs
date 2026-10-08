@@ -21,6 +21,7 @@ import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRequire, isBuiltin } from 'node:module'
+import { homedir } from 'node:os'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const QUICK = process.argv.includes('--quick')
@@ -32,7 +33,7 @@ function pickVendor () {
     arg,
     process.env.DSH_MC_AGENT_MC_DEPS,
     resolve(HERE, '../../../vendor/mc-deps'),                                  // 包内：<profile>/node_modules/dsh-mc-agent/tools → <profile>
-    join(process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? 'C:\\Users\\BLUE', '.dsh'), 'profiles', 'desktop', 'vendor', 'mc-deps'),
+    join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'profiles', 'desktop', 'vendor', 'mc-deps'),
   ].filter((p) => typeof p === 'string' && p && existsSync(p))
   return cands[0] ?? null
 }

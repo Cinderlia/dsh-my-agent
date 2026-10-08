@@ -18,7 +18,7 @@ A\* 寻路 + 挖穿挡路方块 + 垫 1×1 塔 / 搭桥 + 过门 + 卡住检测 
 ## 装在哪（重要）
 
 ```
-C:\Users\BLUE\.dsh\profiles\desktop\vendor\mc-deps\
+%USERPROFILE%\.dsh\profiles\desktop\vendor\mc-deps\
   package.json
   node_modules\mineflayer-pathfinder\      ← 2.4.5
   node_modules\...（41 个包，版本跟宿主一致）
@@ -29,14 +29,14 @@ C:\Users\BLUE\.dsh\profiles\desktop\vendor\mc-deps\
 装/重装：
 
 ```powershell
-cd C:\Users\BLUE\.dsh\profiles\desktop\vendor\mc-deps
+cd %USERPROFILE%\.dsh\profiles\desktop\vendor\mc-deps
 npm install --no-audit --no-fund mineflayer-pathfinder@2.4.5
-node C:\Users\BLUE\Desktop\agent\dsh-mc-agent\tools\check-mc-deps.mjs   # 装完必跑
+node %USERPROFILE%\Desktop\agent\dsh-mc-agent\tools\check-mc-deps.mjs   # 装完必跑
 ```
 
 > 插件目录现在是 **junction**（profile 依赖写 `link:C:/Users/BLUE/Desktop/agent/dsh-mc-agent`），
 > Node 会把符号链接解析成 realpath ⇒ 靠 `import.meta.url` 往上数三层的 `<profile>\vendor\...` 那条候选
-> **会失效**（`../../../vendor` 变成 `C:\Users\BLUE\Desktop\vendor`）。所以 `loadMcDep` 里加了一条
+> **会失效**（`../../../vendor` 变成 `%USERPROFILE%\Desktop\vendor`）。所以 `loadMcDep` 里加了一条
 > **绝对路径兜底**（`$DSH_HOME\profiles\*\vendor\mc-deps\...`），见踩坑档案第 10 条。
 
 ## 怎么接上的

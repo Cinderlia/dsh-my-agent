@@ -9,18 +9,43 @@ DSH 原生 Minecraft Agent 插件：一台无头机器人（mineflayer）跑在 
 
 | | |
 | --- | --- |
-| 项目目录（**唯一可编辑源**） | `C:\Users\BLUE\Desktop\agent\dsh-mc-agent` |
-| 安装位置 | `C:\Users\BLUE\.dsh\profiles\desktop\node_modules\dsh-mc-agent` —— **指向本项目目录的 junction**（profile 里写的是 `link:…`）⇒ 改完**不用再往包里拷**，重启 DSH 即生效 |
+| 项目目录（**唯一可编辑源**） | `%USERPROFILE%\Desktop\agent\dsh-mc-agent` |
+| 安装位置 | `%USERPROFILE%\.dsh\profiles\desktop\node_modules\dsh-mc-agent` —— **指向本项目目录的 junction**（profile 里写的是 `link:…`）⇒ 改完**不用再往包里拷**，重启 DSH 即生效 |
 | 本目录的 `node_modules\` | 103 个 junction，指回 profile 的 `node_modules`（与宿主共用同一份依赖，不用自己 `pnpm install`） |
 | vendor 依赖 | pathfinder / collectBlock / tool / pvp / autoEat 在 `<profile>\vendor\mc-deps\`（见 [PATHFINDER.md](PATHFINDER.md)）；`loadMcDep` 还有 `$DSH_HOME\profiles\*\vendor\mc-deps\…` 兜底，插件包装成链接也不会静默丢 |
 | 上游仓库 / `CHANGELOG.md` 里的旧名字 | **历史，保持原样**（`github.com/yzi1b/whale-craft`） |
+
+## 装到自己的 DSH
+
+前提：DeepSeek Harness 桌面版（`node >= 22`）、一台能连的 Minecraft Java 服务器（离线登录也支持）。
+
+```powershell
+# 1) 插件本体（profile 目录，默认 %USERPROFILE%\.dsh\profiles\desktop）
+cd $env:USERPROFILE\.dsh\profiles\desktop
+pnpm add github:blueziii/dsh-mc-agent
+
+# 2) 5 个 mineflayer 插件：走路 / 挖矿采集 / 自动换工具 / 打怪 / 自动吃
+pnpm add mineflayer-pathfinder mineflayer-collectblock mineflayer-tool mineflayer-pvp mineflayer-auto-eat
+```
+
+然后在同一个 `package.json` 的 `dsh.profile.bundles` 数组里加一项 `"dsh-mc-agent"`，重启 DSH。
+
+- **第 2 步别省**：少装哪个就少一项能力，而**没装 `mineflayer-pathfinder` 时 `mc_move` 的走路会直接拒绝**
+  （`via: "pathfinder-unavailable"` —— 宁可不动也不盲跳；只有"在水里游"和"原地跳"还能用）。
+  插件按 `vendor 树 → 宿主 node_modules` 的顺序找它们，`pnpm add` 装在 profile 里就能被找到。
+- 想改代码：把仓库 clone 到任意位置，依赖那行写成 `"dsh-mc-agent": "link:C:/你的路径/dsh-mc-agent"`
+  （软链，改完不用往包里拷，重启 DSH 即生效）。
+- 装完体检：`node tools\check-mc-deps.mjs`（5 个插件都解析得到、宿主解析器那个尾斜杠地雷不在）。
+- 离线自检（29 个套件 + selfcheck，不需要游戏服务器）：`node tools\check-all.mjs`。
+- 进游戏：跟它说"连 127.0.0.1:25565，名字叫 xxx"，或者直接让它调 `mc_connect`。
+  装好后 DSH 设置里会多一个「MC设置」页（改 `RULES.md`、看记忆目录、开关看门狗）。
 
 ## 跑自检
 
 一条命令跑完（推荐）：
 
 ```powershell
-cd C:\Users\BLUE\Desktop\agent\dsh-mc-agent
+cd %USERPROFILE%\Desktop\agent\dsh-mc-agent
 node tools\check-all.mjs                 # 全部 30 项（29 个套件 + selfcheck），最后给一张 ✓/✗ 表
 node tools\check-all.mjs --fast          # 跳过 selfcheck
 node tools\check-all.mjs --only mc_auto  # 只跑名字里带这段的
@@ -69,7 +94,7 @@ node selfcheck.mjs                       # exit 0；**任何 ❌ 就 exit 1**（
 
 ## 配置速查
 
-记忆根：`C:\Users\BLUE\.dsh\dsh-mc-agent\memory`（由 `memoryDir` 指定）。**下面这些是我加的键**，
+记忆根：`%USERPROFILE%\.dsh\dsh-mc-agent\memory`（由 `memoryDir` 指定）。**下面这些是我加的键**，
 上游原有的键（`host`/`port`/`authUrl`/`timeouts`/`chatHistory`…）见上游 README。
 
 | 键 | 默认 | 作用 |
@@ -125,7 +150,7 @@ node selfcheck.mjs                       # exit 0；**任何 ❌ 就 exit 1**（
 ### 记忆根搬出工作区（`memoryDir`）
 
 用户要求"工作区里别再冒出插件的东西"，所以把记忆根挪到插件自己的家：
-`C:\Users\BLUE\.dsh\dsh-mc-agent\memory`（工作区 `C:\Users\BLUE\Desktop\agent` 里不再有 `.dsh-mc-agent\`）。
+`%USERPROFILE%\.dsh\dsh-mc-agent\memory`（工作区 `%USERPROFILE%\Desktop\agent` 里不再有 `.dsh-mc-agent\`）。
 代价：`memoryDir` 是全局的，所有工作区共用一份。写死 `<工作区>/.dsh-mc-agent` 的地方都改过了
 （三个扩展走 `memoryFor(ws).root`；宿主 `index.js` 的出图路径、文件工具守卫、注入的「长期记忆」提示）。
 老世界的记忆归档在 `<memoryDir>\_archive\旧世界-192.168.1.104\`。
@@ -888,7 +913,7 @@ B 段（眼距 4.6–5.0，用 `gameMode='creative'` 骗过插件那道 4.5 守�
 
 ```
 📖 行事准则（Master 自定义版，长期有效）在文件里，**以文件为准**（改了立刻生效，不用重启）：
-   `C:\Users\BLUE\.dsh\dsh-mc-agent\memory\RULES.md`
+   `%USERPROFILE%\.dsh\dsh-mc-agent\memory\RULES.md`
    开工前先读一遍：`mc_kit_memory {action:"read", path:"RULES.md"}`（或 `read {file_path:"<绝对路径>"}`）
 ```
 
@@ -1122,4 +1147,4 @@ README.md / PATHFINDER.md / 踩坑档案.md
 | [踩坑档案.md](踩坑档案.md) | 40 个真 bug 的现象 → 根因 → 证据 → 修法 → 回归（"为什么现在这么写"） |
 | [PATHFINDER.md](PATHFINDER.md) | 寻路/防卡住专题：为什么用现成的、装在哪、打过的补丁、上游复核、已知缺口 |
 | [插件说明.md](插件说明.md) | **上游原版 README**（功能列表、配置键、命令行的完整说明） |
-| `C:\Users\BLUE\.dsh\profiles\desktop\vendor\mc-deps\README.md` | 那棵独立依赖树装了什么、重装后怎么体检 |
+| `%USERPROFILE%\.dsh\profiles\desktop\vendor\mc-deps\README.md` | 那棵独立依赖树装了什么、重装后怎么体检 |

@@ -35,7 +35,7 @@ const ok = (cond, label, extra = '') => {
 const section = (t) => console.log(`\n${t}`)
 
 // ── 借依赖：源码树里没有 node_modules，从包目录借 vec3 ────────────────────────────
-const DSH_HOME = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? 'C:\\Users\\BLUE', '.dsh')
+const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const PROFILE = join(DSH_HOME, 'profiles', 'desktop')
 const req = (() => {
   const bases = [

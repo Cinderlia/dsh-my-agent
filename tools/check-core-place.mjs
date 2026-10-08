@@ -15,6 +15,7 @@
  */
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import { homedir } from 'node:os'
 
 // ── 断言小工具（和别的 check-*.mjs 一致）────────────────────────────────────────
 let pass = 0, fail = 0
@@ -25,7 +26,7 @@ const section = (t) => console.log(`\n${t}`)
 
 // ── 真 registry ───────────────────────────────────────────────────────────────
 // 源码树里没有 node_modules，得从包目录（<profile>/node_modules/dsh-mc-agent）借 minecraft-data。
-const DSH_HOME = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? 'C:\\Users\\BLUE', '.dsh')
+const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const PROFILE = join(DSH_HOME, 'profiles', 'desktop')
 const loadMcData = () => {
   const bases = [

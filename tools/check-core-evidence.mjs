@@ -29,7 +29,7 @@ const ok = (cond, label, extra = '') => {
 }
 const section = (t) => console.log(`\n${t}`)
 
-const DSH_HOME = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? 'C:\\Users\\BLUE', '.dsh')
+const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const PROFILE = join(DSH_HOME, 'profiles', 'desktop')
 const req = (() => {
   const bases = [
