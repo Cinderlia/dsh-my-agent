@@ -1,0 +1,53 @@
+[log] mc_craft 已加载：工具 mc_craft（递归合成 / 自动用或放工作台 / 缺料报告；不受看图门禁限制）
+(node:14036) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Mineflayer detected that you are using a deprecated event (physicTick)! Please use this event (physicsTick) instead.
+
+=== 连上了 ===
+模式 survival ｜位置 {"x":4,"y":66,"z":0}
+背包 dirt×4 oak_planks×4
+
+=== A1 保证背包里有一个**整方块**（placeBlock 要有东西可放） ===
+  已经有整方块了
+背包 dirt×4 oak_planks×4
+
+=== A2 再弄一个**非实体方块**（火把最好；做不出来就退而做木半砖） ===
+[log] mc_craft：torch ×4 缺料（crafting_table,coal_block）
+  试做火把：❌ 原料不够，做不了：
+[log] mc_craft：oak_button ×1 完成（1 步 / 54ms）
+  做 oak_button：✅ 合成完成（0.1s）：oak_button ×1
+背包 oak_planks×3 oak_button×1 dirt×4
+  ✓ 背包里有**非实体方块**（用来验选料会不会挑错） — oak_button
+  ✓ 背包里有**整方块**（用来真放一块）
+
+=== B1 pickPlaceItem(bot, null) —— 没指定方块时挑谁 ===
+  挑到： oak_planks（slot 9）
+  ✓ 挑到了东西
+  ✓ 挑出来的是**整方块** — oak_planks
+  ✓ **没挑非实体方块**（旧版 items[0] 会照拿） — oak_planks
+  背包顺序： 9:oak_planks 10:oak_button 36:dirt
+
+=== B2 scaffoldingItemIds(bot) —— 交给 pathfinder 垫脚的名单 ===
+  名单： dirt、oak_planks
+  ✓ 名单里全是整方块 — dirt、oak_planks
+  ✓ 名单里没有非实体方块 — dirt、oak_planks
+
+=== C1 找一格"贴着地面、本来就空、且不在基地里"的位置 ===
+  ✓ 找到落脚点 — 3,66,-1（原来是 air，下面是 grass_block）
+
+=== C2 mc.placeBlock() **不给 name** —— 看它落下去的是什么 ===
+  返回： {"placed":"oak_planks","requested":"oak_planks","at":{"x":3,"y":66,"z":-1},"now":"oak_planks","held":"oak_planks"} 
+  现在这一格是： oak_planks
+  ✓ 放置没报错
+  ✓ 方块真的落下去了 — oak_planks
+  ✓ 落下去的是**整方块** — oak_planks
+  ✓ **没放非实体方块** — oak_planks
+
+=== C3 收尾：挖回来，恢复成空气 ===
+  现在这一格是： air
+  ✓ 恢复成空气了 — air
+
+=== 最后背包 ===
+oak_button×1 dirt×4 oak_planks×3
+
+✓ 全部通过：pass=13 fail=0

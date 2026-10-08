@@ -1,0 +1,41 @@
+
+=== 连上 127.0.0.1:25565（survival） ===
+(node:9008) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Mineflayer detected that you are using a deprecated event (physicTick)! Please use this event (physicsTick) instead.
+位置 7,66,3 ｜模式 survival
+插件 {"pathfinder":true,"collectBlock":true,"tool":true,"pvp":true,"autoEat":true}
+
+=== A 基线 —— 先走一小段，确认"走"本身是好的 ===
+  目标 {"x":3,"y":66,"z":3}
+  返回 {"arrived":true,"position":{"x":4,"y":66,"z":3},"ms":716,"moved":2.65,"via":"pathfinder"}
+  ✓ 基线：能走 — moved=2.65 via=pathfinder reason=-
+
+=== B 正常挖一块近的（把 collectBudgetMs 压到 3 秒之前先验一次正常路径） ===
+  返回 ["没挖成 short_grass @ (4, 66, 2)（Took to long to decide path to goal!）","—— 还有 1 个没挖到，退回原地挖试试","挖掉 short_grass @ (4, 66, 2) → 现在 air"]
+  ✓ 正常挖：没报"找不到/没工具" — 没挖成 short_grass @ (4, 66, 2)（Took to long to decide path to goal!）
+
+=== C 制造超时 —— 压小 collectBudgetMs，去挖一块远处的土 ===
+  土候选 3000 块，最远 23.7 格 @ -16,64,-9
+  collectBudgetMs = 2500（这块 23.7 格远，肯定挖不完）
+  用了 3507ms，返回 ["没挖成 dirt @ (-16, 64, -9)（挖方块 超时（2500ms）：这一步在限定时间内没做完（常见原因：目标够不着、寻路失败，或服务端没回应）。控制位已经松开；如果是挖方块/采集，后台任务也已经停掉。可以换个近一点/好走的目标点重试，或先用 mc_status / mc_diag 看状态。）","—— 还有 1 个没挖到，退回原地挖试试","够不着 dirt @ (-16, 64, -9)（5.6 格）"]
+  采样 57 次，其中 57 次采到按键
+  ✓ 超时后很快就返回了（没有干等 90 秒） — 3507ms
+  ✓ 确实触发了超时（这样才验得到那条路） — 没挖成 dirt @ (-16, 64, -9)（挖方块 超时（2500ms）：这一步在限定时间内没做完（常见原因：目标
+  ✓ 采集任务确实启动过（采到过控制键被按下 —— 这就是会冻住的状态）
+
+=== C2 超时之后：控制位必须松开、后台采集任务必须停掉 ===
+  控制位 {}
+  collectBlock.targets.empty = true
+  ✓ **没有控制键还被按着**（修之前 forward 会一直是 true） — （全松）
+  ✓ 后台采集任务已经停了（targets 已空） — empty=true
+
+=== D 超时之后**立刻**走一段 —— 修之前这里会冻死（15 秒挪 0.03 格） ===
+  返回 {"arrived":true,"position":{"x":-7,"y":65,"z":-9},"ms":808,"moved":3.87,"via":"pathfinder"}
+  ✓ **超时之后还能走**（真的位移了） — moved=3.87 via=pathfinder reason=-
+  ✓ 不是"原地打转" — reason=-
+
+=== 收尾 ===
+位置 -7,65,-9 ｜控制位 {}
+
+✓ 全部通过：pass=9 fail=0

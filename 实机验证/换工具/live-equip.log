@@ -1,0 +1,81 @@
+[11:49:01] [craft] mc_craft 已加载：工具 mc_craft（递归合成 / 自动用或放工作台 / 缺料报告；不受看图门禁限制）
+[11:49:03] 连上了：wcequip_live @ {"x":-195,"y":62,"z":-32} 手上=dirtx5 血=17.833335876464844 饥饿=17
+[11:49:03] 起始背包：dirtx5、wooden_pickaxex1、cobblestonex1、oak_planksx3、oak_logx1、stickx2
+[11:49:03] 
+① 空手 + 背包里没有镐 ⇒ 挖石头直接拒绝（不许白花一轮硬挖）
+[11:49:03]   ① 找一列往下挖：柱子 (-196,*,-32) 地表 y=62，往下第 8 格是 stone（y=54）
+[11:49:08]   breakBlock(-196,62,-32)（dirt）⇒ {"broken":"dirt","at":{"x":-196,"y":62,"z":-32},"now":"air","held":"dirtx4","digMs":3750}
+[11:49:09]   breakBlock(-196,61,-32)（dirt）⇒ {"broken":"dirt","at":{"x":-196,"y":61,"z":-32},"now":"air","held":"dirtx5","digMs":750}
+[11:49:14]   breakBlock(-196,60,-32)（dirt）⇒ {"broken":"dirt","at":{"x":-196,"y":60,"z":-32},"now":"air","held":"dirtx6","digMs":3750}
+[11:49:22]   breakBlock(-196,59,-32)（dirt）⇒ {"broken":false,"at":{"x":-196,"y":59,"z":-32},"now":"dirt","held":"dirtx7","digMs":18750,"note":"挖了 11 秒还没挖掉（手上是 dirtx7，这块按手上的东西要 18.8 秒）—— 换个对的工具，或换个更近的点位；别当成\"服务端拒绝\"。"}
+[11:49:26]   breakBlock(-196,59,-32)（dirt）⇒ {"broken":"dirt","at":{"x":-196,"y":59,"z":-32},"now":"air","held":"dirtx7","digMs":3750}
+[11:49:35]   breakBlock(-196,58,-32)（dirt）⇒ {"err":"Digging aborted"}
+[11:49:40]   breakBlock(-87,63,-55)（grass_block）⇒ {"broken":"grass_block","at":{"x":-87,"y":63,"z":-55},"now":"air","held":"dirtx8","digMs":4500}
+[11:49:41]   breakBlock(-87,62,-55)（dirt）⇒ {"broken":"dirt","at":{"x":-87,"y":62,"z":-55},"now":"air","held":"dirtx9","digMs":750}
+[11:49:42]   breakBlock(-87,61,-55)（dirt）⇒ {"broken":"dirt","at":{"x":-87,"y":61,"z":-55},"now":"air","held":"dirtx10","digMs":750}
+[11:49:43]   breakBlock(-87,60,-55)（dirt）⇒ {"broken":"dirt","at":{"x":-87,"y":60,"z":-55},"now":"air","held":"dirtx11","digMs":750}
+[11:49:44]   脚下 (-87,59,-55) 是 stone ⇒ 用它当目标
+[11:49:44]   目标石头：(-87,59,-55) 手上=dirtx12 背包里有镐吗=true
+[11:49:45]   breakBlock(石头) ⇒ {"broken":"stone","at":{"x":-87,"y":59,"z":-55},"now":"air","held":"wooden_pickaxex1","tool":"dirtx12 → wooden_pickaxex1","digMs":1150}
+[11:49:45]   ✗ 没有镐时**直接拒绝**（抛错），不是硬挖到超时 — 竟然没抛错
+[11:49:45]   ✗ 拒绝文案里写清"手上是什么" — undefined
+[11:49:45]   ✗ 写清"挖它需要镐"（人话，不是 pickaxe）
+[11:49:45]   ✗ 写清硬挖的后果
+[11:49:45]   ✗ 给出路：先 mc_craft 一把
+[11:49:45]   ✗ 世界没变（石头还在） — air
+[11:49:45]   ✗ 没有返回"挖掉了"
+[11:49:45] 
+② 备料：砍 3 根原木 → 工作台 → 木板/木棍 → 木镐（真配方；木镐 3 木板 + 2 木棍、工作台 4 木板 = 9 木板 ⇒ 要 3 根原木）
+[11:49:45]   128 格内最近的原木：oak_log @ (-207,63,-61) d=120.2
+[11:49:56]     mc_dig oak_log（第 1 次）：没挖成 oak_log @ (-207, 63, -61)（挖方块 超时（9650ms）：这一步在限定时间内没做完（常见原因：目标够不着、寻路失败，或服务端没回应）。控制位已经松开；如果是挖方块/采集，后台任务也已经停掉。可以换个近一点/好走的目标点重试，或先用 mc_status / mc_diag 看状态。） ｜ —— 这一轮的 11 秒用完了（挖到 0/3），还有 2 个没挖：再叫一次 mc_dig 接着挖 ｜ —— 还有 3 个没挖到，退回原地挖试试 ｜ —— 这一轮的时间到了，剩下的下次再挖 ｜ 手上：wooden_pickaxex1 → dirtx8
+[11:50:06]     mc_dig oak_log（第 2 次）：没挖成 oak_log @ (-207, 64, -61)（挖方块 超时（9881ms）：这一步在限定时间内没做完（常见原因：目标够不着、寻路失败，或服务端没回应）。控制位已经松开；如果是挖方块/采集，后台任务也已经停掉。可以换个近一点/好走的目标点重试，或先用 mc_status / mc_diag 看状态。） ｜ —— 这一轮的 11 秒用完了（挖到 0/3），还有 2 个没挖：再叫一次 mc_dig 接着挖 ｜ —— 还有 3 个没挖到，退回原地挖试试 ｜ —— 这一轮的时间到了，剩下的下次再挖
+[11:50:18]     mc_dig oak_log（第 3 次）：没挖成 oak_log @ (-204, 65, -34)（挖方块 超时（9921ms）：这一步在限定时间内没做完（常见原因：目标够不着、寻路失败，或服务端没回应）。控制位已经松开；如果是挖方块/采集，后台任务也已经停掉。可以换个近一点/好走的目标点重试，或先用 mc_status / mc_diag 看状态。） ｜ —— 这一轮的 11 秒用完了（挖到 0/3），还有 2 个没挖：再叫一次 mc_dig 接着挖 ｜ —— 还有 3 个没挖到，退回原地挖试试 ｜ —— 这一轮的时间到了，剩下的下次再挖
+[11:50:29]     mc_dig oak_log（第 4 次）：挖掉 oak_log @ (-204, 65, -34) → 现在 air ｜ 没挖成 oak_log @ (-204, 66, -34)（挖方块 超时（8047ms）：这一步在限定时间内没做完（常见原因：目标够不着、寻路失败，或服务端没回应）。控制位已经松开；如果是挖方块/采集，后台任务也已经停掉。可以换个近一点/好走的目标点重试，或先用 mc_status / mc_diag 看状态。） ｜ —— 这一轮的 11 秒用完了（挖到 1/3），还有 1 个没挖：再叫一次 mc_dig 接着挖 ｜ —— 还有 2 个没挖到，退回原地挖试试 ｜ —— 这一轮的时间到了，剩下的下次再挖 ｜ 手上：dirtx8 → dirtx7
+[11:50:41]     mc_dig oak_log（第 5 次）：挖掉 oak_log @ (-204, 66, -34) → 现在 air ｜ 没挖成 oak_log @ (-204, 67, -34)（挖方块 超时（3756ms）：这一步在限定时间内没做完（常见原因：目标够不着、寻路失败，或服务端没回应）。控制位已经松开；如果是挖方块/采集，后台任务也已经停掉。可以换个近一点/好走的目标点重试，或先用 mc_status / mc_diag 看状态。） ｜ —— 这一轮的 11 秒用完了（挖到 1/3），还有 1 个没挖：再叫一次 mc_dig 接着挖 ｜ —— 还有 2 个没挖到，退回原地挖试试 ｜ —— 这一轮的时间到了，剩下的下次再挖
+[11:50:41]   原木：拿到 3 根
+[11:50:42] [craft] mc_craft：crafting_table ×1 完成（2 步 / 1288ms）
+[11:50:42]   mc_craft crafting_table ⇒ 　🔨 工作台：(-202,63,-34) | ✅ 合成完成（1.3s）：oak_planks ×4、crafting_table ×1 | 　背包里现在有 **crafting_table ×1** | 　背包：oak_log×2、oak_planks×3、crafting_table×1、dirt×7、wooden_pickaxe×1、cobblestone×2、stick×4、oak_sapling×1
+[11:50:42] [craft] mc_craft：wooden_pickaxe ×1 完成（0 步 / 0ms）
+[11:50:42]   mc_craft wooden_pickaxe（placeTable）⇒ 　🔨 工作台：(-202,63,-34) | ✅ 合成完成（0.0s）： | 　背包里现在有 **wooden_pickaxe ×1** | 　背包：oak_log×2、oak_planks×3、crafting_table×1、dirt×7、wooden_pickaxe×1、cobblestone×2、stick×4、oak_sapling×1
+[11:50:42]   ✓ 背包里真的出现了木镐 — oak_logx2、oak_planksx3、crafting_tablex1、dirtx7、wooden_pickaxex1、cobblestonex2、stickx4、oak_saplingx1
+[11:50:42] 
+③ 手上攥着泥土 + 背包里有镐 ⇒ 自动换成镐再挖，并报换了什么
+[11:50:42]   ③ 就地找一列往下挖：柱子 (-206,*,-36) 地表 y=63，往下第 5 格是 stone（y=58）
+[11:50:46]   breakBlock(-206,62,-36)（grass_block）⇒ {"broken":"grass_block","at":{"x":-206,"y":62,"z":-36},"now":"air","held":"dirtx7","digMs":900}
+[11:50:47]   breakBlock(-206,61,-36)（dirt）⇒ {"broken":"dirt","at":{"x":-206,"y":61,"z":-36},"now":"air","held":"dirtx8","digMs":750}
+[11:50:48]   breakBlock(-206,60,-36)（dirt）⇒ {"broken":"dirt","at":{"x":-206,"y":60,"z":-36},"now":"air","held":"dirtx9","digMs":750}
+[11:50:49]   breakBlock(-206,59,-36)（dirt）⇒ {"broken":"dirt","at":{"x":-206,"y":59,"z":-36},"now":"air","held":"dirtx10","digMs":750}
+[11:50:50]   脚下 (-206,58,-36) 是 stone ⇒ 用它当目标
+[11:50:50]     mc_act equip dirt ⇒ {"held":"dirtx11"}
+[11:50:50]   ✓ 手上现在是泥土 — dirtx11
+[11:50:51]     breakBlock(石头 @-206,58,-36) ⇒ {"broken":"stone","at":{"x":-206,"y":58,"z":-36},"now":"air","held":"wooden_pickaxex1","tool":"dirtx11 → wooden_pickaxex1","digMs":1150}（1308ms）
+[11:50:51]   ✓ 石头真被挖掉了 — air
+[11:50:51]   ✓ 结果里写明换了什么工具 — dirtx11 → wooden_pickaxex1
+[11:50:51]   ✓ 结果里写明现在手上是镐 — wooden_pickaxex1
+[11:50:51]   ✓ 结果里带 digMs（木镐挖石头 < 5 秒） — 1150
+[11:50:51] 
+④ 工具对、但这块这一轮挖不完 ⇒ 文案要说实话
+[11:50:52]     breakBlock(-205,57,-36) 给 400ms ⇒ {"broken":false,"at":{"x":-205,"y":57,"z":-36},"now":"stone","held":"wooden_pickaxex1","digMs":5650,"note":"挖了 11 秒还没挖掉（手上是 wooden_pickaxex1，这块按手上的东西要 5.7 秒）—— 换个对的工具，或换个更近的点位；别当成\"服务端拒绝\"。"}
+[11:50:52]   ✓ 如实报 broken=false — {"broken":false,"at":{"x":-205,"y":57,"z":-36},"now":"stone","held":"wooden_pick
+[11:50:52]   ✓ note 说"还没挖掉" — 挖了 11 秒还没挖掉（手上是 wooden_pickaxex1，这块按手上的东西要 5.7 秒）—— 换个对的工具，或换个更近的点位；别当成"服务端拒绝"。
+[11:50:52]   ✓ **不再**赖"服务端可能拒了这次破坏" — 挖了 11 秒还没挖掉（手上是 wooden_pickaxex1，这块按手上的东西要 5.7 秒）—— 换个对的工具，或换个更近的点位；别当成"服务端拒绝"。
+[11:50:52]   ✓ 这块确实没被挖掉 — stone
+[11:50:52] 
+⑤ placeBlock 的结果里带 held（手上还剩几块）
+[11:50:52]   ⏭ 没能找到"挖完立刻能放回去"的格子（别的东西在动 / 没泥土），跳过⑤（跳过，不算失败）
+[11:50:52] 
+⑥ 收尾：把挖掉的格子填回去
+[11:50:52]   挖过 13 格，现在状态：(-196,62,-32)原dirt→water (-196,61,-32)原dirt→water (-196,60,-32)原dirt→water (-196,59,-32)原dirt→water (-87,63,-55)原grass_block→air (-87,62,-55)原dirt→grass_block (-87,61,-55)原dirt→dirt (-87,60,-55)原dirt→dirt (-206,62,-36)原grass_block→air (-206,61,-36)原dirt→air (-206,60,-36)原dirt→air (-206,59,-36)原dirt→air (-206,58,-36)原stone→air
+[11:50:52]   其中还空着 6 格
+[11:50:52]   手上备料：dirt=11 cobblestone=3
+[11:51:22]     填回 (-87,63,-55)（原 grass_block）用 dirt ⇒ {"placed":"dirt","requested":"dirt","at":{"x":-87,"y":63,"z":-55},"now":"dirt","held":"dirtx6"}
+[11:51:48]     填回 (-206,62,-36)（原 grass_block）用 dirt ⇒ {"placed":"dirt","requested":"dirt","at":{"x":-206,"y":62,"z":-36},"now":"dirt","held":"dirtx5"}
+[11:51:49]     填回 (-206,61,-36)（原 dirt）用 dirt ⇒ {"err":"(-206,61,-36) 已被 grass_block 占住，放不进去——换个位置，或先 mc_act{mode:\"break\"} 清掉"}
+[11:51:50]     填回 (-206,60,-36)（原 dirt）用 dirt ⇒ {"err":"(-206,60,-36) 已被 dirt 占住，放不进去——换个位置，或先 mc_act{mode:\"break\"} 清掉"}
+[11:51:52]     填回 (-206,59,-36)（原 dirt）用 dirt ⇒ {"err":"(-206,59,-36) 已被 dirt 占住，放不进去——换个位置，或先 mc_act{mode:\"break\"} 清掉"}
+[11:51:53]     填回 (-206,58,-36)（原 stone）用 cobblestone ⇒ {"err":"(-206,58,-36) 已被 dirt 占住，放不进去——换个位置，或先 mc_act{mode:\"break\"} 清掉"}
+[11:51:53]   ✓ 挖掉的格子都填回去了（对全部 dug 求） — 13 格都不是 air
+[11:51:53]   最终背包：wooden_pickaxex1、crafting_tablex1、dirtx8、cobblestonex3、leaf_litterx3、eggx1、stickx4、oak_saplingx2、oak_logx2、oak_planksx3｜手上=dirtx8
+[11:51:53]   世界改动：13 格被动过（dirt@(-196,62,-32) dirt@(-196,61,-32) dirt@(-196,60,-32) dirt@(-196,59,-32) grass_block@(-87,63,-55) dirt@(-87,62,-55) dirt@(-87,61,-55) dirt@(-87,60,-55) grass_block@(-206,62,-36) dirt@(-206,61,-36) dirt@(-206,60,-36) dirt@(-206,59,-36) stone@(-206,58,-36)）
+[11:51:53] 
+结果：pass=11 fail=7（跳过 1）

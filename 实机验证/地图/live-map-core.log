@@ -1,0 +1,16 @@
+[dsh-mc-agent 10-07 15:21:02] pathfinder 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:02] collectBlock 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:02] tool 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:02] pvp 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:02] autoEat 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:02] 现成插件就绪：pathfinder / collectBlock / tool / pvp / autoEat
+[dsh-mc-agent 10-07 15:21:02] 已进入 主服 @ (1,68,2) gamemode=survival
+[dsh-mc-agent 10-07 15:21:04] 已下线：实机验证结束（优雅退出，21ms）
+[dsh-mc-agent 10-07 15:21:25] pathfinder 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:25] collectBlock 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:25] tool 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:25] pvp 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:25] autoEat 候选不可用（file:///C:/Users/BLUE/Desktop/vendor/mc-deps/node_modules/mi…）：ERR_MODULE_NOT_FOUND
+[dsh-mc-agent 10-07 15:21:25] 现成插件就绪：pathfinder / collectBlock / tool / pvp / autoEat
+[dsh-mc-agent 10-07 15:21:25] 已进入 主服 @ (1,68,2) gamemode=survival
+[dsh-mc-agent 10-07 15:21:27] 已下线：实机验证结束（优雅退出，21ms）

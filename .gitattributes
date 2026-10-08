@@ -1,0 +1,15 @@
+# 仓库里一律用 LF（这是 Node 项目，跨平台协作时 CRLF 会让 diff 整片变红）
+* text=auto eol=lf
+
+# 二进制（别做换行转换、别按文本 diff）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
+*.7z binary
+
+# 实机验证的日志是证据，保留但标注为非文本处理
+实机验证/**/*.log -text
