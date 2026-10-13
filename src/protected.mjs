@@ -47,8 +47,8 @@ export function isProtectedPathArg (raw) {
 /** 会写文件的宿主工具（read|glob|grep|ls|cat|read_image 是只读的，放行） */
 export const WRITE_FILE_TOOLS = /^(write|edit)$/i
 
-/** 会写文件的记忆工具动作（read/index/search 放行） */
-export const MEMORY_WRITE_ACTIONS = new Set(['append', 'write', 'delete', 'put'])
+/** 会写文件的记忆工具动作（read/index/search/kinds 放行） */
+export const MEMORY_WRITE_ACTIONS = new Set(['append', 'write', 'delete', 'put', 'record'])
 
 /** 统一的拒绝文案（guard 用） */
 export function rejectionText () {

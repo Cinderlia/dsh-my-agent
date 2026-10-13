@@ -454,7 +454,8 @@ section('3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不抢控�
   ok('视线被挡住 → 远处骷髅不算威胁（不叫、不动、不打断）',
     !walked(blocked) && blocked.state().stats.dangerWakes === 0 && blocked.w.calls.interrupts.length === 0)
 
-  // ⑪ 挨了打却看不到怪（隔墙 / 超远射）→ 不自己动，报"上次看到它在哪" + 让它 mc_entities 定位
+  // ⑪ 挨了打却看不到怪（隔墙 / 超远射）→ 不自己动，报"上次看到它在哪" + 让它 mc_observe 定位
+  //    （2026-10-08：`mc_entities` 并进 mc_observe 的"程序检测到"那段，所以这里改成让它 mc_observe {distance:N}）
   const blind = setup({ world: { health: 20, mobs: [] }, patch: { lookAround: false } })
   blind.tick(blind.at(1000))
   await flush()
@@ -464,8 +465,8 @@ section('3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不抢控�
   await flush()
   ok('挨了打但看不到怪 → 也不自己跑', !walked(blind), JSON.stringify(blind.w.walks))
   ok('并叫醒说明"看不到怪"', /看不到怪/.test(steered(blind)), steered(blind))
-  ok('看不到怪时告诉它用 mc_entities 定位（隔墙也能给坐标/血量）',
-    /mc_entities/.test(steered(blind)) && /radius/.test(steered(blind)), steered(blind))
+  ok('看不到怪时告诉它用 mc_observe 定位（"程序检测到"那段隔墙也能给坐标/血量）',
+    /mc_observe/.test(steered(blind)) && /distance/.test(steered(blind)), steered(blind))
 
   // ⑫ AI 正在动手 + 怪在 4 格外 + 没挨打 → 不打扰（等它这一轮跑完）
   const busy = setup({ world: { health: 20, mobs: [MOB('zombie', [16.5, 64, 20.5])] }, patch: { lookAround: false } })
@@ -779,9 +780,9 @@ section('5. 空闲叫醒（首叫 / 间隔 / 退避 / 工具重置 / 上限 / �
   ok('180s 后叫醒一次', nWakes() === 1)
   const m1 = h.agent.steers[0]
   ok('叫醒文案带"自主行动轮"和已闲秒数', textOf(m1).includes('自主行动轮') && /我已经 \d+s 没被安排/.test(textOf(m1)))
-  ok('文案把 mc_view 列成可选项 + 按长期目标开工',
-    textOf(m1).includes('mc_view') && textOf(m1).includes('长期目标') && textOf(m1).includes('自己决定'))
-  ok('看图不强制：文案里 mc_view 那一步明确写着"不强制"、没有"（必须）"',
+  ok('文案把 mc_observe 列成可选项 + 按长期目标开工',
+    textOf(m1).includes('mc_observe') && textOf(m1).includes('长期目标') && textOf(m1).includes('自己决定'))
+  ok('看图不强制：文案里 mc_observe 那一步明确写着"不强制"、没有"（必须）"',
     textOf(m1).includes('不强制') && !textOf(m1).includes('看一眼眼前（必须）'))
   ok('文案明确禁止反问 Master', textOf(m1).includes('不要问他') && textOf(m1).includes('要我做什么'))
   ok('文案禁止用 mc_events 干等', textOf(m1).includes('mc_events waitSec') && textOf(m1).includes('不算行动'))
@@ -991,7 +992,7 @@ section('8. 空闲关心玩家（盯着看 / 观察内容 / 更勤叫醒 / 不�
   const t1 = near.agent.steers[0]?.content?.[0]?.text ?? ''
   ok('叫醒文案带上"玩家在干什么"', t1.includes('Steve') && t1.includes('diamond_pickaxe') && t1.includes('面向北'))
   ok('有人时的文案 = 直接上手帮 + 不用先问 + 只动他东西才 mc_say',
-    t1.includes('旁边有人') && t1.includes('直接上手帮') && t1.includes('不用先问') && t1.includes('mc_say') && t1.includes('mc_view'))
+    t1.includes('旁边有人') && t1.includes('直接上手帮') && t1.includes('不用先问') && t1.includes('mc_say') && t1.includes('mc_observe'))
   ok('文案不再出现"拿不准就先问一句"', !t1.includes('拿不准就先问一句') && !t1.includes('优先去关心玩家'))
 
   const alone = setup({ patch: { enabled: false, avoid: false } })

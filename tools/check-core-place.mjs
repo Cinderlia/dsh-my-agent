@@ -14,6 +14,7 @@
  * 用法：node tools/check-core-place.mjs
  */
 import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -162,7 +163,7 @@ section('④ pickPlaceItem —— 没指定方块时不能挑到火把/半砖')
 /* ─────────────────────── ⑤ 全量扫描：整方块名单里不能混进形状方块 ─────────────────────── */
 section('⑤ 全量扫描 1.21.10 —— 认下来的"整方块"里不能混进半砖/楼梯/栅栏/门…')
 {
-  // 独立词表（故意和 src/core.mjs 里的 NON_FULL_BLOCK 写得不一样，才算交叉验证）
+  // 独立词表（故意和 src/place-items.mjs 里的 NON_FULL_BLOCK 写得不一样，才算交叉验证）
   const SHAPE = /(slab|stairs|_wall$|_fence|_fence_gate$|_carpet$|_pane$|_door$|_trapdoor$|_button$|_pressure_plate$|_sign$|_banner$|_bed$|_rail$|_torch$|_candle$|_bars$|_head$|_skull$|_anvil$|_pot$|_sapling$|^farmland$|^dirt_path$)/
   const accepted = []
   for (const it of Object.values(mcData.items)) {
@@ -177,6 +178,20 @@ section('⑤ 全量扫描 1.21.10 —— 认下来的"整方块"里不能混进�
   for (const n of ['stone', 'cobblestone', 'oak_planks', 'oak_log', 'dirt', 'sand', 'netherrack']) {
     ok(accepted.includes(n), `${n} 没被误杀`)
   }
+}
+
+/* ─────────────────────── ⑥ 接线：这些判据现在住在 src/place-items.mjs ─────────────────────── */
+section('⑥ 接线（路线图第 ④ 条第六刀）')
+{
+  const coreSrc = readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8')
+  const placeSrc = readFileSync(new URL('../src/place-items.mjs', import.meta.url), 'utf8')
+  ok(/from '\.\/place-items\.mjs'/.test(coreSrc), 'core.mjs 确实从 place-items.mjs 导入（别只搬不接）')
+  ok(/export \{ isFullBlockItem, scaffoldingItemIds, pickPlaceItem \} from '\.\/place-items\.mjs'/.test(coreSrc),
+    'core.mjs 保留三个公开件的同名导出（外部 import 一行都不用改）')
+  ok(/export const NON_FULL_BLOCK = /.test(placeSrc) && /export const NO_SCAFFOLD = /.test(placeSrc),
+    '两份名单在新模块里')
+  ok(!/^const NON_FULL_BLOCK = /m.test(coreSrc) && !/^export function pickPlaceItem \(/m.test(coreSrc),
+    'core.mjs 里没有残留定义（搬干净了）')
 }
 
 console.log(`\n${fail === 0 ? '✓ 全部通过' : '✗ 有失败'}：pass=${pass} fail=${fail}`)

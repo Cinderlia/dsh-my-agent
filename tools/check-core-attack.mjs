@@ -437,18 +437,29 @@ section('⑤ 静态接线')
   const idxNo = strip(idx)
   const has = (s, t, label) => ok(s.includes(t), label, t)
 
-  has(coreNo, 'const JUNK_RE =', 'core：掉落物名单 JUNK_RE')
-  has(coreNo, 'const NAME_ALIAS =', 'core：中文别名表 NAME_ALIAS')
-  has(coreNo, 'const entityNameOf = (e) => String(e?.username ?? e?.name', 'core：玩家优先 username')
-  has(coreNo, 'const nameFieldsOf = (e) =>', 'core：所有名字字段一起匹配')
-  has(coreNo, '24 格内实际有：', 'core：找不到时列出半径内实际有谁')
-  has(coreNo, 'const inReach = needle ? all : all.filter((x) => x.d <= 4.5 || rankOf(x) === 0)',
-    'core：不给 who 时只追怪（动物/玩家限 4.5 格）')
+  has(coreNo, "from './entity-names.mjs'", 'core：实体名字与分类从 entity-names.mjs 导入（路线图第 ④ 条第四刀）')
+  // 🔴 2026-10-08 第四刀：这四个定义已搬到 src/entity-names.mjs ⇒ 断言要跟着搬
+  //    （搬家才会暴露的坑：断言按"这个文件里有没有这段文字"来判，代码一换文件就红，红的样子和"功能坏了"一样）
+  const namesNo = strip(readFileSync(new URL('../src/entity-names.mjs', import.meta.url), 'utf8'))
+  has(namesNo, 'const JUNK_RE =', 'entity-names：掉落物名单 JUNK_RE')
+  has(namesNo, 'const NAME_ALIAS =', 'entity-names：中文别名表 NAME_ALIAS')
+  has(namesNo, 'const entityNameOf = (e) => String(e?.username ?? e?.name', 'entity-names：玩家优先 username')
+  has(namesNo, 'const nameFieldsOf = (e) =>', 'entity-names：所有名字字段一起匹配')
+  /* 🔴 2026-10-08 第二十一刀：整个 `attack()` 搬进 `src/attack.mjs` ⇒ 下面这些"按文本找实现"的
+   *    断言全部改成读新模块，并补一条"core 的薄包装 + 确实 import 了"的接线断言。 */
+  const atkNo = strip(readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8'))
+  has(atkNo, '24 格内实际有：', 'attack.mjs：找不到时列出半径内实际有谁')
+  has(atkNo, 'const inReach = needle ? all : all.filter((x) => x.d <= 4.5 || rankOf(x) === 0)',
+    'attack.mjs：不给 who 时只追怪（动物/玩家限 4.5 格）')
   has(coreNo, 'Math.max(2500, Math.floor(left * 0.6))', 'core：dig 单个目标预算封顶')
   /* 🔴 2026-10-08：`dig()` 不再把方块交给 collectBlock（"挖完又复原 + 之后几分钟走不了路"的根因），
    *    那条路上的"临时压低 thinkTimeout 再还原"也就跟着删了。这里改成钉死"不碰插件配置"。 */
   ok(!/pf\.thinkTimeout = Math\.max\(/.test(coreNo), 'core：dig 不再改插件的 thinkTimeout（那条路已删）')
-  has(coreNo, 'if (this.#reachOf(b, fresh) > reachMax) {', 'core：够不着先自己走过去（不再交给 collectBlock）')
+  /* 🔴 2026-10-08 第十刀：`#reachOf` / `#entityHealth` 搬进 `src/world-observer.mjs`
+   *    （改名 `blockReachOf` / `entityHealth`）⇒ 判据要跟着指向新文件，并确认 core 真的导入了。 */
+  const woNo = strip(readFileSync(new URL('../src/world-observer.mjs', import.meta.url), 'utf8'))
+  has(coreNo, 'if (blockReachOf(b, fresh) > reachMax) {', 'core：够不着先自己走过去（不再交给 collectBlock）')
+  has(coreNo, "from './world-observer.mjs'", 'core：观察层从 world-observer.mjs 导入（第十刀）')
   has(coreNo, 'b.collectBlock?.targets?.clear?.()', 'core：采集任务卡死时清空僵尸队列兜底')
   has(coreNo, 'const pinned = pos ? targets[0] : null', 'core：dig 目标按距离升序（显式 pos 仍第一）')
   has(coreNo, 'if (force && this.bot) {', 'core：connect 的 force 分支')
@@ -459,20 +470,26 @@ section('⑤ 静态接线')
   has(idxNo, 'if (args.force)     opts.force     = true', 'index：mc_connect 把 force 传下去')
   has(idxNo, 'force:     { type:', 'index：mc_connect 暴露 force 参数')
   has(idxNo, '中英文都认', 'index：mc_act 描述写明 attack 认中英文名')
-  has(coreNo, 'await b.pvp.attack(target)', 'core：pvp 还是用 attack(target) 设目标（会自己追过去）')
-  has(coreNo, 'if (!b.entities?.[target.id] || target.isValid === false) break',
-    'core：自己等目标消失（pvp.attack 立刻 resolve，不能 await 完就 stop）')
-  has(coreNo, 'Promise.resolve(b.pvp.stop()).catch(() => {})',
-    'core：pvp.stop() 不 await（它最多等 5 秒 path_stop，会把预算吃光）')
-  has(coreNo, '#entityHealth (b, e)', 'core：血量助手 #entityHealth')
-  has(coreNo, 'const hpBefore = this.#entityHealth(b, target)', 'core：动手前先记目标血量')
-  has(coreNo, 'b.pvp?.wasInRange', 'core：用 wasInRange 区分"没打死"和"没追上"')
-  has(coreNo, 'killed: gone', 'core：返回值如实报 killed')
-  has(coreNo, '还没进到攻击距离', 'core：追不上时的文案')
-  ok(!/await b\.pvp\.stop\(\)/.test(coreNo), 'core：不许 await b.pvp.stop()')
-  ok(!/withTimeout\(b\.pvp\.attack/.test(coreNo) && !/raceAbort\(\s*withTimeout\(b\.pvp\.attack/.test(coreNo),
-    'core：不再把 pvp.attack 当同步动作 await（旧写法的病根）')
-  ok(!/附近找不到 "?\$\{who\}?"?\)/.test(coreNo), 'core：不再只有干巴巴一句"附近找不到"')
+  has(atkNo, 'await b.pvp.attack(target)', 'attack.mjs：pvp 还是用 attack(target) 设目标（会自己追过去）')
+  has(atkNo, 'if (!b.entities?.[target.id] || target.isValid === false) break',
+    'attack.mjs：自己等目标消失（pvp.attack 立刻 resolve，不能 await 完就 stop）')
+  has(atkNo, 'Promise.resolve(b.pvp.stop()).catch(() => {})',
+    'attack.mjs：pvp.stop() 不 await（它最多等 5 秒 path_stop，会把预算吃光）')
+  has(woNo, 'export function entityHealth (b, e)', 'world-observer：血量助手 entityHealth（第十刀搬过去的）')
+  has(atkNo, 'const hpBefore = entityHealth(b, target)', 'attack.mjs：动手前先记目标血量')
+  has(atkNo, 'b.pvp?.wasInRange', 'attack.mjs：用 wasInRange 区分"没打死"和"没追上"')
+  has(atkNo, 'killed: gone', 'attack.mjs：返回值如实报 killed')
+  has(atkNo, '还没进到攻击距离', 'attack.mjs：追不上时的文案')
+  ok(!/await b\.pvp\.stop\(\)/.test(atkNo), 'attack.mjs：不许 await b.pvp.stop()')
+  ok(!/withTimeout\(b\.pvp\.attack/.test(atkNo) && !/raceAbort\(\s*withTimeout\(b\.pvp\.attack/.test(atkNo),
+    'attack.mjs：不再把 pvp.attack 当同步动作 await（旧写法的病根）')
+  ok(!/附近找不到 "?\$\{who\}?"?\)/.test(atkNo), 'attack.mjs：不再只有干巴巴一句"附近找不到"')
+  /* 接线：第二十一刀把整个 attack() 搬走 ⇒ core 里只剩薄包装，且必须真的 import 了 */
+  has(coreNo, "import { attack } from './attack.mjs'", 'core：确实 import 了 attack')
+  ok(/async attack \(opts = \{\}\) \{[\s\S]{0,420}return await attack\(this\.requireBot\(\), opts, \{/.test(coreNo),
+    'core：attack 是薄包装（把 bot + t/callLeft/abortSignal/hasPvp 传进去）')
+  ok(!/b\.pvp\.attack\(/.test(coreNo) && !/inReach = needle/.test(coreNo),
+    'core：没有残留的选目标 / pvp.attack 实现')
 }
 
 // ── 收尾 ──────────────────────────────────────────────────────────────────────

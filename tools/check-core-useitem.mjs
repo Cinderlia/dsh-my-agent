@@ -200,15 +200,26 @@ section('⑦ 工具层接线 —— mc_act{useitem} 与"use 不给目标"都要�
   const core = stripComments(readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8'))
   const idx = stripComments(readFileSync(new URL('../index.js', import.meta.url), 'utf8'))
 
-  ok(/async useItem \(\{ hold = 0 \} = \{\}\)/.test(core), 'core 里有 `async useItem ({ hold = 0 } = {})`')
-  ok(/b\.activateItem\(\)/.test(core), 'core 调了 `b.activateItem()`')
-  ok(/b\.deactivateItem\(\)/.test(core), 'core 调了 `b.deactivateItem()`')
-  ok(/this\.callLeft\(\)/.test(core), 'hold 用 `this.callLeft()` 钳过（不是裸 3000）')
-  ok(/this\.callLeft\(\) - 400/.test(core), '按住给松手留了 400ms 余量（否则松手被预算拒掉）')
+  const useSrc = stripComments(readFileSync(new URL('../src/world-use.mjs', import.meta.url), 'utf8'))
 
-  ok(/case 'useitem': return this\.useItem\(s\)/.test(core), 'mc_sequence 的 op 里有 `useitem`')
-  ok(/wait\/move\/look\/toward\/place\/break\/dig\/use\/useitem\/attack/.test(core),
+  ok(/export async function useItem \(b, \{ hold = 0 \} = \{\}, ctx = \{\}\)/.test(useSrc),
+    'useItem 的实现在 src/world-use.mjs（签名照旧收 { hold }）')
+  ok(/b\.activateItem\(\)/.test(useSrc), 'world-use.mjs 调了 `b.activateItem()`')
+  ok(/b\.deactivateItem\(\)/.test(useSrc), 'world-use.mjs 调了 `b.deactivateItem()`')
+  ok(/ctx\.callLeft \? Number\(ctx\.callLeft\(\)\) : 11_000/.test(useSrc), 'hold 用 `ctx.callLeft()` 钳过（不是裸 3000）')
+  ok(/left - 400/.test(useSrc), '按住给松手留了 400ms 余量（否则松手被预算拒掉）')
+  ok(/async useItem \(opts = \{\}\) \{/.test(core) && /from '\.\/world-use\.mjs'/.test(core) && /callLeft: \(\) => this\.callLeft\(\)/.test(core),
+    'core 的 useItem 是薄包装，并且把 callLeft 传进去了')
+
+  /* 🔴 第二十二刀：步骤分发（`#runStep`）搬进 `src\sequence.mjs` ⇒ 这两条改成查新模块
+   *    （那边第一参数是 `self`，所以是 `self.useItem(s)`），并补接线断言。 */
+  const seqSrc = stripComments(readFileSync(new URL('../src/sequence.mjs', import.meta.url), 'utf8'))
+  ok(/case 'useitem': return self\.useItem\(s\)/.test(seqSrc), 'sequence.mjs 的 op 里有 `useitem`')
+  ok(/wait\/move\/look\/toward\/place\/break\/dig\/use\/useitem\/attack/.test(seqSrc),
     '未知 op 的报错文案里列出了 useitem')
+  ok(/import \{ runSequence \} from '\.\/sequence\.mjs'/.test(core)
+    && /async runSequence \(steps, opts = \{\}\) \{ return await runSequence\(this, steps, opts\) \}/.test(core),
+    'core 的 runSequence 是薄包装（步骤分发在 sequence.mjs）')
 
   ok(/case 'useitem': return \{ mode, \.\.\.\(await bot\.useItem\(args\)\) \}/.test(idx),
     'mc_act 的 switch 里有 `case \'useitem\'`')

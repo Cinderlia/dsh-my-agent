@@ -43,6 +43,79 @@ const MAX_DEPTH = 5
 /** 目录/文件名允许的字符：中英文、数字、`._-`、空格（首尾空格与点会被拒）。 */
 const SAFE_SEGMENT = /^[\w.\-\u4e00-\u9fa5 ]+$/
 
+/* ─────────────── 记忆四分类（用户 2026-10-08 路线图第 ⑤ 条） ───────────────
+ * 路线图要求：长期记忆分**四类** —— 世界事实 / 操作经验 / 任务记录 / 用户规则；
+ * 每条带**来源 · 更新时间 · 成功次数 · 失败次数 · 适用版本**；
+ * 而且"**失败记录要写清发生条件，不能把目标标成永久不可达**"。
+ *
+ * 落地方式：四类各有一个固定文件（每个服务器一份），条目是**一行一条、带元数据尾巴**：
+ *
+ *   - **挖铁矿** — 石镐挖 1 个约 4.5 秒　｜　来源 mc_observe · 更新 2026-10-08 · 成功 3 / 失败 1 · 适用 1.21.9 · 条件 背包里没有镐时挖不动
+ *
+ * 同 key 再记一次**不会新增条目**，而是累加成功/失败次数并刷新更新时间 ——
+ * 这样"成功率"才有意义，也才不会把同一个坑记十遍。
+ */
+export const NOTE_KINDS = [
+  { key: 'world', label: '世界事实', file: 'world.md', what: '坐标、地标、基地布局、箱子/熔炉在哪、生物群系 —— "这里有什么"' },
+  { key: 'exp', label: '操作经验', file: 'lessons.md', what: '怎么做成的 / 怎么做不成：工具、路线、条件 —— "该怎么办"' },
+  { key: 'task', label: '任务记录', file: 'tasks.md', what: '干过什么活、结果如何、还剩什么（机器可读的进度在 tasks.json）' },
+  { key: 'rule', label: '用户规则', file: 'RULES.md', what: '用户的长期要求（**受保护文件，只读** —— 要改让用户在「MC设置 → 提示词」里改）' },
+]
+const KIND_BY_KEY = new Map(NOTE_KINDS.map((k) => [k.key, k]))
+const META_SEP = '　｜　'
+const META_RE = /^(.*?)　｜　来源\s*(.*?)\s*·\s*更新\s*(\d{4}-\d{2}-\d{2})\s*·\s*成功\s*(\d+)\s*\/\s*失败\s*(\d+)(?:\s*·\s*适用\s*(.*?))?(?:\s*·\s*条件\s*(.*?))?\s*$/
+
+/** 四类记忆的说明文本（工具 action:"kinds" 与注入用） */
+export function memoryKindsText () {
+  return [
+    '记忆分四类，各有一个固定文件（每服一份）：',
+    ...NOTE_KINDS.map((k) => `· **${k.label}**（kind:"${k.key}"）→ \`<服>/${k.file}\`：${k.what}`),
+    '用 `mc_kit_memory {action:"record", kind, key, text, source, version, ok, condition}` 记一条：'
+      + '**同 key 再记会累加成功/失败次数**，不堆重复条目；`ok:false` 时**必须**给 `condition`（在什么情况下失败）。',
+  ].join('\n')
+}
+
+/** 今天的日期（本地时区，YYYY-MM-DD） */
+export function todayStr (d = new Date()) {
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** 渲染一条带元数据的记忆（一行 bullet） */
+export function renderEntry ({ key = null, text, source = null, updatedAt = null, ok = 0, fail = 0, version = null, condition = null } = {}) {
+  const k = String(key ?? '').trim()
+  const head = k ? `- **${k}** — ${String(text ?? '').trim()}` : `- ${String(text ?? '').trim()}`
+  const meta = [
+    `来源 ${source ? String(source).trim() : '未记'}`,
+    `更新 ${updatedAt || todayStr()}`,
+    `成功 ${Math.max(0, Number(ok) || 0)} / 失败 ${Math.max(0, Number(fail) || 0)}`,
+  ]
+  if (version) meta.push(`适用 ${String(version).trim()}`)
+  if (condition) meta.push(`条件 ${String(condition).trim()}`)
+  return `${head}${META_SEP}${meta.join(' · ')}`
+}
+
+/** 解析一条记忆；不是带元数据的那行就返回 null（老格式的自由 bullet 照旧能用） */
+export function parseEntry (line) {
+  const s = String(line ?? '').trim()
+  const m = /^[-*]\s+(.*)$/.exec(s)
+  if (!m) return null
+  const mm = META_RE.exec(m[1])
+  if (!mm) return null
+  const km = /^\*\*(.+?)\*\*\s*[—-]\s*([\s\S]*)$/.exec(mm[1].trim())
+  return {
+    key: km ? km[1].trim() : null,
+    text: km ? km[2].trim() : mm[1].trim(),
+    source: mm[2] || null,
+    updatedAt: mm[3] || null,
+    ok: Number(mm[4]) || 0,
+    fail: Number(mm[5]) || 0,
+    version: mm[6] ? mm[6].trim() : null,
+    condition: mm[7] ? mm[7].trim() : null,
+    raw: s,
+  }
+}
+
 /** 按扩展名判断"这是文本"。判断不了的再按内容嗅探（见 sniffKind）。 */
 const TEXT_EXT = new Set([
   '.md', '.markdown', '.txt', '.json', '.jsonc', '.yml', '.yaml', '.csv', '.tsv', '.log',
@@ -340,6 +413,102 @@ export class MemoryStore {
     writeFileSync(target.abs, content, 'utf8')
     this._textCache = { text: '', at: 0 }
     return { path: target.rel, replaced: false, entries: countBullets(content), content }
+  }
+
+  /* ─────────────── 四类记忆（带元数据、同 key 累加） ─────────────── */
+
+  /** 四类记忆的落点（每服一份；`rule` 是受保护文件，只能读） */
+  kindTarget ({ kind, server = null } = {}) {
+    const k = KIND_BY_KEY.get(String(kind ?? '').trim().toLowerCase())
+    if (!k) throw new Error(`未知的记忆类别："${kind}"（可用 ${NOTE_KINDS.map((x) => x.key).join(' / ')}）`)
+    if (k.key === 'rule') {
+      throw new Error('用户规则住在 `RULES.md` 里（**受保护文件，只读**）—— 我看得到、改不了。'
+        + '要改请让用户在「MC设置 → 提示词」里改，或者在对话里直接告诉用户想加哪条。')
+    }
+    const dir = server ? String(server).trim() : GLOBAL_DIR
+    return { kind: k.key, label: k.label, target: this.safePath(posix.join(dir, k.file)) }
+  }
+
+  /** 类别指南 + 现在库里各类各有几个文件（工具 action:"kinds"） */
+  kinds () {
+    const counts = {}
+    for (const k of NOTE_KINDS) counts[k.key] = 0
+    let other = 0
+    for (const f of this.list()) {
+      const low = f.rel.toLowerCase()
+      const hit = NOTE_KINDS.find((k) => low === k.file.toLowerCase() || low.endsWith('/' + k.file.toLowerCase()))
+      if (hit) counts[hit.key] += 1
+      else if (low.endsWith('tasks.json')) counts.task += 1
+      else other += 1
+    }
+    return {
+      kinds: NOTE_KINDS,
+      counts,
+      other,
+      text: memoryKindsText() + '\n现在库里：'
+        + NOTE_KINDS.map((k) => `${k.label} ${counts[k.key]}`).join(' · ') + (other ? ` · 其它 ${other}` : ''),
+    }
+  }
+
+  /**
+   * 记一条**带元数据**的记忆（四类之一）：同 key 累加成功/失败次数，不堆重复条目。
+   * 🔴 `ok:false` 时必须给 `condition` —— 用户路线图原话："失败记录要写清发生条件，
+   *    不能把目标标成永久不可达"（"夜里在沼泽找不到沙" ≠ "这个世界没有沙"）。
+   */
+  record ({ kind, key = null, text, source = null, version = null, ok = null, condition = null, server = null } = {}) {
+    const body = String(text ?? '').trim()
+    if (!body) throw new Error('text 不能为空 —— 要记什么？')
+    if (body.length > 1000) throw new Error(`一条记忆太长（${body.length} 字），上限 1000`)
+    const k = String(key ?? '').trim()
+    if (!k) throw new Error('record 需要 key（这条记忆的名字）：同 key 再记一次会累加成功/失败次数，而不是新增一条')
+    if (k.length > 60) throw new Error(`key 太长（${k.length} 字，上限 60）`)
+    const failed = ok === false
+    const cond = String(condition ?? '').trim()
+    if (failed && !cond) {
+      throw new Error('失败记录要写清**发生条件**（"在什么情况下失败"），别写成永久结论（"X 不可达"）—— '
+        + '补一个 condition，例如 condition:"背包里没有镐 / 隔着水 / 夜里怪太多"。')
+    }
+
+    const { kind: kk, label, target } = this.kindTarget({ kind, server })
+    if (target.protected) throw new Error(protectedWriteError(target.rel))
+    if (target.kind !== 'text') throw new Error(`${target.rel} 不是文本文件（record 只写 .md 笔记）`)
+
+    const existed = existsSync(target.abs)
+    const content0 = existed ? readFileSync(target.abs, 'utf8') : ''
+    let merged = null
+    const keep = []
+    for (const line of content0 ? content0.split('\n') : []) {
+      const e = parseEntry(line)
+      if (e && String(e.key ?? '').trim().toLowerCase() === k.toLowerCase()) { merged = e; continue }
+      keep.push(line)
+    }
+    const okN = (merged?.ok ?? 0) + (ok === true ? 1 : 0)
+    const failN = (merged?.fail ?? 0) + (failed ? 1 : 0)
+    const src = source ?? merged?.source ?? null
+    const ver = version ?? merged?.version ?? null
+    const finalCond = cond || merged?.condition || null
+    const entry = renderEntry({ key: k, text: body, source: src, updatedAt: todayStr(), ok: okN, fail: failN, version: ver, condition: finalCond })
+
+    let content
+    if (!existed) {
+      const group = target.rel.includes('/') ? target.rel.slice(0, target.rel.indexOf('/')) : GLOBAL_DIR
+      content = `# ${group === GLOBAL_DIR ? '通用' : group} / ${label}\n\n${entry}\n`
+    } else {
+      content = keep.join('\n').replace(/\s*$/, '\n') + entry + '\n'
+    }
+    if (Buffer.byteLength(content) > MAX_TEXT_BYTES) throw new Error(`文件超过 ${MAX_TEXT_BYTES / 1024}KB 上限，考虑拆成多个文件`)
+    const dir = dirname(target.abs)
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    writeFileSync(target.abs, content, 'utf8')
+    this._textCache = { text: '', at: 0 }
+    return {
+      path: target.rel, kind: kk, label, key: k, text: body, source: src,
+      updatedAt: todayStr(), ok: okN, fail: failN, version: ver, condition: finalCond,
+      merged: Boolean(merged), entries: countBullets(content),
+      note: merged
+        ? `同 key 已有那条，累加后：成功 ${okN} / 失败 ${failN}（**没有新增条目**）`
+        : `新增一条（${label}）。想让以后找得到，顺手在 \`README.md\` 的索引里加一行。`,
+    }
   }
 
   /** 改：整文件覆盖（重组内容、写小标题/表格；任何文本扩展名都行） */

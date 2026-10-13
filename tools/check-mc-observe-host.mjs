@@ -1,8 +1,8 @@
 /**
- * mc_view 扩展的宿主侧自检：用假 ctx / 假 bot 加载真实扩展文件，跑通
+ * mc_observe 扩展的宿主侧自检：用假 ctx / 假 bot 加载真实扩展文件，跑通
  *   ① 工具注册形状  ② 渲染输出（文字 + 图片附件 + 落盘）  ③ 动作前看图门禁（默认关，AI 自主）
  * 不连 MC、不需要 DSH。
- * 跑法：node dsh-mc-agent/tools/check-mc-view-host.mjs [--gate-on]
+ * 跑法：node dsh-mc-agent/tools/check-mc-observe-host.mjs [--gate-on]
  *   默认（不带参数）= **AI 自主模式**：门禁不生效，靠工具说明引导；view.json 能当场打开。
  *   --gate-on = 强制模式（DSH_MC_AGENT_VIEW_GATE=on），验证硬门禁的尺度与失效。
  */
@@ -19,7 +19,7 @@ const AGE = 60_000
 process.env.DSH_MC_AGENT_VIEW_MAX_ACTIONS = String(MAX)
 process.env.DSH_MC_AGENT_VIEW_MAX_AGE_MS = String(AGE)
 
-const EXT = new URL('../extensions/mc_view.mjs', import.meta.url).href
+const EXT = new URL('../extensions/mc_observe.mjs', import.meta.url).href
 
 /** 记忆根（模拟 Master 设了 `config.memoryDir`）；null = 老宿主，退回 `<工作区>/.dsh-mc-agent` */
 let MEM_ROOT = null
@@ -58,12 +58,31 @@ const mineflayerBot = {
   entities: { 1: SELF, 2: STEVE, 3: ZOMBIE },
   world,
 }
+/** 会话上的 McBot 实例（`sess.bot`）—— 感知块要调它的 `entities()`。
+ *  🔴 裸 `mineflayerBot.entities` 是**实体映射对象**（渲染要用），不是函数；2026-10-08 实机
+ *  就踩了这个：`bot.entities(...)` 在真服永远报 `is not a function`，所以这里必须提供这一层。 */
+const mkEntities = (radius = 24, { kind = 'all', limit = 40 } = {}) => {
+  const rows = [
+    { e: STEVE, kind: 'player', hostile: false, player: true, health: 20, distance: 3 },
+    { e: ZOMBIE, kind: 'hostile', hostile: true, player: false, health: 20, distance: 4 },
+  ].map((r) => ({
+    name: r.e.username ?? r.e.name, kind: r.kind, hostile: r.hostile, ranged: false,
+    distance: r.distance, position: { x: r.e.position.x, y: r.e.position.y, z: r.e.position.z }, dy: 0,
+    health: r.health, ...(r.player ? { player: true } : {}),
+  }))
+  return {
+    me: { x: 0.5, y: 1, z: 0.5 }, radius, kind,
+    counts: { hostile: 1, player: 1, other: 0 }, total: rows.length,
+    list: rows.slice(0, limit),
+  }
+}
 /** 让假 bot 正对 Steve 的包围盒中心（眼在 0.5,2.62,0.5） */
 const aimAtSteve = () => { mineflayerBot.entity.yaw = 0.8761; mineflayerBot.entity.pitch = -0.1824 }
-const mkBot = (online) => ({
+const mkBot = (online, { noEntities = false } = {}) => ({
   online,
   bot: mineflayerBot,
   requireBot () { if (!online) throw new Error('机器人不在线（假会话）'); return mineflayerBot },
+  ...(noEntities ? {} : { entities: mkEntities }),
   waitForChunks: async () => {},
   status: () => ({
     online, position: { x: 0, y: 1, z: 0 }, yaw: 0, pitch: 0, gamemode: 'survival',
@@ -117,13 +136,13 @@ const api = {
 
 const mod = await import(EXT + '?v=' + Date.now())
 ok(typeof mod.apply === 'function', '扩展导出 apply(api)')
-ok(mod.name === 'mc_view', '扩展 name = mc_view', mod.name)
+ok(mod.name === 'mc_observe', '扩展 name = mc_observe', mod.name)
 await mod.apply(api)
 
 console.log('— ① 工具注册 —')
 {
-  const spec = registered.get('mc_view')
-  ok(Boolean(spec), '注册了 mc_view')
+  const spec = registered.get('mc_observe')
+  ok(Boolean(spec), '注册了 mc_observe')
   ok(spec && typeof spec.execute === 'function', '有 execute')
   ok(spec && typeof spec.description === 'string'
     && (GATE_ON ? spec.description.includes('硬规则') : spec.description.includes('什么时候看，你自己定')),
@@ -142,7 +161,7 @@ console.log('— ① 工具注册 —')
   ok(Array.isArray(blocks) && blocks.length === 2 && blocks[0].type === 'text' && blocks[1].type === 'image', 'render 同时推文字与图片块', JSON.stringify(blocks))
   const blocks2 = spec.output.render({}, { text: 'hi' })
   ok(blocks2.length === 1 && blocks2[0].type === 'text', '没有图片时只推文字')
-  ok(logs.some((l) => l.includes('mc_view 已加载') || l.includes('mc_view 门禁注册失败')), 'apply 打了加载日志', JSON.stringify(logs))
+  ok(logs.some((l) => l.includes('mc_observe 已加载') || l.includes('mc_observe 门禁注册失败')), 'apply 打了加载日志', JSON.stringify(logs))
 }
 
 console.log('— ② 门禁注册（总是注册，生效与否每次现算）—')
@@ -153,7 +172,7 @@ console.log('— ③ 门禁行为 —')
 {
   const guard = guards[0]
   const ex = (name, id = 'A', withWs = true) => ({ name, agent: withWs ? { id, session: { header: { cwd: wsRoot } } } : { id } })
-  const spec = registered.get('mc_view')
+  const spec = registered.get('mc_observe')
   const post = handlers.get('tools/post-execute')
 
   ok(guard(ex('mc_status')) === undefined, '只读工具（mc_status）永不拦')
@@ -169,7 +188,7 @@ console.log('— ③ 门禁行为 —')
       '自主模式：mc_dig / mc_build / mc_command 也不拦')
     ok(guard(ex('mc_scan')) === undefined, '自主模式：只读工具照旧不拦')
     ok(logs.some((l) => l.includes('AI 自主决定何时看图')),
-      '加载日志写明是"AI 自主"模式', JSON.stringify(logs.filter((l) => l.includes('mc_view 已加载'))))
+      '加载日志写明是"AI 自主"模式', JSON.stringify(logs.filter((l) => l.includes('mc_observe 已加载'))))
 
     // view.json 能**当场**把强制模式打开/关掉（不用重启 DSH）—— 这是"总是注册"的理由
     const viewJson = join(wsRoot, '.dsh-mc-agent', 'view.json')
@@ -177,7 +196,7 @@ console.log('— ③ 门禁行为 —')
     try {
       writeFileSync(viewJson, JSON.stringify({ gate: true, maxActions: 2, maxAgeMs: 60_000 }))
       const denied = guard(ex('mc_move'))
-      ok(typeof denied === 'string' && denied.includes('mc_view'),
+      ok(typeof denied === 'string' && denied.includes('mc_observe'),
         'view.json {"gate":true} ⇒ 当场变强制模式：拒绝并让先看图', String(denied))
       ok(typeof guard(ex('mc_dig')) === 'string', '强制模式下 mc_dig 也拦')
       await spec.execute({}, { agent: { id: 'A', session: { header: { cwd: wsRoot } } } })
@@ -192,14 +211,14 @@ console.log('— ③ 门禁行为 —')
   } else {
     /* —— 强制模式：验证尺度、失效、隔离 —— */
     const denied = guard(ex('mc_move'))
-    ok(typeof denied === 'string' && denied.includes('mc_view'), '在线 + 没看过图 ⇒ 拒绝并让先看 mc_view', String(denied))
+    ok(typeof denied === 'string' && denied.includes('mc_observe'), '在线 + 没看过图 ⇒ 拒绝并让先看 mc_observe', String(denied))
     ok(typeof guard(ex('mc_dig')) === 'string' && typeof guard(ex('mc_act')) === 'string', 'mc_dig / mc_act 也拦')
     ok(guard(ex('mc_scan')) === undefined, 'mc_scan（只读）不拦')
 
     // 看图 → 放行
     const out = await spec.execute({}, { agent: { id: 'A', session: { header: { cwd: wsRoot } } } })
     ok(guard(ex('mc_move')) === undefined, '看过图后 mc_move 放行')
-    ok(guard(ex('mc_view')) === undefined, 'mc_view 自己永远不被拦')
+    ok(guard(ex('mc_observe')) === undefined, 'mc_observe 自己永远不被拦')
 
     // 看一眼能连着做 MAX 个动作：第 1..MAX 个全放行，第 MAX+1 个才被拒
     const allowed = []
@@ -216,7 +235,7 @@ console.log('— ③ 门禁行为 —')
     await spec.execute({}, { agent: { id: 'A', session: { header: { cwd: wsRoot } } } })
     for (let i = 0; i < 3; i++) await post(ex('mc_command'), { isError: true, content: [] }, async () => ({}))
     ok(guard(ex('mc_move')) === undefined, '被拒/失败的动作不占额度（isError）')
-    const passthrough = await post(ex('mc_view'), { content: [] }, async () => 'NEXT')
+    const passthrough = await post(ex('mc_observe'), { content: [] }, async () => 'NEXT')
     ok(passthrough === 'NEXT', 'post-execute 把 next() 的返回值透传出去', String(passthrough))
 
     // 另一个 agent：没会话 ⇒ 不拦；建了会话且没看过 ⇒ 拦
@@ -273,13 +292,60 @@ console.log('— ③ 门禁行为 —')
 
 console.log('— ④ execute 输出（含真实渲染 + 附件 + 落盘）—')
 {
-  const spec = registered.get('mc_view')
+  const spec = registered.get('mc_observe')
   sessions.set('C', { bot: mkBot(true) })
   const exec = { agent: { id: 'C', session: { header: { cwd: wsRoot } } } }
   const out = await spec.execute({}, exec)
-  ok(out.text.includes('👁 第一人称'), 'text 有标题行', out.text.split('\n')[0])
-  ok(out.text.includes('🎯 准星') && out.text.includes('🧱 画面'), 'text 有准星/画面行')
-  ok(out.text.includes('👥'), 'text 有实体行（👥）', out.text.split('\n').find((l) => l.includes('👥')))
+  // ── 三段式感知（2026-10-08 用户要求："看到什么 / 程序检测到什么 / 哪些不确定"分开） ──
+  // 这个假 bot 的 `entities` 是**对象映射**（渲染要用）、`world` 没有 `raycast`
+  // ⇒ 程序侧两条探针都会抛，感知块必须靠 try/catch 兜住并如实说"没跑出来"。
+  ok(out.text.includes('👁 **我看到**'), 'text 第一段是"我看到"（图里数出来的）', out.text.split('\n')[0])
+  ok(out.text.includes('🎯 **程序检测到**'), 'text 第二段是"程序检测到"（游戏数据）')
+  ok(out.text.includes('⚠️ **不确定**'), 'text 第三段是"不确定"清单（别把推测当事实）')
+  ok(out.text.includes('图里 2 个实体') && out.text.includes('Steve'), 'text 的"我看到"段列了图里的实体',
+    out.text.split('\n').find((l) => l.includes('图里')))
+  ok(out.percept && out.percept.seen && out.percept.sensed && Array.isArray(out.percept.uncertain),
+    'percept 结构齐（seen / sensed / uncertain）', JSON.stringify(Object.keys(out.percept ?? {})))
+  ok(out.percept.seen.crosshair && out.percept.seen.crosshair.block === 'stone',
+    'percept.seen.crosshair 记了准星方块', JSON.stringify(out.percept.seen.crosshair))
+  ok(out.percept.seen.entities.length === 2, 'percept.seen.entities 是图里那份（2 个）')
+  ok(Array.isArray(out.percept.sensed.entities) && out.percept.sensed.entities.length === 2,
+    'sensed.entities 走会话上的 McBot.entities()（真数据，不是裸 bot 的映射对象）',
+    JSON.stringify((out.percept.sensed.entities ?? []).map((x) => x.name)))
+  ok(out.percept.sensed.counts?.hostile === 1 && out.percept.sensed.counts?.player === 1,
+    'sensed.counts 有敌对/玩家计数', JSON.stringify(out.percept.sensed.counts))
+  ok(out.text.includes('格内实体：敌对 1 ｜ 玩家 1 ｜ 其它 0'), 'text 给了"半径内实体：敌对 x ｜ 玩家 y ｜ 其它 z"')
+  ok(out.percept.sensed.ray && out.percept.sensed.ray.error,
+    '假 world 没有 raycast ⇒ 程序射线如实记成 { error }，不炸', JSON.stringify(out.percept.sensed.ray))
+  ok(out.percept.uncertain.some((t) => /程序射线没跑出来/.test(t)), '不确定清单里点出"程序射线没跑出来"')
+  ok(out.percept.uncertain.some((t) => /客户端预测/.test(t)), '不确定清单里点名"客户端预测的方块世界"')
+  ok(out.percept.uncertain.some((t) => /重建/.test(t)), '不确定清单里说明图是按方块数据重建的')
+
+  // 静态：别调裸 `bot.entities(...)`（那是映射对象）、射线要喂真 Vec3
+  const viewSrc = readFileSync(new URL('../extensions/mc_observe.mjs', import.meta.url), 'utf8')
+  // 只看**代码**，注释里留着"为什么不能这么写"的说明（那是要留的）
+  const viewCode = viewSrc.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+  ok(/sess\.bot\.entities\(distance/.test(viewSrc), '源码里走的是 `sess.bot.entities(distance, …)`')
+  ok(!/[^.]bot\.entities\(/.test(viewCode), '源码里没有裸 `bot.entities(...)`（实机会报 is not a function）')
+  ok(/const V = bot\.entity\.position\.constructor/.test(viewCode) && /new V\(origin\[0\]/.test(viewCode),
+    '程序射线喂的是真 Vec3（RaycastIterator 要 pos.plus/scaled/floored）')
+
+  // 宿主只有裸 bot（没有 entities()）⇒ 如实说"读不到实体列表"，不假装
+  sessions.set('D', { bot: mkBot(true, { noEntities: true }) })
+  const outNoProg = await spec.execute({}, { agent: { id: 'D', session: { header: { cwd: wsRoot } } } })
+  ok(outNoProg.text.includes('   · 实体：') && /没给 entities\(\)/.test(outNoProg.text),
+    '宿主没有 entities() 时如实说"读不到实体列表"',
+    outNoProg.text.split('\n').find((l) => l.includes('实体')))
+
+  // 程序射线跑通时：和渲染射线对账（一致就点名）
+  world.raycast = async () => ({ name: 'stone', position: { x: 0.5, y: 2, z: -3 } })
+  const outRay = await spec.execute({}, exec)
+  ok(outRay.percept.sensed.ray && outRay.percept.sensed.ray.block === 'stone',
+    '程序射线跑通时记下打到的方块', JSON.stringify(outRay.percept.sensed.ray))
+  const rayLine = outRay.text.split('\n').find((l) => l.includes('程序射线')) ?? ''
+  ok(/stone/.test(rayLine), 'text 的"程序检测到"段写了程序射线结果', rayLine)
+  ok(outRay.text.includes('和渲染一致'), '两套射线一致时点名"和渲染一致"')
+  delete world.raycast
   ok(out.image.width === 192 && out.image.height === 108, '默认 192×108', `${out.image.width}x${out.image.height}`)
   ok(out.image.attachment && out.image.attachment.mediaType === 'image/png', '图片附件已生成', JSON.stringify(out.image.attachment))
   ok(savedImages.length >= 1, 'attachments.saveImage 被调用')
@@ -290,7 +356,7 @@ console.log('— ④ execute 输出（含真实渲染 + 附件 + 落盘）—')
   ok(out.image.unloadedPct > 0, '未加载区域被算出来', String(out.image.unloadedPct))
   ok(out.image.topBlocks.length > 0, '有 topBlocks', JSON.stringify(out.image.topBlocks))
   ok(typeof out.image.renderMs === 'number' && out.image.renderMs < 5000, 'renderMs 合理', String(out.image.renderMs))
-  ok(out.image.file && out.image.file.startsWith('.dsh-mc-agent/.out/mc-view-'), '默认落 .dsh-mc-agent/.out/', String(out.image.file))
+  ok(out.image.file && out.image.file.startsWith('.dsh-mc-agent/.out/mc-observe-'), '默认落 .dsh-mc-agent/.out/', String(out.image.file))
   const file = join(wsRoot, out.image.file)
   ok(existsSync(file), '文件真的写出来了', file)
   const buf = readFileSync(file)
@@ -316,10 +382,22 @@ console.log('— ④ execute 输出（含真实渲染 + 附件 + 落盘）—')
   mineflayerBot.entity.yaw = 0
   mineflayerBot.entity.pitch = 0
 
-  // entities:false ⇒ 不收集、不画
+  // entities:false ⇒ 不收集、不画（感知块里也要如实说"这次没收集"）
   const outNoEnt = await spec.execute({ entities: false }, exec)
   ok(outNoEnt.entities.length === 0, 'entities:false 不收集实体', JSON.stringify(outNoEnt.entities))
-  ok(outNoEnt.text.includes('视野里没有实体'), 'entities:false 时 text 说没有实体')
+  ok(outNoEnt.text.includes('这次没收集实体'), 'entities:false 时"我看到/程序检测到"两段都如实说"没收集实体"')
+  ok(outNoEnt.percept.sensed.entities === null && outNoEnt.percept.seen.entities.length === 0,
+    'entities:false 时感知块里的实体为空')
+  ok(outNoEnt.percept.uncertain.some((t) => /entities:false/.test(t)), '不确定清单里点出"这次没收集实体"')
+
+  // percept:false ⇒ 退回旧的一段式摘要（省 token），且不产出 percept 对象
+  const outPlain = await spec.execute({ percept: false }, exec)
+  ok(outPlain.percept === undefined, 'percept:false 不产出感知块')
+  ok(outPlain.text.includes('👁 第一人称') && outPlain.text.includes('🎯 准星') && outPlain.text.includes('🧱 画面'),
+    'percept:false 退回旧摘要（标题/准星/画面三行）', outPlain.text.split('\n')[0])
+  ok(outPlain.text.includes('👥') && outPlain.text.includes('Steve'), 'percept:false 时实体仍在 👥 那行')
+  const outPlainNoEnt = await spec.execute({ percept: false, entities: false }, exec)
+  ok(outPlainNoEnt.text.includes('视野里没有实体'), 'percept:false + entities:false 时 👥 说没有实体')
 
   // 自定义参数 + 自定义输出路径（发布区）
   const out2 = await spec.execute({ width: 200, height: 100, fov: 40, distance: 20, crosshair: false, out: '.dsh-mc-agent/.express/pic/v.png' }, exec)
@@ -340,7 +418,7 @@ console.log('— ④ execute 输出（含真实渲染 + 附件 + 落盘）—')
 
   // 记忆根覆盖（2026-10-06）：Master 设了 config.memoryDir 之后，默认出图必须跟着记忆根走，
   // 否则 `.out/` 和 express 发布区（`<记忆根>/.express/`）会落在两个地方。
-  const memRoot = mkdtempSync(join(tmpdir(), 'mc-view-mem-'))
+  const memRoot = mkdtempSync(join(tmpdir(), 'mc-observe-mem-'))
   MEM_ROOT = memRoot
   const outMem = await spec.execute({}, exec)
   ok(outMem.image.file && outMem.image.file.startsWith('.dsh-mc-agent/.out/'), '记忆根模式：返回值仍是记忆根相对写法', String(outMem.image.file))
@@ -353,7 +431,7 @@ console.log('— ④ execute 输出（含真实渲染 + 附件 + 落盘）—')
 
 console.log('— ⑤ 离线时不崩 —')
 {
-  const spec = registered.get('mc_view')
+  const spec = registered.get('mc_observe')
   sessions.set('D', { bot: mkBot(false) })
   let err = null
   try { await spec.execute({}, { agent: { id: 'D' } }) } catch (e) { err = e }
@@ -367,7 +445,7 @@ console.log('— ⑥ 皮肤阶段共享 11 秒预算（静态）—')
    *    单个玩家最坏 4~6 个 timeout。旧注释"上界压到 10 秒就不会顶穿 11 秒"是错的，
    *    而且皮肤阶段**没有任何总预算** ⇒ waitForChunks 用光时间后这里照样再跑 10~20 秒。
    *    现在给整个皮肤阶段套 `withTimeout(…, callLeft() - 800)`，到点退回默认配色。 */
-  const src = readFileSync(new URL('../extensions/mc_view.mjs', import.meta.url), 'utf8')
+  const src = readFileSync(new URL('../extensions/mc_observe.mjs', import.meta.url), 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
   ok(/const skinBudget = Math\.max\(300, Math\.min\(CALL_BUDGET_MS, \(sess\.bot\.callLeft\?\.\(\) \?\? CALL_BUDGET_MS\) - 800\)\)/.test(src),
     '皮肤阶段算了总预算（callLeft() - 800，夹在 300..CALL_BUDGET_MS）')

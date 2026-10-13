@@ -1,5 +1,5 @@
 /**
- * mc_view 渲染内核的离线自检：不需要 Minecraft、不需要 DSH、不连服务器。
+ * `mc_view-render`（`mc_observe` 用的第一人称体素渲染内核）的离线自检：不需要 Minecraft、不需要 DSH、不连服务器。
  * 跑法：node dsh-mc-agent/tools/check-mc-view-render.mjs
  * 落盘的 PNG 在系统临时目录（跑完会打印路径），用眼睛确认方向/纹理/实体对不对。
  */

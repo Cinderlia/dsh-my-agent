@@ -14,6 +14,11 @@
  *     「能不能站、脚下有没有地面」，画成 `# · ↓ v ~ ≈ * ?`（另起一套字形，不是方块名）；
  *   · `mapImage({ mode, slab })` 跟着切，洞穴层图有自己的配色（能走=亮、墙=暗）。
  *
+ * 🔴 2026-10-08 路线图第 ④ 条第十一刀：这一层的实现已搬到 `src/map-render.mjs`
+ *   （`isUnderground(b)` / `caveCell(b, …)` / `heightmapOf(b, …)` / `glyphMapText(…)` / `mapImageOf(b, …)`），
+ *   `core.mjs` 只留四个同名薄包装（公开面不变）⇒ 下面⑤那些"按源码文本找代码"的断言
+ *   必须去**新模块**里找（踩坑档案第 46 条那个坑，第十一次）。
+ *
  * 用法：node tools/check-core-map.mjs
  *   ⚠️ **必须从包目录跑**（`<profile>/node_modules/dsh-mc-agent`）：`src/core.mjs` 顶部
  *      `import ... from 'mineflayer'`，源码树里没有 node_modules，会 ERR_MODULE_NOT_FOUND。
@@ -243,17 +248,25 @@ try {
   section('⑤ 静态接线（core.mjs / index.js）')
 
   const core = readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8')
+  const names = readFileSync(new URL('../src/block-names.mjs', import.meta.url), 'utf8')
+  const mapSrc = readFileSync(new URL('../src/map-render.mjs', import.meta.url), 'utf8')
   const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 
   const checks = [
-    [core, /const PASSABLE = /, 'core：有"能穿过去的小东西"名单（花草火把不算墙）'],
-    [core, /const SOFT_ROOF = /, 'core：有"软顶"名单（树叶/竹子/雪层不算地下）'],
-    [core, /const CAVE_GLYPH = \{/, 'core：洞穴字形表'],
-    [core, /isUnderground \(\) \{/, 'core：isUnderground() 方法'],
-    [core, /#caveCell \(b, x, cy, z, slab\) \{/, 'core：#caveCell() 私有方法'],
-    [core, /const cave = mode === 'cave' \|\| \(mode !== 'surface' && this\.isUnderground\(\)\)/, 'core：auto 模式按 isUnderground() 自动切'],
-    [core, /mapImage \(\{ radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'auto', slab = 2 \} = \{\}\)/, 'core：mapImage 也接 mode/slab'],
+    [names, /export const PASSABLE = /, 'block-names：有"能穿过去的小东西"名单（花草火把不算墙）'],
+    [names, /export const SOFT_ROOF = /, 'block-names：有"软顶"名单（树叶/竹子/雪层不算地下）'],
+    [names, /export const CAVE_GLYPH = \{/, 'block-names：洞穴字形表'],
+    [core, /from '\.\/block-names\.mjs'/, 'core：这些纯方块名判据改成从 block-names.mjs 导入（路线图第 ④ 条第二刀）'],
+    [core, /from '\.\/map-render\.mjs'/, 'core：地图那一层改成从 map-render.mjs 导入（路线图第 ④ 条第十一刀）'],
+    [core, /isUnderground \(\) \{ return isUnderground\(this\.requireBot\(\)\) \}/, 'core：isUnderground() 留成薄包装（公开面不变）'],
+    [core, /heightmap \(opts = \{\}\) \{ return heightmapOf\(this\.requireBot\(\), opts\) \}/, 'core：heightmap() 留成薄包装'],
+    [core, /static glyphMap \(names, step = 2, selfIndex = null\) \{ return glyphMapText\(names, step, selfIndex\) \}/, 'core：static glyphMap() 留成薄包装'],
+    [core, /mapImage \(opts = \{\}\) \{ return mapImageOf\(this\.requireBot\(\), opts\) \}/, 'core：mapImage() 留成薄包装'],
+    [mapSrc, /export function isUnderground \(b\) \{/, 'map-render：isUnderground(b)'],
+    [mapSrc, /export function caveCell \(b, x, cy, z, slab\) \{/, 'map-render：caveCell()（原来叫 #caveCell，第十一刀搬过去的）'],
+    [mapSrc, /const cave = mode === 'cave' \|\| \(mode !== 'surface' && isUnderground\(b\)\)/, 'map-render：auto 模式按 isUnderground(b) 自动切'],
+    [mapSrc, /export function mapImageOf \(b, \{ radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'auto', slab = 2 \} = \{\}\)/, 'map-render：mapImageOf 也接 mode/slab'],
     [strip(idx), /mode: \{ type: 'string'/, 'index：mc_map 有 mode 参数'],
     [strip(idx), /slab: \{ type: 'number'/, 'index：mc_map 有 slab 参数'],
     [strip(idx), /heightmap\(\{ radius: args\.radius, yTop: args\.yTop, yBottom: args\.yBottom, mode, slab \}\)/, 'index：把 mode/slab 传进 heightmap'],
@@ -264,6 +277,10 @@ try {
     [strip(idx), /洞穴层俯视图/, 'index：图像文案区分洞穴层'],
   ]
   for (const [src, re, label] of checks) ok(re.test(src), label)
+  ok(!/this\.#caveCell/.test(core) && !/#caveCell \(b, x, cy, z, slab\) \{/.test(core),
+    'core：没有残留的 #caveCell（第十一刀搬走了 —— 别只搬不接）')
+  ok(!/export \{[^}]*\} from '\.\/map-render\.mjs'/.test(core),
+    'core：没有多写 re-export（公开面靠四个同名薄包装）')
   ok(!/hm\.legend\.slice\(0, 15\)\.join\(' '\)/.test(strip(idx)),
     '顺手修掉的老 bug：图例不再是 [object Object]（以前 legend 是对象却直接 join）')
   ok(/想强制看地表就 mode:"surface"/.test(idx), '文案告诉 AI 可以 mode:"surface" 强制看地表')

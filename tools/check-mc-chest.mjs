@@ -1,6 +1,6 @@
 /**
  * mc_chest 扩展的自检：用**假 bot / 假箱子窗口 / 假世界**跑真实扩展文件，覆盖
- *   ① 工具注册形状（且确认它**在** mc_view 的看图门禁名单里）
+ *   ① 工具注册形状（且确认它**在** mc_observe 的看图门禁名单里）
  *   ② 找箱子：坐标指定、半径搜索（🔴 必须用**方块 id**，不是物品 id）、
  *      `findContainers` 要把 findBlocks 返回的**坐标**转回方块（mineflayer 4.39 的坑）
  *   ③ 文本：背包概览 / 箱子概览 / listText 的两条分支 / hintFor
@@ -236,11 +236,11 @@ console.log('— ① 工具注册 —')
   ok(Array.isArray(blocks) && blocks.length === 1 && blocks[0].text === 'hi', 'render 推一个文字块')
   ok(spec.description.includes('箱子'), '描述里说明是箱子')
   ok(spec.description.includes('put') && spec.description.includes('take'), '描述里说明 put/take')
-  ok(spec.description.includes('mc_view'), '描述里提到受看图门禁限制')
+  ok(spec.description.includes('mc_observe'), '描述里提到受看图门禁限制')
   // 门禁名单
-  const viewSrc = readFileSync(new URL('../extensions/mc_view.mjs', import.meta.url), 'utf8')
+  const viewSrc = readFileSync(new URL('../extensions/mc_observe.mjs', import.meta.url), 'utf8')
   const gatedBlock = viewSrc.slice(viewSrc.indexOf('const DEFAULT_GATED'), viewSrc.indexOf(']', viewSrc.indexOf('const DEFAULT_GATED')))
-  ok(gatedBlock.includes('mc_chest'), 'mc_chest 在 mc_view 门禁名单里（会开世界里的箱子）', gatedBlock.replace(/\s+/g, ' '))
+  ok(gatedBlock.includes('mc_chest'), 'mc_chest 在 mc_observe 门禁名单里（会开世界里的箱子）', gatedBlock.replace(/\s+/g, ' '))
   ok(gatedBlock.includes('mc_furnace'), 'mc_furnace 还在门禁名单里')
   ok(!gatedBlock.includes('mc_craft'), 'mc_craft 不在门禁名单里（只动背包）')
   ok(logs.some((l) => l.includes('mc_chest 已加载')), '加载时记了一行日志')

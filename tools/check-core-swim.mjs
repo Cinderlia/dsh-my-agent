@@ -340,44 +340,63 @@ section('⑧ 静态接线：core / index 都在')
   const index = strip(idx)
   const autoSrc = strip(readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8'))
 
-  ok(/async swimUp \(\{ hold = 3_000 \} = \{\}\)/.test(core), 'core.mjs 有 swimUp({hold=3000})')
-  ok(/b\.setControlState\('jump', true\)/.test(core), 'swimUp 里按住 jump')
-  /* 🔴 2026-10-08 实机：`entity.isInWater` 在**泡在水柱里**读出来是 undefined（prismarine-physics
-   *    入水 AABB 从底部缩了 0.401）⇒ 判据一律走 `#inWaterNow`（isInWater 或眼睛那格是水）。 */
-  ok(/if \(!this\.#inWaterNow\(b\)\) break/.test(core), '出水就 break（走 #inWaterNow）')
-  ok(/if \(!this\.#inWaterNow\(b\)\) \{\r?\n      return \{ inWater: false/.test(core),
-    'swimUp 开头就用 #inWaterNow 判断"我在不在水里"（以前只看 isInWater ⇒ 泡水柱里回"我本来就没在水里"）')
-  ok(!/if \(!e\?\.isInWater\) \{\r?\n      return \{ inWater: false/.test(core), 'swimUp 不再只看 entity.isInWater')
+  /* 🔴 第三十五刀：`jump` / `swimUp` 整段搬进 `src\movement.mjs`（那边去掉 2 格缩进、`this.` → `self.`、
+   *    `#beginMove()` → `ctx.bumpGen()`）⇒ 这一组判据改查新模块，core 那边只留"薄包装 + 确实导入了"。 */
+  const movSrc = strip(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8'))
+  ok(/export async function swimUp \(self, \{ hold = 3_000 \} = \{\}, ctx = \{\}\)/.test(movSrc), 'movement.mjs 有 swimUp(self, {hold=3000}, ctx)')
+  ok(/b\.setControlState\('jump', true\)/.test(movSrc), 'swimUp 里按住 jump')
+  /* 🔴 2026-10-08 第十刀：`#inWaterNow` 搬进 `src/world-observer.mjs`（改名 `inWaterNow`）
+   *    ⇒ 调用点变成 `inWaterNow(b)`，判据要跟着改，并确认 movement.mjs 真的导入了。 */
+  ok(/if \(!inWaterNow\(b\)\) break/.test(movSrc), '出水就 break（走 inWaterNow）')
+  ok(/if \(!inWaterNow\(b\)\) \{\r?\n    return \{ inWater: false/.test(movSrc),
+    'swimUp 开头就用 inWaterNow 判断"我在不在水里"（以前只看 isInWater ⇒ 泡水柱里回"我本来就没在水里"）')
+  ok(/from '\.\/world-observer\.mjs'/.test(movSrc), 'movement.mjs：观察层从 world-observer.mjs 导入')
+  ok(/export function inWaterNow \(b\)/.test(strip(readFileSync(new URL('../src/world-observer.mjs', import.meta.url), 'utf8'))),
+    'world-observer：inWaterNow 在新模块里（第十刀搬过去的）')
+  ok(!/if \(!e\?\.isInWater\) \{\r?\n      return \{ inWater: false/.test(movSrc), 'swimUp 不再只看 entity.isInWater')
   ok(/const submerged = submergedIn\(b, e\)[\s\S]{0,200}const inWater = submerged \|\| Boolean\(e\?\.isInWater\)/.test(autoSrc),
     'mc_auto 的憋气判据以"头在水下"为主（以前 isInWater 读不到就整条分支不执行）')
   ok(/submergedIn = \(b, e\) => \{\r?\n  try \{\r?\n    if \(!e\?\.position\) return false/.test(autoSrc),
     'mc_auto 的 submergedIn 不再要求 e.isInWater')
-  ok(/rose >= 0\.4 && a != null && a >= 20/.test(core), '头露出水面 + 氧气回升也 break')
-  ok(/this\.callLeft\(\)[\s\S]{0,700}left - 300/.test(core), 'swimUp 给这一轮留 300ms 余量')
+  ok(/rose >= 0\.4 && a != null && a >= 20/.test(movSrc), '头露出水面 + 氧气回升也 break')
+  ok(/self\.callLeft\(\)[\s\S]{0,700}left - 300/.test(movSrc), 'swimUp 给这一轮留 300ms 余量')
   /* 🔴 2026-10-08 第四份审计报告 ①④⑧：swimUp 以前不认中断、预算归零白送 200ms、`hold:0` 被当 3000。 */
-  ok(/if \(this\.abortSignal\?\.aborted\) throw abortError\('上浮'/.test(core), 'swimUp 认中断')
-  ok(/raceAbort\(sleep\(100\), this\.abortSignal, '上浮'\)/.test(core), 'swimUp 的 sleep 可中断')
-  ok(/const gen = this\.#beginMove\(\)/.test(core) && /if \(this\._moveGen !== gen\) \{ preempted = true; break \}/.test(core),
+  ok(/if \(self\.abortSignal\?\.aborted\) throw abortError\('上浮'/.test(movSrc), 'swimUp 认中断')
+  ok(/raceAbort\(sleep\(100\), self\.abortSignal, '上浮'\)/.test(movSrc), 'swimUp 的 sleep 可中断')
+  ok(/const gen = bumpGen\(\)/.test(movSrc) && /if \(self\._moveGen !== gen\) \{ preempted = true; break \}/.test(movSrc),
     'swimUp 领 _moveGen 号、被接管就让位')
-  ok(/if \(this\._moveGen === gen\) \{ try \{ b\.setControlState\('jump', false\) \}/.test(core), 'swimUp 只在还是自己时松 jump')
-  ok(!/Math\.max\(200, Math\.min\(Number\(hold\)/.test(core), '预算归零时不再白送 200ms')
-  ok(/Number\.isFinite\(Number\(hold\)\) \? Number\(hold\) : 3_000/.test(core), 'hold:0 不再被当成 3000')
-  ok(/case 'swim':    return \(s\.x != null && s\.y != null && s\.z != null\) \? this\.walkTo\(s\) : this\.swimUp\(s\)/.test(core),
-    'mc_sequence 的 op 里有 swim（给坐标=游过去，不给=上浮）')
+  ok(/if \(self\._moveGen === gen\) \{ try \{ b\.setControlState\('jump', false\) \}/.test(movSrc), 'swimUp 只在还是自己时松 jump')
+  ok(!/Math\.max\(200, Math\.min\(Number\(hold\)/.test(movSrc), '预算归零时不再白送 200ms')
+  ok(/Number\.isFinite\(Number\(hold\)\) \? Number\(hold\) : 3_000/.test(movSrc), 'hold:0 不再被当成 3000')
+  /* 第三十五刀接线：core 那边只剩薄包装，私有 `#beginMove` 靠 `ctx.bumpGen` 递进去（迁移规矩第 28 条）。 */
+  ok(/from '\.\/movement\.mjs'/.test(core), 'core：movement 从 movement.mjs 导入')
+  ok(/async jump \(\) \{ return await jumpImpl\(this, \{ bumpGen: \(\) => this\.#beginMove\(\) \}\) \}/.test(core), 'core 的 jump 是薄包装')
+  ok(/async swimUp \(opts = \{\}\) \{ return await swimUpImpl\(this, opts, \{ bumpGen: \(\) => this\.#beginMove\(\) \}\) \}/.test(core), 'core 的 swimUp 是薄包装')
+  /* 🔴 第二十二刀：步骤分发（`#runStep`）搬进 `src\sequence.mjs` ⇒ 改成查新模块（那边是 `self.`）。 */
+  const seqSrc = strip(readFileSync(new URL('../src/sequence.mjs', import.meta.url), 'utf8'))
+  ok(/case 'swim':    return \(s\.x != null && s\.y != null && s\.z != null\) \? self\.walkTo\(s\) : self\.swimUp\(s\)/.test(seqSrc),
+    'sequence.mjs 的 op 里有 swim（给坐标=游过去，不给=上浮）')
   // 🔴 水里不能用 pathfinder（它的 A* 明确拒绝水节点，见 #walkSwim 的注释）
-  ok(/async #walkSwim \(target, \{ arrive = 1\.6, budget = this\.cfg\.moveBudgetMs \} = \{\}\)/.test(core), 'core.mjs 有 #walkSwim（直接游）')
-  ok(/if \(this\.#inWaterNow\(b\)\) \{\r?\n      const swim = await this\.#walkSwim/.test(core), 'walkTo 在水里先走 #walkSwim（判据同 #inWaterNow）')
-  ok(/return \{ \.\.\.rest, swam: true, swimMoved: swim\.moved, swimMs: swim\.ms \}/.test(core), '上岸后交回 pathfinder（并标注 swam/swimMoved）')
-  ok(/via: 'swim'/.test(core), '#walkSwim 返回 via:swim')
-  ok(/b\.setControlState\('forward', true\)\r?\n        b\.setControlState\('jump', true\)/.test(core), '#walkSwim 按住 forward + jump（jump = 浮在水面）')
-  ok(/reason: outOfWater \? 'swim-shore' : 'swim-budget'/.test(core), '如实区分"上岸了"与"这一轮用完了"')
-  ok(/const fluid = name \?\?/.test(core) && /if \(fluid && isLiquid\(fluid\)\)/.test(core), 'dig() 先拒流体')
-  ok(/air: Number\.isFinite\(b\.oxygenLevel\) \? b\.oxygenLevel : null/.test(core), 'status() 报氧气 air')
+  // 路线图第 ④ 条第三十六刀：`walkTo` / `#walkSwim` 的函数体已搬进 `src\movement.mjs`（core 只剩薄包装）。
+  ok(/export async function walkSwim \(self, target, \{ arrive = 1\.6, budget = self\.cfg\.moveBudgetMs \} = \{\}, ctx = \{\}\)/.test(movSrc), 'movement.mjs 有 walkSwim（直接游）')
+  ok(/if \(inWaterNow\(b\)\) \{\r?\n    const swim = await walkSwim\(self, target, \{ arrive, budget \}, ctx\)/.test(movSrc), 'walkTo 在水里先走 walkSwim（判据同 inWaterNow）')
+  ok(/return \{ \.\.\.rest, swam: true, swimMoved: swim\.moved, swimMs: swim\.ms \}/.test(movSrc), '上岸后交回 pathfinder（并标注 swam/swimMoved）')
+  ok(/via: 'swim'/.test(movSrc), 'walkSwim 返回 via:swim')
+  ok(/b\.setControlState\('forward', true\)\r?\n      b\.setControlState\('jump', true\)/.test(movSrc), 'walkSwim 按住 forward + jump（jump = 浮在水面）')
+  ok(/reason: outOfWater \? 'swim-shore' : 'swim-budget'/.test(movSrc), '如实区分"上岸了"与"这一轮用完了"')
+  ok(/from '\.\/movement\.mjs'/.test(core), 'core 确实从 movement.mjs 导入（搬走 + 忘接 = 假绿）')
+  /* 路线图第 ④ 条第四十刀：`dig()` 已搬进 `src\mining.mjs`。 */
+  const mineSrc = strip(readFileSync(new URL('../src/mining.mjs', import.meta.url), 'utf8'))
+  ok(/const fluid = name \?\?/.test(mineSrc) && /if \(fluid && isLiquid\(fluid\)\)/.test(mineSrc)
+    && /from '\.\/mining\.mjs'/.test(core), 'dig() 先拒流体（实现已搬到 src\\mining.mjs）')
+  /* 路线图第 ④ 条第十三刀：`status()` 已搬进 `src/status.mjs` —— 下面五条改查那个文件。 */
+  const stSrc = strip(readFileSync(new URL('../src/status.mjs', import.meta.url), 'utf8'))
+  ok(/air: Number\.isFinite\(b\.oxygenLevel\) \? b\.oxygenLevel : null/.test(stSrc), 'status() 报氧气 air（实现已搬到 src\\status.mjs）')
   // 🔴 实机（2026-10-07）：`bot.oxygenLevel` 只在头入水后才有读数（水面上是 null）⇒ 判据要有"头在水下"
-  ok(/submerged: \(\(\) => \{/.test(core), 'status() 报"头在水下"submerged（氧气读不到时的可靠判据）')
-  ok(/b\.entity\.position\.offset\(0, b\.entity\.eyeHeight \?\? 1\.62, 0\)/.test(core), 'submerged 用眼睛那一格算')
-  ok(/return isLiquid\(b\.blockAt\(eye\)\?\.name\)/.test(core), 'submerged = 眼睛那格是液体')
-  ok(!/if \(!b\.entity\.isInWater\) return false/.test(core), 'status().submerged 不再先要求 entity.isInWater（泡水柱时它会漏报）')
+  ok(/submerged: \(\(\) => \{/.test(stSrc), 'status() 报"头在水下"submerged（氧气读不到时的可靠判据）')
+  ok(/b\.entity\.position\.offset\(0, b\.entity\.eyeHeight \?\? 1\.62, 0\)/.test(stSrc), 'submerged 用眼睛那一格算')
+  ok(/return isLiquid\(b\.blockAt\(eye\)\?\.name\)/.test(stSrc), 'submerged = 眼睛那格是液体')
+  ok(!/if \(!b\.entity\.isInWater\) return false/.test(stSrc), 'status().submerged 不再先要求 entity.isInWater（泡水柱时它会漏报）')
 
   ok(/mode === 'swim'/.test(index), 'index.js 的 mc_move 认 swim')
   ok(/sess\.bot\.swimUp\(\{ hold: args\.budgetMs \}\)/.test(index), 'swim 不给坐标时把 budgetMs 当上浮时间')

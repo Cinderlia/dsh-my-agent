@@ -16,7 +16,7 @@
  *
  * 装法：放在 `<profile>/node_modules/dsh-mc-agent/extensions/` 下即自动加载（插件 index.js:4089 的扩展点）。
  *
- * 门禁：**不**加进 mc_view 的 `DEFAULT_GATED` —— 合成只动背包、不动世界，不需要"先看一眼"。
+ * 门禁：**不**加进 mc_observe 的 `DEFAULT_GATED` —— 合成只动背包、不动世界，不需要"先看一眼"。
  * （`mc_furnace` 会动世界里的熔炉，所以它进。）
  *
  * 环境变量：无。参数都在工具调用里。
@@ -26,7 +26,7 @@ import {
 } from './mc_util.mjs'
 import { withTimeout, CALL_MS } from '../src/core.mjs'
 
-/* 上面这些原来在本文件里定义，2026-10-06 搬到 `mc_util.mjs`（mc_chest / mc_furnace / mc_view 也用
+/* 上面这些原来在本文件里定义，2026-10-06 搬到 `mc_util.mjs`（mc_chest / mc_furnace / mc_observe 也用
  * 同一份；箱子工具不该去 import 合成工具）。这里再导出一次，老的 `from './mc_craft.mjs'` 不用改。 */
 export { itemNameOf, itemIdOf, blockIdOf, canPlaceInto, blockAtXYZ, findPlaceSpot }
 
@@ -41,7 +41,7 @@ const MAX_DEPTH = 4
 
 /* ───────────────────────── 基础查询（都能脱离真实 bot 单测） ───────────────────────── */
 /* 名字 ↔ id 互转、`countOf`、`canPlaceInto`、`vec3Of`、`blockAtXYZ` 2026-10-06 搬到
- * `mc_util.mjs`（mc_chest / mc_furnace / mc_view 也用同一份）—— 文件顶部的 import 与再导出里都有。 */
+ * `mc_util.mjs`（mc_chest / mc_furnace / mc_observe 也用同一份）—— 文件顶部的 import 与再导出里都有。 */
 
 /** 找工作台：给了 x/y/z 就查那一格；否则在 radius 内找最近的一个 */
 export function findTableBlock (bot, { x, y, z, radius = 4 } = {}) {
@@ -775,7 +775,7 @@ export async function apply (api) {
       + '· `list:true` 看配方/看当前能做什么；`dryRun:true` 只出计划不动手（拿不准就先 dryRun）。\n'
       + '· `count` 是"背包里**一共**要到几个"（默认 1）：已经够了就**一个都不做**，结果会如实说"一个都没做"。要"再做 4 个"就写 `{count:4, more:true}`。\n'
       + '· 🔴 合成**连着两三次都"超时"**就先 `mc_connect` 重连一次再试：重连会把卡在合成格里的材料退回背包（我每次动手前也会先把合成格里的东西点回背包）。\n'
-      + '🔴 合成只动背包、不动世界，所以**不受 mc_view 门禁限制**。',
+      + '🔴 合成只动背包、不动世界，所以**不受 mc_observe 门禁限制**。',
     parameters: {
       name: { type: 'string', description: '要合成的物品（英文 id 或简称，如 oak_planks / planks / stick / wooden_pickaxe / crafting_table / furnace）' },
       count: { type: 'number', description: '合成后背包里**一共**要有几个（默认 1）。要"再做 N 个"就加 more:true' },

@@ -1,12 +1,12 @@
 /**
  * mc_util —— 扩展之间共用的最小工具件（**不是**一个扩展，没有 `apply`）
  *
- * 为什么有这个文件：`mc_craft` / `mc_chest` / `mc_furnace` / `mc_view` 都要"名字 ↔ id 互转、
+ * 为什么有这个文件：`mc_craft` / `mc_chest` / `mc_furnace` / `mc_observe` 都要"名字 ↔ id 互转、
  * 查某一格方块、找个能放东西的位置、夹取一个数"这几件事。原来这些是各自抄一份
  * （`clamp` 4 份、`countOf` 3 份），或者让箱子/熔炉去 `import` 合成模块 —— 箱子工具依赖合成工具，
  * 方向不对，而且想单独给某个扩展做离线套件时得连合成那一坨一起拖进来。
  *
- * 现在统一在这里，依赖方向是：mc_craft / mc_chest / mc_furnace / mc_view → **mc_util** → mc_view-render。
+ * 现在统一在这里，依赖方向是：mc_craft / mc_chest / mc_furnace / mc_observe → **mc_util** → mc_view-render。
  * 插件加载器只对导出 `apply` 的文件调扩展点（index.js:4278），所以这个文件被 import 时会被安静跳过。
  *
  * 这里只放**跟具体业务无关**的东西；凡是有"合成/熔炼/箱子"语义的一律留在各自扩展里。

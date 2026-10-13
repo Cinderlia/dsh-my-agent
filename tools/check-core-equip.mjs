@@ -252,38 +252,88 @@ section('⑥ mc_move 垫路 ⇒ 带 pillared + pillaredWith + held')
 section('⑦ 静态接线')
 {
   const coreSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/core.mjs', import.meta.url), 'utf8'))
-  ok(/#heldText \(b\) \{/.test(coreSrc), 'core 有 #heldText（统一的"手上那叠"文案）')
+/* 路线图第 ④ 条第二十七刀：`interact` / `equip` 已搬进 `src\world-use.mjs`。 */
+const useSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/world-use.mjs', import.meta.url), 'utf8'))
+const buildSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/build.mjs', import.meta.url), 'utf8'))
+  // 路线图第 ④ 条第三十六/三十七刀：`walkTo` / `#walkSwim` / `flyTo` / `#walkPathfinder` 搬进 `src/movement.mjs`。
+  const movSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/movement.mjs', import.meta.url), 'utf8'))
+  // 路线图第 ④ 条第七刀：背包那一层（heldText/invSnap/invUsed/canHarvestNow/toolKinds/countOf/freeSlot）
+  // 搬到了 `src/inventory.mjs` —— 下面几条判据改成查新模块，并补"core 确实 import 了"（防搬走 + 忘接）。
+  const invSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/inventory.mjs', import.meta.url), 'utf8'))
+  // 路线图第 ④ 条第十四刀：挖掘速度那一层（digMsFor/digToolKindOf/digToolSpeedOf/fixDigMs/
+  // patchDigTime/bestToolFor）搬到了 `src/dig-speed.mjs`。
+  const dsSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/dig-speed.mjs', import.meta.url), 'utf8'))
+  ok(/export function digMsFor \(b, blk, itemType = null\) \{/.test(dsSrc), 'dig-speed 有 digMsFor')
+  ok(/export function fixDigMs \(b, blk, itemType\) \{/.test(dsSrc), 'dig-speed 有 fixDigMs（上游缺倍率的兜底）')
+  ok(/export function patchDigTime \(b\) \{/.test(dsSrc) && /export function bestToolFor \(b, blk\) \{/.test(dsSrc),
+    'dig-speed 有 patchDigTime / bestToolFor')
+  ok(/export function digToolKindOf \(name\) \{/.test(dsSrc) && /export function digToolSpeedOf \(reg, itemType\) \{/.test(dsSrc),
+    'dig-speed 有 digToolKindOf / digToolSpeedOf')
+  ok(/from '\.\/dig-speed\.mjs'/.test(coreSrc), 'core 确实从 dig-speed.mjs 导入（别只搬不接）')
+  ok(!/#digMsFor \(b|#fixDigMs \(b|#digToolKindOf \(|#digToolSpeedOf \(|#bestToolFor \(b|#patchDigTime \(b/.test(coreSrc),
+    'core 里没有残留的挖掘速度私有方法定义')
+  ok(/patchDigTime \(b\) \{ return patchDigTime\(b\) \}/.test(coreSrc), 'patchDigTime 公开方法保留成薄包装（自检脚本一行都不用改）')
+  ok(/export function heldText \(b\) \{/.test(invSrc), 'inventory 有 heldText（统一的"手上那叠"文案）')
+  ok(/export function canHarvestNow \(b, blk\) \{/.test(invSrc), 'inventory 有 canHarvestNow（手上这叠能不能挖）')
+  ok(/export function toolKinds \(b, blk\) \{/.test(invSrc), 'inventory 有 toolKinds（人话版"需要镐/斧/锹"）')
+  ok(/export function invSnap \(b\) \{/.test(invSrc) && /export function invUsed \(b, snap\) \{/.test(invSrc), 'inventory 有 invSnap / invUsed（路上用掉了什么）')
+  ok(/export function countOf \(b, name\) \{/.test(invSrc) && /export function freeSlot \(b, itemName = null\) \{/.test(invSrc),
+    'inventory 有 countOf / freeSlot（背包计数、选槽位）')
+  ok(/from '\.\/inventory\.mjs'/.test(coreSrc), 'core 确实从 inventory.mjs 导入（别只搬不接）')
+  ok(/return countOf\(this\.bot, name\)/.test(coreSrc), 'countOf 公开方法保留成薄包装（外部一行都不用改）')
+  ok(!/#heldText \(b\) \{|#invSnap \(b\) \{|#freeSlot \(b/.test(coreSrc), 'core 里没有残留的旧私有方法定义')
   ok(/#equipFor \(b, blk, label/.test(coreSrc), 'core 有 #equipFor（动手前换对工具）')
-  ok(/#canHarvestNow \(b, blk\) \{/.test(coreSrc), 'core 有 #canHarvestNow（手上这叠能不能挖）')
-  ok(/#toolKinds \(b, blk\) \{/.test(coreSrc), 'core 有 #toolKinds（人话版"需要镐/斧/锹"）')
-  ok(/#invSnap \(b\) \{/.test(coreSrc) && /#invUsed \(b, snap\) \{/.test(coreSrc), 'core 有 #invSnap / #invUsed（路上用掉了什么）')
-  ok(/#withHeld \(out, b, before\) \{/.test(coreSrc), 'core 有 #withHeld（dig 结果里补"手上变了"）')
-  ok(/await this\.#equipFor\(b, blk, `换工具挖 \$\{name\}`\)/.test(coreSrc), 'breakBlock 动手前调 #equipFor')
-  ok(/if \(!this\.#canHarvestNow\(b, blk\)\) \{/.test(coreSrc), 'breakBlock 换不上就拒绝（不硬挖）')
-  ok(/硬挖会一直超时/.test(coreSrc), '拒绝文案写清"硬挖会一直超时"')
-  ok(/const digMs = this\.#digMsFor\(b, blk/.test(coreSrc), 'breakBlock 用 #digMsFor 算"这块要几秒"')
-  ok(/#digMsFor \(b, blk, itemType = null\)/.test(coreSrc) && /typeof blk\?\.digTime !== 'function'/.test(coreSrc),
-    '#digMsFor 走 block.digTime（能算"换成背包里那把会快多少"）')
-  ok(/if \(digMs != null && leftMs < digMs \+ 900\)/.test(coreSrc), '时间不够就不开始挖（别挖一半松手）')
+  // 路线图第 ④ 条第十五刀：采集/落地守卫（collectBusy/cancelCollect/waitGrounded/withHeld）
+  // 搬到了 `src/dig-guard.mjs`。薄包装同名 ⇒ 所有调用点一行都不用改。
+  const dgSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/dig-guard.mjs', import.meta.url), 'utf8'))
+  ok(/#withHeld \(out, b, before\) \{ return withHeld\(out, b, before\) \}/.test(coreSrc), 'core 有 #withHeld 薄包装（dig 结果里补"手上变了"）')
+  ok(/export function withHeld \(out, b, before\) \{/.test(dgSrc), 'dig-guard 有 withHeld')
+  ok(/export function collectBusy \(b\) \{/.test(dgSrc) && /export async function cancelCollect \(b, ctx = \{\}\) \{/.test(dgSrc),
+    'dig-guard 有 collectBusy / cancelCollect（停掉后台采集任务）')
+  ok(/export async function waitGrounded \(b, \{ maxMs = 1_200, signal = null \} = \{\}\) \{/.test(dgSrc), 'dig-guard 有 waitGrounded（空中挖慢 5 倍）')
+  ok(/from '\.\/dig-guard\.mjs'/.test(coreSrc), 'core 确实从 dig-guard.mjs 导入（别只搬不接）')
+  ok(/bumpGen: \(\) => \{ this\._moveGen\+\+ \}/.test(coreSrc), '薄包装把移动代号推进去（模块不碰 this）')
+  ok(!/const cap = budgetMs == null/.test(coreSrc) && !/#collectBusy \(b\) \{\r?\n\s+try \{ return Boolean\(b\?\.collectBlock/.test(coreSrc) &&
+    !/#waitGrounded \(b, maxMs = 1_200\) \{\r?\n\s+const ent = b\?\.entity/.test(coreSrc) && !/#withHeld \(out, b, before\) \{\r?\n\s+const held = heldText\(b\)/.test(coreSrc),
+    'core 里没有残留的旧私有方法体（只剩薄包装）')
+  /* 路线图第 ④ 条第三十八刀：`breakBlock` 搬进 `src\mining.mjs`（core 只剩薄包装 + `#mineCtx()`）。 */
+  const mineSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/mining.mjs', import.meta.url), 'utf8'))
+  ok(/export async function breakBlock \(self, \{ x, y, z \} = \{\}, ctx = \{\}\) \{/.test(mineSrc), 'mining 有 breakBlock')
+  ok(/await ctx\.equipFor\(b, blk, `换工具挖 \$\{name\}`\)/.test(mineSrc), 'breakBlock 动手前调 equipFor（实现在 src\\mining.mjs）')
+  ok(/if \(!canHarvestNow\(b, blk\)\) \{/.test(mineSrc), 'breakBlock 换不上就拒绝（不硬挖）')
+  ok(/硬挖会一直超时/.test(mineSrc), '拒绝文案写清"硬挖会一直超时"')
+  ok(/const digMs = digMsFor\(b, blk/.test(mineSrc), 'breakBlock 用 digMsFor 算"这块要几秒"')
+  ok(/export function digMsFor \(b, blk, itemType = null\)/.test(dsSrc) && /typeof blk\?\.digTime !== 'function'/.test(dsSrc),
+    'digMsFor 走 block.digTime（能算"换成背包里那把会快多少"）')
+  ok(/if \(digMs != null && leftMs < digMs \+ 900\)/.test(mineSrc), '时间不够就不开始挖（别挖一半松手）')
+  ok(/from '\.\/mining\.mjs'/.test(coreSrc), 'core 确实从 mining.mjs 导入（别只搬不接）')
+  ok(/async breakBlock \(opts = \{\}\) \{ return await breakBlockImpl\(this, opts, this\.#mineCtx\(\)\) \}/.test(coreSrc), 'core 有 breakBlock 薄包装')
+  ok(!/if \(digMs != null && leftMs < digMs \+ 900\)/.test(coreSrc), 'core 里没有残留的 breakBlock 实现体')
   // 空中挖会慢 5 倍，但 `onGround` 在走路下台阶/贴斜坡边缘时会瞬时为 false ⇒ 实机把"1.1 秒能挖掉"
   // 估成 5650ms，白拒一次。所以判据取"**真在下落**"：离地 **且** 竖直速度明显为负。
   // （2026-10-08 熔炼验证：掉进 7 格深的坑、在下落途中挖原木 ⇒ 真 digTime 是 3 秒 ×5 = 15 秒，
   //   按"站着"估成 3 秒就放行 ⇒ `bot.dig()` 挂满整轮预算只回一句"超时"。）
-  ok(/const vY = Number\(b\?\.entity\?\.velocity\?\.y \?\? 0\)/.test(coreSrc)
-    && /const notOnGround = !b\?\.entity\?\.onGround && vY < -0\.02/.test(coreSrc),
-    '#digMsFor 只在"真在下落"（离地 + 竖直速度为负）时按空中估')
-  ok(!/const notOnGround = !b\?\.entity\?\.onGround\s*$/.test(coreSrc),
+  ok(/const vY = Number\(b\?\.entity\?\.velocity\?\.y \?\? 0\)/.test(dsSrc)
+    && /const notOnGround = !b\?\.entity\?\.onGround && vY < -0\.02/.test(dsSrc),
+    'digMsFor 只在"真在下落"（离地 + 竖直速度为负）时按空中估')
+  ok(!/const notOnGround = !b\?\.entity\?\.onGround\s*$/.test(dsSrc),
     '没有只看 `!b.entity.onGround`（瞬时浮空会把估计放大 5 倍、白拒一次）')
-  ok(/const roadInfo = \(\) => \{/.test(coreSrc) && /pillaredWith: used\[0\]\.name/.test(coreSrc),
-    'walkTo 垫路后报 pillaredWith')
-  ok(/\.\.\.\(placed \? \{ pillared: placed \} : \{\}\), \.\.\.roadInfo\(\)/.test(coreSrc), '两条返回路径都带 roadInfo()')
-  ok(/if \(r\?\.placed\) \{ if \(!used\) used = r\.placed; ok\.push\(at\) \}/.test(coreSrc)
-    && /fail\.push\(`\$\{at\}: 现在那里是/.test(coreSrc),
-    'build 只把**复核过真放上去**的算 placed（placed:false 不再计数）')
+  ok(/const roadInfo = \(\) => \{/.test(movSrc) && /pillaredWith: used\[0\]\.name/.test(movSrc)
+    && /from '\.\/movement\.mjs'/.test(coreSrc),
+    'walkTo 垫路后报 pillaredWith（实现已搬到 src\\movement.mjs）')
+  ok(/\.\.\.\(placed \? \{ pillared: placed \} : \{\}\), \.\.\.roadInfo\(\)/.test(movSrc), '两条返回路径都带 roadInfo()（实现在 src\\movement.mjs）')
+  /* 路线图第 ④ 条第三十四刀：`build` 已搬进 `src\build.mjs`（core 只剩薄包装）。 */
+  ok(/if \(r\?\.placed\) \{ if \(!used\) used = r\.placed; ok\.push\(at\) \}/.test(buildSrc)
+    && /fail\.push\(`\$\{at\}: 现在那里是/.test(buildSrc)
+    && /from '\.\/build\.mjs'/.test(coreSrc),
+    'build 只把**复核过真放上去**的算 placed（placed:false 不再计数；实现已搬到 src\\build.mjs）')
   ok(!/held: b\.heldItem\?\.name \?\? null/.test(coreSrc), 'placeBlock 不再只回方块名（要带数量）')
-  ok(/const held = this\.#heldText\(b\)/.test(coreSrc) && /const ok = b\.heldItem\?\.name === item\.name/.test(coreSrc)
-    && /\.\.\.\(before !== held \? \{ before \} : \{\}\)/.test(coreSrc),
-    'equip 的 held **读回来**（换手失败会如实说）')
+  ok(/const held = heldText\(b\)/.test(useSrc) && /const ok = b\.heldItem\?\.name === item\.name/.test(useSrc)
+    && /\.\.\.\(before !== held \? \{ before \} : \{\}\)/.test(useSrc),
+    'equip 的 held **读回来**（换手失败会如实说；实现已搬到 src\\world-use.mjs）')
+  ok(/import \{ useBlock, useItem, interact, equip \} from '\.\/world-use\.mjs'/.test(coreSrc)
+    && /async equip \(opts = \{\}\) \{ return await equip\(this, opts, \{ t: \(p, k, l\) => this\.#t\(p, k, l\) \}\) \}/.test(coreSrc),
+    'core 有 equip 薄包装、并且确实从 world-use.mjs 导入（ctx.t 塞的是本轮的 11 秒闸门）')
 }
 
 /* ─────────── 收尾 ─────────── */

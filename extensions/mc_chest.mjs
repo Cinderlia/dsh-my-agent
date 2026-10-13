@@ -22,7 +22,7 @@
  *
  * 装法：放在 `<profile>/node_modules/dsh-mc-agent/extensions/` 下即自动加载（插件 index.js:4089 的扩展点）。
  *
- * 门禁：**加进** mc_view 的 `DEFAULT_GATED` —— 存取会开世界里的箱子、挪里面的东西，
+ * 门禁：**加进** mc_observe 的 `DEFAULT_GATED` —— 存取会开世界里的箱子、挪里面的东西，
  * 属于"要动手之前先看一眼"那一类（门禁默认关，只有强制模式才拦）。
  *
  * 环境变量：无。参数都在工具调用里。
@@ -199,7 +199,7 @@ export async function apply (api) {
       + '都没有会告诉你去 `mc_craft {name:"chest"}` 做一个（8 个木板）。\n'
       + '· `all:true` 是**真的全搬**（工具也会被放进去！想留东西就写 `name`，或者用 `keep:"wooden_pickaxe,stone_sword"` 留一手）。\n'
       + '· 背包满 / 箱子满 / 开不开都会如实说；搬完会重新读一遍箱子，告诉你现在里面有什么。\n'
-      + '🔴 会动世界里的箱子，所以**受 mc_view 门禁限制**（强制模式下要先看一眼）。',
+      + '🔴 会动世界里的箱子，所以**受 mc_observe 门禁限制**（强制模式下要先看一眼）。',
     parameters: {
       action: { type: 'string', description: 'list（看，默认）/ put（放进去）/ take（拿出来）' },
       name: { type: 'string', description: '物品英文 id 或简称，如 iron_ingot / coal / cobblestone / oak_log；put/take 不给就要 all:true' },

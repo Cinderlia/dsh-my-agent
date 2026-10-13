@@ -26,7 +26,7 @@
  *
  * 装法：放在 `<profile>/node_modules/dsh-mc-agent/extensions/` 下即自动加载（插件 index.js:4089 的扩展点）。
  *
- * 门禁：**加进** mc_view 的 `DEFAULT_GATED` —— 熔炼会动世界里的熔炉（放/开/塞东西），
+ * 门禁：**加进** mc_observe 的 `DEFAULT_GATED` —— 熔炼会动世界里的熔炉（放/开/塞东西），
  * 属于"要动手之前先看一眼"那一类（门禁默认关，只有强制模式才拦）。
  *
  * 环境变量：无。参数都在工具调用里。
@@ -411,7 +411,7 @@ export async function apply (api) {
       + '最多给 10 秒）；过一会儿再叫一次 `mc_furnace` 就能收成品（不用重新装料）。'
       + '要烧很多就少量多次（一次最多装 8 个）。\n'
       + '· `takeOnly:true` = 只把熔炉里已经烧好的拿走（不新塞东西）；`dryRun:true` 只出计划。\n'
-      + '🔴 熔炼会动世界里的熔炉，所以**受 mc_view 门禁限制**（强制模式要先看）。',
+      + '🔴 熔炼会动世界里的熔炉，所以**受 mc_observe 门禁限制**（强制模式要先看）。',
     parameters: {
       name: { type: 'string', description: '要烧的东西（英文 id 或简称），如 raw_iron / sand / beef / oak_log；也可以写产物名 iron_ingot / glass / charcoal' },
       count: { type: 'number', description: '想要几个产物（默认 1；一次调用最多装 8 个进炉子，剩下的下次再叫一次）' },

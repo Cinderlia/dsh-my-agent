@@ -324,6 +324,7 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   const { readFileSync } = await import('node:fs')
   const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
   console.log(`  ${!tools.has('mc_kit_share') ? '✅' : '❌'} 🔴 mc_kit_share 已移除（它只是在调宿主**另装**的 dsh-file-host，插件本身没有文件服务器）`)
+  // 29 = 25 个 mc_*（mc_entities 2026-10-08 并进 mc_observe 的三段式感知，同日又加了 mc_task）+ 3 + 1
   console.log(`  ${tools.size === 29 ? '✅' : '❌'} 工具数 29（实际 ${tools.size}）：mc_* 25 + mc_kit_* 3 + mc_admin_* 1`)
   // 只看**代码**，不看注释：注释里留着"为什么删"的说明（那是要留的）
   const codeOnly = idx.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
@@ -2998,8 +2999,10 @@ console.log('\n--- 认证请求 URL（真机 bug 回归）---')
     const okAgent = parsed?.agent?.name === 'Minecraft' && parsed?.agent?.version === 1
     const okRest = parsed?.username === 'user-x' && parsed?.password === 'pass-y' && parsed?.requestUser === true
     console.log(`  ${okAgent && okRest ? '✅' : '❌'} 🔴 authenticate 请求体带 agent（Yggdrasil 必填；缺了 LittleSkin 会回 400）：agent=${JSON.stringify(parsed?.agent)}`)
-    const coreSrc = (await import('node:fs')).readFileSync(new URL('./src/core.mjs', import.meta.url), 'utf8')
-    console.log(`  ${/Yggdrasil Connect/.test(coreSrc) && /缺 agent 直接回 \*\*400\*\*/.test(coreSrc) ? '✅' : '❌'} 代码里留了这条事故的说明（免得后人又把 agent 删掉）`)
+    const authSrc = (await import('node:fs')).readFileSync(new URL('./src/auth-session.mjs', import.meta.url), 'utf8')
+    const coreWired = (await import('node:fs')).readFileSync(new URL('./src/core.mjs', import.meta.url), 'utf8')
+    console.log(`  ${/Yggdrasil Connect/.test(authSrc) && /缺 agent 直接回 \*\*400\*\*/.test(authSrc) ? '✅' : '❌'} 代码里留了这条事故的说明（免得后人又把 agent 删掉）`)
+    console.log(`  ${/from '\.\/auth-session\.mjs'/.test(coreWired) ? '✅' : '❌'} core 确实从 auth-session.mjs 导入（认证/会话层第三十刀搬出去了）`)
   }
 
   // ── 按键上报兼容层（player_input，为 26.2 加的）已整体移除（2026-10-02 用户决策）──
@@ -3472,9 +3475,13 @@ console.log('\n--- 放置可行性判据 ---')
   const { readFileSync } = await import('node:fs')
   const { fileURLToPath } = await import('node:url')
   const src = readFileSync(fileURLToPath(new URL('./src/core.mjs', import.meta.url)), 'utf8')
+  // 路线图第 ④ 条第八刀：CONTAINER_RE / TOGGLE_RE / canPlaceInto 搬到 src/block-names.mjs
+  // （判据本身在那边，所以这里要连新模块一起读，否则会误报 ❌）
+  const blockNamesSrc = readFileSync(fileURLToPath(new URL('./src/block-names.mjs', import.meta.url)), 'utf8')
+  const both = src + '\n' + blockNamesSrc
 
-  console.log(`  ${/boundingBox === 'empty'/.test(src) ? '✅' : '❌'} 判据用 boundingBox==='empty'（不占空间 = 可放）`)
-  console.log(`  ${/isLiquid/.test(src) ? '✅' : '❌'} 液体被认作可放 —— 旧版只认 air，水里建不了（码头/桥全废）`)
+  console.log(`  ${/boundingBox === 'empty'/.test(both) ? '✅' : '❌'} 判据用 boundingBox==='empty'（不占空间 = 可放）`)
+  console.log(`  ${/isLiquid/.test(both) ? '✅' : '❌'} 液体被认作可放 —— 旧版只认 air，水里建不了（码头/桥全废）`)
   console.log(`  ${/canPlaceInto/.test(src) ? '✅' : '❌'} canPlaceInto 已就位`)
   console.log(`  ${/未加载（区块还没到）/.test(src) ? '✅' : '❌'} 未加载的坐标明确拒绝（不盲放）`)
   console.log(`  ${/占住，放不进去/.test(src) ? '✅' : '❌'} 被占住时报错说清是哪个方块`)

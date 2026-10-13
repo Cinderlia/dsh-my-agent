@@ -29,6 +29,9 @@ const read = (p) => readFileSync(join(ROOT, p), 'utf8')
 
 const INDEX = read('index.js')
 const CORE = read('src/core.mjs')
+/* 路线图第 ④ 条第三十一刀：连接层（connect / #scheduleReconnect / disconnect）搬进
+ * `src\connection.mjs` ⇒ 这几条静态断言改读新模块，另补一条"core 确实是薄包装"的接线断言。 */
+const CONN = read('src/connection.mjs')
 const WATCH = read('src/watchdog.mjs')
 const WAIT = read('src/wait.mjs')
 const LAN = read('src/lan.mjs')
@@ -48,20 +51,23 @@ const section = (t) => console.log(`\n${t}`)
 // ── 1. F1 自动重连：别再把子服名当 opts ────────────────────────────────────────
 section('1. F1 自动重连（`connect(sub)` 把子服名当 opts ⇒ 永远连不上 + 无限重试）')
 {
-  ok(/if \(typeof opts === 'string'\) opts = \{ subserver: opts \}/.test(CORE),
+  ok(/if \(typeof opts === 'string'\) opts = \{ subserver: opts \}/.test(CONN),
     'connect() 兜住老写法：字符串 = 只指定子服')
-  ok(/this\._connectOpts = \{ host, port, subserver: sub, version, auth \}/.test(CORE),
+  ok(/self\._connectOpts = \{ host, port, subserver: sub, version, auth \}/.test(CONN),
     '连接成功前记下**真**连接参数（含 auth，只存内存）')
-  ok(/await this\.connect\(\{ \.\.\.o, subserver: sub \|\| o\.subserver \}\)/.test(CORE),
+  ok(/await connect\(self, \{ \.\.\.o, subserver: sub \|\| o\.subserver \}, ctx\)/.test(CONN),
     '#scheduleReconnect 用记下的参数重连（不再把 sub 字符串塞进 connect）')
   // 只看真代码（注释里会引用旧写法当反例）
-  const CORE_CODE = CORE.split('\n').filter((l) => !/^\s*(\*|\/\/)/.test(l)).join('\n')
-  ok(!/this\.connect\(sub\)/.test(CORE_CODE),
+  const CONN_CODE = CONN.split('\n').filter((l) => !/^\s*(\*|\/\/)/.test(l)).join('\n')
+  ok(!/connect\(self, sub\)/.test(CONN_CODE),
     '旧写法 `await this.connect(sub)` 已从代码里彻底移除（只在注释里留作反例）')
-  ok(/maxReconnectAttempts/.test(CORE) && /tries >= max/.test(CORE),
-    '重试有次数上限（DEFAULTS.maxReconnectAttempts）')
-  ok(/自动重连没有可用的登录参数/.test(CORE) && /willReconnect: false/.test(CORE),
+  ok(/maxReconnectAttempts/.test(CORE) && /tries >= max/.test(CONN),
+    '重试有次数上限（DEFAULTS.maxReconnectAttempts 在 core，判据在 connection.mjs）')
+  ok(/自动重连没有可用的登录参数/.test(CONN) && /willReconnect: false/.test(CONN),
     '没有登录参数 / 次数耗尽时如实回 `willReconnect:false`（看门狗据此收手并叫 AI mc_connect）')
+
+  ok(/from '\.\/connection\.mjs'/.test(CORE) && /async connect \(opts = \{\}\) \{ return await connectImpl\(this, opts, this\.#connCtx\(\)\) \}/.test(CORE),
+    'core 的 connect / #scheduleReconnect / disconnect 都是薄包装、并且确实 import 了 connection.mjs')
 
   // 行为：真发一次连接（端口 1 必拒）。只验"参数在连接一开始就被认到" ——
   //   修复前 `#scheduleReconnect(sub)` 走的是 `connect('lobby')`，auth 在这一层就丢了。
@@ -188,7 +194,9 @@ section('9. F11 mc_config 凭空创建看门狗、reset 少回 defaults')
 // ── 10. F12 mc_capabilities 别泄露家目录 ─────────────────────────────────────
 section('10. F12 mc_capabilities 暴露宿主绝对路径（含用户名）')
 {
-  ok(/export function redactPath \(p\)/.test(CORE), 'core.mjs 导出 redactPath()')
+  /* 路线图第 ④ 条第二刀：`redactPath` 已搬进 `src/format.mjs`（core 里只剩 import + 用法）。 */
+  ok(/export function redactPath \(p\)/.test(read('src/format.mjs')), 'redactPath() 在 src/format.mjs 里（第二刀搬走的）')
+  ok(/redactPath/.test(CORE), 'core.mjs 里确实在用 redactPath（薄包装/调用点）')
   const wrapped = (INDEX.match(/redactPath\(/g) ?? []).length
   ok(wrapped >= 5, 'mc_capabilities 的 5 个路径字段全包了 redactPath（dir/file/memoryDir/workspaceConfigFile/agentsMd）', `实测 ${wrapped} 处`)
 

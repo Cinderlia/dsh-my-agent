@@ -42,7 +42,7 @@ console.log('\n脚下:', bot.blockAt(new Vec3(Math.floor(me.x), Math.floor(me.y)
 console.log('游戏内时间:', bot.time?.timeOfDay, '｜difficulty:', bot.game?.difficulty ?? '(无字段)')
 console.log('插件能力:', mc.pfReady ? 'pathfinder 就绪' : 'pathfinder 没装上', '｜插件:', Object.keys(mc.mcPlugins ?? {}).join(', ') || '（无）')
 
-console.log('\n=== mc_entities 工具（分类 / 血量 / 远程标记）===')
+console.log('\n=== 实体列表（分类 / 血量 / 远程标记）—— 2026-10-08 起在 mc_observe 的「程序检测到」那段 ===')
 console.log('   内核 bot.entities 条数:', Object.keys(bot.entities ?? {}).length,
   '｜util 助手:', typeof bot.util?.entity?.getHealth === 'function'
     ? '在（血量走 @nxg-org/mineflayer-util-plugin）' : '不在（退回 e.health / 点到点距离）')

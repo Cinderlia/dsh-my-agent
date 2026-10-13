@@ -7,7 +7,8 @@
  *     （`cacheReadTokens` 合计 6,877,952 × 0.1）⇒ 成本 ≈ 上下文大小 × 步数；
  *   · 固定前缀里 **42 个工具的 JSON = 30,706 字符（≈11.8K token）**，其中 `mc_*` 占 22,595；
  *   · 工具**结果**最肥的是 `mc_status`（14 次 / 35,469 字符，均 2,534）与 `mc_entities`
- *     （3 次 / 7,887）——大头是"把整个对象 pretty-print 成 JSON 灌回历史"。
+ *     （3 次 / 7,887，**2026-10-08 已并进 `mc_observe` 的三段式感知**）——大头是"把整个对象
+ *     pretty-print 成 JSON 灌回历史"。
  * 所以这里盯两件事：
  *   ① **每次请求都要重发**的部分（description + parameters 的正文）逐个工具设上限；
  *   ② 几条"默认视图必须是紧凑文本、别把对象原样回给宿主"的判据（宿主规则：返回对象里有 `text`
@@ -117,7 +118,7 @@ const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\
 section('1. 工具描述 + 参数说明的体积（每次请求都要重发）')
 const INDEX = read('index.js')
 const specFiles = ['index.js']
-const EXT_FILES = ['mc_view', 'mc_auto', 'mc_furnace', 'mc_chest', 'mc_craft']
+const EXT_FILES = ['mc_observe', 'mc_auto', 'mc_furnace', 'mc_chest', 'mc_craft']
 for (const f of EXT_FILES) {
   const p = `extensions/${f}.mjs`
   if (existsSync(join(ROOT, p))) specFiles.push(p)
@@ -170,11 +171,14 @@ ok(/const statusLean = \(sess, s, w\) => \{/.test(INDEX), 'mc_status 的默认�
 ok(/return \{ text: statusLean\(sess, s, sess\.watchdog\?\.status\(\) \?\? null\) \}/.test(INDEX),
   'mc_status 默认路径把文本包成 `{ text }`')
 
-const ent = idxBlock('mc_entities')
-ok(/return \{ text: lines\.join\('\\n'\) \}/.test(ent), 'mc_entities 只回 `{ text }`')
-ok(!/\.\.\.r \}/.test(ent), 'mc_entities 不再把原始实体数组 `...r` 一起塞进结果')
-ok(/args\.limit \?\? 24/.test(ent), 'mc_entities 默认只列 24 个')
-ok(/g\.length < 3/.test(ent), 'mc_entities 的"其它"类按名字合并（≥3 个才合）')
+/* `mc_entities` 已于 2026-10-08 并进 `mc_observe` 的三段式感知（② 程序检测到）——
+ * 实体排布（怪/玩家一只一行、"其它"按名字合并、默认只列 16 个）搬到了 mc_observe 里，这里改盯那一份。 */
+const viewSrc = read('extensions/mc_observe.mjs')
+ok(!/name: 'mc_entities'/.test(INDEX), 'mc_entities 不再单独注册（少一个工具 = 少一份固定前缀）')
+ok(/bot\.entities\(distance, \{ kind: 'all', limit: 16 \}\)/.test(viewSrc), '感知块的实体列表默认只列 16 个')
+ok(/g\.length < 3/.test(viewSrc), '感知块里"其它"类按名字合并（≥3 个才合）')
+ok(/args\.percept !== false/.test(viewSrc), '三段式感知有 `percept:false` 开关（不想要就别占 token）')
+ok(/percept: \{ type: 'boolean'/.test(viewSrc), 'mc_observe 暴露了 percept 参数')
 
 const ev = idxBlock('mc_events')
 ok(/TAG = \{ chat: '聊天'/.test(ev), 'mc_events 把事件渲染成"一行一条"')
@@ -187,15 +191,21 @@ ok(/out\.text = lines\.join\('\\n'\)/.test(map), 'mc_map 给了 `text`（否则�
 
 section('4. 自己说的话别记两条（服务端会回显）')
 const CORE = read('src/core.mjs')
-ok(/#emitPlayerChat \(who, text, selfName\)/.test(CORE), '#emitPlayerChat 仍带 selfName 参数')
-ok(/last\?\.kind === 'self' && last\.text === t/.test(CORE), '自己说的话命中"刚记过"就不重复记 player 那条')
+const CHAT = read('src/chat.mjs')
+ok(/#emitPlayerChat \(who, text, selfName\)/.test(CORE), '#emitPlayerChat 薄包装仍带 selfName 参数（core 对外形状不变）')
+ok(/last\?\.kind === 'self' && last\.text === t/.test(CHAT), '自己说的话命中"刚记过"就不重复记 player 那条（实现在 src/chat.mjs）')
+ok(/from '\.\/chat\.mjs'/.test(CORE), 'core 确实 import 了 chat.mjs（搬走 + 忘接 = 这条红）')
+ok(/export function wireChatEvents \(self, b\) \{/.test(CHAT), 'wireChatEvents 的实现搬进了 src/chat.mjs（自检走的是 core 那个公开薄包装）')
+ok(!/^  #plain \(msg\) \{\r?\n    try/m.test(CORE), 'core 里没有残留的 #plain 实现（只留薄包装）')
 ok(/recentChat \(n = 10\) \{ return this\.chat\.slice\(-n\) \}/.test(CORE), 'recentChat 仍在（mc_status 靠它取最近聊天）')
 
 /* ────────────────── 5. 别为了瘦身丢功能 ────────────────── */
 
 section('5. 瘦身不许丢功能')
-ok(/entities \(radius = 24, \{ kind = 'all', limit = 40 \} = \{\}\)/.test(CORE), 'core.entities 的签名没变（limit 上限仍由调用方给）')
-ok(/const R = Math\.min\(Math\.max\(Number\(radius\) \|\| 24, 1\), 128\)/.test(CORE), 'core.entities 的半径上限仍是 128')
+const SCAN = read('src/world-scan.mjs')
+ok(/entities \(radius = 24, opts = \{\}\) \{ return entitiesNear\(this\.requireBot\(\), radius, opts\) \}/.test(CORE), 'core.entities 是薄包装（照样先 requireBot）')
+ok(/export function entitiesNear \(b, radius = 24, \{ kind = 'all', limit = 40 \} = \{\}\) \{/.test(SCAN), 'entitiesNear 的签名没变（limit 上限仍由调用方给；实现在 src/world-scan.mjs）')
+ok(/const R = Math\.min\(Math\.max\(Number\(radius\) \|\| 24, 1\), 128\)/.test(SCAN), 'entitiesNear 的半径上限仍是 128（在 src/world-scan.mjs）')
 ok(/slice\(0, 70\)/.test(INDEX), 'recentChat 每条仍截断（70 字）')
 ok(/verbose: \{ type: 'boolean'/.test(INDEX), 'mc_status 仍能用 verbose:true 取完整明细')
 

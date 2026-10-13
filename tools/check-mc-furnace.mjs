@@ -1,6 +1,6 @@
 /**
  * mc_furnace 扩展的自检：用**假 bot / 假熔炉窗口 / 假世界**跑真实扩展文件，覆盖
- *   ① 工具注册形状（且确认它**在** mc_view 的看图门禁名单里）
+ *   ① 工具注册形状（且确认它**在** mc_observe 的看图门禁名单里）
  *   ② 熔炼表：正向查表（矿石/粗矿/沙/圆石/原木/生肉/工具盔甲→粒）、反向查表、边界（烧不出来的必须 null）
  *   ③ 名字解析：写烧炼物、写产物名（优先背包里真有的）、没给名字 / 不认识 → 报错说人话
  *   ④ 燃料：只认真燃料、按"浪费最少"挑、指定燃料、排除产物本身、不够时的兜底
@@ -252,15 +252,15 @@ console.log('— ① 工具注册 —')
   ok(Array.isArray(blocks) && blocks.length === 1 && blocks[0].text === 'hi', 'render 推一个文字块')
   ok(spec.description.includes('熔炼'), '描述里说明是熔炼')
   ok(spec.description.includes('燃料'), '描述里说明会挑燃料')
-  ok(spec.description.includes('mc_view 门禁'), '描述里说明受看图门禁限制')
+  ok(spec.description.includes('mc_observe 门禁'), '描述里说明受看图门禁限制')
   ok(spec.description.includes('产物名'), '描述里说明可以写产物名')
   ok(/默认\s*0\s*=\s*不盯|默认不盯|不用盯着/.test(spec.description), '描述里说明默认不盯熔炉', spec.description.slice(0, 400))
   ok(spec.parameters.maxWaitSec.description.includes('默认 0'), 'maxWaitSec 说明默认 0（不盯）', spec.parameters.maxWaitSec.description)
   ok(logs.some((l) => l.includes('mc_furnace 已加载')), 'apply 打了加载日志', JSON.stringify(logs))
   // 门禁名单：熔炉会动世界，**该**进门禁
-  const viewSrc = readFileSync(new URL('../extensions/mc_view.mjs', import.meta.url), 'utf8')
+  const viewSrc = readFileSync(new URL('../extensions/mc_observe.mjs', import.meta.url), 'utf8')
   const gatedBlock = viewSrc.slice(viewSrc.indexOf('const DEFAULT_GATED'), viewSrc.indexOf(']', viewSrc.indexOf('const DEFAULT_GATED')))
-  ok(gatedBlock.includes('mc_furnace'), 'mc_furnace 在 mc_view 门禁名单里（会动世界里的熔炉）', gatedBlock.replace(/\s+/g, ' '))
+  ok(gatedBlock.includes('mc_furnace'), 'mc_furnace 在 mc_observe 门禁名单里（会动世界里的熔炉）', gatedBlock.replace(/\s+/g, ' '))
   ok(!gatedBlock.includes('mc_craft'), 'mc_craft 仍然不在门禁名单里', gatedBlock.replace(/\s+/g, ' '))
 }
 

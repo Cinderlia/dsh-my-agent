@@ -14,7 +14,7 @@
  *   ⑤ `runSequence()`：到点停下并给出 `stoppedAt` / `remaining` / `hint`（从第几步接着发）；
  *   ⑥ `build()`：本轮时间用完 → 返回 `remaining` + hint，且**已经放对的格子会跳过**；
  *   ⑦ `index.js`：每个 `mc_*` 工具注册时的 `timeoutMs` 都 ≤ 12 秒（`LONG_TOOLS` 例外）+ asTool 里真的钳了；
- *   ⑧ 四个扩展（mc_view / mc_craft / mc_chest / mc_furnace）的 `timeoutMs` 也 ≤ 12 秒。
+ *   ⑧ 四个扩展（mc_observe / mc_craft / mc_chest / mc_furnace）的 `timeoutMs` 也 ≤ 12 秒。
  *
  * 用法：node tools/check-call-budget.mjs
  *   ⚠️ **必须从包目录跑**（`<profile>/node_modules/dsh-mc-agent`）：`src/core.mjs` 顶部
@@ -379,7 +379,7 @@ section('⑧ 四个扩展的 timeoutMs 也 ≤ 12 秒')
     out.push(cur)
     return out.map((x) => x.trim())
   }
-  for (const f of ['mc_view.mjs', 'mc_craft.mjs', 'mc_chest.mjs', 'mc_furnace.mjs']) {
+  for (const f of ['mc_observe.mjs', 'mc_craft.mjs', 'mc_chest.mjs', 'mc_furnace.mjs']) {
     const src = readFileSync(new URL(`../extensions/${f}`, import.meta.url), 'utf8')
     ok(/import \{[^}]*\bCALL_MS\b[^}]*\} from '\.\.\/src\/core\.mjs'/.test(src), `${f} 从 core.mjs 引了 CALL_MS`)
     // 取到行尾再掐掉尾逗号：`clamp(a, b, c)` 里有逗号，不能按逗号截
@@ -418,16 +418,28 @@ section('⑨ core.mjs —— 长动作排 deadline 要算上"本轮已用掉的�
   /* 🔴 2026-10-08：`dig()` 不再把方块交给 collectBlock（"挖完又复原 + 之后几分钟走不了路"的根因），
    *    所以那条 `budgetMs: leftOf() - 200` 也没了。现在还要"限住取消动作"的地方只剩 `#grabDrops`
    *    （捡不到时收尾），给它一个**固定**的小额度，别让捡东西把这一轮吃光。 */
-  ok(/budgetMs: 300/.test(src), '#grabDrops 捡不到时收尾（budgetMs 300，不让捡东西吃光预算）')
+  // 路线图第 ④ 条第二十三刀：`#grabDrops` 已搬到 `src/pickup.mjs`（薄包装同名，调用点一行都没改）。
+  const pkSrc = readFileSync(new URL('../src/pickup.mjs', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  ok(/ctx\.cancelCollect\?\.\(b, \{ budgetMs: 300 \}\)/.test(pkSrc), '#grabDrops 捡不到时收尾（budgetMs 300，不让捡东西吃光预算；实现已搬到 src\\pickup.mjs）')
+  ok(/cancelCollect: \(bb, o\) => this\.#cancelCollect\(bb, o\)/.test(src), 'core 的 #grabDrops 薄包装把 cancelCollect 递进模块（模块够不着私有方法）')
   ok(!/collectBlock\.collect\(\[target\]/.test(src), 'dig() 不再把方块交给 collectBlock（那条路会"挖完又复原"）')
-  ok(/budgetMs == null/.test(src), '#cancelCollect 的 budgetMs == null 是"没指定"（别被 Number(null)===0 吃成"一秒都不等"）')
+  // 路线图第 ④ 条第十五刀：`#cancelCollect` 已搬到 `src/dig-guard.mjs`（薄包装同名，调用点一行都没改）。
+  const dgSrc = readFileSync(new URL('../src/dig-guard.mjs', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  ok(/budgetMs == null/.test(dgSrc), '#cancelCollect 的 budgetMs == null 是"没指定"（别被 Number(null)===0 吃成"一秒都不等"，实现已搬到 src\\dig-guard.mjs）')
+  // 路线图第 ④ 条第三十六/三十七刀：`walkTo` / `#walkPathfinder` 也搬进 `src/movement.mjs` 了。
+  const movSrc = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  ok(/budgetAsked: callBudget\(budget\)/.test(movSrc), 'walkTo 把"调用方要的预算"传给寻路层（实现已搬到 src\\movement.mjs）')
+  ok(/budgetAsked = null/.test(movSrc), '#walkPathfinder 接 budgetAsked（判"是不是被预算截断的"，实现已搬到 src\\movement.mjs）')
+  ok(/budget <= Number\(budgetAsked \?\? budget\) \+ 50/.test(movSrc), '被预算截断 ≠ 走不通（文案分流，实现已搬到 src\\movement.mjs）')
+  ok(/from '\.\/movement\.mjs'/.test(src), 'core 确实从 movement.mjs 导入（搬走 + 忘接 = 假绿）')
+  ok(/bumpGen: \(\) => \{ this\._moveGen\+\+ \}/.test(src), '薄包装里把移动代号往前推（模块不碰 this）')
   ok(/callLeft \(\) \{/.test(src), 'McBot 上有 callLeft() = min(一整轮, 本轮剩余)')
   ok(!/const deadline = callDeadline\(\)/.test(src), '没有"又给整整一整轮"的 `const deadline = callDeadline()`')
   ok(!/msLeft\(\) \|\| CALL_BUDGET_MS/.test(src), '没有 `msLeft() || CALL_BUDGET_MS`（用完了 0 会变成 10000）')
   ok(!/Number\(ms\) \|\| CALL_MS/.test(src), 'setCallDeadline 里没有 `Number(ms) || CALL_MS`（0 会变成一整轮）')
-  ok(/budgetAsked: callBudget\(budget\)/.test(src), 'walkTo 把"调用方要的预算"传给寻路层')
-  ok(/budgetAsked = null/.test(src), '#walkPathfinder 接 budgetAsked（判"是不是被预算截断的"）')
-  ok(/budget <= Number\(budgetAsked \?\? budget\) \+ 50/.test(src), '被预算截断 ≠ 走不通（文案分流）')
 }
 
 /* ─────────── ⑩ 移动抢占：两边共用一个 pathfinder，谁后动谁说了算 ─────────── */
@@ -456,30 +468,37 @@ section('⑩ interruptMove() —— 自保反射抢 AI 那一步的移动（"动
 
   const raw = readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8')
   const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  /* 🔴 第三十三刀：超时闸门 / 抢占 / 停寻路 / 接 abort 搬进了 `src/runtime.mjs`
+   *    ⇒ 判"实现体在不在"要连着那个模块一起看（core 里只剩薄包装）。 */
+  const runSrc = readFileSync(new URL('../src/runtime.mjs', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  // 路线图第 ④ 条第三十七刀：`#walkPathfinder` 的函数体也搬进 `src/movement.mjs`（core 只剩薄包装 + #pathCtx）。
+  const movSrc = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
   ok(/_moveGen = 0/.test(src), '有移动代号 _moveGen（每次移动领一个号）')
   ok(/#beginMove \(\) \{ return \+\+this\._moveGen \}/.test(src), '#beginMove() 领号')
   ok(/async interruptMove \(reason = ''\)/.test(src), 'interruptMove(reason = "") 是公开方法')
-  const bumps = [...src.matchAll(/this\._moveGen\+\+/g)].length
+  const bumps = [...src.matchAll(/this\._moveGen\+\+/g)].length + [...runSrc.matchAll(/self\._moveGen\+\+/g)].length
   ok(bumps >= 2, `抢占时把代号往前推（${bumps} 处：interruptMove / #cancelCollect）`, String(bumps))
   const begins = [...src.matchAll(/this\.#beginMove\(\)/g)].length
   ok(begins >= 3, `走路 / 采集 / 游泳各领一次号（${begins} 处：#walkPathfinder / dig / #walkSwim）`, String(begins))
-  ok(/const preempted = this\._moveGen !== gen/.test(src), '收尾时先判断"我这一号还是不是最新的"')
-  ok(/const reasonOut = preempted \? 'preempted'/.test(src) && /reason: reasonOut/.test(src),
-    '被抢占 → reason = preempted（其余 reason 走映射表，不漏 `Error`/`block_updated`）')
-  ok(/const noProgress = moved < 0\.6/.test(src) && /是真没走通/.test(src),
-    '一格没挪时如实说"真没走通"（不是"再叫一次就好"）')
-  ok(/if \(this\._moveGen === gen\) \{/.test(src), 'finally 里只有"还是最新一号"才停 pathfinder + 松控制位')
+  ok(/const preempted = self\._moveGen !== gen/.test(movSrc), '收尾时先判断"我这一号还是不是最新的"（实现在 src\\movement.mjs）')
+  ok(/const reasonOut = preempted \? 'preempted'/.test(movSrc) && /reason: reasonOut/.test(movSrc),
+    '被抢占 → reason = preempted（其余 reason 走映射表，不漏 `Error`/`block_updated`，实现在 src\\movement.mjs）')
+  ok(/const noProgress = moved < 0\.6/.test(movSrc) && /是真没走通/.test(movSrc),
+    '一格没挪时如实说"真没走通"（不是"再叫一次就好"，实现在 src\\movement.mjs）')
+  ok(/if \(self\._moveGen === gen\) \{/.test(movSrc), 'finally 里只有"还是最新一号"才停 pathfinder + 松控制位（实现在 src\\movement.mjs）')
   /* 🔴 2026-10-08 审计②③④⑦⑨：这五条是这一轮审计的**回归钉子**，谁把它们改回去谁红。 */
-  ok(/#stopPathing \(b\) \{/.test(src) && /b\.pathfinder\.setGoal\?\.\(null\)/.test(src),
+  ok(/#stopPathing \(b\) \{ return stopPathing\(b\) \}/.test(src) && /export function stopPathing \(b\) \{/.test(runSrc) && /b\.pathfinder\.setGoal\?\.\(null\)/.test(runSrc),
     '真停 pathfinder：`stop()` 只是置标志 ⇒ 必须先 setGoal(null)（审计②）')
-  ok(/if \(this\._moveGen !== gen\) \{/.test(src) && /reason: emptyNoPath \? 'NoPath' : 'goal-reached-elsewhere'/.test(src),
-    '空路径的假成功 / 别人的 goal_reached 不再冒充 preempted（审计③）')
-  ok(/_ctrlLease = new Map\(\)/.test(src) && /holdControl \(key, ms = 300\)/.test(src)
-    && /const until = this\._ctrlLease\.get\(k\) \?\? 0/.test(src),
-    '自保反射的控制位有租约，移动收尾跳过没过期的键（审计⑨）')
+  ok(/if \(self\._moveGen !== gen\) \{/.test(movSrc) && /reason: emptyNoPath \? 'NoPath' : 'goal-reached-elsewhere'/.test(movSrc),
+    '空路径的假成功 / 别人的 goal_reached 不再冒充 preempted（审计③，实现在 src\\movement.mjs）')
+  ok(/_ctrlLease = new Map\(\)/.test(src) && /holdControl \(key, ms = 300\) \{ return holdControlImpl\(this, key, ms\) \}/.test(src)
+    && /export function releaseControls \(self\) \{/.test(runSrc) && /const until = self\._ctrlLease\.get\(k\) \?\? 0/.test(runSrc),
+    '自保反射的控制位有租约，移动收尾跳过没过期的键（审计⑨；租约表留在 core，读写实现第四十一刀搬到 src\\runtime.mjs）')
   ok(/const leftMs = this\.msLeft\(\)\r?\n\s*if \(leftMs <= 100\)/.test(src) && !/Math\.max\(150, Math\.min\(callBudget\(budget\), this\.msLeft\(\)\)\)/.test(src),
     '本轮时间用完就别再开始走（不再被外层 Math.max(150/300) 白送时间，审计⑦）')
-  ok(/Promise\.resolve\(this\.interruptMove\('用户中断'\)\)/.test(src),
+  ok(/Promise\.resolve\(self\.interruptMove\('用户中断'\)\)/.test(runSrc) && /from '\.\/runtime\.mjs'/.test(src),
     '用户点停止（signal abort）⇒ 立刻真停（interruptMove 不再死代码，审计④）')
 
   /* ⑩.5 别人的 goal_reached 会把我这次 goto 一起 resolve

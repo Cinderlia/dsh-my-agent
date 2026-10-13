@@ -1,6 +1,6 @@
 /**
  * mc_craft 扩展的自检：用**假 bot / 假配方表 / 假世界**跑真实扩展文件，覆盖
- *   ① 工具注册形状（且确认它**不在** mc_view 的看图门禁名单里）
+ *   ① 工具注册形状（且确认它**不在** mc_observe 的看图门禁名单里）
  *   ② 基础查询（物品名/坐标方块/找工作台/找放桌子的空位）
  *   ③ 名字解析（简称、大小写、歧义时按背包自动选）
  *   ④ 递归规划（原木→木板→木棍→木镐、虚拟背包记账、缺料、需要工作台、深度上限、次数上限）
@@ -295,14 +295,14 @@ console.log('— ① 工具注册 —')
   ok(spec.description.includes('合成'), '描述里说明是合成')
   ok(spec.description.includes('自动补齐中间产物') && spec.description.includes('工作台'), '描述里说明递归补齐 + 工作台')
   ok(spec.description.includes('缺什么') && spec.description.includes('mc_dig'), '描述里说明缺料报告')
-  ok(spec.description.includes('不受 mc_view 门禁'), '描述里说明不受看图门禁限制')
+  ok(spec.description.includes('不受 mc_observe 门禁'), '描述里说明不受看图门禁限制')
   ok(logs.some((l) => l.includes('mc_craft 已加载')), 'apply 打了加载日志', JSON.stringify(logs))
   // 门禁名单：合成只动背包，**不该**进门禁；熔炉（会动世界）该进
-  const viewSrc = readFileSync(new URL('../extensions/mc_view.mjs', import.meta.url), 'utf8')
+  const viewSrc = readFileSync(new URL('../extensions/mc_observe.mjs', import.meta.url), 'utf8')
   const gatedBlock = viewSrc.slice(viewSrc.indexOf('const DEFAULT_GATED'), viewSrc.indexOf(']', viewSrc.indexOf('const DEFAULT_GATED')))
-  ok(!gatedBlock.includes('mc_craft'), 'mc_craft 不在 mc_view 门禁名单里（只动背包，不用先看图）')
-  ok(gatedBlock.includes('mc_furnace'), 'mc_furnace 在 mc_view 门禁名单里（会动世界里的熔炉）', gatedBlock.replace(/\s+/g, ' '))
-  ok(gatedBlock.includes('mc_chest'), 'mc_chest 在 mc_view 门禁名单里（会开世界里的箱子）', gatedBlock.replace(/\s+/g, ' '))
+  ok(!gatedBlock.includes('mc_craft'), 'mc_craft 不在 mc_observe 门禁名单里（只动背包，不用先看图）')
+  ok(gatedBlock.includes('mc_furnace'), 'mc_furnace 在 mc_observe 门禁名单里（会动世界里的熔炉）', gatedBlock.replace(/\s+/g, ' '))
+  ok(gatedBlock.includes('mc_chest'), 'mc_chest 在 mc_observe 门禁名单里（会开世界里的箱子）', gatedBlock.replace(/\s+/g, ' '))
 }
 
 /* ─────────────────────── ② 基础查询 ─────────────────────── */

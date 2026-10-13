@@ -64,7 +64,7 @@ export async function apply(api) {
 import { clamp, blockIdOf, countOf, findPlaceSpot } from './mc_util.mjs'
 ```
 
-依赖方向：`mc_craft` / `mc_chest` / `mc_furnace` / `mc_view` / `mc_auto` → **`mc_util`** → `mc_view-render`。
+依赖方向：`mc_craft` / `mc_chest` / `mc_furnace` / `mc_observe` / `mc_auto` → **`mc_util`** → `mc_view-render`。
 （`mc_craft.mjs` 仍然把其中几个再导出一次，只是为了不改老的 import 路径。）
 
 ## 模板

@@ -258,12 +258,27 @@ section('⑦ 静态接线 —— 这些写法不许回退')
   const coreSrc = strip(readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8'))
   const chestSrc = strip(readFileSync(new URL('../extensions/mc_chest.mjs', import.meta.url), 'utf8'))
   const craftSrc = strip(readFileSync(new URL('../extensions/mc_craft.mjs', import.meta.url), 'utf8'))
+// 路线图第 ④ 条第七刀：背包那一层搬到 `src/inventory.mjs`（heldText/invSnap/…）
+const invSrc = strip(readFileSync(new URL('../src/inventory.mjs', import.meta.url), 'utf8'))
 
-  ok(/const matchNameOf = \(e, needle, alias = null\)/.test(coreSrc), '有 matchNameOf()（多字段 + 别名）')
-  ok(/const pickEntity = \(list, who\)/.test(coreSrc), '有 pickEntity()')
-  ok(/const CONTAINER_RE = /.test(coreSrc) && /const TOGGLE_RE = /.test(coreSrc), '有 CONTAINER_RE / TOGGLE_RE')
-  ok(/#aimAt \(b, point\)/.test(coreSrc) && /b\.entity\.yaw = yaw/.test(coreSrc),
-    '#aimAt 直接写 yaw/pitch')
+  // 🔴 2026-10-08 第四刀：matchNameOf / pickEntity 已搬到 src/entity-names.mjs ⇒ 断言改读新文件
+  const namesSrc = strip(readFileSync(new URL('../src/entity-names.mjs', import.meta.url), 'utf8'))
+  ok(/const matchNameOf = \(e, needle, alias = null\)/.test(namesSrc), '有 matchNameOf()（多字段 + 别名）')
+  ok(/const pickEntity = \(list, who\)/.test(namesSrc), '有 pickEntity()')
+  ok(/from '\.\/entity-names\.mjs'/.test(coreSrc), 'core.mjs 确实从 entity-names.mjs 导入（别只搬不接）')
+  // 🔴 2026-10-08 第八刀：CONTAINER_RE / TOGGLE_RE / canPlaceInto 已搬进 src/block-names.mjs ⇒ 断言改读新文件
+  const blockNamesSrc = strip(readFileSync(new URL('../src/block-names.mjs', import.meta.url), 'utf8'))
+  ok(/export const CONTAINER_RE = /.test(blockNamesSrc) && /export const TOGGLE_RE = /.test(blockNamesSrc), '有 CONTAINER_RE / TOGGLE_RE（在 block-names.mjs 里）')
+  ok(/export const canPlaceInto = \(blk\) =>/.test(blockNamesSrc), '有 canPlaceInto()（在 block-names.mjs 里）')
+  ok(/from '\.\/block-names\.mjs'/.test(coreSrc) && /CONTAINER_RE/.test(coreSrc.split('\n').find((l) => l.includes("from './block-names.mjs'")) ?? ''), 'core.mjs 确实从 block-names.mjs 导入这三个名字（别只搬不接）')
+  // 🔴 2026-10-08 第十七刀：lookAnglesTo / aimAt / lookAt 搬到 src/camera.mjs ⇒ 断言改读新文件
+  const camSrc = strip(readFileSync(new URL('../src/camera.mjs', import.meta.url), 'utf8'))
+const chatSrc = strip(readFileSync(new URL('../src/chat.mjs', import.meta.url), 'utf8'))
+const useSrc = strip(readFileSync(new URL('../src/world-use.mjs', import.meta.url), 'utf8'))
+  ok(/export function aimAt \(b, point\)/.test(camSrc) && /b\.entity\.yaw = yaw/.test(camSrc),
+    'aimAt 直接写 yaw/pitch（在 camera.mjs 里）')
+  ok(/#aimAt \(b, point\) \{ return aimAt\(b, point\) \}/.test(coreSrc) && /from '\.\/camera\.mjs'/.test(coreSrc),
+    'core 有 #aimAt 薄包装、并且确实从 camera.mjs 导入（别只搬不接）')
   /* `bot.lookAt(point, force)`：**force=true** 时 mineflayer 立刻 return（physics.js:352-356）；
    * 不带 force 才会 `await lookingTask.promise` —— 那个 promise 只在物理循环发出 look 包时 finish，
    * 站着不动/骑乘/刚死时物理循环 early return（physics.js:158-162）⇒ 永远挂着。 */
@@ -271,15 +286,35 @@ section('⑦ 静态接线 —— 这些写法不许回退')
   ok(lookLines.length > 0 && lookLines.every((l) => /, true\)/.test(l)),
     'b.lookAt(...) 一律带 force=true（不带会在"站着不动/骑乘/刚死"时挂住）',
     lookLines.map((l) => l.trim().slice(0, 34)).join(' | '))
-  ok(/if \(t\.startsWith\('\/'\)\) \{/.test(coreSrc), 'chatSay 拒绝 `/` 开头')
-  ok(/const lost = \(snap\.get\(item\.name\) \?\? 0\) - \(this\.#invSnap\(b\)\.get\(item\.name\) \?\? 0\)/.test(coreSrc),
-    'tossItem 按背包数量差对账')
-  ok(/if \(r\?\.placed\) \{ if \(!used\) used = r\.placed; ok\.push\(at\) \}/.test(coreSrc), 'build 只算复核过的 placed')
-  ok(/if \(!want && cur && !isAir\(cur\)\)/.test(coreSrc), 'build 不给 name 时跳过已占用的格子')
-  ok(/没挖成/.test(coreSrc), 'dig 兜底分支如实说"没挖成"')
-  ok(/#heldText \(b\)/.test(coreSrc) && /const ok = b\.heldItem\?\.name === item\.name/.test(coreSrc),
-    'equip 的 held 读回来')
-  ok(/const noProgress = moved < 0\.6/.test(coreSrc) && /是真没走通/.test(coreSrc), 'walkTo 一格没挪时如实说')
+  /* 路线图第 ④ 条第二十六刀：`chatSay` 已搬进 `src/chat.mjs`（core 只剩薄包装）。 */
+  ok(/if \(t\.startsWith\('\/'\)\) \{/.test(chatSrc) && /export function chatSay \(self, text\)/.test(chatSrc),
+    'chatSay 拒绝 `/` 开头（实现已搬到 src\\chat.mjs）')
+  ok(/chatSay \(text\) \{ return chatSayImpl\(this, text\) \}/.test(coreSrc) && /chatSay as chatSayImpl \} from '\.\/chat\.mjs'/.test(coreSrc),
+    'core 有 chatSay 薄包装、并且确实从 chat.mjs 导入（import 取别名）')
+  /* 路线图第 ④ 条第十九刀：`tossItem` 已搬进 `src/inventory.mjs`（上面 `invSrc` 就是那个文件）。 */
+  ok(/const lost = \(snap\.get\(item\.name\) \?\? 0\) - \(invSnap\(b\)\.get\(item\.name\) \?\? 0\)/.test(invSrc),
+    'tossItem 按背包数量差对账（实现已搬到 src\\inventory.mjs）')
+  /* 路线图第 ④ 条第三十四刀：`build` 已搬进 `src\build.mjs`（core 只剩薄包装）。 */
+  const buildSrc = strip(readFileSync(new URL('../src/build.mjs', import.meta.url), 'utf8'))
+  ok(/if \(r\?\.placed\) \{ if \(!used\) used = r\.placed; ok\.push\(at\) \}/.test(buildSrc)
+    && /import \{ build as buildImpl \} from '\.\/build\.mjs'/.test(coreSrc)
+    && /async build \(opts = \{\}\) \{ return await buildImpl\(this, opts\) \}/.test(coreSrc),
+    'build 只算复核过的 placed（实现已搬到 src\\build.mjs，core 有薄包装且确实导入）')
+  ok(/if \(!want && cur && !isAir\(cur\)\)/.test(buildSrc), 'build 不给 name 时跳过已占用的格子')
+  /* 路线图第 ④ 条第四十刀：`dig` 已搬进 `src\mining.mjs`（core 只剩薄包装）。 */
+  const mineSrc = strip(readFileSync(new URL('../src/mining.mjs', import.meta.url), 'utf8'))
+  ok(/没挖成/.test(mineSrc)
+    && /async dig \(opts = \{\}\) \{ return await digImpl\(this, opts, this\.#mineCtx\(\)\) \}/.test(coreSrc)
+    && /from '\.\/mining\.mjs'/.test(coreSrc),
+    'dig 兜底分支如实说"没挖成"（实现已搬到 src\\mining.mjs，core 有薄包装且确实导入）')
+  /* 路线图第 ④ 条第二十七刀：`equip` 已搬进 `src\world-use.mjs`（core 只剩薄包装）。 */
+  ok(/export function heldText \(b\)/.test(invSrc) && /heldText\(b\)/.test(mineSrc)
+    && /const ok = b\.heldItem\?\.name === item\.name/.test(useSrc),
+    'equip 的 held 读回来（heldText 在 inventory.mjs，equip 实现在 world-use.mjs）')
+  // 路线图第 ④ 条第三十六/三十七刀：`walkTo` / `#walkPathfinder` 已搬进 `src\movement.mjs`。
+  const movSrc = strip(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8'))
+  ok(/const noProgress = moved < 0\.6/.test(movSrc) && /是真没走通/.test(movSrc)
+    && /from '\.\/movement\.mjs'/.test(coreSrc), 'walkTo 一格没挪时如实说（实现已搬到 src\\movement.mjs）')
 
   ok(/export function chestSnap \(win\)/.test(chestSrc) && /真放进去了/.test(chestSrc),
     'mc_chest 按箱子数量对账（不再拿计划当结果）')

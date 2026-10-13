@@ -145,7 +145,7 @@ DSH 把截止时刻设成一整轮时，预算到点还剩约 1 秒 ⇒ 被误�
 ## 测试
 
 - **离线**：pathfinder 的加载、`via:"pathfinder"`、不许谎报到达、`NoPath` 如实上报、超时和未加载时安全停止，
-  随 `check-mc-view-host.mjs` 的移动回归覆盖。
+  随 `check-mc-observe-host.mjs` 的移动回归覆盖。
 - **补丁体检**：`node tools\check-mc-pathfinder.mjs`（24/0）—— 两处补丁在不在、`collides()` 六种情形
   （穿模 0.06 算 / 擦到不算 / 半砖顶面不算 / 1 格宽走廊不算）、`simulateStraight()` 撞进方块标 `blocked`、
   `canStraightLine()` 老写法误判而补丁后不误判、`getMoveDiagonal()` 在台阶角上被禁而拐角空着时照旧允许。

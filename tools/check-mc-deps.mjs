@@ -10,7 +10,7 @@
  *   → 整个 `import()` 失败 → 那一项能力（寻路/挖/换工具/打怪）静默消失。
  *
  * 这个脚本把整棵依赖树里的 require/import 全过一遍，用**和 DSH 一样的判据**找地雷；
- * 再按 `src/core.mjs` 的候选路径把 5 个 vendor 依赖 import 一遍验形状；
+ * 再按 `src/plugins.mjs` 的候选路径把 5 个 vendor 依赖 import 一遍验形状；
  * 最后检查 mineflayer-tool 那个**无限递归补丁**还在不在（见第 4 节，会 OOM 的坑）。
  * 每次 `npm install` 之后跑一次（readable-stream 是传递依赖，重装可能把地雷带回来）。
  *
@@ -116,8 +116,8 @@ for (const b of mines) {
   console.log(`          改法：把尾斜杠去掉（'${b.name}/' → '${b.name}'）`)
 }
 
-// ── 2. 5 个 vendor 依赖能否按 core.mjs 的候选路径 import ───────────────────────
-section('2. vendor 依赖 import（走 src/core.mjs 的候选 2：<profile>/vendor/mc-deps）')
+// ── 2. 5 个 vendor 依赖能否按 plugins.mjs 的候选路径 import ───────────────────────
+section('2. vendor 依赖 import（走 src/plugins.mjs 的候选 2：<profile>/vendor/mc-deps）')
 const DEPS = [
   ['pathfinder', 'mineflayer-pathfinder', 'index.js', 'pathfinder'],
   ['collectBlock', 'mineflayer-collectblock', 'lib/index.js', 'plugin'],

@@ -29,9 +29,10 @@ const ORDER = [
   'check-core-swim.mjs', 'check-core-map.mjs', 'check-core-inventory.mjs', 'check-core-equip.mjs', 'check-core-evidence.mjs',
   'check-call-budget.mjs', 'check-token-budget.mjs', 'check-mc-pathfinder.mjs',
   'check-mc-craft.mjs', 'check-mc-furnace.mjs', 'check-mc-chest.mjs',
-  'check-mc-view-host.mjs', 'check-mc-view-render.mjs', 'check-mc-skin.mjs',
+  'check-mc-observe-host.mjs', 'check-mc-view-render.mjs', 'check-mc-skin.mjs',
   'check-mc-auto.mjs', 'check-mc-deps.mjs',
   'check-session-memory.mjs', 'check-rules-file.mjs', 'check-logging.mjs', 'check-watch-chat.mjs', 'check-audit-session.mjs',
+  'check-module-load.mjs',
   'check-core.mjs',
 ]
 

@@ -9,6 +9,11 @@
  *   ③ `logOnce()` 在**整个进程**内只打一次 —— 必须跨模块实例有效（每个 MC 连接都会重新 import 一份 core.mjs）；
  *   ④ 超过 `MC_LOG_MAX_BYTES` 会改名轮转、只留 `MC_LOG_KEEP` 份；⑤ 旧的噪声/UTC/成对写法不再回潮。
  *
+ * 🔴 2026-10-08（路线图第 ④ 条第五刀）：这些函数**整体搬到了 `src/log.mjs`**，
+ *    `core.mjs` 只是 re-export（外部 import 一行没改）。所以 ⑦ 的静态断言改成查 `src/log.mjs`，
+ *    并补一条"`core.mjs` 确实 re-export 了"（否则"搬走 + 忘接"也会绿）。
+ *    另外：轮转上限现在是**现读**环境变量 —— 模块只加载一次，加载时读死会让本节 ⑥ 永远读到旧值。
+ *
  * 用法：node tools/check-logging.mjs
  *   ⚠️ 必须从**包目录**跑（要 node_modules）；工作区根目录跑会因为解析不到 mineflayer 而 ERR_MODULE_NOT_FOUND。
  */
@@ -16,8 +21,10 @@ import { readFileSync, existsSync, readdirSync, mkdtempSync, rmSync } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-/* 🔴 必须在 import core.mjs **之前**设好：`MC_LOG` / `MC_LOG_MAX_BYTES` / `MC_LOG_KEEP`
- *    是模块加载时读进常量的（真机上由环境变量给，测试里这样喂）。 */
+/* 🔴 必须在 import core.mjs **之前**设好：`MC_LOG` 是模块加载时读进 `DEFAULTS` 的
+ *    （真机上由环境变量给，测试里这样喂）。
+ *    第五刀之后 `MC_LOG_MAX_BYTES` / `MC_LOG_KEEP` 是**轮转时现读**的（`src/log.mjs`
+ *    整个进程只加载一次，加载时读死的话本节 ⑥ 会永远读到旧值）。 */
 const TMP = mkdtempSync(join(tmpdir(), 'wc-logging-'))
 const LOG = join(TMP, 'dsh-mc-agent.log')
 process.env.MC_LOG = LOG
@@ -26,6 +33,7 @@ process.env.MC_LOG_KEEP = '2'
 delete process.env.MC_LOG_LEVEL
 
 const CORE_URL = new URL('../src/core.mjs', import.meta.url).href
+const LOG_URL = new URL('../src/log.mjs', import.meta.url).href
 const core = await import(CORE_URL)
 const { stamp, logLevel, logLine, logDebug, logOnce, McBot } = core
 
@@ -86,9 +94,14 @@ section('④ logOnce() —— 每个连接重打一遍的启动横幅只留一�
   ok(logOnce('check-logging:k1', '只该出现一次的行') === false, '第二次返回 false（跳过）')
   ok(count(rd(LOG), '只该出现一次的行') === 1, '文件里只有一行', String(count(rd(LOG), '只该出现一次的行')))
   const before = count(rd(LOG), '只该出现一次的行')
-  const core2 = await import(`${CORE_URL}?fresh=1`)      // 模拟"下一个连接重新 import 一份 core.mjs"
-  ok(core2.logOnce !== logOnce, '确实拿到了新的模块实例（函数不是同一个）')
-  ok(core2.logOnce('check-logging:k1', '只该出现一次的行') === false,
+  /* 第五刀之后 `logOnce` 住在 `src/log.mjs`：core.mjs 只是 re-export ⇒ 换一份 core 实例
+   * 拿到的是**同一个**函数对象（这本身就是要验证的效果）。要模拟"下一个连接"，
+   * 得换一份 **log.mjs** 实例 —— 那才是"模块级变量拦不住"的那个边界。 */
+  const core2 = await import(`${CORE_URL}?fresh=1`)
+  ok(core2.logOnce === logOnce, 'core 的 fresh 实例 re-export 的还是同一份 log.mjs（第五刀的效果）')
+  const log2 = await import(`${LOG_URL}?fresh=1`)
+  ok(log2.logOnce !== logOnce, '换一份 log.mjs 实例：确实拿到了新的函数对象')
+  ok(log2.logOnce('check-logging:k1', '只该出现一次的行') === false,
     '新实例也认得出"这个 key 打过了"（靠 globalThis，不是模块级变量）')
   ok(count(rd(LOG), '只该出现一次的行') === before, '没有多打一行', String(count(rd(LOG), '只该出现一次的行')))
 }
@@ -144,19 +157,33 @@ section('⑦ 源码静态检查 —— 降级过的行别再回到 info，UTC �
 {
   const root = new URL('../', import.meta.url)
   const coreSrc = readFileSync(new URL('src/core.mjs', root), 'utf8')
+/* 路线图第 ④ 条第二十八刀：vendor 依赖加载器搬进 `src\plugins.mjs`（`logWarn ?? log` 在那里）。 */
+const plugSrc = readFileSync(new URL('src/plugins.mjs', root), 'utf8')
+  /* 路线图第 ④ 条第五刀：日志基建（stamp/logLevel/logDebug/logLine/logOnce + 轮转）搬到了
+   * `src/log.mjs` ⇒ 按名字找代码的静态断言要跟着搬（否则红的是"文件里没这段文字"，不是行为）。 */
+  const logSrc = readFileSync(new URL('src/log.mjs', root), 'utf8')
+  /* 路线图第 ④ 条第三十一刀：连接层搬进 `src\connection.mjs`（`已进入 …` / `后重连 …` 两行日志在那里）。 */
+  const connSrc = readFileSync(new URL('src/connection.mjs', root), 'utf8')
+const runSrc = readFileSync(new URL('src/runtime.mjs', root), 'utf8')
   const idxSrc = readFileSync(new URL('index.js', root), 'utf8')
   const scSrc = readFileSync(new URL('selfcheck.mjs', root), 'utf8')
-  ok(!/toISOString\(\)\.slice\(11, 19\)/.test(coreSrc), 'core.mjs 里没有 UTC 时分秒写法')
-  ok(/export function stamp \(/.test(coreSrc) && /export function logDebug \(/.test(coreSrc) && /export function logOnce \(/.test(coreSrc),
-    'stamp / logDebug / logOnce 都导出了')
-  ok(/globalThis\.__dshMcAgentLogged/.test(coreSrc), 'logOnce 用 globalThis 判重（跨模块实例）')
+  ok(!/toISOString\(\)\.slice\(11, 19\)/.test(coreSrc) && !/toISOString\(\)\.slice\(11, 19\)/.test(logSrc),
+    'core.mjs / log.mjs 里都没有 UTC 时分秒写法')
+  ok(/export function stamp \(/.test(logSrc) && /export function logDebug \(/.test(logSrc) && /export function logOnce \(/.test(logSrc),
+    'stamp / logDebug / logOnce 都在 src/log.mjs 里导出了')
+  ok(/export \{[^}]*logLine[^}]*\} from '\.\/log\.mjs'/.test(coreSrc),
+    'core.mjs 照样导出 logLine 等名字（第五刀：外部 import 一行都不用改）')
+  ok(/globalThis\.__dshMcAgentLogged/.test(logSrc), 'logOnce 用 globalThis 判重（跨模块实例）')
+  ok(/function logLimits \(\)/.test(logSrc) && /process\.env\.MC_LOG_MAX_BYTES/.test(logSrc) && /\.slice\(keep\)/.test(logSrc),
+    '轮转上限是**现读**环境变量（搬进单例模块后不能在加载时读死）')
   ok(/if \(!this\.stopped\) this\.log\('连接结束'/.test(coreSrc), '主动下线不再打「连接结束」两行')
-  ok(/已进入 \$\{sub \|\| '主服'\}/.test(coreSrc) && /后重连 \$\{sub \|\| '主服'\}/.test(coreSrc),
+  ok(/已进入 \$\{sub \|\| '主服'\}/.test(connSrc) && /后重连 \$\{sub \|\| '主服'\}/.test(connSrc),
     '`sub` 为空时显示「主服」（不再出现双空格）')
-  ok(/这一轮的时间用完了（还剩/.test(coreSrc), '超时文案能区分"本轮时间用完"与"操作超时"')
-  ok(/logOnce\('deps-ready'/.test(coreSrc), '「现成插件就绪」进程内只打一次')
-  ok(/const logWarn = \(m\) => this\.log\(m\)/.test(coreSrc) && /logWarn \?\? log/.test(coreSrc),
-    '依赖细节走 debug、失败行仍走 info（logWarn）')
+  ok(/这一轮的时间用完了（还剩/.test(runSrc) && /from '\.\/runtime\.mjs'/.test(coreSrc),
+    '超时文案能区分"本轮时间用完"与"操作超时"（第三十三刀起在 src\\runtime.mjs 里）')
+  ok(/logOnce\('deps-ready'/.test(plugSrc), '「现成插件就绪」进程内只打一次（第二十八刀起在 src\\plugins.mjs 里）')
+  ok(/const logWarn = \(m\) => self\.log\(m\)/.test(plugSrc) && /logWarn \?\? log/.test(plugSrc),
+    '依赖细节走 debug、失败行仍走 info（logWarn；第二十九刀起两处都在 src\\plugins.mjs）')
   ok(/logFile: process\.env\.MC_LOG/.test(coreSrc), 'MC_LOG 仍然决定日志落点')
 
   ok(/logDebug, logOnce, logLevel/.test(idxSrc), 'index.js 从 core 引入 logDebug/logOnce/logLevel')

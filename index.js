@@ -30,6 +30,8 @@ import { resolve, sep, join, isAbsolute, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
 import { defineTool, toolDefKind } from './src/tool-def.mjs'
+/* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
+import { outcomeOf, verdictText } from './src/task-runner.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
   readVersionPrompt, writeVersionPrompt, resetVersionPrompt, syncVersionPrompt,
@@ -1651,6 +1653,24 @@ export function apply(ctx, rawConfig) {
   const round2 = (n) => (Number.isFinite(Number(n)) ? Math.round(Number(n) * 100) / 100 : n)
 
   /**
+   * 给动作结果补"三种结局"（用户 2026-10-08 路线图第 ⑥ 条）。
+   *
+   * 为什么值得多两个字段：模型看到 `{arrived:false, moved:3.2, reason:'budget'}` 时，
+   * 只能自己猜"这是失败了还是还没走完"。而 `budget`/`timeout`/`preempted` 的真实含义是
+   * **结果未知** —— 人可能已经挪了几格、那一镐可能已经挖下去了。把结局写在结果里，
+   * 模型就不会把"时间到了"当"没做成"再重做一遍（重做有时比不动更糟：刚放好的方块又被挖掉）。
+   *
+   * 只加字段、不改原有结构（`text()` 的渲染是 `JSON.stringify`，新字段自动出现在输出里）；
+   * 数组/标量返回值原样透传（`dig()` 那种返回数组的走"往数组里 push 一行判决"那条路）。
+   */
+  const withOutcome = (res, opts = {}) => {
+    if (!res || typeof res !== 'object' || Array.isArray(res)) return res
+    if (res.outcome) return res
+    const outcome = outcomeOf(res, opts)
+    return { ...res, outcome, outcomeText: verdictText(outcome) }
+  }
+
+  /**
    * 工具定义统一入口：
    *   ① 返回值无损化（宿主要求无损 JSON；mineflayer 到处返回 Vec3 类实例）
    *   ② 注入本轮 turn 的 exec.signal 给 bot —— 这是"停止按钮真的有效"的关键：
@@ -1729,6 +1749,11 @@ export function apply(ctx, rawConfig) {
         sess.bot.setAbortSignal(exec?.signal)
         // 本轮截止时刻：长动作到点就带着进度返回，而不是把这次调用挂住
         sess.bot.setCallDeadline(CALL_MS)
+        /* 📋 任务状态机（用户 2026-10-08 路线图第 ②③ 条）：每次调用喂一次记忆根，
+         * 让"挖 16 根原木"这种长活儿的进度落在 `<记忆根>/tasks.json` 里 ——
+         * 掉线、重连、换一轮对话回来都还在，不只在模型的对话上下文里。
+         * 拿不到工作区/记忆根（理论上不会）就让 `setTaskDir(null)` 退化成只在内存里记。 */
+        try { sess.bot.setTaskDir(memoryRootFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent))) } catch { /* 记不了就不记 */ }
         return lossless(await spec.execute(args, exec))
       },
     })
@@ -2387,7 +2412,7 @@ export function apply(ctx, rawConfig) {
           const wsRoot = workspaceRootFor(exec?.agent)
           /* 🔴 2026-10-06（本机补丁）：记忆根可能已被 Master 挪出工作区（`config.memoryDir`）。
            *    默认输出必须落在**记忆根**的 `.out/`，否则每调一次 mc_map 就会在工作区里
-           *    重新长出一个 `.dsh-mc-agent/`。规则与 mc_view 扩展一致：
+           *    重新长出一个 `.dsh-mc-agent/`。规则与 mc_observe 扩展一致：
            *      · `.dsh-mc-agent/...` 前缀 = 记忆根相对（老写法，兼容）
            *      · 其它相对路径 = 工作区相对；绝对路径原样 */
           const memRoot = memoryRootFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent)) ?? wsRoot
@@ -2438,57 +2463,9 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
-    name: 'mc_entities',
-    description: '附近有谁（怪 / 玩家 / 动物 / 掉落物）：名字、坐标、离我几格、上下差几格、血量、是不是远程怪。\n'
-      + '怪和玩家一只一行；掉落物 / 鱼 / 箭这类"其它"按名字合并成一行（只列最近 3 个的坐标）——省 token。\n'
-      + '数据来自 mineflayer 内核的 `bot.entities`（服务端 spawn/移动包同步过来的，**不用扫方块**）；'
-      + '血量走现成的 `bot.util.entity.getHealth`。\n'
-      + '🔴 只读：不动世界、不按控制位，不受看图门禁限制，随时可调。\n'
-      + '用法：`kind:"hostile"` 只看威胁；拿到坐标后用 `mc_move` / `mc_act{"action":"toward"}` 过去；'
-      + '看不见的（地下/远处）把 radius 调大（上限 128）——没加载进区块的实体不会出现。',
-    parameters: {
-      radius: { type: 'number', description: '水平半径（默认 24，上限 128）' },
-      kind: { type: 'string', description: 'all（默认）/ hostile 只看敌对 / player 只看玩家 / mob 只看生物' },
-      limit: { type: 'number', description: '最多列几个（默认 24，上限 64）' },
-    },
-    output: text(),
-    timeoutMs: CALL_MS + 1_000,
-    async execute(args, exec) {
-      const sess = getSession(exec)
-      await sess.bot.waitForChunks()
-      const r = sess.bot.entities(Number(args.radius ?? 24), { kind: args.kind, limit: args.limit ?? 24 })
-      if (r?.error) return { text: `❌ ${r.error}` }
-      const label = { hostile: '敌对', player: '玩家', other: '生物' }
-      const one = (e) => {
-        const bits = [`${label[e.kind] ?? e.kind} **${e.name}**`, `(${e.position.x}, ${e.position.y}, ${e.position.z})`, `${e.distance} 格`]
-        if (e.dy) bits.push(`上下 ${e.dy > 0 ? '+' : ''}${e.dy}`)
-        if (e.health != null) bits.push(`血 ${e.health}`)
-        if (e.ranged) bits.push('远程')
-        return `· ${bits.join(' · ')}`
-      }
-      const lines = [`🧭 我在 (${r.me.x}, ${r.me.y}, ${r.me.z}) ｜ ${r.radius} 格内：敌对 ${r.counts.hostile} ｜ 玩家 ${r.counts.player} ｜ 其它生物 ${r.counts.other}`]
-      if (!r.list.length) lines.push(`（${r.kind === 'all' ? '半径内什么都没有' : `半径内没有 ${r.kind} 这一类`}）`)
-      /* 🔴 省 token（2026-10-07）：怪和玩家要逐个应对 ⇒ 一只一行；掉落物 / 鱼 / 箭这类"其它"
-       * 按名字合并（≥3 个才合并），只留最近 3 个的坐标 —— 实测一次 mc_entities 里 12 个 item/salmon/arrow
-       * 能省掉 2/3 的行数。返回值也**只给 text**，不再把原始实体数组（几十行 JSON）一起塞进结果。 */
-      const groups = new Map()
-      for (const e of r.list) {
-        if (e.kind !== 'other') { lines.push(one(e)); continue }
-        const g = groups.get(e.name) ?? []
-        g.push(e)
-        groups.set(e.name, g)
-      }
-      for (const [nm, g] of groups) {
-        if (g.length < 3) { for (const e of g) lines.push(one(e)); continue }
-        const near = g.slice(0, 3).map((e) => `(${e.position.x}, ${e.position.y}, ${e.position.z}) ${e.distance} 格`).join('、')
-        lines.push(`· 其它 **${nm}**×${g.length}（最近 3 个：${near}）`)
-      }
-      if (r.total > r.list.length) lines.push(`（还有 ${r.total - r.list.length} 个没列出来：加大 limit 或缩小 radius）`)
-      return { text: lines.join('\n') }
-    },
-  }))
-
+  /* mc_entities（附近有谁）已于 2026-10-08 并进 mc_observe 的三段式感知（② 程序检测到）——
+   * 用户要求「不要只让 AI 看截图，也不要只让 AI 读取方块坐标」，所以一次调用给全：图 + 程序侧实体（坐标/血量）。
+   * 实体数据仍走 src/core.mjs 的 entities()（同一份判据），功能没有损失。 */
   ctx.tools.register(asTool({
     name: 'mc_inventory',
     description: '看背包和手持物品。',
@@ -2529,9 +2506,9 @@ export function apply(ctx, rawConfig) {
       if (mode === 'swim') {
         // 给了坐标 = 游过去（walkTo 在水里会自动走"直接游"那条）；没给 = 只上浮换气
         if (args.x !== undefined && args.y !== undefined && args.z !== undefined) {
-          return sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs) })
+          return withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs) }), { expect: 'moved' })
         }
-        return sess.bot.swimUp({ hold: args.budgetMs })
+        return withOutcome(await sess.bot.swimUp({ hold: args.budgetMs }), { expect: 'moved' })
       }
       if (args.x === undefined || args.y === undefined || args.z === undefined) {
         throw new Error('walk/fly 需要 x/y/z；只想跳一下请给 mode:"jump"，在水里上浮请给 mode:"swim"')
@@ -2540,9 +2517,9 @@ export function apply(ctx, rawConfig) {
       const creative = sess.bot.bot?.game?.gameMode === 'creative'
       const use = mode || (creative ? 'fly' : 'walk')
       // 🔴 2026-10-08 审计⑤：fly 以前不传 budgetMs —— 写 budgetMs:2000 也照样跑满 10 秒
-      if (use === 'fly') return sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) })
+      if (use === 'fly') return withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' })
       if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / fly / jump / swim）`)
-      return sess.bot.walkTo(target, { budget: callBudget(args.budgetMs) })
+      return withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs) }), { expect: 'moved' })
     },
   }))
 
@@ -2579,16 +2556,16 @@ export function apply(ctx, rawConfig) {
       switch (mode) {
         case 'look':    return { mode, ...(await bot.lookAt(args)) }
         case 'toward':  return { mode, ...(await bot.interact(args)) }
-        case 'place':   return { mode, ...(await bot.placeBlock(args)) }
-        case 'break':   return { mode, ...(await bot.breakBlock(args)) }
+        case 'place':   return withOutcome({ mode, ...(await bot.placeBlock(args)) }, { expect: 'placed' })
+        case 'break':   return withOutcome({ mode, ...(await bot.breakBlock(args)) })
         case 'use': {
           // 没给坐标也没给 who ⇒ 不是"右键某个东西"，而是"用手上的东西"（对着空气用）
           const noTarget = args.who == null && args.x == null && args.y == null && args.z == null
           if (noTarget) return { mode: 'useitem', ...(await bot.useItem(args)) }
-          return { mode, ...(await bot.useBlock(args)) }
+          return withOutcome({ mode, ...(await bot.useBlock(args)) })
         }
         case 'useitem': return { mode, ...(await bot.useItem(args)) }
-        case 'attack':  return { mode, ...(await bot.attack(args)) }
+        case 'attack':  return withOutcome({ mode, ...(await bot.attack(args)) })
         case 'equip':   return { mode, ...(await bot.equip({ name: args.name })) }
         case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
         default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/break/use/useitem/attack/equip/toss）`)
@@ -2687,6 +2664,71 @@ export function apply(ctx, rawConfig) {
         maxDistance: args.maxDistance ?? 16, count: args.count,
       })
       return { result: lines }
+    },
+  }))
+
+  ctx.tools.register(asTool({
+    name: 'mc_task',
+    description: '长活儿的进度台账（挖 4 个以上会自动开一条）：进度落在记忆根的 tasks.json 里，'
+      + '**掉线、重连、换一轮对话回来都还在**，不只在你的对话上下文里。\n'
+      + '`resume` 会用**现场背包**复核进度，并给出下一步该调哪个工具；`list` 看在做的事；`cancel` 取消。',
+    parameters: {
+      action: { type: 'string', description: 'list（默认）| get | resume | note | done | cancel | forget' },
+      taskId: { type: 'string', description: '任务 id（默认最近一件在做的事）' },
+      text: { type: 'string', description: 'note 要记的一句话' },
+      all: { type: 'boolean', description: 'list 时连已完成/取消的也列出来' },
+      limit: { type: 'number', description: 'list 最多几条（默认 10）' },
+    },
+    output: text(),
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const action = String(args.action ?? 'list').toLowerCase()
+      const id = args.taskId ? String(args.taskId) : null
+      const bot = sess.bot
+      const lines = []
+      if (action === 'get') {
+        const t = bot.taskGet({ taskId: id })
+        if (!t) return { text: '📋 没有这个任务（`mc_task {action:"list"}` 看看在做的是哪些）' }
+        lines.push(t.line)
+        if (t.checkpoint) lines.push(`上次现场：${JSON.stringify(t.checkpoint)}`)
+        if (t.lastError) lines.push(`上次卡在：${t.lastError.kind} —— ${t.lastError.reason ?? ''}`)
+        if (t.loopDetected) lines.push(`⚠️ 同一个动作连着失败 ${t.loopDetected.count} 次 —— 别再原地重试，换个办法或取消`)
+        for (const h of t.history ?? []) lines.push(`  · ${new Date(h.at).toTimeString().slice(0, 8)} ${h.text}`)
+        return { text: lines.join('\n') }
+      }
+      if (action === 'resume') {
+        const r = bot.taskResume({ taskId: id })
+        if (!r?.ok) return { text: `📋 没有可恢复的任务（${r?.reason ?? '现在没有在做的事'}）。要开一件：直接 mc_dig {count:16} 这类"一次干一批"的调用，会自动开工。` }
+        const t = r.task
+        lines.push(`📋 ${t.taskId} · ${t.kind} · ${t.goal ?? ''} · ${t.status}`)
+        lines.push(`现场复核：${r.verified ? `背包里有 ${r.have} 个，还差 ${r.need} 个` : `复核不了（${r.verifyNote ?? '读不到背包'}）`}`)
+        lines.push(`下一步：${r.next} —— ${r.hint}`)
+        if (r.action) lines.push(`现在就可以调：\`${r.action.tool}\` ${JSON.stringify(r.action.args)}`)
+        if (t.loopDetected) lines.push(`⚠️ 之前同一个动作连着失败 ${t.loopDetected.count} 次 —— 别再用同样的参数重试`)
+        return { text: lines.join('\n') }
+      }
+      if (action === 'note') {
+        const t = bot.taskNote({ taskId: id, text: String(args.text ?? '') })
+        return { text: t ? `📋 记下了：${t.taskId} · ${t.progress.done}/${t.progress.total ?? '?'}` : '📋 没有活跃任务可记' }
+      }
+      if (action === 'done') {
+        const t = bot.taskDone({ taskId: id, note: args.text ? String(args.text) : null })
+        return { text: t ? `📋 收工：${t.taskId}（${t.progress.done}${t.progress.unit ?? '个'}）` : '📋 没有活跃任务' }
+      }
+      if (action === 'cancel') {
+        const t = bot.taskCancel({ taskId: id, why: args.text ? String(args.text) : '模型取消' })
+        return { text: t ? `📋 取消：${t.taskId}` : '📋 没有活跃任务' }
+      }
+      if (action === 'forget') {
+        const n = bot.taskForget({ taskId: id })
+        return { text: n ? '📋 删掉了' : '📋 没有这个任务' }
+      }
+      const list = bot.taskList({ limit: args.limit ?? 10, all: Boolean(args.all) })
+      if (!list.length) {
+        return { text: '📋 现在没有在做的事。要开一件：直接 `mc_dig {count:16}` 这类"一次干一批"的调用，会自动开工并记账。' }
+      }
+      for (const t of list) lines.push(`· ${t.line}`)
+      return { text: lines.join('\n') }
     },
   }))
 
@@ -2917,31 +2959,35 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_kit_memory',
-    description: '长期记忆（跨会话、重启后还在）。固定放在工作区的 **`.dsh-mc-agent/`** 文件夹里，'
-      + '按服务器建子文件夹（`_global/` 放通用的）。\n'
-      + '**索引由你自己维护**：`.dsh-mc-agent/README.md`（插件每轮把它的内容 + 一份自动目录树注入你的上下文，'
-      + '所以就算忘了更新 README 也不会失真；但记得**改了记忆就顺手更新 README**）。\n'
+    description: '长期记忆（跨会话、重启后还在），放在 `.dsh-mc-agent/` 里，按服务器建子文件夹（`_global/` 放通用的）。\n'
+      + '**索引由你自己维护**：`README.md`（插件每轮把它的内容 + 自动目录树注入上下文，忘了更新也不失真，但改了记忆就顺手更新它）。\n'
       + 'action：\n'
       + '· index（默认）看总览：有哪些文件夹/文件、各多少条、README 现状\n'
+      + '· kinds   四类记忆的说明 + 各类各有几个文件\n'
+      + '· record  记一条**带元数据**的记忆（推荐）：kind+key+text+from+version+ok；**同 key 再记累加成功/失败**，不堆重复；`ok:false` 必须给 `condition`\n'
       + '· read    读文件（path 或 topic+server）；**读图片会作为附件给你，你能直接看到**\n'
-      + '· append  追加一条（最常用；给 key 则**覆盖**同 key 的那条，不会堆积）——只对文本文件\n'
-      + '· write   整文件覆盖（重组内容、写小标题/表格）——文本文件\n'
-      + '· put     把自己读到的**任意文件（图片最常用）复制进记忆**，之后可随时 read 出来看\n'
+      + '· append  追加一条（同 key 覆盖）—— 只对文本文件\n'
+      + '· write   整文件覆盖（重组内容/小标题/表格）\n'
+      + '· put     把工作区里的**任意文件（图片最常用）复制进记忆**\n'
       + '· delete  删文件（path 指向目录则整目录删）\n'
       + '· search  跨文本文件搜关键词，返回命中行\n'
-      + '路径写法：`path:"mc.example.com/maps/town.png"`，或 `topic:"landmarks"`（server 默认取你当前所在服，'
-      + '不传 server 就写进 `_global/`）。\n'
-      + '⚠️ 这个文件夹里**只读写文件，不执行任何东西**（没有 shell、不跑脚本）。',
+      + '路径写法：`path:"mc.example.com/maps/town.png"` 或 `topic:"landmarks"`（server 默认当前服，不传写进 `_global/`）。\n'
+      + '⚠️ 只读写文件，不执行任何东西（没有 shell、不跑脚本）。',
     parameters: {
-      action: { type: 'string', description: 'index（默认）/ read / append / write / put / delete / search' },
-      path: { type: 'string', description: '相对路径，如 mc.example.com/landmarks.md（与 topic 二选一）' },
-      topic: { type: 'string', description: '主题名（会拼成 <server>/<topic>.md）' },
-      server: { type: 'string', description: '服务器文件夹；默认当前所在服，不传则 _global' },
-      text: { type: 'string', description: 'append 的内容（一条事实，一句话说清）' },
-      content: { type: 'string', description: 'write 的完整内容（文本文件）' },
-      key: { type: 'string', description: 'append 用：同 key 覆盖（如 "用户叫什么"）' },
-      source: { type: 'string', description: 'put 用：要存入记忆的文件路径（工作区内；图片最常用）' },
-      name: { type: 'string', description: 'put 用：存进去的名字（缺省用原文件名）' },
+      action: { type: 'string', description: 'index（默认）/ kinds / record / read / append / write / put / delete / search' },
+      kind: { type: 'string', description: 'record：world/exp/task/rule（世界事实/操作经验/任务记录/用户规则，后者只读）' },
+      key: { type: 'string', description: 'record/append：这条记忆的名字（同 key 累加或覆盖）' },
+      text: { type: 'string', description: 'record/append 的内容（一句话）' },
+      source: { type: 'string', description: 'put：要存入记忆的文件路径（工作区内；图片最常用）' },
+      from: { type: 'string', description: 'record：从哪来的（mc_observe / 用户说的 / 实测）' },
+      version: { type: 'string', description: 'record：适用版本（如 1.21.9；跨版本通用就不填）' },
+      ok: { type: 'boolean', description: 'record：成功 true / 失败 false；只记事实不填' },
+      condition: { type: 'string', description: 'record：**失败必须填**——什么情况下失败（别写"永久不可达"）' },
+      path: { type: 'string', description: '相对路径，如 mc.example.com/landmarks.md' },
+      topic: { type: 'string', description: '主题名（拼成 <server>/<topic>.md）' },
+      server: { type: 'string', description: '服务器文件夹；默认当前服，不传 _global' },
+      content: { type: 'string', description: 'write 的完整内容' },
+      name: { type: 'string', description: 'put：存进去的名字（缺省用原名）' },
       query: { type: 'string', description: 'search 的关键词' },
       limit: { type: 'number', description: 'search 最多几条（默认 30）' },
     },
@@ -2958,6 +3004,7 @@ export function apply(ctx, rawConfig) {
       const mem = memoryFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent))
       const action = String(args.action ?? 'index').toLowerCase()
       if (action === 'index') return mem.overview()
+      if (action === 'kinds') return mem.kinds()
 
       // put：把工作区里的源文件复制进记忆（图片最常用；任何格式都行）
       if (action === 'put') {
@@ -2999,11 +3046,15 @@ export function apply(ctx, rawConfig) {
           }
           return r
         }
+        case 'record': return mem.record({
+          kind: args.kind, key: args.key, text: args.text, source: args.from,
+          version: args.version, ok: args.ok, condition: args.condition, server,
+        })
         case 'append': return mem.append({ ...sel, text: args.text, key: args.key })
         case 'write':  return mem.write({ ...sel, content: args.content })
         case 'delete': return mem.delete(sel)
         case 'search': return mem.search({ query: args.query, limit: args.limit })
-        default: throw new Error(`未知 action："${action}"（可用 index/read/append/write/put/delete/search）`)
+        default: throw new Error(`未知 action："${action}"（可用 index/kinds/record/read/append/write/put/delete/search）`)
       }
     },
   }))

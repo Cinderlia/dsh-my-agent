@@ -7,6 +7,9 @@
  * 「分类 + 血量 + 远程标记 + kind 过滤 + 计数」，**没有另开一个平行工具**（两个重叠的工具
  * 只会让模型挑花眼）。数据全是 mineflayer 内核的 `bot.entities`（服务端 spawn / teleport /
  * relative-move 包喂进去的），**不用扫方块、不用自己算**。
+ * 2026-10-08（用户「不要只让 AI 看截图，也不要只让 AI 读取方块坐标」）：`mc_entities`
+ * 这个工具**下掉了**，实体列表并进 `mc_observe` 的「② 程序检测到」那段 —— `entities()` 本身没动，
+ * 所以这个套件的 ①~⑧ 照旧跑；⑨ 的静态检查改成盯 `mc_observe` 里的感知块。
  *
  * 这个脚本把下面几件事钉死（防止以后改坏）：
  *   ① 自己不算进去；按距离排序；hostile / player / other 分类；
@@ -14,8 +17,8 @@
  *   ③ 血量**优先**用 `bot.util.entity.getHealth`；助手缺失/抛错时退回 `e.health`，绝不炸；
  *   ④ 距离**优先**用 `bot.util.entity.entityDistance`（证明用的是现成助手，不是自己算）；
  *   ⑤ `e.kind === 'Hostile mobs'` 也算敌对（名字不在名单里的怪也能认出来）；
- *   ⑥ 静态检查：`index.js` 里只有一个 `mc_entities`（**没有** `mc_mobs` 这种平行工具）、
- *      只读说明在、不在看图门禁名单里、`timeoutMs` 压在 12 秒内；
+ *   ⑥ 静态检查：`index.js` 里**没有**第二个实体工具（`mc_entities` 已并进 `mc_observe`）、
+ *      感知块用了 `entities()`、不在看图门禁名单里；
  *      `core.mjs` 的 HOSTILE/RANGED 名单与 `extensions/mc_auto.mjs` 的逐字一致。
  *
  * 用法：node tools/check-core-entities.mjs
@@ -243,39 +246,53 @@ section('⑧ limit 截断 + 还没位置信息时不炸 + 掉落物也能列出�
   ok(rd.list.length === 1 && rd.list[0].name === 'item' && rd.list[0].kind === 'other', '掉落物（type=object）也列出来，归到"其它"')
 }
 
-/* ─────────── ⑨ 静态检查：工具注册 + 门禁 + 名单一致性 ─────────── */
-section('⑨ 静态检查（只有一个 mc_entities、不看图门禁、名单与 mc_auto 一致）')
+/* ─────────── ⑨ 静态检查：工具注册 + 门禁 + 名单一致性 + 实现位置 ─────────── */
+section('⑨ 静态检查（实体工具已并进 mc_observe 感知块、不看图门禁、名单与 mc_auto 一致、实现在 world-scan.mjs）')
 {
   const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
   const core = readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8')
   const auto = readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8')
-  const view = readFileSync(new URL('../extensions/mc_view.mjs', import.meta.url), 'utf8')
+  const view = readFileSync(new URL('../extensions/mc_observe.mjs', import.meta.url), 'utf8')
 
-  ok(!/name: 'mc_mobs'/.test(idx), '没有另开平行的 mc_mobs 工具（只保留上游那个 mc_entities）')
-  const at = idx.indexOf("name: 'mc_entities'")
-  ok(at > 0, 'index.js 里注册了 mc_entities')
-  const seg = at > 0 ? idx.slice(at, at + 2400) : ''
-  ok(/只读/.test(seg), '工具说明里写明了"只读"')
-  ok(/timeoutMs: CALL_MS \+ 1_000/.test(seg), 'timeoutMs 压在 11 秒 + 1 秒余量内')
-  ok(/kind: 'all'|kind = 'all'/.test(seg + core), '参数里有 kind（all/hostile/player/mob）')
-  ok(/radius/.test(seg) && /limit/.test(seg), '参数里有 radius / limit')
+  ok(!/name: 'mc_mobs'/.test(idx), '没有另开平行的 mc_mobs 工具')
+  /* 2026-10-08：`mc_entities` 并进 `mc_observe` 的三段式感知（用户要求"一次调用给全"）⇒
+   * 这里改成钉"没有第二个实体工具" + "感知块真的用了 entities()" + "不确定清单在"。 */
+  ok(!/name: 'mc_entities'/.test(idx), 'mc_entities 不再单独注册（实体信息在 mc_observe 的"程序检测到"里）')
+  ok(/程序检测到/.test(view), 'mc_observe 有"程序检测到"那段')
+  ok(/bot\.entities\(distance, \{ kind: 'all', limit: 16 \}\)/.test(view), '感知块的实体列表走 core 的 entities()（同一份判据）')
+  ok(/不确定/.test(view), 'mc_observe 有"不确定"清单（别把推测当事实）')
+  const segAt = view.indexOf('程序侧实体')
+  const seg = view.slice(segAt, segAt + 2600)
+  ok(segAt > 0 && /kind/.test(seg) && /limit/.test(seg), '感知块里按 kind 分类 + limit 限制条数')
 
   const gated = (view.match(/DEFAULT_GATED\s*=\s*\[([^\]]*)\]/) ?? [])[1] ?? ''
   ok(!/mc_entities/.test(gated), 'mc_entities 不在看图门禁名单里（只读工具永不拦）', gated.replace(/\s+/g, ' ').slice(0, 90))
 
-  ok(/entities \(radius = 24, \{ kind = 'all', limit = 40 \} = \{\}\)/.test(core), 'core.mjs 里有 entities(radius, {kind, limit}) 默认值')
-  ok(/b\?\.util\?\.entity/.test(core), 'core.mjs 走现成的 bot.util.entity 助手')
+  /* 🔴 2026-10-08 第十二刀：`scan()` / `entities()` 的**实现**搬到 `src/world-scan.mjs`
+   * （它们是公开方法 ⇒ `core.mjs` 里留同名薄包装）。所以"实现长什么样"要读新文件；
+   * 另外补两条"确实接上了"的断言 —— 否则"搬走 + 忘 import"这种错也能绿。 */
+  const scanSrc = readFileSync(new URL('../src/world-scan.mjs', import.meta.url), 'utf8')
+  ok(/export function entitiesNear \(b, radius = 24, \{ kind = 'all', limit = 40 \} = \{\}\)/.test(scanSrc), 'world-scan.mjs 里有 entitiesNear(b, radius, {kind, limit}) 默认值')
+  ok(/export function scanAround \(b, \{ radius = 8, height = 4, name = null, limit = 10 \} = \{\}\)/.test(scanSrc), 'world-scan.mjs 里有 scanAround(b, {radius, height, name, limit}) 默认值')
+  ok(/^import \{ scanAround, entitiesNear \} from '\.\/world-scan\.mjs'$/m.test(core), 'core.mjs 确实从 world-scan.mjs 导入（别只搬不接）')
+  ok(/entities \(radius = 24, opts = \{\}\) \{ return entitiesNear\(this\.requireBot\(\), radius, opts\) \}/.test(core), 'entities 是薄包装（照样先 requireBot）')
+  ok(/scan \(opts = \{\}\) \{ return scanAround\(this\.requireBot\(\), opts\) \}/.test(core), 'scan 是薄包装（照样先 requireBot）')
+  ok(!/^  entities \(radius = 24, \{ kind = 'all'/m.test(core) && !/^  scan \(\{ radius = 8/m.test(core), 'core.mjs 里没有残留的 scan/entities 实现')
+  ok(/b\?\.util\?\.entity/.test(scanSrc), 'world-scan.mjs 走现成的 bot.util.entity 助手')
 
   const pick = (src, name) => {
     const m = src.match(new RegExp(`const ${name} = (/[^\\n]*/[a-z]*)`))
     return m ? m[1] : null
   }
-  const h1 = pick(core, 'HOSTILE_RE'); const h2 = pick(auto, 'HOSTILE')
-  const r1 = pick(core, 'RANGED_RE'); const r2 = pick(auto, 'RANGED')
-  ok(h1 && h2 && h1 === h2, 'core 的 HOSTILE_RE 与 mc_auto 的 HOSTILE 逐字一致（别让两份名单漂移）',
+  // 🔴 2026-10-08 第四刀：两份名单已搬到 src/entity-names.mjs ⇒ 逐字比对要读新文件
+  const names = readFileSync(new URL('../src/entity-names.mjs', import.meta.url), 'utf8')
+  const h1 = pick(names, 'HOSTILE_RE'); const h2 = pick(auto, 'HOSTILE')
+  const r1 = pick(names, 'RANGED_RE'); const r2 = pick(auto, 'RANGED')
+  ok(h1 && h2 && h1 === h2, 'HOSTILE_RE 与 mc_auto 的 HOSTILE 逐字一致（别让两份名单漂移）',
     h1 === h2 ? '' : `core=${String(h1).slice(0, 40)} auto=${String(h2).slice(0, 40)}`)
-  ok(r1 && r2 && r1 === r2, 'core 的 RANGED_RE 与 mc_auto 的 RANGED 逐字一致',
+  ok(r1 && r2 && r1 === r2, 'RANGED_RE 与 mc_auto 的 RANGED 逐字一致',
     r1 === r2 ? '' : `core=${String(r1).slice(0, 40)} auto=${String(r2).slice(0, 40)}`)
+  ok(/from '\.\/entity-names\.mjs'/.test(core), 'core.mjs 确实从 entity-names.mjs 导入（别只搬不接）')
 }
 
 // ── 收尾 ────────────────────────────────────────────────────────────────────
