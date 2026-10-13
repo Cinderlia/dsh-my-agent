@@ -31,6 +31,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { encodePng } from '../src/png.mjs'
+import { equipmentOf, equipmentText } from '../src/inventory.mjs'
 import { EXPRESS_DIR, OUT_DIR } from '../src/express.mjs'
 import { withTimeout, CALL_MS, CALL_BUDGET_MS } from '../src/core.mjs'
 import { VIEW_DEFAULTS, compassOf, isAirName, makePos, renderView } from './mc_view-render.mjs'
@@ -149,26 +150,24 @@ export async function apply (api) {
   ctx.tools.register(asTool({
     name: 'mc_observe',
     description: '👁 **第一人称视角**：从我眼睛（眼高 1.62）朝我正在看的方向渲染截图，直接内联给你看，并附**三段式感知**：'
-      + '① **我看到**（图里数出来的：像素占比、画了谁在哪一侧、准星压着什么、手里拿什么）；'
-      + '② **程序检测到**（游戏数据：坐标/朝向/独立射线打到的方块/半径内实体带坐标·距离·血量/生命·饥饿/脚下）；'
-      + '③ **不确定**（哪些字段不可信：客户端预测的方块世界、没加载的区块、读不到的血量 —— **别把推测当事实**）。'
-      + '两套眼睛对不上时点名（以程序射线为准）；`image:false` 不画图（只要结构化状态），`percept:false` 不要文字。\n'
-      + '图里能看出：方块纹理、体素阴影、昼夜天色、**玩家（人形带脸）· 怪物（敌对红/被动黄）· 掉落物**'
-      + '（黑描边）、右下角手里的东西；玩家按朝向转身，**有正版皮肤就贴真实皮肤**（离线号用默认配色）。\n'
+      + '① **我看到**（图里数出来的：像素占比、谁在哪一侧、准星压着什么、手里拿什么）；'
+      + '② **程序检测到**（游戏数据：坐标/朝向/独立射线打到的方块/半径内实体带坐标·距离·血量/脚下）；'
+      + '③ **不确定**（客户端预测的方块世界、没加载的区块、读不到的血量 —— **别把推测当事实**）。'
+      + '两套眼睛对不上时点名（以程序射线为准）；`image:false` 不画图，`percept:false` 不要文字。\n'
+      + '图里：**玩家（人形，正版皮肤就贴真的）· 怪物（敌对红/被动黄）· 掉落物（黑描边）**、右下角手上的东西。\n'
       + (gateEnabled
         ? '🔴 **硬规则：动手之前必须先看一眼**。动作类工具（mc_move / mc_act / mc_dig / mc_build / '
           + 'mc_give / mc_command / mc_sequence）手上没有够新的图会被**直接拒绝**'
-          + `（拒绝信息就是让你先调 mc_observe）。看一眼后最多连着做 ${maxActions} 个动作${spanText}，超了再看一次。\n`
-          + '嫌紧可以改（**立即生效，不用重启**）：工作区写 `.dsh-mc-agent/view.json`，'
-          + '如 {"maxActions":8,"maxAgeMs":180000} 放宽，或 {"gate":false} 关掉。\n'
-        : '👁 **什么时候看，你自己定**（没有硬性门禁）：只读查询（mc_status / mc_inventory / '
-          + 'mc_scan / mc_diag…）不用看；**动手前先看一眼**最划算 —— 挖/放/拆/建、走过去、找路找东西、'
-          + '确认玩家或怪物在哪、看不清周围、被卡住。一张图够连着做一段动作；'
-          + '环境变了（走远/挖穿/天黑/挨打/被卡）就再看一眼。\n')
+          + `（让你先调 mc_observe）。看一眼后最多连着做 ${maxActions} 个动作${spanText}，超了再看一次。\n`
+          + '嫌紧可以改（立即生效）：写 `.dsh-mc-agent/view.json`，如 {"maxActions":8} 或 {"gate":false}。\n'
+        : '👁 **什么时候看，你自己定**：只读查询（mc_status / mc_inventory / '
+          + 'mc_scan…）不用看；**动手前先看一眼**最划算 —— 挖/放/拆/建、走路、找路找东西、'
+          + '确认玩家或怪在哪、看不清、被卡住；一张图够做一段动作；'
+          + '环境变了（走远/天黑/挨打）就再看一眼。\n')
       + (gateEnabled
         ? ''
-        : '（想变回强制模式：写 `.dsh-mc-agent/view.json` 的 {"gate":true}，立即生效。）\n')
-      + '图里约定：白色十字=准星；暗紫色块=区块没加载；越远越淡（雾跟天色走）。\n'
+        : '（想变回强制模式：写 `.dsh-mc-agent/view.json` 的 {"gate":true}。）\n')
+      + '图里：白色十字=准星；暗紫色块=区块没加载；越远越淡。\n'
       + `🔴 要让 **Master** 看到：\`out:"\\.dsh-mc-agent/${EXPRESS_DIR}/<子目录>/view.png"\` 写进发布区，`
       + '再用 `mc_kit_express` 取；默认落 `.dsh-mc-agent/' + OUT_DIR + '/`（不对外）。',
     parameters: {
@@ -317,6 +316,12 @@ export async function apply (api) {
         inv = { items, stacks: all.length, kinds: items.length, free, held: s.held ?? null }
       } catch (err) { inv = { error: err?.message ?? String(err) } }
 
+      /* 装备栏（头/身/腿/脚/副手）：`inventory.items()` **看不到这几格**（它们不在背包范围里），
+       * 所以以前"我身上穿着什么"在感知里是空白 —— 2026-10-13 用户报"看不到自己身上的装备"。 */
+      let equipment = null
+      try { equipment = equipmentOf(bot) } catch { equipment = null }
+      const eqText = (() => { try { return equipmentText(bot) } catch { return null } })()
+
       const out = {
         capturedAt: nowMs,
         position: s.position ?? { x: fx, y: fy, z: fz },
@@ -331,6 +336,7 @@ export async function apply (api) {
         submerged: Boolean(s.submerged),
         gamemode: s.gamemode ?? null,
         held: s.held ?? null,
+        equipment,
         inventory: inv,
         crosshair: !wantImage
           ? { block: null, note: '这次没截图（image:false）—— 准星对着什么看 structured 里的程序射线' }
@@ -547,6 +553,7 @@ export async function apply (api) {
             + (out.air != null ? ` · 氧气 ${out.air}` : '') + (out.submerged ? '（头在水下）' : '')
             + ` · 模式 ${out.gamemode ?? '?'} · 手持 ${out.held ?? '空手'}`,
           `   · 🎒 背包：${invText}`,
+          `   · 🛡 装备栏：${eqText ?? '读不到'}（这几格不在背包里，穿/脱用 mc_act {mode:"equip"}）`,
           `   · 脚下 ${out.surroundings.underFeet} · 脚内 ${out.surroundings.feetBlock} · 头上一格 ${out.surroundings.headBlock} · 正前方一格 ${out.surroundings.ahead}`
             + (out.surroundings.inWater ? ' · 泡在水里' : ''),
           '⚠️ **不确定**（别当成事实）：' + shown.map((t, i) => `${'①②③④⑤⑥⑦⑧⑨'[i] ?? '·'}${t}`).join('　'),
@@ -558,7 +565,7 @@ export async function apply (api) {
           capturedAtLocal: stamp,
           position: out.position, facing: out.facing, yawDeg: out.yawDeg, pitchDeg: out.pitchDeg,
           health: out.health, food: out.food, air: out.air, submerged: out.submerged,
-          heldItem: out.held, gamemode: out.gamemode, inventory: inv,
+          heldItem: out.held, gamemode: out.gamemode, inventory: inv, equipment,
           targetBlock: ray, visibleEntities: prog?.list ?? null,
           image: wantImage ? { width, height, bytes: png.length, renderMs } : null,
           uncertain,
@@ -582,7 +589,7 @@ export async function apply (api) {
             ray,
             counts: prog?.counts ?? null, total: prog?.total ?? null, entities: prog?.list ?? null,
             health: out.health, food: out.food, air: out.air, submerged: out.submerged,
-            gamemode: out.gamemode, held: out.held, inventory: inv,
+            gamemode: out.gamemode, held: out.held, inventory: inv, equipment,
             surroundings: out.surroundings,
           },
         }
@@ -615,6 +622,7 @@ export async function apply (api) {
             + (out.surroundings.inWater ? ' · 泡在水里' : ''))
         }
         lines.push(`🎒 背包：${invText}`)
+        lines.push(`🛡 装备栏：${eqText ?? '读不到'}（穿/脱用 mc_act {mode:"equip"}）`)
         if (out.image && out.image.unloadedPct > 25) {
           lines.push('⚠️ 未加载像素偏多：区块可能还没加载完，可以稍等再 mc_observe 一次。')
         }

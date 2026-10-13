@@ -33,6 +33,60 @@ export function heldText (b) {
   return b?.heldItem ? `${b.heldItem.name}x${b.heldItem.count}` : '空手'
 }
 
+/**
+ * 装备栏那五格 —— `bot.inventory.slots` 的 **5/6/7/8/45**（头/身/腿/脚/副手）。
+ *
+ * 为什么要有这一段（2026-10-13 用户报"它现在看不到自己身上的装备"）：
+ * `bot.inventory.items()` 只回**背包范围**（`minecraft:inventory` 窗口的 `inventoryStart..inventoryEnd`
+ * = 槽 9–44，也就是主背包 + 快捷栏）。5–8 的盔甲和 45 的副手**不在里面** —— 所以以前
+ * `mc_inventory` / `mc_observe` 的"背包"里根本看不到身上穿着什么，AI 会以为自己光着，
+ * 于是把已经穿在身上的头盔又做一遍。
+ *
+ * 名字用 `bot.getEquipmentDestSlot()` 那套（`head` / `torso` / `legs` / `feet` / `off-hand`），
+ * 这样 `mc_act {mode:"equip", name, to}` 能直接拿它当 `to` 用。
+ */
+export const EQUIP_SLOTS = [
+  [5, 'head', '头'],
+  [6, 'torso', '身'],
+  [7, 'legs', '腿'],
+  [8, 'feet', '脚'],
+  [45, 'off-hand', '副手'],
+]
+
+/** 身上穿着什么：`{ head: 'iron_helmetx1' | null, torso, legs, feet, 'off-hand' }` */
+export function equipmentOf (b) {
+  const slots = b?.inventory?.slots
+  const out = {}
+  for (const [i, dest] of EQUIP_SLOTS) {
+    const it = Array.isArray(slots) ? slots[i] : null
+    out[dest] = it ? `${it.name}x${it.count}` : null
+  }
+  return out
+}
+
+/** 装备栏一行字（`头 空 · 身 铁胸甲x1 · 腿 空 · 脚 空 · 副手 空`） */
+export function equipmentText (b) {
+  const eq = equipmentOf(b)
+  return EQUIP_SLOTS.map(([, dest, label]) => `${label} ${eq[dest] ?? '空'}`).join(' · ')
+}
+
+/**
+ * 物品名 → 该穿在哪一格。不认名字就回 `hand`（照旧"拿到手上"）。
+ *
+ * 判据照 `extensions\mc_auto.mjs` 的 `ARMOR_SLOTS`（自动穿甲那套）抄，多认了 `elytra`、
+ * `carved_pumpkin` 和盾/图腾（盾和 `totem_of_undying` 是副手件 —— 1.21 里副手就是
+ * `off-hand`，`simple_inventory.js:19` 加的键名带连字符）。
+ */
+export function equipDestOf (name) {
+  const n = String(name ?? '')
+  if (/(_helmet|_cap)$/.test(n) || n === 'turtle_helmet' || /_skull$/.test(n) || n === 'carved_pumpkin') return 'head'
+  if (/(_chestplate|_tunic)$/.test(n) || n === 'elytra') return 'torso'
+  if (/(_leggings|_pants)$/.test(n)) return 'legs'
+  if (/_boots$/.test(n)) return 'feet'
+  if (n === 'shield' || n === 'totem_of_undying') return 'off-hand'
+  return 'hand'
+}
+
 /** 背包按**名字合计**快照（走路/挖矿前后比"路上用掉了什么"） */
 export function invSnap (b) {
   const m = new Map()
@@ -138,7 +192,11 @@ export function inventoryView (b) {
    *    写"格"会让模型以为"背包只剩 3 格空位"。改成"叠"，并补一句空位。 */
   const free = (() => { try { return b.inventory.emptySlotCount() } catch { return null } })()
   lines.push(`共 ${all.length} 叠 / ${items.length} 样${free != null ? `（背包还有 ${free} 个空位）` : ''}`)
-  return { text: lines.join('\n'), held, items }
+  /* 装备栏单独一行（2026-10-13 用户要求）：这几格不在 `items()` 里，以前完全看不见。
+   * 用 `mc_act {mode:"equip", name, to}` 往里穿；`to` 就是这里的 head/torso/legs/feet/off-hand。 */
+  const equipment = equipmentOf(b)
+  lines.push(`装备栏：${equipmentText(b)}（这几格不占背包位，穿装备用 mc_act {mode:"equip"}）`)
+  return { text: lines.join('\n'), held, items, equipment }
 }
 
 /**

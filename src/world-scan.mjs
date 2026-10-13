@@ -20,8 +20,10 @@ import { Vec3 } from 'vec3'
 import { isAir } from './block-names.mjs'
 import { entityNameOf, HOSTILE_RE, RANGED_RE } from './entity-names.mjs'
 
-export function scanAround (b, { radius = 8, height = 4, name = null, limit = 10 } = {}) {
-  const R = Math.min(Math.max(radius, 1), 24)
+export function scanAround (b, { radius = 16, height = 4, name = null, limit = 10 } = {}) {
+  /* 半径默认 16 = **1 区块**（2026-10-13 用户要求，先定 32 后改回 16）：一次扫 33×33 格，
+   * 找树 / 找矿 / 找水源够用，又不至于每次调用都查几万格。上限 48 留给显式传大半径的场合。 */
+  const R = Math.min(Math.max(radius, 1), 48)
   const H = Math.min(Math.max(height, 0), 16)
   const c = b.entity.position.floored()
   const counts = new Map()

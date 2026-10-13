@@ -44,7 +44,7 @@ import { plainText, playerChatFrom, pushChat, emitPlayerChat, wireChatEvents, ch
  * `src/camera.mjs`。下面留三个同名薄包装（`static lookAnglesTo` / `#aimAt` / `async lookAt`），
  * 调用点一行没改。核心动机见 `src/camera.mjs` 头注释：**不要用 mineflayer 的 `bot.lookAt()`**。 */
 import { lookAnglesTo, aimAt, lookAt } from './camera.mjs'
-import { useBlock, useItem, interact, equip } from './world-use.mjs'
+import { useBlock, useItem, interact, equip, enchantTable, anvilTable, smithingTable } from './world-use.mjs'
 import { build as buildImpl } from './build.mjs'
 import {
   jump as jumpImpl, swimUp as swimUpImpl,
@@ -823,6 +823,12 @@ export class McBot extends EventEmitter {
 
   /** 装备某物到手上（实现在 `src\world-use.mjs` 的 `equip`）。 */
   async equip (opts = {}) { return await equip(this, opts, { t: (p, k, l) => this.#t(p, k, l) }) }
+  /** 附魔台：看三个选项 / 选一个附魔（实现在 `src\world-use.mjs` 的 `enchantTable`）。 */
+  async enchantTable (opts = {}) { return await enchantTable(this, opts, { t: (p, k, l) => this.#t(p, k, l) }) }
+  /** 铁砧：合并/修复两件、或者改名（实现在 `src\world-use.mjs` 的 `anvilTable`）。 */
+  async anvilTable (opts = {}) { return await anvilTable(this, opts, { t: (p, k, l) => this.#t(p, k, l) }) }
+  /** 锻造台：模板 + 底座 + 附加 → 成品（实现在 `src\world-use.mjs` 的 `smithingTable`）。 */
+  async smithingTable (opts = {}) { return await smithingTable(this, opts, { t: (p, k, l) => this.#t(p, k, l) }) }
   /** 批量放置：从 (x1,y1,z1) 到 (x2,y2,z2) 的实心长方体（实现在 `src\build.mjs` 的 `build`）。
    *  逐个调用 placeBlock（会自己走近/垫脚），count 上限保护；到点带着已放好的返回。 */
   async build (opts = {}) { return await buildImpl(this, opts) }

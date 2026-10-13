@@ -25,7 +25,7 @@ import { sleep } from './async-util.mjs'
 import { aimAt } from './camera.mjs'
 import { CONTAINER_RE, TOGGLE_RE } from './block-names.mjs'
 import { entityNameOf, pickEntity } from './entity-names.mjs'
-import { heldText } from './inventory.mjs'
+import { heldText, equipDestOf } from './inventory.mjs'
 
 /**
  * 使用/激活方块或实体（开门、按按钮、拉杆、开箱子、喂动物…）。
@@ -199,21 +199,517 @@ export async function interact (self, args = {}) {
   throw new Error(`未知 mode：${mode}（可用 look / place / break / toward）`)
 }
 
-/** 装备某物到手上 */
-export async function equip (self, { name } = {}, ctx = {}) {
+/**
+ * 穿/换装备。
+ *
+ * `to` 不传就按物品名猜（`equipDestOf`）：头盔→头、胸甲→身、护腿→腿、靴子→脚、盾/图腾→副手，
+ * 其余照旧"拿到手上"。**只给 `to` 不给 `name` = 脱下那一格**（`bot.unequip`）。
+ *
+ * 为什么会有这一版（2026-10-13 用户："它现在看不到自己身上的装备，增加装备栏，让它能通过装备栏
+ * 装备装备"）：旧版只会 `b.equip(item, 'hand')` —— 盔甲也能"拿到手上"，但**永远穿不到身上**；
+ * 而 `bot.inventory.items()` 又只回背包那 9–44 格（`inventory.mjs` 的 `equipmentOf` 注释里写了
+ * 为什么），所以 AI 既看不见自己穿没穿、也没法把头盔真戴上。
+ *
+ * 复核方式：手上那格看 `b.heldItem`；盔甲那格看 `b.inventory.slots[5/6/7/8/45]`（上游对非
+ * `hand` 的目标走 `moveSlotItem`，是**换位**——原来穿着的那件会回到背包，所以带 `swappedOut`）。
+ */
+export async function equip (self, { name = null, to = null } = {}, ctx = {}) {
   const t = ctx.t ?? ((p) => p)
   const b = self.requireBot()
-  const before = heldText(b)
+  const DEST_OK = new Set(['hand', 'head', 'torso', 'legs', 'feet', 'off-hand'])
+  const dest = to == null ? null : String(to).toLowerCase() === 'offhand' ? 'off-hand' : String(to).toLowerCase()
+  if (dest && !DEST_OK.has(dest)) {
+    throw new Error(`to 只能是 hand / head / torso / legs / feet / off-hand（给的是 ${to}）`)
+  }
+  const slotOf = (d) => { try { return b.getEquipmentDestSlot?.(d) ?? null } catch { return null } }
+  const readSlot = (s) => (s != null && Array.isArray(b.inventory?.slots) ? b.inventory.slots[s] : null)
+
+  /* 只给 to ⇒ 脱掉那一格 */
+  if (name == null && dest) {
+    if (typeof b.unequip !== 'function') throw new Error('这个 mineflayer 版本没有 unequip；要脱装备只能用 mc_chest 之类手动换')
+    const slot = slotOf(dest)
+    const was = readSlot(slot)
+    if (!was) return { to: dest, now: '空', note: `${dest} 那一格本来就是空的` }
+    await t(b.unequip(dest), 'equip', `脱下 ${dest}（${was.name}）`)
+    const now = readSlot(slot)
+    return {
+      to: dest,
+      now: now ? `${now.name}x${now.count}` : '空',
+      tookOff: `${was.name}x${was.count}`,
+      held: heldText(b),
+      ...(now ? { note: `那一格现在还是 ${now.name} —— 没脱下来，再叫一次试试` } : {}),
+    }
+  }
+  if (name == null) throw new Error('要给 name（如 iron_helmet / diamond_sword）；只想脱装备就只给 to')
+
   const item = b.inventory.items().find((i) => i.name === String(name))
-  if (!item) throw new Error(`背包里没有 ${name}（用 mc_inventory 看有什么）`)
-  await t(b.equip(item, 'hand'), 'equip', `手持 ${name}`)
-  /* 🔴 `held` 必须**读回来**（2026-10-08 审计：旧版拿装备前那个 item 对象拼字符串，
-   *    换手静默失败时照样报"手上是 X"） */
+  if (!item) throw new Error(`背包里没有 ${name}（用 mc_inventory 看有什么；**身上穿着的在"装备栏"那一行**）`)
+  const d = dest ?? equipDestOf(item.name)
+  const isHand = d === 'hand'
+  const slot = slotOf(d)
+  const before = readSlot(slot)
+  const beforeHeld = heldText(b)
+  await t(b.equip(item, d), 'equip', isHand ? `手持 ${name}` : `${d} ← ${name}`)
+  const now = readSlot(slot)
+  const got = isHand ? b.heldItem?.name === item.name : now?.name === item.name
   const held = heldText(b)
-  const ok = b.heldItem?.name === item.name
   return {
-    held, ...(before !== held ? { before } : {}),
-    ...(ok ? {} : { note: `换手没成功（现在手上是 ${held}）—— 那一叠可能被占用了，或刚被用掉；再叫一次 mc_act{mode:"equip",name:"${name}"}，先用 mc_inventory 看还剩什么` }),
+    to: d,
+    ...(isHand ? {} : { now: now ? `${now.name}x${now.count}` : '空' }),
+    ...(before && before.name !== now?.name ? { swappedOut: `${before.name}x${before.count}` } : {}),
+    ...(beforeHeld !== held ? { beforeHeld } : {}),
+    held,
+    ...(got
+      ? {}
+      : {
+          note: isHand
+            ? `换手没成功（现在手上是 ${held}）—— 那一叠可能被占用了，或刚被用掉；再叫一次 mc_act{mode:"equip",name:"${name}"}，先用 mc_inventory 看还剩什么`
+            : `没穿上 ${d}（那一格现在是 ${now ? now.name : '空'}）—— 那一叠可能被占用了，或刚被用掉；先 mc_inventory 看一眼还剩什么`,
+        }),
+  }
+}
+
+/**
+ * 附魔台：看三个选项 / 选一个附魔。
+ *
+ * 为什么单独有这个动作（2026-10-13 用户贴游戏里 AI 的话："附魔台能打开（窗口类型 enchantment，
+ * 38 格），但我这边没有『选附魔』的工具"）：`mc_act {mode:"use"}` 只是 `bot.activateBlock`，
+ * 服务端把窗口开了，但**没有 mineflayer 的附魔助手** —— 三个选项（`table.enchantments`）、
+ * `ready` 事件、`table.enchant(choice)` 全是 `bot.openEnchantmentTable(block)` 挂上去的
+ * （上游 `mineflayer\lib\plugins\enchantment_table.js`）。所以这里要自己把窗口"正规地"开一遍。
+ *
+ * 🔴 `bot.openBlock(block)`（`inventory.js:405`）= `bot.activateBlock` + `await once(bot,'windowOpen')`
+ * ⇒ **已经有窗口开着时服务端会忽略这次使用，`openBlock` 就挂死**。所以先关掉别的窗口。
+ *
+ * 用法：`mc_act {mode:"enchant"}` 只看选项；`{mode:"enchant", option:0}` 真附魔。
+ * 自动做四件事：① 关掉别的窗口再 `openEnchantmentTable`；② 槽 0 空就把手上那件（或 `item`
+ * 点名的那件）放进去；③ 槽 1 空就从背包补一块青金石；④ 附完把附魔好的那件拿回背包
+ * （青金石不用管，关窗口时服务端会自己退回背包）。
+ */
+export async function enchantTable (self, args = {}, ctx = {}) {
+  const t = ctx.t ?? ((p) => p)
+  const b = self.requireBot()
+  const raw = args.option
+  const option = raw == null || raw === '' ? null : Number(raw)
+  if (option != null && (!Number.isInteger(option) || option < 0 || option > 2)) {
+    throw new Error(`option 只能是 0 / 1 / 2（附魔台从上到下三个选项），给的是 ${raw}`)
+  }
+  if (typeof b.openEnchantmentTable !== 'function') {
+    throw new Error('这个 mineflayer 没有 openEnchantmentTable —— 附魔台用不了')
+  }
+
+  // ① 找附魔台：给了坐标用坐标，没给就在 4 格内找最近的一座
+  let blk = null
+  if (args.x != null && args.y != null && args.z != null) {
+    blk = b.blockAt(new Vec3(Math.floor(args.x), Math.floor(args.y), Math.floor(args.z)))
+    if (!blk) throw new Error(`(${args.x},${args.y},${args.z}) 还没加载，我看不到那里是什么`)
+    if (blk.name !== 'enchanting_table') throw new Error(`(${args.x},${args.y},${args.z}) 是 ${blk.name}，不是附魔台`)
+  } else {
+    blk = b.findBlock({ matching: (x) => x?.name === 'enchanting_table', maxDistance: 4 })
+    if (!blk) throw new Error('附近 4 格内没有附魔台 —— 先 mc_scan {name:"enchanting_table"} 找一座，或者把 x/y/z 给我')
+  }
+  const at = `${blk.position.x},${blk.position.y},${blk.position.z}`
+
+  // ② 要一个"带助手"的附魔窗口（已经正规开着就复用；别的窗口先关掉，否则 openBlock 会挂死）
+  let table = null
+  let note = null
+  const cur = b.currentWindow
+  if (cur && cur !== b.inventory && typeof cur.enchant === 'function' && /enchant/.test(String(cur.type ?? ''))) {
+    table = cur
+  } else {
+    if (cur && cur !== b.inventory && typeof b.closeWindow === 'function') {
+      try { await t(Promise.resolve(b.closeWindow(cur)), 'act', '关掉上一个窗口') } catch { /* 关不掉就让下面那次超时如实报 */ }
+    }
+    table = await t(b.openEnchantmentTable(blk), 'act', `打开附魔台 (${at})`)
+  }
+
+  // 窗口里"我的背包"从哪一格开始（上游 `putAway` 用的是 `window.inventoryStart`，跟着它走）
+  const start = Number.isFinite(table?.inventoryStart) ? table.inventoryStart : 2
+  const end = Number.isFinite(table?.inventoryEnd) ? table.inventoryEnd : Math.max(start, (table?.slots?.length ?? start) - 1)
+  const slotName = (i) => table.slots?.[i]?.name ?? null
+  const findInv = (name) => {
+    for (let i = start; i <= end; i++) {
+      const it = table.slots?.[i]
+      if (it && it.name === name) return { item: it, slot: i }
+    }
+    return null
+  }
+  // 手上那件在窗口 0 里是 36..44（快捷栏）、9..35 是主背包；容器窗口里玩家背包从
+  // `inventoryStart` 起，前 27 格是主背包、后 9 格才是快捷栏 ⇒ 要按这个布局平移。
+  const heldSlot = () => {
+    const h = b.heldItem
+    const hs = Number(h?.slot)
+    if (!h || !Number.isFinite(hs)) return null
+    const idx = hs >= 36 && hs <= 44 ? 27 + (hs - 36) : (hs >= 9 && hs <= 35 ? hs - 9 : null)
+    if (idx == null) return null
+    const s = start + idx
+    return s >= start && s <= end ? s : null
+  }
+
+  // ③ 槽 0 要有待附魔的东西
+  if (!slotName(0)) {
+    const want = args.item ? String(args.item) : null
+    const pick = want ? findInv(want) : null
+    const slot = pick?.slot ?? heldSlot()
+    if (slot == null) {
+      throw new Error(want
+        ? `背包里没有 ${want} —— 要附魔的东西得先在手边（或者名字写对：mc_inventory 看一眼）`
+        : '附魔台槽 0 是空的：先用手拿着要附魔的东西，或者点名 item（如 item:"iron_pickaxe"）')
+    }
+    await t(Promise.resolve(b.moveSlotItem(slot, 0)), 'act', '把待附魔的那件放进附魔槽')
+  }
+
+  // ④ 槽 1 要有青金石
+  if (!slotName(1)) {
+    const l = findInv('lapis_lazuli')
+    if (l) await t(Promise.resolve(b.moveSlotItem(l.slot, 1)), 'act', '补一块青金石')
+  }
+
+  // ⑤ 等三个选项到位（服务端用 craft_progress_bar 的属性包填，通常一个 tick 就到）
+  const shortName = (s) => String(s ?? '?').replace(/^minecraft:/, '')
+  const enName = (id) => (id == null || Number(id) < 0 ? '?' : shortName(b.registry?.enchants?.[id]?.name ?? `#${id}`))
+  const ready = () => Array.isArray(table.enchantments) && table.enchantments.length > 0
+    && table.enchantments.every((x) => Number(x?.level) >= 0)
+  const until = Date.now() + 1_200
+  while (!ready() && Date.now() < until) await sleep(80)
+
+  const opts = Array.isArray(table.enchantments) ? table.enchantments : []
+  const optLine = (x, i) => (Number(x?.level) < 0
+    ? `  ${i}. 这一项不可用（经验不够 / 没有青金石 / 这件东西不能附魔）`
+    : `  ${i}. 要 ${x.level} 级经验 → ${enName(x?.expected?.enchant)}${Number(x?.expected?.level) > 0 ? ' ' + x.expected.level : ''}`)
+  const target = slotName(0)
+  const lapis = slotName(1)
+  const base = {
+    at,
+    target,
+    lapisIn: lapis,
+    options: opts.map((x, i) => ({
+      option: i,
+      level: Number(x?.level) ?? -1,
+      enchant: enName(x?.expected?.enchant),
+      enchantLevel: Number(x?.expected?.level) ?? -1,
+    })),
+  }
+
+  // ⑥ 没给 option：只看选项
+  if (option == null) {
+    return {
+      ...base,
+      ...(ready() ? {} : { note: '三个选项还没全到（窗口刚开，服务端要一个 tick 才发属性包）—— 再叫一次 mc_act {mode:"enchant"}' }),
+      text: `🔮 附魔台 (${at})：槽 0 = ${target ?? '空'}，槽 1 = ${lapis ?? '空'}\n${opts.map(optLine).join('\n')}`,
+    }
+  }
+
+  // ⑦ 真附魔
+  if (!ready()) {
+    return {
+      ...base,
+      enchanted: false,
+      note: `三个选项还没到齐，这一轮没动手 —— 再叫一次 mc_act {mode:"enchant", option:${option}}（窗口还开着）`,
+    }
+  }
+  const newItem = await t(Promise.resolve(table.enchant(option)), 'act', `附魔选项 ${option}`)
+
+  // ⑧ 把附魔好的那件拿回背包（拿不回就靠关窗退回）
+  try {
+    if (table.slots?.[0] && typeof table.takeTargetItem === 'function') {
+      await t(Promise.resolve(table.takeTargetItem()), 'act', '把附魔好的那件拿回来')
+    }
+  } catch (e) {
+    note = `没能自动把槽 0 那件拿回背包（${e.message}）—— 关窗口时服务端会把它退回背包，用 mc_inventory 确认一下`
+  }
+  try { if (typeof b.closeWindow === 'function') await t(Promise.resolve(b.closeWindow(table)), 'act', '关掉附魔台') } catch { /* 关不掉不影响结果 */ }
+
+  const en = Array.isArray(newItem?.enchants) ? newItem.enchants : []
+  const enText = en.length
+    ? en.map((x) => `${shortName(x?.name ?? x?.ench)} ${x?.lvl ?? x?.level ?? ''}`.trim()).join('、')
+    : null
+  return {
+    ...base,
+    enchanted: true,
+    option,
+    got: newItem?.name ?? null,
+    ...(enText ? { enchants: enText } : {}),
+    ...(note ? { note } : {}),
+    text: `🔮 附魔完成（选项 ${option}）：${newItem?.name ?? target ?? '那件'}`
+      + (enText ? ` → **${enText}**` : '（没读回附魔属性，用 mc_inventory 看一眼那件）')
+      + (lapis ? '\n槽 1 剩的青金石在关窗时已退回背包。' : ''),
+  }
+}
+
+/* ───────── 铁砧 / 锻造台（2026-10-13：用户问"铁砧 锻造台都可以用吗"） ───────── */
+
+/**
+ * 找一个"要右键打开的工作方块"：给了坐标用坐标（并校验名字），没给就在 radius 格内找最近的。
+ *
+ * 🔴 `findBlock` 的匹配函数只能看 `.name`（它内部走 `findBlocks`，喂进来的方块原型没有 position）。
+ */
+function findWorkBlock (b, args, re, label, radius = 4) {
+  const ok = (n) => re.test(String(n ?? ''))
+  if (args.x != null && args.y != null && args.z != null) {
+    const blk = b.blockAt(new Vec3(Math.floor(args.x), Math.floor(args.y), Math.floor(args.z)))
+    if (!blk) throw new Error(`(${args.x},${args.y},${args.z}) 还没加载，我看不到那里是什么`)
+    if (!ok(blk.name)) throw new Error(`(${args.x},${args.y},${args.z}) 是 ${blk.name}，不是${label}`)
+    return blk
+  }
+  const blk = b.findBlock({ matching: (x) => ok(x?.name), maxDistance: radius })
+  if (!blk) throw new Error(`附近 ${radius} 格内没有${label} —— 先 mc_scan 找一座，或者把 x/y/z 给我`)
+  return blk
+}
+
+/**
+ * 要一个"能干活"的窗口：已经正规开着就复用；别的窗口先关掉。
+ *
+ * 🔴 `bot.openBlock` = `bot.activateBlock` + 等 `windowOpen`（上游 `inventory.js:405`）⇒
+ * **已经有窗口开着时服务端会忽略这次使用，`openBlock` 就挂死**。所以先关掉别的窗口。
+ *
+ * `helper` 给了就要求窗口上有那个助手函数（附魔台的 `enchantments`/`enchant()` 是
+ * `openEnchantmentTable` 挂上去的，`activateBlock` 开出来的没有）；锻造台没有助手，给 null 即可。
+ */
+async function openWorkWindow (b, t, blk, { helper = null, typeRe, label, open }) {
+  const cur = b.currentWindow
+  const reusable = cur && cur !== b.inventory && typeRe.test(String(cur.type ?? ''))
+    && (!helper || typeof cur[helper] === 'function')
+    && Number.isFinite(cur.inventoryStart)
+  if (reusable) return cur
+  if (cur && cur !== b.inventory && typeof b.closeWindow === 'function') {
+    try { await t(Promise.resolve(b.closeWindow(cur)), 'act', '关掉上一个窗口') } catch { /* 关不掉就让下面那次超时如实报 */ }
+  }
+  return await t(open(blk), 'act', `打开${label}`)
+}
+
+/** 窗口里的"我的背包"范围 + 查格子的助手（附魔台 / 铁砧 / 锻造台三处布局一样）。 */
+function winSlots (b, win) {
+  const start = Number.isFinite(win?.inventoryStart) ? win.inventoryStart : 2
+  const end = Number.isFinite(win?.inventoryEnd) ? win.inventoryEnd : Math.max(start, (win?.slots?.length ?? start) - 1)
+  const slotName = (i) => win?.slots?.[i]?.name ?? null
+  const findInv = (name, skip = -1) => {
+    for (let i = start; i <= end; i++) {
+      const it = win?.slots?.[i]
+      if (it && it.name === name && i !== skip) return { item: it, slot: i }
+    }
+    return null
+  }
+  // 手上那件在窗口里是第几格：窗口 0 里快捷栏是 36..44、主背包 9..35；容器窗口里玩家背包从
+  // `inventoryStart` 起，前 27 格是主背包、后 9 格才是快捷栏 ⇒ 按这个布局平移。
+  const heldSlot = () => {
+    const h = b.heldItem
+    const hs = Number(h?.slot)
+    if (!h || !Number.isFinite(hs)) return null
+    const idx = hs >= 36 && hs <= 44 ? 27 + (hs - 36) : (hs >= 9 && hs <= 35 ? hs - 9 : null)
+    if (idx == null) return null
+    const s = start + idx
+    return s >= start && s <= end ? s : null
+  }
+  return { start, end, slotName, findInv, heldSlot }
+}
+
+/** 一件东西的人话：名字 + 自定义名 + 附魔 + 还剩多少耐久。 */
+function describeItem (it) {
+  if (!it) return null
+  const en = Array.isArray(it.enchants) ? it.enchants.filter(Boolean) : []
+  const enText = en.length
+    ? en.map((e) => `${String(e.name ?? e.ench ?? '?').replace(/^minecraft:/, '')} ${e.lvl ?? e.level ?? ''}`.trim()).join('、')
+    : null
+  const dmg = Number(it.durabilityUsed)
+  const max = Number(it.maxDurability)
+  const dur = Number.isFinite(dmg) && Number.isFinite(max) && max > 0 ? `耐久 ${max - dmg}/${max}` : null
+  return [it.name, it.customName ? `「${it.customName}」` : null, enText, dur].filter(Boolean).join(' · ')
+}
+
+/**
+ * 铁砧：合并/修复两件装备，或者给一件改名。
+ *
+ * 为什么不用 `mc_act {mode:"use"}`（2026-10-13 用户问"铁砧 锻造台都可以用吗"）：`use` 只是
+ * `bot.activateBlock` —— 窗口开得出来，但**没有 mineflayer 的铁砧助手**：`combine`（自己算经验、
+ * 挑划算的方向、发 `MC|ItemName` 改名包、把成品拿出来）和 `rename` 都是 `bot.openAnvil(block)`
+ * 挂上去的（上游 `mineflayer\lib\plugins\anvil.js`）。
+ *
+ * 用法：
+ *   `{mode:"anvil", action:"combine", item:"iron_pickaxe", name:"iron_pickaxe"}` —— 两把合成一把更耐久的
+ *   `{mode:"anvil", action:"rename",  item:"diamond_sword", name:"屠龙刀"}` —— 改名
+ * 经验不够 / 这两件根本合不了，上游会直接抛错（不会白扣等级）。
+ */
+export async function anvilTable (self, args = {}, ctx = {}) {
+  const t = ctx.t ?? ((p) => p)
+  const b = self.requireBot()
+  const action = String(args.action ?? 'combine').toLowerCase()
+  if (action !== 'combine' && action !== 'rename') {
+    throw new Error(`action 只能是 combine（合并/修复两件）或 rename（改名），给的是 ${args.action}`)
+  }
+  if (typeof b.openAnvil !== 'function') throw new Error('这个 mineflayer 没有 openAnvil —— 铁砧用不了')
+
+  const blk = findWorkBlock(b, args, /^(chipped_|damaged_)?anvil$/, '铁砧')
+  const at = `${blk.position.x},${blk.position.y},${blk.position.z}`
+  const table = await openWorkWindow(b, t, blk, {
+    helper: 'combine', typeRe: /anvil/, label: `铁砧 (${at})`, open: (x) => b.openAnvil(x),
+  })
+  const { findInv, heldSlot } = winSlots(b, table)
+
+  // 第一件：点名的那件，或者手上那件
+  const want1 = args.item ? String(args.item) : null
+  const pick1 = want1 ? findInv(want1) : null
+  const s1 = pick1?.slot ?? heldSlot()
+  if (s1 == null) {
+    throw new Error(want1
+      ? `背包里没有 ${want1} —— 要放进铁砧的东西得在手边（名字写对没：mc_inventory 看一眼）`
+      : '铁砧槽 0 是空的：先用手拿着要处理的东西，或者点名 item（如 item:"iron_pickaxe"）')
+  }
+  const first = table.slots[s1]
+
+  const close = async () => {
+    try { if (typeof b.closeWindow === 'function') await t(Promise.resolve(b.closeWindow(table)), 'act', '关掉铁砧') } catch { /* 关不掉不影响结果 */ }
+  }
+
+  if (action === 'rename') {
+    const newName = args.name == null ? '' : String(args.name).trim()
+    if (!newName) throw new Error('rename 要给 name（新名字），例如 {mode:"anvil", action:"rename", item:"diamond_sword", name:"屠龙刀"}')
+    if (newName.length > 35) throw new Error(`名字太长（${newName.length} 个字），铁砧最多 35 个`)
+    let err = null
+    try { await t(Promise.resolve(table.rename(first, newName)), 'act', `改名成「${newName}」`) } catch (e) { err = e }
+    await sleep(200)
+    const got = b.inventory.items().find((it) => it.customName === newName) ?? null
+    await close()
+    if (err && !got) throw new Error(`改名没成：${err.message}`)
+    return {
+      at, action, from: first?.name ?? null, name: newName, got: got?.name ?? null, renamed: Boolean(got),
+      ...(err ? { note: `服务端那边报了 ${err.message}，但背包里确实有一件叫「${newName}」的` } : {}),
+      text: `⚒️ 铁砧改名：${first?.name ?? '那件'} → **「${newName}」**`
+        + (got ? `（背包里那件是 ${got.name}）` : '（没能从背包里复核到，用 mc_inventory 看一眼）'),
+    }
+  }
+
+  // combine：第二件（跳过第一件那格，免得两件挑到同一格）
+  const want2 = args.name ? String(args.name) : null
+  if (!want2) {
+    throw new Error('combine 要给 name（第二件），例如 {mode:"anvil", action:"combine", item:"iron_pickaxe", name:"iron_pickaxe"}（两把合成一把更耐久的）')
+  }
+  const pick2 = findInv(want2, s1)
+  if (!pick2) throw new Error(`背包里没有第二件 ${want2}（第一件在槽 ${s1}）`)
+  const second = pick2.item
+  let err = null
+  try { await t(Promise.resolve(table.combine(first, second, null)), 'act', '铁砧合并') } catch (e) { err = e }
+  await sleep(250)
+  // 上游 `combine` 不返回成品 ⇒ 从背包里挑"附魔最多、耐久最好"的那件同名物来报
+  const cands = b.inventory.items().filter((it) => it.name === first?.name)
+  cands.sort((a, c) => (c.enchants?.length ?? 0) - (a.enchants?.length ?? 0) || ((a.durabilityUsed ?? 0) - (c.durabilityUsed ?? 0)))
+  const got = cands[0] ?? null
+  await close()
+  if (err) {
+    return {
+      at, action, first: first?.name ?? null, second: want2, combined: false,
+      note: `铁砧没认这次合并：${err.message}`,
+      text: `⚒️ 铁砧合并失败：${err.message}`,
+    }
+  }
+  const desc = describeItem(got)
+  return {
+    at, action, first: first?.name ?? null, second: want2, combined: true, got: desc,
+    ...(got ? {} : { note: '合并命令发出去了，但没能在背包里复核到结果 —— 用 mc_inventory 看一眼' }),
+    text: `⚒️ 铁砧合并完成：${first?.name ?? ''} + ${want2}`
+      + (desc ? ` → **${desc}**` : '（没复核到结果，用 mc_inventory 看一眼）'),
+  }
+}
+
+/**
+ * 锻造台：模板 + 底座 + 附加 → 成品（下界合金升级、盔甲纹饰都走它）。
+ *
+ * 🔴 mineflayer **没有**锻造台助手（`lib\plugins\` 里只有 `anvil.js`、`enchantment_table.js`）
+ * ⇒ 这里自己按槽位来：槽 0 = 模板、槽 1 = 底座、槽 2 = 附加，成品在槽 3（`minecraft:smithing`）。
+ * 三样都放好之后服务端一个 tick 就把成品算出来，我们读出来再 `putAway(3)` 拿回背包。
+ *
+ * 用法：`{mode:"smithing", item:"diamond_chestplate", name:"netherite_ingot"}` —— 模板没给就自己
+ * 从背包里挑（优先下界合金升级模板；背包里只有一种纹饰模板时用它；有多种就报错让你点名 template）。
+ */
+export async function smithingTable (self, args = {}, ctx = {}) {
+  const t = ctx.t ?? ((p) => p)
+  const b = self.requireBot()
+  if (typeof b.openBlock !== 'function') throw new Error('这个 mineflayer 没有 openBlock —— 锻造台用不了')
+
+  const blk = findWorkBlock(b, args, /^smithing_table$/, '锻造台')
+  const at = `${blk.position.x},${blk.position.y},${blk.position.z}`
+  const table = await openWorkWindow(b, t, blk, {
+    typeRe: /smithing/, label: `锻造台 (${at})`, open: (x) => b.openBlock(x),
+  })
+  const { start, end, slotName, findInv, heldSlot } = winSlots(b, table)
+  const close = async () => {
+    try { if (typeof b.closeWindow === 'function') await t(Promise.resolve(b.closeWindow(table)), 'act', '关掉锻造台') } catch { /* 关不掉不影响结果 */ }
+  }
+
+  // 底座：点名的那件，或者手上那件
+  const wantBase = args.item ? String(args.item) : null
+  const base = wantBase ? findInv(wantBase) : null
+  const baseSlot = base?.slot ?? heldSlot()
+  if (baseSlot == null) {
+    throw new Error(wantBase
+      ? `背包里没有 ${wantBase}（底座）—— 名字写对没：mc_inventory 看一眼`
+      : '锻造台底座槽是空的：先用手拿着要升级/纹饰的那件，或者点名 item（如 item:"diamond_chestplate"）')
+  }
+  // 附加材料
+  const wantAdd = args.name ? String(args.name) : null
+  if (!wantAdd) {
+    throw new Error('要给 name（附加材料），例如 name:"netherite_ingot"（下界合金升级）或 name:"redstone"（盔甲纹饰）')
+  }
+  const add = findInv(wantAdd, baseSlot)
+  if (!add) throw new Error(`背包里没有 ${wantAdd}（附加材料）`)
+  // 模板
+  const wantTpl = args.template ? String(args.template) : null
+  let tpl = wantTpl ? findInv(wantTpl) : null
+  if (wantTpl && !tpl) throw new Error(`背包里没有 ${wantTpl}（模板）`)
+  if (!tpl) {
+    const kinds = []
+    for (let i = start; i <= end; i++) {
+      const it = table.slots?.[i]
+      if (it && /_smithing_template$/.test(it.name)) kinds.push(it.name)
+    }
+    const uniq = [...new Set(kinds)]
+    const pickName = uniq.includes('netherite_upgrade_smithing_template')
+      ? 'netherite_upgrade_smithing_template'
+      : (uniq.length === 1 ? uniq[0] : null)
+    if (!pickName) {
+      throw new Error(uniq.length === 0
+        ? '背包里没有锻造模板（*_smithing_template）—— 下界合金升级要 netherite_upgrade_smithing_template，盔甲纹饰要对应的纹饰模板'
+        : `背包里有多种模板（${uniq.join('、')}）—— 用 template 点名要哪一种`)
+    }
+    tpl = findInv(pickName)
+  }
+
+  // 三样按槽位放好（模板 0 / 底座 1 / 附加 2）
+  const move = async (slot, dest, what) => {
+    await t(Promise.resolve(b.moveSlotItem(slot, dest)), 'act', `把 ${what} 放进槽 ${dest}`)
+    await sleep(120)
+  }
+  await move(tpl.slot, 0, tpl.item.name)
+  await move(baseSlot, 1, base?.item?.name ?? wantBase ?? '底座')
+  await move(add.slot, 2, wantAdd)
+
+  // 等成品（服务端一个 tick 就算出来）
+  const until = Date.now() + 1_200
+  while (!slotName(3) && Date.now() < until) await sleep(80)
+  const out = table.slots?.[3] ?? null
+  if (!out) {
+    await close()
+    return {
+      at, base: base?.item?.name ?? wantBase ?? null, addition: wantAdd, template: tpl.item.name,
+      smithed: false,
+      note: '锻造台槽 3 一直是空的 —— 这三样搭不起来（模板 / 底座 / 附加对不上），或者缺经验（下界合金升级要 1 级）。放进槽里的东西关窗口时会退回背包。',
+      text: `🔨 锻造台 (${at}) 没给出成品：${base?.item?.name ?? wantBase} + ${wantAdd}（模板 ${tpl.item.name}）搭不起来，或经验不够`,
+    }
+  }
+  const desc = describeItem(out)
+  let takeErr = null
+  try { await t(Promise.resolve(b.putAway(3)), 'act', '把成品拿回背包') } catch (e) { takeErr = e }
+  await sleep(150)
+  const gotName = out.name
+  const inBag = b.inventory.items().some((it) => it.name === gotName)
+  await close()
+  return {
+    at, base: base?.item?.name ?? wantBase ?? null, addition: wantAdd, template: tpl.item.name,
+    smithed: true, got: desc, inBag,
+    ...(takeErr || !inBag
+      ? { note: `成品是 ${desc}，但${takeErr ? `没拿回背包（${takeErr.message}）` : '没能从背包里复核到'} —— 关窗口时服务端会把它退回背包，用 mc_inventory 确认一下` }
+      : {}),
+    text: `🔨 锻造台完成：${base?.item?.name ?? wantBase} + ${wantAdd}（模板 ${tpl.item.name}）→ **${desc}**`,
   }
 }
 

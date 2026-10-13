@@ -25,6 +25,7 @@ import { isAir, isLiquid } from './block-names.mjs'
 import { heldText, canHarvestNow, toolKinds } from './inventory.mjs'
 import { digMsFor } from './dig-speed.mjs'
 import { blockReachOf, slowDigWhy, stateNameOf, dropHint } from './world-observer.mjs'
+import { classifyRestore } from './server-break.mjs'
 import { callBudget, callSecText } from './budget.mjs'
 
 export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
@@ -104,15 +105,16 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
   const now = b.blockAt(pos)?.name ?? null
   const localGone = now !== name
   /* 没挂上监听（假 bot）时**别下结论**：报 `null` 而不是 false（"没收到回包"是结论，不能凭空说）。 */
-  const confirmed = watch.watching ? watch.hit() : null
-  /* 🔴 服务端把方块**改回来**了（＝这次破坏服务端没认，客户端随即"复原"）。见 `#watchServerBreak` 注释。 */
-  const restored = watch.watching ? watch.restored() : null
+  /* 🔴 服务端把这个位置改成了**非空气** —— 得先看是不是**同一个方块**（`classifyRestore`）：
+   *   同一个 ⇒ 真拒绝（复原）；变成**液体** ⇒ 破坏其实成功了（冰挖掉就是水，海草/海带同理）；别的 ⇒ 客户端区块旧了。 */
+  const rest = classifyRestore(watch)
+  const confirmed = watch.watching ? (watch.hit() || rest?.kind === 'liquid') : null
   watch.stop()
   const held = heldText(b)
-  if (restored != null) {
+  if (rest?.kind === 'same') {
     await sleep(150)                      // 等客户端把服务端这个包应用上，好报出"复原成什么"
     /* 服务端包里的状态 id 是**权威**的（本地 `blockAt` 可能还没应用上这个包，会读成 air）⇒ 优先用它。 */
-    const back = stateNameOf(b, restored) ?? b.blockAt(pos)?.name ?? '别的方块'
+    const back = rest.name ?? stateNameOf(b, watch.restored()) ?? b.blockAt(pos)?.name ?? '别的方块'
     self.log(`⚠️ 服务端把 ${name} 复原了（${pos.x},${pos.y},${pos.z}）—— 这次破坏没被认`)
     return {
       broken: false, restored: true, at: { x: pos.x, y: pos.y, z: pos.z }, now: back,
@@ -121,6 +123,19 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
       ...(digMs != null ? { digMs } : {}),
       note: `服务端把这块**改回了 ${back}**（复原）—— 这次破坏服务端没认（多半是我离得远，或客户端区块旧了）。`
         + '先 `mc_move` 走到它旁边（3 格以内）再叫一次；连着两三次都这样就用 `mc_connect {force:true}` 重连刷新区块。',
+    }
+  }
+  if (rest?.kind === 'other') {
+    await sleep(150)
+    const back = rest.name ?? '别的方块'
+    self.log(`⚠️ 服务端说 ${pos.x},${pos.y},${pos.z} 是 ${back}，和我以为的 ${name} 不一样 —— 客户端区块旧了？`)
+    return {
+      broken: false, restored: true, desync: true, at: { x: pos.x, y: pos.y, z: pos.z }, now: back,
+      held, reach: Math.round(blockReachOf(b, blk) * 100) / 100,
+      ...(t.changed ? { tool: `${t.heldBefore} → ${t.held}` } : {}),
+      ...(digMs != null ? { digMs } : {}),
+      note: `服务端说这一格是 **${back}**，和我这边看到的 **${name}** 不一样（客户端区块旧了）—— 这次破坏没被认。`
+        + '先 `mc_connect {force:true}` 重连刷新区块，再 `mc_scan` 复核一眼，别照着旧方块继续动手。',
     }
   }
   /* 真挖掉了 ⇒ 掉落物就在脚边。用户 2026-10-08 原话："挖完方块…老是忘记走过去拾取"。
@@ -135,6 +150,12 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
     ...(t.changed ? { tool: `${t.heldBefore} → ${t.held}` } : {}),
     ...(digMs != null ? { digMs } : {}),
     ...(pickup ? { pickup } : {}),
+    /* 服务端把这一格发成了**液体**（冰挖掉就是水，海草/海带也是）⇒ 破坏**成功**了，只是液体立刻涌了进来。
+     * 单独说一句，免得模型把它当成"服务端复原 / 没挖掉"再挖一次。 */
+    ...(rest?.kind === 'liquid' ? {
+      note: `这一格现在是 **${rest.name}**（液体立刻涌了进来）—— 这次破坏是**成功**的，不是"服务端复原"。`
+        + '挖到的东西按方块的正常掉落算；别当成没挖掉重挖一次。',
+    } : {}),
     ...(localGone && confirmed === false ? {
       note: '本地世界已经清掉了，但**没收到服务端的破坏回包** —— 服务端很可能拒了这次破坏'
         + '（领地保护 / 权限 / 反作弊 / 太远），客户端这边却把方块写成空气了。'
@@ -334,16 +355,23 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
           /* 等**服务端**的判决（客户端那个 air 是预测，不算数；服务端的包可能晚到约 1 秒） */
           await ctx.awaitServerBreak(b, watch)
           const now = b.blockAt(p)?.name ?? '?'
-          const confirmed = watch.watching ? watch.hit() : null
-          /* 🔴 服务端把方块**改回来**了（复原）：这次破坏服务端没认。见 `#watchServerBreak` 注释。 */
-          const restored = watch.watching ? watch.restored() : null
-          if (restored != null) {
+          /* 🔴 服务端把这一格改成非空气 —— 先看是不是**同一个方块**（见 `classifyRestore`）：
+           *   同一个 ⇒ 真拒绝（复原）；变成**液体** ⇒ 破坏其实成功了（冰挖掉就是水）；别的 ⇒ 客户端区块旧了。 */
+          const rest = classifyRestore(watch)
+          const confirmed = watch.watching ? (watch.hit() || rest?.kind === 'liquid') : null
+          if (rest?.kind === 'same') {
             await sleep(150)
-            const back = stateNameOf(b, restored) ?? b.blockAt(p)?.name ?? '别的方块'
+            const back = rest.name ?? stateNameOf(b, watch.restored()) ?? b.blockAt(p)?.name ?? '别的方块'
             self.log(`⚠️ 服务端把 ${nm} 复原了（${p}）—— 这次破坏没被认`)
             out.push(`没挖掉 ${nm} @ ${p}：服务端把这块**改回了 ${back}**（复原）`
               + ' —— 多半是我离得远，或客户端区块旧了。先 `mc_move` 走到它旁边（3 格以内）再叫一次 mc_dig；'
               + '连着两三次都这样就用 `mc_connect {force:true}` 重连刷新区块')
+          } else if (rest?.kind === 'other') {
+            await sleep(150)
+            const back = rest.name ?? '别的方块'
+            self.log(`⚠️ 服务端说 ${p} 是 ${back}，和我以为的 ${nm} 不一样 —— 客户端区块旧了？`)
+            out.push(`没挖掉 ${nm} @ ${p}：服务端说这一格是 **${back}**，和我这边看到的 **${nm}** 不一样`
+              + '（客户端区块旧了）—— 先 `mc_connect {force:true}` 重连刷新区块，再 `mc_scan` 复核一眼')
           } else if (now !== nm) {
             okCount++
             if (task) self.tasks.progress(task.taskId, { add: 1 })
@@ -351,8 +379,10 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
              *    `_updateBlockState(pos, 0)` 又自己接住）⇒ 服务端拒了也照样"成功"。
              *    只有服务端发的破坏包才算真挖掉。 */
             if (!watch.watching) out.push(`挖掉 ${nm} @ ${p}（原地，不用走过去）→ 现在 ${now}`)
-            else if (confirmed) out.push(`挖掉 ${nm} @ ${p}（原地，不用走过去）→ 现在 ${now}（服务端已确认）`)
-            else out.push(`本地读到 ${nm} @ ${p} 已经变成 ${now}，但**没收到服务端的破坏回包**`
+            else if (confirmed) {
+              out.push(`挖掉 ${nm} @ ${p}（原地，不用走过去）→ 现在 ${now}（服务端已确认`
+                + `${rest?.kind === 'liquid' ? '：液体立刻涌了进来，这次破坏是成功的' : ''}）`)
+            } else out.push(`本地读到 ${nm} @ ${p} 已经变成 ${now}，但**没收到服务端的破坏回包**`
               + ' —— 服务端很可能拒了这次破坏（够不着 / 领地保护 / 权限 / 反作弊）：别当成挖掉了，'
               + '先 `mc_scan` 复核，真没挖掉就 `mc_connect {force:true}` 重连刷新区块')
             /* 🔴 原地挖绕过了 collectBlock（它平时挖完还会把掉落物捡回来）⇒ 得自己去捡，

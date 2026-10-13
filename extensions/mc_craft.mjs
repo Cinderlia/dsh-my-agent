@@ -515,9 +515,43 @@ const tableUsable = (bot, tbl) => {
  *
  * @returns {Promise<string[]>} 搬回去的东西（`["oak_planksx5"]`），没搬就空数组
  */
+/**
+ * 跟服务端对一次窗口账。
+ *
+ * 🔴 为什么必须先做这一步（2026-10-13 用户报"合成方块还是会卡在合成栏里"）：
+ *    1.17.1+ 的服务端"只在它认为客户端记录过期时才回包"，**被它忽略的点击永远不回**
+ *    ⇒ 客户端这份 `bot.inventory.slots` 会一直停在"合成格是空的"，而服务端里其实还堆着东西。
+ *    这时去点那 4 个格子等于睁眼瞎（循环里 `win.slots[slot]` 全是 null），材料就一直卡着。
+ *    `bot._syncWindow(窗口)`（`mineflayer\lib\plugins\inventory.js:853-870`）发一个
+ *    `stateId:-1` 的空点击，服务端**必回**整窗内容 ⇒ 客户端模型被刷成服务端的真实状态。
+ *    老版本 mineflayer 没有 `stateIdUsed` 特性时它是空操作（立刻 return，不会挂）。
+ */
+const syncNextAt = new WeakMap() // bot -> 下次允许对账的时间（成功 0.8 秒内不重复；**失败后退避 8 秒**，别连着卡）
+const resyncInventory = async (bot, msLeft = () => Infinity) => {
+  try {
+    if (typeof bot?._syncWindow !== 'function' || !bot.inventory) return false
+    if (Date.now() < (syncNextAt.get(bot) ?? 0)) return false
+    syncNextAt.set(bot, Date.now() + 800)
+    const left = msLeft() ?? Infinity
+    const ms = Number.isFinite(left) ? Math.max(300, Math.min(1_200, left - 300)) : 1_200
+    try {
+      await withTimeout(Promise.resolve(bot._syncWindow(bot.inventory)), ms, '同步背包窗口')
+    } catch (e) {
+      /* 服务端没回包（超时/断线）：退避 8 秒再试 —— 否则每次关窗口都白等一个超时 */
+      syncNextAt.set(bot, Date.now() + 8_000)
+      throw e
+    }
+    await new Promise((r) => setTimeout(r, 150))
+    return true
+  } catch { return false }
+}
+
 async function clearCraftGrid (bot, msLeft = () => Infinity) {
   const win = bot?.inventory
   if (!win?.slots) return []
+  /* 🔴 先跟服务端对账再动手。只在"4 个合成格看起来全是空的"时候对 ——
+   *    这正是客户端模型过期（服务端里还压着东西）的样子；格子里看得见东西就不用白跑一趟。 */
+  if ([1, 2, 3, 4].every((s) => !win.slots[s])) await resyncInventory(bot, msLeft)
   const moved = []
   for (let slot = 1; slot <= 4; slot++) {         // 0 = 合成结果槽，1~4 = 2×2 合成格
     const it = win.slots[slot]
@@ -533,6 +567,18 @@ async function clearCraftGrid (bot, msLeft = () => Infinity) {
       moved.push(`${it.name}x${it.count}`)
     } catch { break }
   }
+  /* 🔴 万一两次点击中间被打断（东西还捏在光标上），关窗口会把它**掉在地上** —— 先放回背包。
+   *    `bot.moveSlotItem` 是"拿起来 + 放下"两次点击，第二次超时就是这个状态。 */
+  try {
+    if (win.selectedItem) {
+      const held = `${win.selectedItem.name}x${win.selectedItem.count}`
+      const dest2 = typeof win.firstEmptyInventorySlot === 'function' ? win.firstEmptyInventorySlot() : null
+      if (dest2 != null) {
+        await withTimeout(Promise.resolve(bot.clickWindow(dest2, 0, 0)), 1_200, '把手上的东西放回背包')
+        moved.push(`${held}（光标上那件）`)
+      }
+    }
+  } catch {}
   return moved
 }
 
@@ -645,10 +691,19 @@ async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null
         if (st === 'stuck-cleared') notes.push(`${why} —— 我这次会先等它收尾，不会开第二条链`)
         const waitMs = Math.max(300, Math.min(1_500, msLeft() - 400))
         if (!(await craftSettled(bot, waitMs))) {
-          /* 等不到收尾：只关**容器窗口**（服务端会把里面的东西退回背包），**不点合成格**。 */
+          /* 等不到收尾：关**容器窗口**（服务端会把里面的东西退回背包）。
+           * 🔴 另外，链已经挂了不止 3 秒 ⇒ 它不会再动了，**顺手把自己背包 2×2 合成格里压着的东西
+           *    点回背包**（`clearCraftGrid` 里会先 `resyncInventory` 跟服务端对账，否则那 4 格
+           *    在客户端模型里是空的、点不动 —— 这正是"材料卡在合成格里、背包里看不见"的主因）。
+           *    3 秒是留给"正常但慢的合成"的余地，免得把还在干活的链刚放进去的原料抢走（审计 M1）。 */
           await closeContainer()
+          const age = Date.now() - (craftPendingAt.get(bot) ?? 0)
+          const grid = age > 3_000 ? await clearCraftGrid(bot, msLeft) : []
           throw new Error(`${why} —— 我**没有**开第二条链`
-            + '（只把合成窗口关掉了，格子里的东西服务端会退回背包）。过一会儿再叫一次 mc_craft 重试；'
+            + (grid.length
+              ? `；顺手把合成格里压着的 ${grid.join('、')} 点回背包了`
+              : '（只把合成窗口关掉了，格子里的东西服务端会退回背包）')
+            + '。过一会儿再叫一次 mc_craft 重试；'
             + '要是还卡，就用 mc_connect 重连一次（重连也会把合成格里的东西退回背包）。')
         }
         await closeMaybeWindow()

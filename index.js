@@ -2315,7 +2315,7 @@ export function apply(ctx, rawConfig) {
     name: 'mc_scan',
     description: '扫描我周围方块：给 name 就找这种方块的位置；不给就返回方块统计。',
     parameters: {
-      radius: { type: 'number', description: '水平半径（默认 8，上限 24）' },
+      radius: { type: 'number', description: '水平半径（默认 16，上限 48）' },
       height: { type: 'number', description: '垂直范围 ±（默认 4，上限 16）' },
       name: { type: 'string', description: '可选：只找这种方块（如 oak_log）' },
       limit: { type: 'number', description: 'name 模式下最多返回几个（默认 10）' },
@@ -2468,7 +2468,7 @@ export function apply(ctx, rawConfig) {
    * 实体数据仍走 src/core.mjs 的 entities()（同一份判据），功能没有损失。 */
   ctx.tools.register(asTool({
     name: 'mc_inventory',
-    description: '看背包和手持物品。',
+    description: '看背包、装备栏和手持物品。',
     parameters: {},
     output: text(),
     async execute(args, exec) {
@@ -2527,25 +2527,33 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_act',
-    description: '与游戏世界互动（**优先用这个，而不是服务器指令**）。mode：\n'
-      + '· look   看向坐标(x,y,z)或玩家(who)——"看向我"就是 look + who\n'
+    description: '与游戏世界互动（**优先用它，别用服务器指令**）。mode：\n'
+      + '· look   看向坐标(x,y,z)或玩家(who)："看向我" = look + who\n'
       + '· toward 看向并走近某个玩家(who)\n'
-      + '· place  把背包方块放到 (x,y,z)；悬空时会先垫脚搭上去（=搭高）；结果带 used/held\n'
-      + '· break  破坏 (x,y,z)：**会先自动换对的工具**；结果带 held/digMs；换不上就拒绝（不白挖一轮）\n'
-      + '· use    使用/激活方块(x,y,z)或实体(who)：开门、按按钮、拉杆、喂动物；**不给坐标也不给 who 就是"用手上的东西"**\n'
-      + '· useitem 用手上的东西：扔眼睛/雪球、拉弓、喝药水（hold=毫秒数）\n'
-      + '· attack 打实体：给 who 按名字找（**中英文都认**，24 格内的会追过去）；不给 who 就打 4.5 格内最近的（怪优先）。会真追着打约 10 秒，没打死再叫一次\n'
-      + '· equip  把背包里的物品拿到手上(name)\n'
+      + '· place  放方块到 (x,y,z)；悬空先垫脚（=搭高）；带 used/held\n'
+      + '· break  破坏 (x,y,z)：**先自动换对的工具**；换不上就拒绝\n'
+      + '· use    使用方块或实体(who)：开门、按钮、拉杆、喂动物；**都不给 = 用手上的东西**\n'
+      + '· useitem 用手上的东西：扔眼睛/雪球、拉弓、喝药水\n'
+      + '· attack 打实体：给 who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。约 10 秒，没打死再叫一次\n'
+      + '· equip  装备(name)：护甲自动穿到对应格（头盔/胸甲/护腿/靴子/盾→副手），其余拿到手上；to 指定格子\n'
+      + '· enchant 附魔台：自动开窗放料；option:0-2 真附魔，不给只报选项\n'
+      + '· anvil   铁砧：action:combine(默认) / rename；item + name\n'
+      + '· smithing 锻造台：item 底座、name 附加、template 模板\n'
       + '· toss   丢弃物品(name, count)',
     parameters: {
-      mode: { type: 'string', description: 'look / toward / place / break / use / useitem / attack / equip / toss' },
-      who: { type: 'string', description: '玩家或实体名（look/toward/use/attack 用）' },
+      mode: { type: 'string', description: '见上面各 mode（默认 look）' },
+      who: { type: 'string', description: '玩家或实体名（look/toward/use/attack）' },
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
-      name: { type: 'string', description: '方块或物品名（place/equip/toss 用）' },
+      name: { type: 'string', description: '方块或物品名（place/equip/toss/anvil/smithing 用）' },
+      to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand/hand；只给 = 脱掉' },
       count: { type: 'number', description: 'toss 丢几个（默认 1）' },
-      hold: { type: 'number', description: 'useitem 按住多少毫秒再松手（拉弓 1000，药水 1600；默认 0）' },
-      approach: { type: 'boolean', description: 'toward 是否走近（默认 true）' },
-      budgetMs: { type: 'number', description: 'toward 走近的时间（默认 10000，上限 10000）' },
+      hold: { type: 'number', description: 'useitem 按住毫秒（拉弓 1000）' },
+      approach: { type: 'boolean', description: 'toward 走近吗（默认 true）' },
+      budgetMs: { type: 'number', description: 'toward 走近毫秒（默认 10000）' },
+      option: { type: 'number', description: 'enchant 第几项（0/1/2）' },
+      item: { type: 'string', description: 'enchant/anvil/smithing 哪件（默认手上）' },
+      action: { type: 'string', description: 'anvil：combine（默认）/ rename' },
+      template: { type: 'string', description: 'smithing 的模板（默认自己挑）' },
     },
     output: text(),
     timeoutMs: CALL_MS + 1_000,
@@ -2566,9 +2574,12 @@ export function apply(ctx, rawConfig) {
         }
         case 'useitem': return { mode, ...(await bot.useItem(args)) }
         case 'attack':  return withOutcome({ mode, ...(await bot.attack(args)) })
-        case 'equip':   return { mode, ...(await bot.equip({ name: args.name })) }
+        case 'equip':   return { mode, ...(await bot.equip({ name: args.name, to: args.to })) }
+        case 'enchant': return { mode, ...(await bot.enchantTable({ option: args.option, item: args.item, x: args.x, y: args.y, z: args.z })) }
+        case 'anvil':   return { mode, ...(await bot.anvilTable({ action: args.action, item: args.item, name: args.name, x: args.x, y: args.y, z: args.z })) }
+        case 'smithing': return { mode, ...(await bot.smithingTable({ item: args.item, name: args.name, template: args.template, x: args.x, y: args.y, z: args.z })) }
         case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
-        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/break/use/useitem/attack/equip/toss）`)
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/break/use/useitem/attack/equip/enchant/toss）`)
       }
     },
   }))

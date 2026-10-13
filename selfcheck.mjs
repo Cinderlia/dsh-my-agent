@@ -2886,7 +2886,7 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
     console.log(`  ${p1.includes('a.example:25566') && p1.includes('acc-1') && !/local network/.test(p1) ? '✅' : '❌'} 提示词含地址 + 账户 \`名字 (id: …)\`；手动连接不追加局域网说明`)
     console.log(`  ${/local network/.test(p2) ? '✅' : '❌'} 🔴 局域网触发才追加"该地址可能是临时的"`)
     const { DEFAULT_AGENTS_MD } = await import('./src/agentsmd.mjs')
-    console.log(`  ${!/within 11 seconds|Keep every tool call short|SAME tool again/.test(p1) && /## 省算力/.test(DEFAULT_AGENTS_MD) && /单次调用别超过 11 秒/.test(DEFAULT_AGENTS_MD) && /这一轮的 11 秒用完了/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 🔴 "单次调用 ≤11 秒：一次一小步、到点再叫一次同一个工具"写在 **RULES.md（行事准则）**的「省算力」里，**不再注入连接提示词**（用户 2026-10-08：先要求 ≤5 秒 → 抬到 11 秒 → 规则挪进文件让它自己读）`)
+    console.log(`  ${!/within 11 seconds|Keep every tool call short|SAME tool again/.test(p1) && /## 不用替我省 token/.test(DEFAULT_AGENTS_MD) && /单次调用别超过 11 秒/.test(DEFAULT_AGENTS_MD) && /这一轮的 11 秒用完了/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 🔴 "单次调用 ≤11 秒：一次一小步、到点再叫一次同一个工具"写在 **RULES.md（行事准则）**的「不用替我省 token」里，**不再注入连接提示词**（用户 2026-10-08：先要求 ≤5 秒 → 抬到 11 秒 → 规则挪进文件让它自己读）`)
 
     const isrc = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
     console.log(`  ${/path === '\/api\/mc\/servers'/.test(isrc) && /path === '\/api\/mc\/lan'/.test(isrc) && /path === '\/api\/mc\/connect'/.test(isrc) ? '✅' : '❌'} 三个新端点在 index.js（servers / lan / connect）`)

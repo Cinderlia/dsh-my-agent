@@ -126,7 +126,7 @@ node tools\scan-moved-assertions.mjs     # 两遍扫描：①按导出名找 ②
 | --- | --- |
 | `<memoryDir>\auto.json` | 自主层：`enabled`/`follow`/`pickup`/`avoid`（自保：被打了只叫醒 AI）/`standing`（长期目标）… |
 | `<memoryDir>\view.json` | 看图门禁：`{"gate":true,"maxActions":8,"maxAgeMs":120000}`（默认不强制） |
-| `<memoryDir>\RULES.md` | 行事准则（游戏内 AI 自己读；含「说话方式」「打怪与保命」「工具速查」「省算力」等节；**单次调用 ≤11 秒、到点再叫一次同一个工具**这条规则也在这儿）。2026-10-08 重写过一次：**内置默认与记忆里这份是同一份文本**了（以前分叉，点「恢复默认」会丢节） |
+| `<memoryDir>\RULES.md` | 行事准则（游戏内 AI 自己读；含「说话方式」「打怪与保命」「工具速查」「不用替我省 token」等节；**单次调用 ≤11 秒、到点再叫一次同一个工具**这条规则也在这儿）。2026-10-08 重写过一次：**内置默认与记忆里这份是同一份文本**了（以前分叉，点「恢复默认」会丢节） |
 | `<memoryDir>\版本提示.md` | 版本提示（每个版本的时效性注意事项；**以前是硬编码在提示词里注入，现在也只投一行指针**）。在「MC设置 → 提示词」里能直接改、能恢复默认；「随版本更新」打开时插件升级会替换它 |
 
 环境变量（都可选）：`DSH_MC_AGENT_PATHFINDER`（`off` 或给路径）、`DSH_MC_AGENT_MC_DEPS`、
@@ -147,7 +147,7 @@ node tools\scan-moved-assertions.mjs     # 两遍扫描：①按导出名找 ②
 | `src\entity-names.mjs` | **路线图第 ④ 条的第四刀**："谁是谁"那一层 —— `HOSTILE_RE` / `RANGED_RE`（敌对与远程名单，与 `extensions\mc_auto.mjs` 的 `HOSTILE` / `RANGED` 逐字一致）/ `JUNK_RE` / `NOT_DROP_RE` + `isDropEntity()`（掉落物判据只有这一份：掉落物实体的 `type` 是 `'other'`，不能拿 `displayName` 兜底）/ `NAME_ALIAS`（中文叫法 → 实体名）/ `entityNameOf()` / `nameFieldsOf()` / `matchNameOf()` / `pickEntity()`。全是纯函数与常量（不碰 `bot`/世界/事件）⇒ 这批名字**没有一个是外部 import 的**，所以 `core.mjs` 只 import、不 re-export |
 | `src\log.mjs` | **路线图第 ④ 条的第五刀**：日志基建 —— `stamp()`（本地 `MM-DD HH:MM:SS`）/ `logLevel()` / `logLine()` / `logDebug()` / `logOnce()`（`globalThis` 判重，跨模块实例）/ `appendLog()`（自动建目录 + 轮转）/ `rotateLogIfNeeded()` / `LOG_LEVELS`。**唯一"自带默认值"的一刀**：`logLine` 要写 `DEFAULTS.logFile`，而 `DEFAULTS` 在 `core.mjs` 里 ⇒ 由 `core.mjs` 用 `setDefaultLogFile()` **注入**（不反向 import，避免循环导入）；`MC_LOG_MAX_BYTES` / `MC_LOG_KEEP` 改成轮转时**现读**（这个模块整个进程只加载一次） |
 | `src\place-items.mjs` | **路线图第 ④ 条的第六刀**："挑方块 / 垫脚料"那一层 —— `NON_FULL_BLOCK`（形状不是整方块的方块名黑名单：半砖/楼梯/墙/栅栏/地毯/耕地/土路/头颅/铁砧…）、`isFullBlockItem(bot, name)`（三段判据：`boundingBox === 'block'` + `transparent === false` + 黑名单 —— 光看 `boundingBox` 不够，用户 2026-10-06 报的"它搭方块会用非实体方块搭"就踩在这）、`NO_SCAFFOLD`（贵重方块与家当不拿去垫）、`scaffoldingItemIds(bot)`（交给 pathfinder 的 `scafoldingBlocks`，**item id**、按存货多少排序）、`pickPlaceItem(bot, want)`（没点名时**只挑整方块**）。都是"读 `bot` 但不改状态"的纯函数 ⇒ `core.mjs` 照样导出三个公开件（`tools\check-core-place.mjs` 与 `实机验证\搭方块\live-place.mjs` 都从 `core.mjs` 导入） |
-| `src\inventory.mjs` | **路线图第 ④ 条的第七刀**：背包那一层 —— `heldText(b)`（`dirtx18` / `空手`，AI 判断"我手里现在是什么"的唯一来源）、`invSnap(b)` / `invUsed(b, snap)`（走路挖矿前后比"路上用掉了什么"）、`canHarvestNow(b, blk)` / `toolKinds(b, blk)`（手上这叠能不能挖 / 人话版"需要镐／斧／锹"）、`countOf(b, name)`（同名合计，**读不到回 `null`、不是 `0`**）、`freeSlot(b, itemName)`（优先复用同款槽）。这一刀是第一次搬"**读 bot 实时状态**"的东西：只读、不 await、不改状态；签名比原来多一个 `b`（原来是 `this.#heldText(b)` 这种私有方法），`countOf` 在 `core.mjs` 里留成薄包装（公开面一行都没少） **第十九刀又把这层的"动作"也收进来**：`inventoryView(b)`（`mc_inventory` 的正文：同名合计 + 只报一次手上 + 叠数/样数/空位）、`giveItem(b, opts, ctx)`（创造取物，`slot` 钳到 9-44 并如实说被挪过；那格还是空的就**不许**说"已放进背包"）、`clearInventory(b, ctx)`（清完抽查一遍再说结果）、`tossItem(b, opts, ctx)`（按**背包数量差**说丢掉了几个）—— 这四个要发包，所以 `ctx = { t, makeItem }` 由薄包装传进去（`t` 是本轮 11 秒闸门，`makeItem` 是造 prismarine-item；模块自己**不 import 游戏库**） | **第三十二刀**：`equipFor(self, b, blk, label, ctx)`（动手前换对的工具：手上不能挖、或背包里有明显更快的就换；换不上就照旧返回 `changed:false`，调用方按"手上还是不对"如实拒绝）。
+| `src\inventory.mjs` | **路线图第 ④ 条的第七刀**：背包那一层（**2026-10-13 加装备栏**：`EQUIP_SLOTS` / `equipmentOf(b)` / `equipmentText(b)` / `equipDestOf(name)`；`inventoryView()` 多一行 `🛡 装备栏`） —— `heldText(b)`（`dirtx18` / `空手`，AI 判断"我手里现在是什么"的唯一来源）、`invSnap(b)` / `invUsed(b, snap)`（走路挖矿前后比"路上用掉了什么"）、`canHarvestNow(b, blk)` / `toolKinds(b, blk)`（手上这叠能不能挖 / 人话版"需要镐／斧／锹"）、`countOf(b, name)`（同名合计，**读不到回 `null`、不是 `0`**）、`freeSlot(b, itemName)`（优先复用同款槽）。这一刀是第一次搬"**读 bot 实时状态**"的东西：只读、不 await、不改状态；签名比原来多一个 `b`（原来是 `this.#heldText(b)` 这种私有方法），`countOf` 在 `core.mjs` 里留成薄包装（公开面一行都没少） **第十九刀又把这层的"动作"也收进来**：`inventoryView(b)`（`mc_inventory` 的正文：同名合计 + 只报一次手上 + 叠数/样数/空位）、`giveItem(b, opts, ctx)`（创造取物，`slot` 钳到 9-44 并如实说被挪过；那格还是空的就**不许**说"已放进背包"）、`clearInventory(b, ctx)`（清完抽查一遍再说结果）、`tossItem(b, opts, ctx)`（按**背包数量差**说丢掉了几个）—— 这四个要发包，所以 `ctx = { t, makeItem }` 由薄包装传进去（`t` 是本轮 11 秒闸门，`makeItem` 是造 prismarine-item；模块自己**不 import 游戏库**） | **第三十二刀**：`equipFor(self, b, blk, label, ctx)`（动手前换对的工具：手上不能挖、或背包里有明显更快的就换；换不上就照旧返回 `changed:false`，调用方按"手上还是不对"如实拒绝）。
 | `src\budget.mjs` | **路线图第 ④ 条的第九刀**：单次调用的时间预算 —— `TIMEOUTS`（各类操作的默认超时）、`CALL_MS = 11_000`（硬上限）、`CALL_BUDGET_MS = 10_000`（长动作默认预算）、`callBudget(v)`（钳进 `[200, 10_000]`）、`callDeadline(ms)`、`callSecText()` / `budgetSecText()`（文案秒数跟着常量走）。全是纯常量与纯函数；`setCallDeadline()` / `msLeft()` / `callLeft()` 是**实例状态**，留在 `core.mjs` 的类里。`CALL_MS` / `CALL_BUDGET_MS` / `callBudget` / `callDeadline` 被 `index.js`、4 个扩展、`tools\check-call-budget.mjs` 从 `core.mjs` 导入 ⇒ 七个名字原样 re-export |
 | `src\world-observer.mjs` | **路线图第 ④ 条的第十刀**：**只读观察**那一层 —— `entityHealth(b, e)`（读血量，读不到回 `null`，**不编**）、`inWaterNow(b)`（脚在水的 AABB 里**或**眼睛那格是水 —— `entity.isInWater` 浮在水面时读出来是 false）、`slowDigWhy(b)`（"我在水里 / 我在空中，挖方块慢 5 倍"）、`dropsNear(b, radius)` / `dropHint(b, {radius})`（附近还没捡的掉落物 + "东西还掉在地上"那句话）、`blockReachOf(b, blk)`（**眼睛 → 方块中心**，服务端/上游的判据；原来叫 `#reachOf`，改名是为了跟 `mc_craft.mjs` 那个"材料够不够做"的 `reachOf` 分开）、`stateNameOf(b, stateId)`。都是"收 `bot` 当参数、只读、不 await"的模块级函数，只往下依赖 `src\entity-names.mjs` |
 | `src\map-render.mjs` | **路线图第 ④ 条的第十一刀**：**地图那一层** —— `isUnderground(b)`、`caveCell(b, x, cy, z, slab)`（洞穴层一格：先看身体那两格、再看脚下）、`heightmapOf(b, {radius, yTop, yBottom, mode, slab})`（俯视地形，自带 2.5 秒软上限）、`glyphMapText(names, step, selfIndex)`（字符图）、`mapImageOf(b, {…, scale})`（RGBA 像素图）。只借 `vec3`（`blockAt()` 要真 Vec3），不反向 import core；`core.mjs` 里留四个同名薄包装（公开面不变） |
@@ -158,7 +158,7 @@ node tools\scan-moved-assertions.mjs     # 两遍扫描：①按导出名找 ②
 | `src\chat.mjs` | **路线图第 ④ 条的第十六刀**：**聊天记录那一层** —— `wireChatEvents(self, b)`（把 mineflayer 的聊天/系统消息接到实例事件上：签名聊天走 `player_chat`、未签名 `system_chat` 按 positionId 分流、`position:'system'` 还要按渲染形状再判一次）、`plainText(msg)`（去颜色码 §x）、`playerChatFrom(msg, plain)`（认出"玩家在说话"：队伍聊天 / 公屏 / 私聊 / `<名字> 正文` 兜底）、`emitPlayerChat(self, who, text, selfName)`（唯一入口：1.5 秒去重 + 自己说的话不重复记 `player` 那条）、`pushChat(self, kind, who, text)`（按 `cfg.chatHistory` 截断）。**这一层有可变实例状态 ⇒ 第一参数直接收 `self`**（迁移规矩第 20 条）；**第二十六刀**又把 `chatSay(self, text)`（往公屏说话，`/` 开头直接拒）也收了进来，聊天那一层就此完整 |
 | `src\camera.mjs` | **路线图第 ④ 条的第十七刀**：**朝向/相机那一层** —— `lookAnglesTo(from, to)`（目标点 → mineflayer 的 yaw/pitch）、`aimAt(b, point)`（**直接写 `b.entity.yaw/pitch`**，绕开会挂住的 `bot.lookAt()`：物理循环在"站着不动/骑乘/刚死"时整个 early return，`await lookingTask.promise` 就永远不 resolve）、`lookAt(b, {x,y,z,who})`（看向坐标或某个玩家/怪物：英文名 / 玩家名 / 中文别名都认，实体表里没有时退回 `b.players`）。**只吃一个 `bot`、不碰实例状态**；`core.mjs` 里留**三个同名薄包装**（`static lookAnglesTo` / `#aimAt` / `async lookAt`），调用点一行没改 |
 | `src\server-break.mjs` | **路线图第 ④ 条的第十八刀**：**"服务端到底认没认这次破坏"的判决层** —— `watchServerBreak(b, pos)` 挂原始包监听（`block_change` / `block_update` / `multi_block_change`，位段格式照抄 mineflayer `blocks.js:363-394`），把服务端的话翻成**三态**：`hit()` = 改成了**空气**（真挖掉）、`restored()` = 改成了**非空气**（＝把原方块发回来"复原"，说明服务端**拒了**这次破坏）、其余一律当**没有证据**；`watching === false`（假 bot 挂不上监听）时调用方**别下结论**。`awaitServerBreak(b, watch, {maxMs, callLeft, signal})` 等这份判决（服务端的包**可以晚到约 1 秒**，只 `sleep(200)` 会把好端端挖掉的方块报成"没收到回包"）。**只认服务端的包，不认客户端那个预测的 air**；`core.mjs` 里留**两个同名薄包装**（`#watchServerBreak` / `#awaitServerBreak`），调用点一行没改 |
-| `src\world-use.mjs` | **路线图第 ④ 条的第二十刀**：**“使用/交互”那一层** —— `useBlock(b, {x,y,z,who}, ctx)`（右键方块或实体：开箱子/按按钮/开门/喂动物/上船；**服务端不回执** ⇒ 按“窗口开没开、方块属性翻没翻”复核）＋ `useItem(b, {hold}, ctx)`（对着空气用手上的东西：扔末影之眼/珍珠、拉弓、喝药水；`hold` 最多 3 秒且**给松手包留 400ms**）。两者都要 `ctx.t`（预算闸门）与 `ctx.callLeft`（`useItem` 钳 hold），所以走 `ctx` 不走 `self`；**第二十七刀**又把 `interact(self, args)`（`mc_act` 的 look/place/break/toward 四个 mode 在这里分流）与 `equip(self, opts, ctx)`（装备到手上；`held` 必须**读回来**，换手静默失败要如实说）收了进来 |
+| `src\world-use.mjs` | **路线图第 ④ 条的第二十刀**（**2026-10-13**：`equip` 支持穿甲/脱甲 —— `to` 指定 `head`/`torso`/`legs`/`feet`/`off-hand`，不写 `to` 按物品名猜，只给 `to` = 脱下来，换下来的报 `swappedOut`）：**“使用/交互”那一层** —— `useBlock(b, {x,y,z,who}, ctx)`（右键方块或实体：开箱子/按按钮/开门/喂动物/上船；**服务端不回执** ⇒ 按“窗口开没开、方块属性翻没翻”复核）＋ `useItem(b, {hold}, ctx)`（对着空气用手上的东西：扔末影之眼/珍珠、拉弓、喝药水；`hold` 最多 3 秒且**给松手包留 400ms**）。两者都要 `ctx.t`（预算闸门）与 `ctx.callLeft`（`useItem` 钳 hold），所以走 `ctx` 不走 `self`；**第二十七刀**又把 `interact(self, args)`（`mc_act` 的 look/place/break/toward 四个 mode 在这里分流）与 `equip(self, opts, ctx)`（装备到手上；`held` 必须**读回来**，换手静默失败要如实说）收了进来 |
 | `src\attack.mjs` | **路线图第 ④ 条的第二十一刀**：**攻击那一层** —— `attack(b, {who, budget}, ctx)`（给 `who` 就按英文名/玩家名/中文别名找，不给就打最近的那个：敌对不限距、动物/玩家限 4.5 格、掉落物垫底；**`pvp.attack()` 是立刻 resolve 的后台循环** ⇒ 自己轮询等目标消失，`pvp.stop()` 不 `await`；动手前记血量，回来如实报 `killed`/`targetHealth`/`waitedMs`，地上有掉落物就补一句"先捡东西"） |
 | `src\sequence.mjs` | **路线图第 ④ 条的第二十二刀**：**连串动作的调度层** —— `runSequence(self, steps, {stopOnError, budgetMs})`（按顺序跑一串步骤，到点/被打断就停下并给出 `stoppedAt`/`remaining`/`hint`，让模型**从第几步接着发**）+ `runStep(self, s)`（op → 具体动作：wait/move/look/toward/place/break/dig/use/useitem/attack/equip/give/toss/say/jump/swim）。**第一参数收 `self`**（要回调一堆实例方法，见迁移规矩第 27 条）；不为没执行的步骤记 `ok:false`、`move` 的 `ok` 看 `arrived`、步骤自己发现预算用尽一样给 `stoppedAt` |
 | `src\pickup.mjs` | **路线图第 ④ 条的第二十三刀**：**捡掉落物那一层** —— `grabDrops(self, b, {radius, budgetMs}, ctx)`（挖完/打完顺手把地上的 `item` 捡回来；**报"捡回几个"按背包差算**，不看 `entity.isValid`；捡不到时**显式收尾** `ctx.cancelCollect({budgetMs:300})`，别让 collectBlock 的实体目标挂着）。收 `self`（要回调 `self.callLeft()` / `self.walkTo()`），私有方法 `#cancelCollect` 由 core 塞进 `ctx`（迁移规矩第 28 条） |
@@ -183,7 +183,7 @@ node tools\scan-moved-assertions.mjs     # 两遍扫描：①按导出名找 ②
 | `selfcheck.mjs` | 跑之前截断自己的 `logs\selfcheck.log`；**任何 ❌ 就 exit 1**（以前永远 exit 0，❌ 会静默腐烂） |
 | `extensions\mc_observe.mjs`、`mc_view-render.mjs`、`mc_skin.mjs` | 第一人称截图（门禁默认关，AI 自主决定何时看）、**三段式感知**（我看到 / 程序检测到 / 不确定，`percept:false` 可关；实体信息并进来了）、**统一感知**（一次给齐坐标/朝向/血量/饥饿/氧气/手持/背包/附近实体/目标方块 + `capturedAt`；`image:false` 不画图只要结构化状态）、纯函数渲染内核、皮肤下载/解码/UV 采样 |
 | `extensions\mc_auto.mjs` | 自主行动层：待机唤醒、长期目标、**被打了只叫醒 AI 定策略（不自己跑也不还手）**、**在水里憋气（头在水下）也叫醒 AI 上浮**、反射层换成现成插件 |
-| `extensions\mc_craft.mjs`、`mc_furnace.mjs`、`mc_chest.mjs` | 合成（掐断后自动关窗口把材料收回背包、**动手前把 2×2 合成格里的东西点回背包**、同一个 bot 不并行两条合成链、**缺料时报整条链条 + "要同一种木头"**、`count` 已经够了就如实说"一个都没做"（`more:true` 才是"再做 N 个"））、熔炼（按数量挑正经燃料、装好料就返回）、存取箱子 |
+| `extensions\mc_craft.mjs`、`mc_furnace.mjs`、`mc_chest.mjs` | 合成（掐断后自动关窗口把材料收回背包、**动手前先 `_syncWindow` 跟服务端对账再把 2×2 合成格里的东西点回背包**、同一个 bot 不并行两条合成链、**缺料时报整条链条 + "要同一种木头"**、`count` 已经够了就如实说"一个都没做"（`more:true` 才是"再做 N 个"））、熔炼（按数量挑正经燃料、装好料就返回）、存取箱子 |
 | `extensions\mc_util.mjs` | 扩展共用件（**不是扩展**）：名字/id 互转、`countOf`、`clamp`、放得下吗、`findPlaceSpots()`（放熔炉被服务端拒时能换下一个点位重试）… 原来 `clamp` 抄了 4 份、`countOf` 抄了 3 份，而且箱子/熔炉要去 `import` 合成模块（方向不对） |
 | `vendor\mc-deps\...` | 给 `mineflayer-pathfinder`（2 处）和 `mineflayer-tool`（1 处）打的补丁，见 PATHFINDER.md |
 
@@ -645,6 +645,26 @@ AI 打一条 **0.6 格**外的船，返回 `attacked: oak_boat`，而**船一点
 - `mc_diag` 新增 `crafting` 字段：**开着的窗口 + 合成格（含自己背包的 2×2 槽 1~4）里的东西**直接摊出来。
 
 回归：`tools\check-mc-craft.mjs` **176/0**（第 ⑧ 节 15 条 + 缺料报链条 4 条 + ⑨ 只做一批补做）；细节见「踩坑档案」第 16、24 条。
+
+### 材料不再卡在合成格里：点格子之前先跟服务端**要一次整窗内容**（`mc_craft`，2026-10-13）
+
+用户报过："合成方块还是会卡在合成栏里。"
+
+**根因**：`clearCraftGrid()` 照着客户端那份 `bot.inventory.slots[1..4]` 去点，而 1.17.1+ 的服务端
+**只在它认为客户端记录过期时才回包** —— 被它忽略的点击永远不回 ⇒ 客户端模型会一直停在"合成格是空的"，
+而服务端里其实还压着东西；循环里那 4 格全是 `null`，一个 `continue` 就跳过去了。
+另外 `bot.moveSlotItem()` 是"拿起来 + 放下"两次点击，第二次超时会把东西留在**光标**上，关窗口就掉地上了。
+
+**修法**：
+
+- 新增 `resyncInventory()`：动手前发一个 `stateId:-1` 的空点击（mineflayer 的 `bot._syncWindow`），
+  服务端**必回**整窗内容 ⇒ 客户端模型被刷成真实状态。**只在 4 个格子看起来全是空的时做**，
+  `withTimeout` 包住，**失败退避 8 秒**（服务端不回包时别每次关窗口都白等），成功 0.8 秒内不重复。
+- `clearCraftGrid()` 先对账再点；点完检查光标，还捏着东西就放回背包。
+- 上一条链**挂住超过 3 秒**时，拒绝开第二条链的同时顺手清合成格（3 秒是留给"正常但慢的合成"的余地）。
+
+回归：临时 A/B 冒烟 **19/0**（模型空/服务端有东西 ⇒ 先对账再点回；只点了一半 ⇒ 光标那件放回背包；
+`_syncWindow` 挂住 ⇒ 2.4 秒收工且只对账一次）；细节见「踩坑档案」第 79 条。
 
 ### 背包数字不会数两遍（`mc_inventory`）+ 缺料时报整条链条（`mc_craft`）
 
@@ -2196,6 +2216,98 @@ core 里留下的薄包装 `#movements () { return movements(this) }` **忘了�
 `node --check` 只看语法、那一刀的 A/B 冒烟又把 `ctx.movements` 桩掉了，于是一路全绿到真走路才炸。
 判据写进踩坑档案第 74 条：**薄包装"委托给谁"，谁就必须在 import 名单里**。
 
+### 装备栏：以前"我身上穿着什么"是空白（2026-10-13）
+
+用户报"它现在看不到自己身上的装备，增加装备栏，让它能通过装备栏装备装备"。查下来是两件事叠在一起：
+
+- **看不见**：`bot.inventory.items()` 只回**背包范围**（`minecraft:inventory` 窗口的 9–44 格 = 主背包 + 快捷栏）。
+  头/身/腿/脚（槽 5/6/7/8）和副手（槽 45）**不在里面** ⇒ `mc_inventory` 与 `mc_observe` 的"背包"里根本没有身上穿着什么，
+  AI 会以为自己光着，于是把已经穿着的头盔又做一遍。
+- **穿不上**：`equip` 只会 `b.equip(item, 'hand')` —— 盔甲也能"拿到手上"，但**永远穿不到身上**。
+
+改动：
+
+- `src\inventory.mjs` 新增 `EQUIP_SLOTS`（5/6/7/8/45 与 `head`/`torso`/`legs`/`feet`/`off-hand` 的对照）、
+  `equipmentOf(b)`、`equipmentText(b)`、`equipDestOf(name)`（按名字猜该穿哪格：头盔→头、胸甲→身、护腿→腿、靴子→脚、
+  盾/图腾→副手，其余照旧拿到手上）；`inventoryView()` 多一行 `🛡 装备栏：头 … · 身 … · 腿 … · 脚 … · 副手 …`，返回值多一个 `equipment`。
+- `src\world-use.mjs` 的 `equip(self, { name, to }, ctx)`：`to` 可显式指定格子（`offhand` 也认成 `off-hand`）；
+  **只给 `to` 不给 `name` = 脱下来**（`bot.unequip`）；穿完**读回那一格**复核（`hand` 看 `b.heldItem`，
+  盔甲看 `b.inventory.slots[5/6/7/8/45]`），原来穿着的那件被换下来时如实报 `swappedOut`。
+- `index.js`：`mc_act` 的 `equip` 加 `to` 参数说明；`mc_inventory` 描述改成"看背包、装备栏和手持物品"。
+- `extensions\mc_observe.mjs`：结构化字段（`out.equipment` / `percept.equipment`）与文本（`🛡 装备栏`）都带，
+  看图与不看图（`image:false`）两条路都加。
+- 记忆规则（11 份 `RULES.md`）：「打怪与保命」补一条"穿上盔甲"，「工具速查」的 `mc_inventory` 改成"背包**和装备栏**"。
+
+回归：自写临时 A/B 冒烟 **54/0**（`equipDestOf` 18 组名字、装备栏五格读法、`inventoryView` 带装备栏、
+`equip` 的 14 条路：自动猜格 / 显式 `to` / 只给 `to` 脱甲 / 脱空格子不白调 `unequip` / 换下来的回到背包 /
+缺料报错并指路装备栏 / `to` 非法 / 什么都不给 / 剑仍拿到手上 / `offhand` 别名 / 没穿上如实说 / 换手失败如实说 /
+老版本没有 `unequip` / 脱失败如实说），加接线断言 9 条。`node --check` 四个文件全过，扫描器第二遍 0 条，token 预算 17974/18000。
+
+### 挖冰被报成"服务端复原"：非空气回包 ≠ 服务端拒绝（2026-10-13）
+
+**现象**：AI 在冰湖上跟玩家说「我这边客户端把湖面看成冰，服务端说是水，方块对不上」—— 它在猜"客户端和服务端的方块不一致"。
+
+**根因**：`src\server-break.mjs` 原来把**任何非空气回包**都当成"复原（服务端拒绝）"。可挖冰时冰没了、水立刻露出来，服务端把那一格正常发成 `water` ⇒ 挖成功的冰被报成「服务端把这块改回了 water（复原）—— 这次破坏服务端没认」。
+
+**后果不只是文案**：那是一片**冰盖下的水** —— `swimUp` 顶到冰出不去，AI 唯一的出路就是砸冰，而砸冰一直被报成"服务端没认"，于是它泡在水里十几分钟，`mc_auto` 的憋气唤醒响了 15 次，血掉到 4/20。
+
+**改法**：`watchServerBreak()` 现在会记下动手前客户端以为的方块名，新增 `classifyRestore(watch)` 三分类 —— **同一个方块**发回来 = 真拒绝；**变成水/岩浆** = 破坏成功（液体涌进来）；**别的方块** = 客户端区块旧了（提示 `mc_connect {force:true}`）。`breakBlock()` 与 `dig()` 都按这三路分别说话。
+
+**回归**：临时冒烟 14/0；`node --check` ×2；52 个 `src\*.mjs` 全部能 import（详见 `踩坑档案.md` 第 81 条）。
+
+### 附魔台：窗口开得出来、三个选项却读不到（2026-10-13）
+
+游戏里的 AI 报原话：「附魔台能打开（窗口类型 enchantment，38 格），但我这边没有"选附魔"的工具」——
+`mc_act` 只有 look/place/break/use/useitem/attack/equip/toss。
+
+**根因**：`mc_act {mode:"use"}` 走的是 `bot.activateBlock` —— 窗口确实开了，但**附魔的助手不在窗口上**。
+三个选项（`table.enchantments`）、`ready` 事件、`table.enchant(choice)`、`putTargetItem`/`putLapis`/
+`takeTargetItem` **全是 `bot.openEnchantmentTable(block)` 挂上去的**（上游 `enchantment_table.js`）。
+
+**第二个坑**：`bot.openBlock(block)` = `activateBlock` + `await once(bot,'windowOpen')` ⇒ **已经有窗口开着时
+服务端会忽略这次使用，`openBlock` 直接挂死**（`inventory.js:405`）。所以不能无脑再开一次。
+
+**改法**：`src\world-use.mjs` 新增 `enchantTable(self, args, ctx)`，`mc_act {mode:"enchant"}` 接上：
+① 已经有"带助手的"附魔窗口就复用，别的窗口先 `closeWindow` 再 `openEnchantmentTable`；
+② 槽 0 空就把手上那件（或 `item` 点名的那件）放进去（**手上那件的槽号要从窗口 0 的 36..44 平移到容器窗口的
+`inventoryStart + 27 + 快捷栏序号`**）；③ 槽 1 空就从背包补一块青金石；④ 等三个选项到齐，报
+「要 N 级经验 → 附魔名 等级」；给了 `option:0/1/2` 才真附魔，附完把附魔好的那件拿回背包、关窗口
+（青金石关窗时服务端自己退回）。不给 `option` 就只看选项，**不动手**。
+
+**回归**：临时冒烟 28/0（找台/坐标不对/没加载/只看选项/点名物品/槽 0 空/选项没到齐/越界 option/
+复用窗口/关掉别的窗口/用 `activateBlock` 开的窗口要重开）；`node --check` ×3；mc_* 体积合计 17980/18000
+（详见 `踩坑档案.md` 第 82 条）。
+
+### 铁砧 / 锻造台：一个要 `openAnvil`，一个干脆没有助手（2026-10-13）
+
+用户接着问"铁砧 锻造台都可以用吗"。查下来两个都**只能开窗、不能动手**：`src\block-names.mjs` 的
+`CONTAINER_RE` 里早就有 `anvil`/`smithing_table`，所以 `mc_act {mode:"use"}` 能把窗口打开、能报
+`{opened:"minecraft:anvil", slots:39}` —— 但窗口上什么都没有。
+
+- **铁砧**：`combine`（合并/修复）和 `rename`（改名）是 `bot.openAnvil(block)` 挂上去的
+  （上游 `mineflayer\lib\plugins\anvil.js`）—— 跟附魔台同一个坑。上游这两个助手会自己算经验、挑划算的方向、
+  发 `MC|ItemName` 改名包、把成品 `putAway(2)` 拿出来，经验不够/合不了会直接抛错（不白扣等级）。
+- **锻造台**：mineflayer **一个助手都没有**（`lib\plugins\` 里只有 `anvil.js`、`enchantment_table.js`）
+  ⇒ 只能按槽位自己来：**槽 0 = 模板、槽 1 = 底座、槽 2 = 附加，成品在槽 3**（`minecraft:smithing`）。
+
+**改法**：`src\world-use.mjs` 新增 `anvilTable(self, args, ctx)` 与 `smithingTable(self, args, ctx)`，
+`mc_act {mode:"anvil"}` / `{mode:"smithing"}` 接上；三个共用助手抽在同一处：
+`findWorkBlock`（坐标或 `findBlock` 半径 4 找台，matcher 只按 `.name`）、`openWorkWindow`（**已经开着同样类型、
+且带所需助手的窗口就复用，否则先 `closeWindow` 再开** —— 附魔台那刀踩过的坑）、`winSlots`（窗口里"我的背包"
+范围 + `findInv` + `heldSlot`：手上那件从 36..44 平移到 `inventoryStart + 27 + 序号`）。
+
+- `{mode:"anvil", action:"combine", item:"iron_pickaxe", name:"iron_pickaxe"}` —— 两把合成一把更耐久的
+  （上游不返回成品 ⇒ 从背包里挑"附魔最多、耐久最好"的那件同名物来报）。
+- `{mode:"anvil", action:"rename", item:"diamond_sword", name:"屠龙刀"}` —— 改名（名字上限 35 个字，本地先拦）。
+- `{mode:"smithing", item:"diamond_chestplate", name:"netherite_ingot"}` —— 模板没给就自己挑：优先
+  `netherite_upgrade_smithing_template`，背包里只有一种纹饰模板时用它，**有多种就报错让 AI 点名 `template`**。
+
+**回归**：临时冒烟 43/0（合并成功 / 上游抛错如实报 / 第二件没有 / 槽 0 空、改名成功 / 名字太长 / 抛错但背包里确实改了、
+窗口复用 / 先关别的窗口 / 坐标不是铁砧 / 附近没有铁砧、锻造成功（模板→0 底座→1 附加→2、成品 `putAway(3)`、进背包）/
+槽 3 一直空如实报失败、模板自己挑 / 多种模板要点名 / 没模板 / 点名了没有 / 没给 name / 坐标不是锻造台 /
+手上那件当底座的槽位映射）；`node --check` ×5；mc_* 体积合计 **17973/18000**（加了两行 mode + `action`/`template`
+两个参数，在 `mc_observe` 与 `mc_auto` 的描述上各瘦了一点）。详见 `踩坑档案.md` 第 83 条。
+
 ### 单次调用 ≤11 秒（宁可少量多次）
 
 用户先要求"一次工具调用别超过 5 秒"，2026-10-08 又要求"把使用工具 5 秒的限制提高到 11 秒" ⇒
@@ -2216,7 +2328,7 @@ core 里留下的薄包装 `#movements () { return movements(this) }` **忘了�
   `mc_furnace` 默认装好料就返回。
 - **模型的活**：看到"这一轮用完了"就**再叫一次**（同一个参数），不要换目标、不要重连。
 - **规则写在文件里，不注入正文**（用户 2026-10-08 要求）：这段"单次调用 ≤11 秒、一次只做一小步、
-  到点用同样的参数再叫一次同一个工具"的话，写在 **`RULES.md`（行事准则）的 `## 省算力`** 里
+  到点用同样的参数再叫一次同一个工具"的话，写在 **`RULES.md`（行事准则）的 `## 不用替我省 token`** 里
   —— 每个 MC 会话开场都会收到**一行指针**（路径 + 读法），正文由会话自己去读，用户也能在「MC设置 → 提示词」里自己改
   （见上一节「规则放在文件里，会话自己去读」）。
   `src\agentsmd.mjs` 的 `DEFAULT_AGENTS_MD`（默认版）与记忆根现存的 `RULES.md` 都加了这条。
@@ -2385,7 +2497,7 @@ README.md / PATHFINDER.md / 踩坑档案.md
 | 文档 | 讲什么 |
 | --- | --- |
 | 本文件 | 装进去、跑自检、配置速查、我改了什么、各功能怎么用 |
-| [踩坑档案.md](踩坑档案.md) | 78 个真 bug 的现象 → 根因 → 证据 → 修法 → 回归（"为什么现在这么写"） |
+| [踩坑档案.md](踩坑档案.md) | 83 个真 bug 的现象 → 根因 → 证据 → 修法 → 回归（"为什么现在这么写"） |
 | [PATHFINDER.md](PATHFINDER.md) | 寻路/防卡住专题：为什么用现成的、装在哪、打过的补丁、上游复核、已知缺口 |
 | [插件说明.md](插件说明.md) | **上游原版 README**（功能列表、配置键、命令行的完整说明） |
 | `%USERPROFILE%\.dsh\profiles\desktop\vendor\mc-deps\README.md` | 那棵独立依赖树装了什么、重装后怎么体检 |
