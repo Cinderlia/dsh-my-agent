@@ -63,15 +63,19 @@ section('1. 补丁在不在')
 const physicsSrc = existsSync(join(PF_DIR, 'lib', 'physics.js')) ? readFileSync(join(PF_DIR, 'lib', 'physics.js'), 'utf8') : ''
 const indexSrc = existsSync(join(PF_DIR, 'index.js')) ? readFileSync(join(PF_DIR, 'index.js'), 'utf8') : ''
 const coreSrc = existsSync(join(HERE, '..', 'src', 'core.mjs')) ? readFileSync(join(HERE, '..', 'src', 'core.mjs'), 'utf8') : ''
-// 第二十九刀起 `movements()`（`walkAllowParkour` 的读点）搬进了 src/plugins.mjs
+// 第二十九刀起 `movements()`（`walkAllowParkour` 的读点）搬进了 src/plugins.mjs；
+// 导航 P2（2026-10-15）起那几行权重改由 `src/terrain.mjs` 的地形档案铺上去，
+// 配置键登记在 `TERRAIN_CFG_KEYS` —— 所以两处都要看。
 const plugSrc = existsSync(join(HERE, '..', 'src', 'plugins.mjs')) ? readFileSync(join(HERE, '..', 'src', 'plugins.mjs'), 'utf8') : ''
+const terrainSrc = existsSync(join(HERE, '..', 'src', 'terrain.mjs')) ? readFileSync(join(HERE, '..', 'src', 'terrain.mjs'), 'utf8') : ''
 
 ok(/collides\s*\(pos\)/.test(physicsSrc), 'physics.js 有 collides(pos)（按 shapes 判真正重叠）')
 ok(/simulateStraight\s*\(/.test(physicsSrc), 'physics.js 有 simulateStraight()')
 ok(/straight\.blocked/.test(physicsSrc), 'canStraightLine 里认 blocked（撞进方块就不算能直走）')
 ok(/block\.shapes/.test(physicsSrc), 'collides 用 block.shapes 判（半砖/台阶不会误判成墙）')
 ok(/allowSprinting\s*&&\s*physics\.canSprintJump\(path\)/.test(indexSrc), 'index.js 里 canSprintJump → jump=true 的分支还在（返回 false 才会走到这里）')
-ok(/walkAllowParkour/.test(plugSrc), 'movements() 认 walkAllowParkour 配置键（默认关；第二十九刀起在 src\\plugins.mjs 里）')
+ok(/profileFor\(terrain\?\.kind/.test(plugSrc), 'movements() 按地形取权重（导航 P2）')
+ok(/allowParkour: 'walkAllowParkour'/.test(terrainSrc), 'walkAllowParkour 配置键登记在 terrain.mjs 的 TERRAIN_CFG_KEYS 里（默认关）')
 ok(/from '\.\/plugins\.mjs'/.test(coreSrc), 'core.mjs 确实从 plugins.mjs 取装配（搬走 + 忘接 = 这条会红）')
 
 // ── 假世界：一小片地板 + 那个 1 格台阶 + 一块半砖 + 一条 1 格宽走廊 ────────────────

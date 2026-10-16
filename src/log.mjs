@@ -47,6 +47,18 @@ export function stamp (d = new Date()) {
   const p = (n) => String(n).padStart(2, '0')
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
+/** 🟡 2026-10-15 审计（报告 E 第 10 条）：原来写 `Number(env) || 默认` ——
+ *  ① `MC_LOG_KEEP=0` 被当成假值退回 7（0 不可配）；② 非法值静默变默认（用户以为自己配了）；
+ *  ③ 更糟的是**负数**：`MC_LOG_MAX_BYTES=-1` 时下面 `statSync(file).size < maxBytes` 恒假
+ *  ⇒ `appendLog` 每写一行就轮转一次日志。这里统一校验：只有"正的有限数"才采用。 */
+function envPositiveInt (raw, dflt) {
+  const s = String(raw ?? '').trim()
+  if (!s) return dflt
+  const n = Number(s)
+  if (!Number.isFinite(n) || n <= 0) return dflt
+  return Math.floor(n)
+}
+
 /**
  * 轮转上限。🔴 **每次轮转现读环境变量**，不是模块加载时读一次。
  * 理由（第五刀搬完才暴露）：搬进 `src/log.mjs` 之后这个模块**整个进程只加载一次**，
@@ -56,8 +68,8 @@ export function stamp (d = new Date()) {
  */
 function logLimits () {
   return {
-    maxBytes: Number(process.env.MC_LOG_MAX_BYTES) || 2 * 1024 * 1024,
-    keep: Number(process.env.MC_LOG_KEEP) || 7,
+    maxBytes: envPositiveInt(process.env.MC_LOG_MAX_BYTES, 2 * 1024 * 1024),
+    keep: envPositiveInt(process.env.MC_LOG_KEEP, 7),
   }
 }
 

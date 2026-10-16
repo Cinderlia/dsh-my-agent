@@ -17,6 +17,8 @@
  * ============================================================================
  */
 
+import { waitUntil } from './async-util.mjs'
+
 /**
  * 等在途事件。四种收工条件：
  *   ① 该来事件了（新事件里有一条符合 `kind`）
@@ -46,21 +48,22 @@ export async function waitForEvents ({
 } = {}) {
   const startedAt = now()
   if (!(Number(waitSec) > 0)) return { waitedMs: 0, interrupted: false, reason: null }
-  const deadline = startedAt + Number(waitSec) * 1000
   const hasFresh = () => {
     const evs = sess?.events ?? []
     if (fromSeq != null) return evs.some((e) => Number(e?.seq ?? 0) > fromSeq && (!kind || e.kind === kind))
     return evs.slice(Number(from) || 0).some((e) => !kind || e.kind === kind)   // 老写法（会漏，仅兼容）
   }
-  while (now() < deadline) {
-    if (signal?.aborted) return { waitedMs: now() - startedAt, interrupted: false, reason: '用户停止' }
-    if (Number(sess?.waitInterruptedAt ?? 0) > startedAt) {
-      return { waitedMs: now() - startedAt, interrupted: true, reason: sess?.waitInterruptReason ?? '唤醒' }
-    }
-    if (hasFresh()) {
-      return { waitedMs: now() - startedAt, interrupted: false, reason: '有事件' }
-    }
-    await sleep(pollMs)
-  }
-  return { waitedMs: now() - startedAt, interrupted: false, reason: null }
+  const interruptedNow = () => Number(sess?.waitInterruptedAt ?? 0) > startedAt
+  /* 2026-10-15 异步方案 ②：这个手写轮询循环也收口到 `waitUntil` ——
+   * "查中止 / 算 deadline / 睡多久 / 什么时候收工"全仓库只有一份实现。
+   * ⚠️ 判据里**中断排在前面**：原实现在循环里也是先看中断再看事件，
+   *    "同一轮里既被唤醒又来了事件"要报"被唤醒"（那才是用户看到的原因）。 */
+  const r = await waitUntil(() => interruptedNow() || hasFresh(), {
+    ms: Number(waitSec) * 1000, pollMs, signal, label: '等在途事件', now, sleep,
+  })
+  const waitedMs = now() - startedAt
+  if (r.reason === 'aborted') return { waitedMs, interrupted: false, reason: '用户停止' }
+  if (interruptedNow()) return { waitedMs, interrupted: true, reason: sess?.waitInterruptReason ?? '唤醒' }
+  if (hasFresh()) return { waitedMs, interrupted: false, reason: '有事件' }
+  return { waitedMs, interrupted: false, reason: null }
 }

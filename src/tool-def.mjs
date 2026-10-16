@@ -281,7 +281,10 @@ export function builtinDefineTool (options) {
     parameters,
     output: {
       schema: outputSchema,
-      render (args, value) { return userRender(args, value) },
+      /* 🟡 2026-10-15 审计（报告 E 第 11 条）：`options.output.render` 在宿主里是**可选**的，
+       *   而这里原来直接 `return userRender(args, value)` —— 省略 render 的工具定义期不报错，
+       *   等宿主真去渲染结果时才 `TypeError: userRender is not a function`（爆在离现场很远的地方）。 */
+      render (args, value) { return (userRender ?? ((a, v) => v))(args, value) },
     },
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     async execute (args, exec) {

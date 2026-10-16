@@ -18,7 +18,7 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 
 // ── 断言小工具（和别的 check-*.mjs 一致）────────────────────────────────────────
 let pass = 0, fail = 0
@@ -400,7 +400,8 @@ section('⑧ 静态接线：core / index 都在')
 
   ok(/mode === 'swim'/.test(index), 'index.js 的 mc_move 认 swim')
   ok(/sess\.bot\.swimUp\(\{ hold: args\.budgetMs \}\)/.test(index), 'swim 不给坐标时把 budgetMs 当上浮时间')
-  ok(/return sess\.bot\.walkTo\(\{ x: Number\(args\.x\), y: Number\(args\.y\), z: Number\(args\.z\) \}, \{ budget: callBudget\(args\.budgetMs\) \}\)/.test(index),
+  /* 2026-10-15：walkTo 的返回值现在过 `withOutcome(..., { expect: 'moved' })`（结果台账要判得动）。 */
+  ok(/sess\.bot\.walkTo\(\{ x: Number\(args\.x\), y: Number\(args\.y\), z: Number\(args\.z\) \}, \{ budget: callBudget\(args\.budgetMs\) \}\)/.test(index),
     'swim 给了坐标就游过去（walkTo 会自动走"直接游"）')
   ok(/在水里会自动改成"直接游"/.test(index), 'mc_move 描述里写明"在水里自动直接游"')
   ok(/在水里（氧气/.test(index), 'mc_status 瘦身视图里带氧气')

@@ -41,7 +41,7 @@ const mkWorld = ({
   const calls = {
     look: [], lookAt: [], controls: [], swings: 0, equips: [], consumes: 0,
     attacks: [],
-    // 自保抢占用：core.mjs 的 interruptMove（现在只有 dig/craft 抢占会调；自保不再抢控制权）
+    // 自保"先停手"用：core.mjs 的 interruptMove（自保叫醒时先停底下那件事；仍然不跑、不还手）
     interrupts: [],
     // 现成插件的桩：吃交给 mineflayer-auto-eat，捡交给 mineflayer-collectblock
     eats: { enabled: false, enables: 0, disables: 0, opts: null },
@@ -318,6 +318,18 @@ section('3. 自保（踩到岩浆后退 / 有怪只叫醒 AI、不自己跑）')
   lava.tick(lava.at(1200))
   ok('危险没消失时持续后退（不再重复计数）', lava.w.calls.controls.filter(([k, v]) => k === 'back' && v).length >= 2 && lava.state().stats.escapes === before)
 
+  /* 🔴 名单统一（mc_map 第二轮）：反射层原来自己写了一份正则，**漏了灵魂火 / 灵魂营火**。
+   *    现在和搭路共用 `src/bridge.mjs` 的 `BRIDGE_FATAL_NAMES`，这几个都该被认出来。 */
+  for (const bad of ['soul_fire', 'soul_campfire', 'cactus', 'powder_snow', 'sweet_berry_bush']) {
+    const w = setup({ world: { overrides: { '10,63,20': bad } }, patch: { lookAround: false } })
+    w.tick(w.at(1000))
+    ok(`脚下方块是 ${bad} → 后退（反射层和搭路共用同一份危险名单）`,
+      w.w.calls.controls.some(([k, v]) => k === 'back' && v === true))
+  }
+  const stone = setup({ world: { overrides: { '10,63,20': 'stone' } }, patch: { lookAround: false } })
+  stone.tick(stone.at(1000))
+  ok('普通石头不触发自保（名单收紧后没误伤）', !stone.w.calls.controls.some(([k, v]) => k === 'back' && v === true))
+
   const safe = setup({ world: { overrides: { '10,63,20': 'grass_block' } }, patch: { lookAround: false } })
   safe.tick(safe.at(1000))
   ok('安全方块不会乱后退', !safe.w.calls.controls.some(([k, v]) => k === 'back' && v))
@@ -341,7 +353,10 @@ section('3. 自保（踩到岩浆后退 / 有怪只叫醒 AI、不自己跑）')
 /* ───── 3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不还手） ─────
    用户 m10335「被攻击先逃跑，让 ai 决定用那种策略」→ m11410「既然选择可以获取怪物位置，
    把受到攻击自动跑离开去掉」→ 随后「反射层兜底还手：judgeFight() 不需要了」：
-   反射层**既不移动也不还手**，只报怪名/坐标/距离/血量 + 叫醒 AI；没人值守时只记档。 */
+   反射层**既不移动也不还手**，只报怪名/坐标/距离/血量 + 叫醒 AI；没人值守时只记档。
+   2026-10-14 任务驱动第三步（用户："先停止采集，再由 AI 决定逃跑、战斗还是继续任务"）：
+   急事叫醒时**先把手里那件事停下**（`dangerStopWork`，默认开，`interruptMove` + 台账那步放回 pending）——
+   但"不跑、不还手、不替 AI 决策"这三条**没变**。 */
 
 section('3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不抢控制权、不还手）')
 {
@@ -361,7 +376,7 @@ section('3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不抢控�
   ok('被怪贴上来：不自己跑开、也不还手，只叫醒 AI',
     !walked(armed) && armed.w.calls.attacks.length === 0,
     JSON.stringify({ walks: armed.w.walks.length, attacks: armed.w.calls.attacks.length }))
-  ok('不再抢 AI 的控制权（不调 interruptMove）', armed.w.calls.interrupts.length === 0, JSON.stringify(armed.w.calls.interrupts))
+  ok('没在干活时不乱停（不调 interruptMove）', armed.w.calls.interrupts.length === 0, JSON.stringify(armed.w.calls.interrupts))
   ok('叫醒 AI（interruptWait + steer 各一次）', armed.sess._interrupts.includes('danger') && armed.agent.steers.length === 1, JSON.stringify(armed.sess._interrupts))
   ok('叫醒文案带怪名 + 坐标 + 血量 + 三个选项（还手 / 撤 / 躲）',
     /zombie/.test(steered(armed)) && /\(14, 64, 21\)/.test(steered(armed)) && /血 20\/20/.test(steered(armed))
@@ -481,8 +496,9 @@ section('3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不抢控�
   urgent.auto.noteToolStart('a1')
   urgent.tick(urgent.at(1000))
   await flush()
-  ok('AI 正在动手但怪贴到 4 格内 → 叫醒，但仍然不抢控制权、不自己跑',
-    !walked(urgent) && urgent.w.calls.interrupts.length === 0 && urgent.state().stats.dangerWakes === 1)
+  ok('AI 正在动手但怪贴到 4 格内 → 叫醒 + 先把手里的活停下（但自己不跑）',
+    !walked(urgent) && urgent.w.calls.interrupts.length >= 1 && urgent.state().stats.dangerWakes === 1,
+    JSON.stringify({ i: urgent.w.calls.interrupts, w: urgent.w.walks.length }))
 
   // ⑭ 静态检查：自保段里不许再出现"自己跑"的代码（用户 m11410 要的就是去掉它）
   const src = readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8')
@@ -526,9 +542,17 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
     steered(h))
   ok('文案里不许出现"看不到怪"（那是"被打"的说法，会把 AI 带偏）',
     !/看不到怪/.test(steered(h)), steered(h).slice(0, 60))
-  ok('不自己跑、不还手、不抢控制权（反射层只叫醒）',
-    !walked(h) && h.w.calls.attacks.length === 0 && h.w.calls.interrupts.length === 0,
-    JSON.stringify({ walks: h.w.walks.length, attacks: h.w.calls.attacks.length }))
+  ok('不还手、不抢控制权（打怪 / 打断 AI 一次都不做）',
+    h.w.calls.attacks.length === 0 && h.w.calls.interrupts.length === 0,
+    JSON.stringify({ attacks: h.w.calls.attacks.length, interrupts: h.w.calls.interrupts.length }))
+  /* 🔴 2026-10-15 用户点名："水下寻路"要**自动接管** —— 反射层现在会自己去搜出口、走一条路线
+   *    （`startWaterRecover` → `recoverFromWater`）。但用户同时要求"**绝不偷偷接管**"：
+   *    叫醒文案里要说清我同时在干什么，走完还会再 steer 一条报结果。 */
+  ok('🔴 水下会自动接管（自己去搜出口、走一条路线），不是干等着',
+    walked(h) && h.state().waterRecoverAt > 0,
+    JSON.stringify({ walks: h.w.walks.length, at: h.state().waterRecoverAt }))
+  ok('🔴 叫醒文案里说清"我同时在试着自己找出口"（不偷偷接管）',
+    /同时在试着自己找出口/.test(steered(h)), steered(h).slice(-200))
   ok('统计：自保提醒 +1、叫醒 +1',
     h.state().stats.alerts === 1 && h.state().stats.dangerWakes === 1, JSON.stringify(h.state().stats))
 
@@ -537,7 +561,8 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
   g.tick(g.at(1000))
   await flush()
   ok('氧气 ≤4：按住 jump 抬一下（保命动作，和"脚下是岩浆"同类）', jumped(g) >= 1, JSON.stringify(g.w.calls.controls))
-  ok('抬一下也不横向移动、不还手', !walked(g) && g.w.calls.attacks.length === 0, JSON.stringify({ walks: g.w.walks.length }))
+  ok('抬一下 + 水下自救都不还手、不打断 AI', g.w.calls.attacks.length === 0 && g.w.calls.interrupts.length === 0,
+    JSON.stringify({ walks: g.w.walks.length, attacks: g.w.calls.attacks.length }))
   ok('同一 tick 也照旧叫醒 AI（不是默默自救）', g.agent.steers.length === 1, String(g.agent.steers.length))
 
   // ③ 氧气满：在水里也不叫醒（别神经过敏）
@@ -597,8 +622,8 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
     /多半不是被打/.test(steered(sub0)) && /读不到氧气数字/.test(steered(sub0)) && /已经在下面 1[01] 秒/.test(steered(sub0)),
     steered(sub0).slice(0, 170))
   ok('这一条文案也不许出现"看不到怪"', !/看不到怪/.test(steered(sub0)), steered(sub0).slice(0, 60))
-  ok('仍然只叫醒：不横向跑、不还手、不抢控制权',
-    !walked(sub0) && sub0.w.calls.attacks.length === 0 && sub0.w.calls.interrupts.length === 0,
+  ok('不还手、不抢控制权（水下自救也不打架、不打断 AI）',
+    sub0.w.calls.attacks.length === 0 && sub0.w.calls.interrupts.length === 0,
     JSON.stringify({ w: sub0.w.walks.length, a: sub0.w.calls.attacks.length }))
 
   // ⑨ 头在水下 + 刚掉血（溺水掉血就是这样）→ 立刻叫醒，不用等 10 秒；同时只按一下 jump
@@ -608,8 +633,9 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
   await flush()
   ok('头在水下 + 掉血 → 立刻叫醒（不等 10 秒）',
     subHurt.agent.steers.length === 1 && /憋气/.test(steered(subHurt)), steered(subHurt).slice(0, 90))
-  ok('这时候按住 jump 抬一下（保命动作），但仍然不横向跑',
-    jumped(subHurt) >= 1 && !walked(subHurt), JSON.stringify({ j: jumped(subHurt), w: subHurt.w.walks.length }))
+  ok('这时候按住 jump 抬一下（保命动作），同时也自动接管去找出口',
+    jumped(subHurt) >= 1 && subHurt.state().waterRecoverAt > 0,
+    JSON.stringify({ j: jumped(subHurt), w: subHurt.w.walks.length, at: subHurt.state().waterRecoverAt }))
 
   // ⑩ 只是泡在水里、头在水面上 + 掉血 → 不许按憋气报（那是"被打"）
   const swim = setup({ world: { inWater: true, air: null, submerged: false, health: 17 }, patch: { lookAround: false } })
@@ -651,7 +677,7 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
   drain.w.raw.oxygenLevel = 5      // 服务端真的在扣气 ⇒ 就算 submerged 判不出来，也得叫醒
   drain.tick(drain.at(2000)); await flush()
   ok('头那格读不到、但氧气在往下掉（12 → 5）⇒ 照旧叫醒（兜底那一路）',
-    drain.agent.steers.length === 1 && /憋气/.test(steered(drain)), steered(drain).slice(0, 120))
+    drain.agent.steers.length >= 1 && /憋气/.test(steered(drain)), steered(drain).slice(0, 120))
 
   // ⑭ 静态：判据里确实有"读数正在往下掉"这一路，且 state 里声明了 lastAir
   ok('判据里有 draining（读数在往下掉）这一路，state 里也声明了 lastAir',
@@ -666,22 +692,23 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
    ② `eatFinish/eatFail` 挂在 bot 对象上，重连换了新 bot，离线分支只复位 `s.hooked` 漏了 `s.eatHooked`。
    ③ 加载日志写死"空闲 180s、旁边有人 60s"，实际默认 5s/5s。 */
 
-section('3.7 busy 期间照样检测并叫醒（但不抢控制位）')
+section('3.7 busy 期间照样检测并叫醒（先停手，但不抢控制位）')
 {
   const MOB = (name, pos = [13.5, 64, 20.5]) => ({ name, position: pos })
   const steered = (h) => h.agent.steers.map((m) => JSON.stringify(m)).join(' ')
   const backPresses = (h) => h.w.calls.controls.filter(([k, v]) => k === 'back' && v === true).length
   const strip = (s) => String(s).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 
-  // ① busy（AI 那一步还在跑）时怪贴上来：**照样叫醒**，但一下控制位都不碰
+  // ① busy（AI 那一步还在跑）时怪贴上来：**照样叫醒**，并把手里那件事停下
+  //    （2026-10-14 任务驱动第三步：先停止采集，再由 AI 决定；但一下控制位都不碰）
   const h = setup({ world: { health: 20, mobs: [MOB('zombie')] }, patch: { lookAround: false } })
   h.state().busy = true
   h.tick(h.at(1000))
   await flush()
   ok('busy 期间照样叫醒 AI（旧版 `if (s.busy) return` 直接吞掉）',
     h.agent.steers.length === 1 && /zombie/.test(steered(h)), steered(h).slice(0, 120))
-  ok('busy 期间不抢控制位（不调 interruptMove、不自己走）',
-    h.w.calls.interrupts.length === 0 && h.w.walks.length === 0,
+  ok('busy 期间先把手里那件事停下（interruptMove），但自己不走路',
+    h.w.calls.interrupts.length >= 1 && h.w.walks.length === 0,
     JSON.stringify({ i: h.w.calls.interrupts, w: h.w.walks.length }))
 
   // ② busy 期间踩到岩浆：不按 back（不跟 AI 抢），但探测与统计照做
@@ -792,7 +819,18 @@ section('5. 空闲叫醒（首叫 / 间隔 / 退避 / 工具重置 / 上限 / �
   ok('文案带"正常玩家的发育路线"台阶（木头→石具→铁→钻石→下界→末地）',
     textOf(m1).includes('发育路线') && textOf(m1).includes('末地传送门') && textOf(m1).includes('别跳级'))
   ok('文案带用户定的约束（别拆别人东西）', textOf(m1).includes('别拆别人'))
-  ok('消息来源是 plugin:dsh-mc-agent', m1?.source?.kind === 'plugin:dsh-mc-agent', String(m1?.source?.kind))
+  /* mc_map 第二轮：自主层也吃结构化地图数据 —— 叫醒时附一句"脚下一层长什么样"，
+   * 省得 AI 醒来第一件事就是调 mc_map。 */
+  ok('叫醒文案里带脚下一层的结构化摘要', textOf(m1).includes('🧭 脚下一层'), textOf(m1).split('\n').find((l) => l.includes('🧭')) ?? '(没有这一行)')
+  {
+    const src = readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8')
+    ok('🔴 危险名单不再自己写一份（和搭路共用 src/bridge.mjs 的 BRIDGE_FATAL）',
+      /const DANGER = BRIDGE_FATAL/.test(src) && !/const DANGER = \/lava\|fire/.test(src))
+    ok('navLineOf 在 idleText 里被调用', /const navLine = navLineOf\(sess\)/.test(src))
+    ok('navLineOf 半径压到 8 格（floorMapOf 是逐列扫描，别每 tick 全图跑）', /const NAV_RADIUS = 8/.test(src))
+    ok('navLineOf 拿不到世界时返回空串、不抛（try/catch 兜住）',
+      /const navLineOf = \(sess\) => \{[\s\S]{0,2500}?catch \{ return '' \}/.test(src))
+  }  ok('消息来源是 plugin:dsh-mc-agent', m1?.source?.kind === 'plugin:dsh-mc-agent', String(m1?.source?.kind))
   ok('注入前打断了正在等的工具', h.sess._interrupts.includes('idle'))
   ok('叫醒被记进统计', h.state().stats.wakes === 1 && h.state().lastWakeAt === h.at(181_000))
 

@@ -179,12 +179,16 @@ export async function statusPing ({ host, port = 25565, timeoutMs = 5000, fakeHo
       const Client = require2('client')
       const states = require2('states')
       const tcpDns = require2('client/tcp_dns')
-      const mcData = requireFromMineflayer('minecraft-data')(mc.defaultVersion)
-      const version = mcData?.version
-      if (!version) return done({ ...out, ok: false, error: `minecraft-data 里没有 ${mc.defaultVersion} 的版本信息`, hint: '环境问题，不是服务器问题' })
+      /* 🔴 2026-10-15 审计（报告 B 第 3 条）：这里原来写 `const version = mcData?.version`
+       *    —— 用 `const` 把**形参** `version` 遮蔽掉了，于是 `statusPing({version:'1.20.1'})`
+       *    传进来的协议版本**永远不生效**（一直拿 `mc.defaultVersion` 握手）。改个名，并真的用它。 */
+      const vKey = (typeof version === 'string' && version) ? version : mc.defaultVersion
+      const mcData = requireFromMineflayer('minecraft-data')(vKey)
+      const verInfo = mcData?.version
+      if (!verInfo) return done({ ...out, ok: false, error: `minecraft-data 里没有 ${vKey} 的版本信息`, hint: '环境问题，不是服务器问题' })
 
-      const protocolVersion = version.version
-      client = new Client(false, version.minecraftVersion)
+      const protocolVersion = verInfo.version
+      client = new Client(false, verInfo.minecraftVersion)
       client.on('error', fail)
 
       const opts = {

@@ -127,12 +127,23 @@ export function findPlaceSpots (bot, { radius = 2, limit = 6 } = {}) {
   // （悬崖边、树屋、浮空平台上很常见，McBot.placeBlock 也支持贴着侧面放）
   const out = []
   for (const t of placeable) if (!canPlaceInto(blockAtXYZ(bot, t.x, t.y - 1, t.z))) out.push({ x: t.x, y: t.y, z: t.z })
-  for (const t of placeable) if (hasSolidNeighbor(t)) out.push({ x: t.x, y: t.y, z: t.z })
+  /* 🔴 审计 G8：第二圈会把第一圈已经收进去的点**再 push 一遍** ⇒ `out` 里出现 [A,B,A]
+   *    这种重复，`limit:3` 的调用方（`mc_furnace`）实际只拿到 2 个不同点位。去重。 */
+  const added = new Set(out.map((t) => `${t.x},${t.y},${t.z}`))
+  for (const t of placeable) {
+    const k = `${t.x},${t.y},${t.z}`
+    if (added.has(k)) continue
+    if (hasSolidNeighbor(t)) { added.add(k); out.push({ x: t.x, y: t.y, z: t.z }) }
+  }
   const lim = clamp(Number(limit) || 6, 1, 16)
   return out.slice(0, lim)
 }
 
 /** 只要"最好的那一个"点位（多数调用方用这个）。 */
 export function findPlaceSpot (bot, { radius = 2 } = {}) {
-  return findPlaceSpots(bot, { radius, limit: 1 })[0] ?? null
+  /* 🔴 审计 G3：`findPlaceSpots()` 在拿不到 bot 坐标时**回 null**，旧写法直接 `[0]`
+   *    ⇒ `TypeError: Cannot read properties of null (reading '0')`，
+   *    而调用方（mc_craft / mc_furnace / mc_chest）只想拿到"没有点位"这一个答案。 */
+  const spots = findPlaceSpots(bot, { radius, limit: 1 })
+  return spots ? (spots[0] ?? null) : null
 }

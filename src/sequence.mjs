@@ -25,6 +25,66 @@
 import { CALL_BUDGET_MS, callBudget } from './budget.mjs'
 import { sleep, raceAbort } from './async-util.mjs'
 
+/**
+ * 这一步**到底成没成**（报告 H3，2026-10-13）。
+ *
+ * 以前是 `step.op === 'move' ? r?.arrived !== false : r?.ok !== false` —— 只有 `move` 特判，
+ * 其余全走 `r?.ok !== false`，而**动作模块没有一个返回 `ok` 字段**：
+ *   `place` 回 `{placed: 名|false}`、`break` 回 `{broken: 名|false}`、`dig` 回 `{result:[…]}`、
+ *   `attack` 回 `{killed, attacked}` … ⇒ `undefined !== false` 恒真 ⇒ 汇总把失败的
+ *   place / break / dig / attack 全算成 `succeeded`，模型据此以为做成了。
+ *
+ * 判据只认"明确的失败证据"（各 op 自己的成功字段为 `false`，或返回里带 `error`），
+ * 拿不准就按成功算 —— 宁可让模型自己看 `results` 里的原文，也不要凭空报失败。
+ */
+export function stepOk (step, r) {
+  const op = step?.op
+  if (r == null) return true
+  if (r.ok === false || r.error) return false
+  switch (op) {
+    case 'move':
+    case 'swim':
+      return r.arrived !== false
+    case 'place':
+      return r.placed !== false && r.placed != null
+    case 'break':
+      return r.broken !== false && r.broken != null
+    case 'attack':
+      return r.killed !== false && r.attacked !== false
+    /* 🔴 2026-10-15 审计（报告 C 第 1 条）：下面 equip / toss / use / useitem 四条原来都是
+     *   `r.xxx !== false` —— 而那几个字段**要么根本不存在、要么永远是真值**，于是"失败的步骤
+     *   被算成成功"，`stopOnError` 也就永远不触发。改成看各动作**真正复核过的**字段
+     *   （字段是 2026-10-15 一并补上的：`equipped` / `ok` / `opened` / `toggled`）。 */
+    case 'equip':
+      if (typeof r.equipped === 'boolean') return r.equipped
+      return r.held !== undefined || r.now !== undefined
+    case 'give':
+      return r.gave !== false
+    case 'toss':
+      if (typeof r.ok === 'boolean') return r.ok
+      if (typeof r.tossed === 'boolean') return r.tossed
+      return !/只少了|没丢出去/.test(String(r.note ?? ''))
+    case 'use': {
+      // 容器看窗口开没开、门/按钮看状态翻没翻（这两条是硬证据）；其它方块服务端不回执，按"拿不准就算成功"
+      if (r.usedBlock !== undefined && r.usedBlock !== null) {
+        if (r.opened !== undefined) return Boolean(r.opened)
+        if (r.toggled !== undefined) return Boolean(r.toggled)
+        return true
+      }
+      if (r.usedEntity !== undefined) return r.reached !== false
+      return r.used !== false && r.usedBlock !== false
+    }
+    case 'useitem':
+      return r.used !== false
+    case 'dig': {
+      const txt = Array.isArray(r.result) ? r.result.join('\n') : String(r.result ?? '')
+      return !/没挖成|没挖掉|够不着|没有能挖|不在线|复原|找不到|失败/.test(txt)
+    }
+    default:
+      return true
+  }
+}
+
 /** 按顺序执行一串步骤。替代"让 AI 写脚本"——我们不给它脚本能力，而是把"走这里→放几个→再走那里"收进一个工具。 */
 export async function runSequence (self, steps, { stopOnError = true, budgetMs = CALL_BUDGET_MS } = {}) {
   if (!Array.isArray(steps) || !steps.length) throw new Error('steps 必须是非空数组')
@@ -50,8 +110,10 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
        *    `{arrived:false, stuck:true, reason:…}`，汇总里 `succeeded` 于是把它也算成功，
        *    模型据此以为"我已经在目标点了"。move 的 ok 必须看 `arrived`。
        * 🔴 报告⑤：`wait` 步骤被本轮预算**静默截断**时也会自报 `ok:false`（没等完），
-       *    那时也要如实算失败、并从这一步重发。 */
-      const ok = step.op === 'move' ? r?.arrived !== false : r?.ok !== false
+       *    那时也要如实算失败、并从这一步重发。
+       * 🔴 报告 H3：其余 op 以前走 `r?.ok !== false`（动作模块根本不回 `ok`）⇒ 恒真。
+       *    现在交给 `stepOk()` 按各 op 的真实成功字段判（见上面那个函数的注释）。 */
+      const ok = stepOk(step, r)
       results.push({
         i, op: step.op, ok, ...r,
         ...(ok ? {} : {

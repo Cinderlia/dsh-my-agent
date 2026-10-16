@@ -13,7 +13,7 @@
  *   · 不碰 `this`，全是纯函数（`patchDigTime` 会改传进来的 `b`，这是它的本职工作）；
  *   · 判定不了就返回 null，不抛。
  */
-import { inWaterNow } from './world-observer.mjs'
+import { inWaterNow, fallingNow } from './world-observer.mjs'
 
 /** 方块名/工具名 → 工具种类（`stone_pickaxe` → `pickaxe`）。认不出返回 null。 */
 export function digToolKindOf (name) {
@@ -22,6 +22,32 @@ export function digToolKindOf (name) {
     if (n === k || n.endsWith('_' + k)) return k
   }
   return null
+}
+
+/** 一件物品上的附魔列表（认不出就返回空数组）。mineflayer 里可能是数组也可能是对象。 */
+export function enchantsOfItem (it) {
+  try {
+    const arr = Array.isArray(it?.enchants) ? it.enchants : (it?.enchants ? Object.values(it.enchants) : [])
+    return arr.filter((x) => x && typeof x.name === 'string').map((x) => ({ name: x.name, lvl: x.lvl ?? x.level ?? 1 }))
+  } catch { return [] }
+}
+
+/** 🔴 2026-10-15 审计：`fixDigMs` 重算的是**没有附魔**的原版公式。
+ *
+ *  **效率（Efficiency）是手持物附魔，不进 `b.entity.effects`** —— 原来只查药水效果，
+ *  拿效率镐时 `fixDigMs` 照样返回那个"没算效率"的偏快值，`digMsFor` 的 `Math.min(...cands)`
+ *  又让偏快值胜出 ⇒ `patchDigTime` 喂给 `bot.digTime` ⇒ mineflayer 按偏快时长 STOP ⇒
+ *  服务端判进度不够、把方块发回来 = 用户看到的"挖完又复原"。
+ *  ⇒ 只要这件工具（或头盔）带附魔，`fixDigMs` 就一律不修，退回上游那个把附魔算进去的值。 */
+function enchantedFor (b, itemType) {
+  try {
+    if (itemType == null) return false
+    const held = b?.heldItem ?? null
+    if (held && held.type === itemType && enchantsOfItem(held).length) return true
+    const items = b?.inventory?.items?.() ?? []
+    for (const it of items) if (it?.type === itemType && enchantsOfItem(it).length) return true
+  } catch {}
+  return false
 }
 
 /** 这把工具的"品级速度"：从 registry 里**所有** material 表里取它的最大倍率
@@ -64,6 +90,8 @@ export function fixDigMs (b, blk, itemType) {
     // 有药水效果 / 附魔时不算（Haste、效率、水下速掘都会改速度，宁可退回上游那个保守值）
     const eff = b?.entity?.effects
     if (eff && typeof eff === 'object' && Object.keys(eff).length > 0) return null
+    // 🔴 效率是**手持物附魔**，不在 entity.effects 里（见 enchantedFor 的注释）
+    if (enchantedFor(b, itemType)) return null
     const have = reg.materials[blk?.material]?.[itemType]
     if (Number.isFinite(have) && have > 1) return null        // 数据没问题，上游算得对
     const heldKind = digToolKindOf(reg.items?.[itemType]?.name)
@@ -88,8 +116,7 @@ export function fixDigMs (b, blk, itemType) {
     const aqua = Number(b?.inventory?.slots?.[5]?.enchants?.find?.((x) => x?.name === 'aqua_affinity')?.lvl ?? 0)
     let sp = speed
     if (inWater && !aqua) sp /= 5
-    const vY = Number(b?.entity?.velocity?.y ?? 0)
-    if (!b?.entity?.onGround && vY < -0.02) sp /= 5
+    if (fallingNow(b)) sp /= 5
     const delta = sp / hardness / 30
     if (!(delta > 0)) return null
     return Math.ceil(1 / delta) * 50
@@ -128,18 +155,12 @@ export function digMsFor (b, blk, itemType = null) {
      *    `mc_dig oak_log` —— 真 digTime 是 3 秒 ×5 = **15 秒**，这里按站着估成 3 秒 ⇒ 放行 ⇒
      *    `bot.dig()` 挂满 11 秒预算（连 `finishDigging` 都没到点，方块还在），只回一句"超时"。
      *    正解是落地再挖（见 `#waitGrounded`）。 */
-    const vY = Number(b?.entity?.velocity?.y ?? 0)
-    const notOnGround = !b?.entity?.onGround && vY < -0.02
+    const notOnGround = fallingNow(b)
     /* 🔴 2026-10-08 第五份审计报告 ④：以前**附魔传空数组** —— 上游 `bot.digTime`（digging.js:228-256）
      *    会把**手持物品的附魔**和**头盔的附魔**（水下速掘 Aqua Affinity）都算进去。
      *    漏掉附魔 ⇒ 拿效率镐时我们估的 ms 偏大 ⇒ `breakBlock`/`dig` 会**白拒**一次本来挖得完的挖掘
      *    （"我没开始挖"）。这里补上：手上那件（只在问"手上这件"时）+ 头盔槽 5。 */
-    const enchantsOf = (it) => {
-      try {
-        const arr = Array.isArray(it?.enchants) ? it.enchants : (it?.enchants ? Object.values(it.enchants) : [])
-        return arr.filter((x) => x && typeof x.name === 'string').map((x) => ({ name: x.name, lvl: x.lvl ?? x.level ?? 1 }))
-      } catch { return [] }
-    }
+    const enchantsOf = enchantsOfItem
     const held = b?.heldItem ?? null
     const sameAsHeld = Boolean(held && (itemType == null || itemType === held.type))
     const helmet = (() => { try { return b?.inventory?.slots?.[5] ?? null } catch { return null } })()

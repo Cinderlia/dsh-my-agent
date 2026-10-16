@@ -40,6 +40,9 @@
  */
 import { userMessage } from '../src/user-message.mjs'
 import { clamp } from './mc_util.mjs'
+import { BRIDGE_FATAL } from '../src/bridge.mjs'
+import { floorMapOf, hazardCellsOf } from '../src/map-render.mjs'
+import { recoverFromWater, waterReportText } from '../src/water-recovery.mjs'
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -95,6 +98,15 @@ export const AUTO_DEFAULTS = {
 
   /** 任何工具调用后，反射层静默多久（毫秒）——把控制权让给 AI */
   quietAfterToolMs: 6000,
+
+  /**
+   * 自保叫醒时**先停下手里的事**（默认开）。用户 2026-10-14 任务驱动第三步：
+   * "先停止采集，再由 AI 决定逃跑、战斗还是继续任务"。
+   *
+   * 🔴 只"停手"，**不跑、不还手** —— 那是用户 2026-10-06 定的（自保层不替 AI 做决策）。
+   * 关掉它 = 回到"只叫醒、什么都不动"的老行为。
+   */
+  dangerStopWork: true,
 }
 
 /** 数值项的合法区间（越界就夹住，不报错） */
@@ -129,6 +141,10 @@ const DROWN_AIR = 6
 const DROWN_SUBMERGE_MS = 10_000
 /** "头在水下"这条的重复叫醒间隔（毫秒）：比掉血那条宽，免得潜水时一秒一条 */
 const DROWN_SUBMERGE_GAP_MS = 20_000
+/** 🔴 水下自动救援的最短间隔（毫秒）：一次"搜出口 + 走一条路线"最多 12 秒，别叠着跑 */
+const WATER_RECOVER_GAP_MS = 15_000
+/** 🔴 水下自动救援一次的墙钟上限（毫秒）：超了就放弃这一轮（`recoverFromWater` 自己也有 12 秒预算） */
+const WATER_RECOVER_MAX_MS = 15_000
 
 /* ─────────────────────────── 小工具 ─────────────────────────── */
 
@@ -178,8 +194,10 @@ const mkPos = (x, y, z) => ({
   offset (dx, dy, dz) { return mkPos(this.x + dx, this.y + dy, this.z + dz) },
 })
 
-/** 危险方块（踩上去/碰到就吃亏） */
-const DANGER = /lava|fire|cactus|magma_block|campfire|sweet_berry_bush|powder_snow/
+/** 危险方块（踩上去/碰到就吃亏）—— **名单的唯一出处是 `src/bridge.mjs` 的 `BRIDGE_FATAL_NAMES`**。
+ *  这里原来自己写了一份正则，漏了 `soul_fire` / `soul_campfire`（灵魂火也是火），
+ *  而且两份名单迟早会走岔。搭路那边认的危险方块，反射层这边就该认同一批。 */
+const DANGER = BRIDGE_FATAL
 /** 敌对生物（名字/类型里出现就躲） */
 const HOSTILE = /zombie|skeleton|creeper|spider|witch|enderman|slime|pillager|vindicator|ravager|phantom|drowned|husk|stray|blaze|ghast|hoglin|piglin|wither|warden|silverfish|guardian|shulker/i
 /** 不是"掉落物"的实体（船/矿车/展示框…），捡东西时跳过 */
@@ -271,13 +289,15 @@ const hostilesNear = (b, radius) => {
   return out.sort((a, c) => a.distance - c.distance)
 }
 
-/** 最近的敌对实体（在 radius 内）—— 保留老名字，别处还在用 */
-const nearestHostile = (b, radius) => hostilesNear(b, radius)[0] ?? null
+/* 🟢 2026-10-15 审计（报告 H 第 10 条）：这里原来有
+ *    `const nearestHostile = (b, radius) => hostilesNear(b, radius)[0] ?? null`
+ *    —— 注释写着"别处还在用"，但全仓库（含 tools/check-mc-auto.mjs、selfcheck.mjs）
+ *    只有它自己的定义、**零调用点**。删掉。`hostilesNear` 还有 `:1007` 在用，保留。 */
 
 /* 🔴 这里原来有 weaponInHand / weaponInBag / judgeFight（"叫不醒 AI 就自己判断打得过打不过"）。
  * 用户 2026-10-06："反射层兜底还手：judgeFight() 不需要了" ⇒ 整段删掉。
  * 反射层**永不还手**：挨打只叫醒 AI，打不打由 AI 自己定（它用 mc_observe 的"程序检测到"拿坐标/血量，
- * 用 mc_act {"action":"attack"} 动手）。 */
+ * 用 mc_act {"mode":"attack"} 动手）。 */
 
 /** a→c 的视线有没有被方块挡住（每 0.5 格取一次方块名；粗粒度够用了） */
 const losBlocked = (b, a, c) => {
@@ -476,6 +496,11 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         drownJumpAt: 0,
         submergedSince: 0,
         lastAir: null,
+        /** 🔴 水下自动救援（2026-10-15 用户点名的"水下寻路"）：限流时间戳 + 正在跑 + 上一次结果。
+         *  **绝不偷偷接管** —— 每次跑完都 `agent.steer` 报一条，并记进 stats。 */
+        waterRecoverAt: 0,
+        waterRecoverBusy: false,
+        waterRecoverLast: null,
         lastArmorAt: 0,
         lastWakeAt: 0,
         wakeTimes: [],
@@ -484,7 +509,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         nudgedAt: 0,
         lastError: null,
         lastAction: null,
-        stats: { wakes: 0, dangerWakes: 0, alerts: 0, nudges: 0, looks: 0, watches: 0, eats: 0, pickups: 0, escapes: 0, follows: 0, denied: 0 },
+        stats: { wakes: 0, dangerWakes: 0, alerts: 0, nudges: 0, looks: 0, watches: 0, eats: 0, pickups: 0, escapes: 0, follows: 0, denied: 0, waterRecovers: 0, waterEscapes: 0 },
       }
       sessions.set(sid, s)
     }
@@ -622,6 +647,100 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     } catch {}
   }
 
+  /* ─────────────── 任务层桥（2026-10-14 任务驱动第三步） ───────────────
+   * 用户给的三层分工：**自主层**（本文件，决定"什么时候该看一眼"）/ **任务层**（`src\task-runner.mjs`
+   * 的目标与步骤台账）/ **动作层**（`src\core.mjs` + 工具）。
+   *
+   * 这里只做**桥**：读台账、把"手里还有事"写进叫醒文案、急事时先停手。
+   * 🔴 不自己推任务（推一步是 `mc_task {action:"run"}` 或模型的事），也不绕过 core 下发动作。
+   */
+
+  /** 会话的任务台账（McBot 的薄包装）；这个 bot 没有台账就 null。 */
+  const ledgerOf = (sess) => {
+    const bot = sess?.bot
+    return bot && typeof bot.taskList === 'function' ? bot : null
+  }
+
+  /**
+   * 最近一条还没做完的事（进行中/等条件/暂停/卡住）。
+   * 返回：任务对象 / `null`（台账确实没有）/ **`undefined`（台账读不出来）**。
+   * 🔴 必须把"没有"和"读不出来"分开 —— 混成 null 就会在叫醒文案里对 AI 说
+   *    "台账上没有没做完的事"这句假话（2026-10-14 冒烟抓到的）。
+   */
+  const activeTaskOf = (sess) => {
+    try {
+      const bot = ledgerOf(sess)
+      if (!bot) return null
+      const list = bot.taskList({ limit: 10, all: false }) ?? []   // 按 updatedAt 倒序
+      return list[0] ?? null
+    } catch { return undefined }
+  }
+
+  /** 一条任务的"一行话"：`t-… · dig · oak_log · 6/16个 · 进行中（第 2/4 步 做木板）` */
+  const taskBriefLine = (t) => {
+    if (!t) return ''
+    const p = t.progress ?? {}
+    const prog = p.total == null
+      ? `${p.done ?? 0}${p.unit ?? ''}`
+      : `${p.done ?? 0}/${p.total}${p.unit ?? ''}`
+    const st = {
+      running: '进行中', waiting: '在等条件', paused: '暂停了（断过线）',
+      blocked: '卡住了', done: '做完了', cancelled: '已取消',
+    }[t.status] ?? t.status
+    return `${t.taskId} · ${t.kind} · ${t.goal ?? t.params?.item ?? ''} · ${prog} · ${st}`
+      + (t.step ? `（${t.step}）` : '')
+      + (t.loopDetected ? ' ⚠️ 反复失败' : '')
+      + (t.lastError ? ` ｜上次：${String(t.lastError).slice(0, 60)}` : '')
+  }
+
+  /**
+   * 自保"先停手"：真的把手里那件事停下 —— `interruptMove()`（推移动号 + 停采集 + 松控制位），
+   * 并把台账里"正在做"的那一步放回"还没做"。
+   *
+   * 为什么必须真停：`mc_dig` / `mc_move` 的超时只是"我们不等了"，底层**还在跑**
+   * （`withTimeout` 不取消 promise），不停就变成"AI 在决定撤，机器人还按着 forward 往前走"。
+   *
+   * 🔴 只停手，**不跑、不还手**（用户 2026-10-06 定的：自保层不替 AI 做决策）。
+   * 返回一句人话（停了什么）或 null（本来就没在干什么）。
+   */
+  const stopWork = (s, sess) => {
+    const bot = sess?.bot
+    const b = bot?.bot
+    if (!bot || !b) return null
+    const moving = Boolean(b?.pathfinder?.goal)
+    if (!(s.busy === true || s.inFlight > 0 || moving)) return null
+    try { Promise.resolve(bot.interruptMove?.('自保：先停手')).catch(() => {}) } catch { /* 忽略 */ }
+    s.busy = false
+    let stepTxt = ''
+    try {
+      const t = activeTaskOf(sess)
+      const cur = (t?.steps ?? []).find((x) => x.status === 'running') ?? null
+      if (t && cur) {
+        bot.taskStep?.({ taskId: t.taskId, step: cur.id, status: 'pending', why: '自保叫醒时中断了这一步' })
+        stepTxt = `（台账里"${cur.id}"那一步已放回"还没做"）`
+      }
+    } catch { /* 忽略 */ }
+    return stepTxt
+  }
+
+  /**
+   * 反射层的写动作也走**统一动作调度器**（用户 2026-10-14 设计第一轮：
+   * "自动拾取、自动换装备通过相同调度器执行，不能绕开锁直接改状态"）。
+   *
+   * 没有调度器（老 core / 独立脚本）就照旧直接跑；`enforce` 模式下被占着就**这轮不做** ——
+   * 反射层做的是后台活（`priority: background`），被任务或用户占着就让位，不跟它们抢。
+   *
+   * @returns {Promise<'done'|'busy'>} `'busy'` = 被挡住了，调用方直接跳过这一轮
+   */
+  const viaScheduler = async (sess, name, resources, run) => {
+    const sch = sess?.bot?.actionScheduler?.()
+    if (!sch) { await run(); return 'done' }
+    const r = await sch.run({ name, owner: 'auto', resources, priority: 'background', execute: run })
+    if (r.status === 'busy') return 'busy'
+    if (r.status === 'failed') throw r.error
+    return 'done'
+  }
+
   /**
    * 走过去捡最近的掉落物 —— 交给现成的 **mineflayer-collectblock**（它会走到跟前把东西收进背包）。
    *
@@ -644,10 +763,35 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     if (playersNear(b, 1.8).length) return          // 别从人身上踩过去
     s.lastPickupAt = t
     s.busy = true
+    /* 顺手把"捡到东西"记进台账（用户 2026-10-14 任务驱动第三步："发现掉落物 → 判断是否值得拾取，
+     * 并更新当前任务"）。只对**这条任务要的那件东西**记，数量从背包差算 —— 算不出就不记
+     * （宁可不说，也不编一个数）。 */
+    let pickBot = null
+    let pickTask = null
+    let pickItem = null
+    let pickBefore = null
     try {
-      await withTimeout(b.collectBlock.collect(drops[0], { ignoreNoPath: true }), 8000, '捡东西')
+      pickBot = ledgerOf(sess)
+      pickTask = activeTaskOf(sess)
+      pickItem = pickTask?.goalSpec?.item ?? pickTask?.params?.item ?? null
+      if (pickBot && pickTask && pickItem) pickBefore = pickBot.countOf(pickItem)
+    } catch { pickBefore = null }
+    try {
+      /* 统一动作调度器（阶段 P0：只记账）：反射层的自动拾取也是"占 interaction + movement"的写动作，
+       * 走同一条路 —— 用户第一轮要求"自动拾取 / 自动换装备不能绕开锁直接改状态"。
+       * 没接上调度器（老 core / 独立脚本）就照旧直接跑。 */
+      const st = await viaScheduler(sess, 'auto:pickup', ['interaction', 'movement'], async () => {
+        await withTimeout(b.collectBlock.collect(drops[0], { ignoreNoPath: true }), 8000, '捡东西')
+      })
+      if (st === 'busy') return                       // enforce 模式下被占着：这轮不捡，让位给任务
       s.stats.pickups++
       s.lastAction = '捡掉落物'
+      if (pickBefore != null && pickItem) {
+        const after = pickBot.countOf(pickItem)
+        if (Number.isFinite(after) && after > pickBefore) {
+          pickBot.taskNote?.({ taskId: pickTask.taskId, text: `捡掉落物：${pickItem} ${pickBefore} → ${after}` })
+        }
+      }
     } catch (e) {
       s.lastError = `捡东西失败：${e?.message ?? e}`
     } finally {
@@ -673,7 +817,8 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const agent = s.agent
     if (!agent || typeof agent.steer !== 'function') return 'none'
     const { threat = null, foes = [], health = 20, ranged = false, hurt = false, blind = false,
-      drown = false, air = null, submerged = false, subSec = 0, gap = DANGER_WAKE_GAP_MS } = info ?? {}
+      drown = false, air = null, submerged = false, subSec = 0, gap = DANGER_WAKE_GAP_MS,
+      waterRecover = false } = info ?? {}
     if (t - num(s.lastDangerWakeAt, 0) < gap) return 'throttled'
     s.wakeTimes = s.wakeTimes.filter((x) => t - x < 3_600_000)
     if (s.wakeTimes.length >= cfg.idleWakeMaxPerHour) { s.stats.denied++; return 'throttled' }
@@ -681,6 +826,12 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const me = b?.entity?.position
     const held = String(b?.heldItem?.name ?? '空手')
     const L = []
+    /* 自保第一步：**先停下手里的事**（用户 2026-10-14 任务驱动第三步："先停止采集，再由 AI
+     * 决定逃跑、战斗还是继续任务"）。只停手 —— 不跑、不还手。 */
+    const stopped = cfg.dangerStopWork !== false ? stopWork(s, sess) : null
+    const stopLine = stopped === null
+      ? ''
+      : `⏸ 我已经先把手里的活停下了（寻路 / 采集 / 控制位都松开了${stopped}）—— 现在你说了算。`
     if (drown) {
       /* 憋气（溺水）：**必须和"被打"分开报**。以前这种"掉血但看不到怪"会被当成远程怪隔墙射，
        * AI 于是跑去找一个不存在的敌人，人还在水里继续沉 —— 用户 2026-10-07："现在容易被淹死"。 */
@@ -692,6 +843,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         ? '**多半不是被打** —— 是**憋气**。这会儿读不到氧气数字（`bot.oxygenLevel` 要头入水、'
           + `服务端发 air_supply 之后才有），我按"头在水下"判断：已经在下面 ${subSec || '几'} 秒了。水底待够 15 秒就开始掉血。`
         : '**这不是被打** —— 是**憋气**（氧气掉到 0 之后才开始掉血），别去找什么远程怪。')
+      if (stopLine) L.push(stopLine)
       if (air == null && submerged) {
         L.push('（也可能水里有怪：溺尸/守卫者/鱿鱼群。要是想确认，先 `mc_observe {"distance":16}` 看"程序检测到"那段。）')
       }
@@ -700,7 +852,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         + (subSec ? `，头在水下 ${subSec} 秒` : '')
         + `，在 ${me ? `${Math.round(me.x)} ${Math.round(me.y)} ${Math.round(me.z)}` : '?'}`)
       L.push('')
-      L.push('**下一步你来定**（我这次只在水里按了一下 jump 想把你抬上来，没横向跑、也没抢你的动作）：')
+      L.push(waterRecover
+        ? '**下一步你来定**（我**同时在试着自己找出口**：局部扫一圈 → 挑一个能换气 / 能上岸的目标 → 走不通就换下一条；'
+          + '**找到没找到都会再给你发一条**，说清我为什么动、往哪游、结果如何 —— 我不会偷偷接管）：'
+        : '**下一步你来定**（我这次只在水里按了一下 jump 想把你抬上来，没横向跑、也没还手）：')
       L.push('· 上浮换气：`mc_move {"mode":"swim"}`（按住 jump 游上来，一次最多 3 秒；没上来就再叫一次同一个参数）')
       L.push('· 出水之后往岸上走：`mc_move` 到最近的干燥方块；不知道岸在哪就先 `mc_scan {"radius":16}` 看一圈')
       L.push('· 水/岩浆是**流体，挖不掉** —— 别 `mc_dig` 水（白花一次调用）')
@@ -731,14 +886,17 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       }
       L.push(`我：血 ${Math.round(health)}/20，手上 ${held}，在 ${me ? `${Math.round(me.x)} ${Math.round(me.y)} ${Math.round(me.z)}` : '?'}`)
       L.push('')
-      L.push('**下一步你来定**（我这次**没有自己跑**、也没打断你手上的动作 —— 打、撤、躲、垒墙都由你定）：')
+      if (stopLine) L.push(stopLine)
+      L.push('**下一步你来定**（我这次**没有自己跑、也没还手**'
+        + (stopLine ? '，只把手里那件事停了' : '、也没打断你手上的动作')
+        + ' —— 打、撤、躲、垒墙都由你定）：')
       if (ranged) {
         L.push('· 远程怪**要看得见你才打得到你**：`mc_build` 在它和你之间垒两格方块挡视线，或钻到墙后/树后/坑里；'
           + '血够（≥16）也可以贴上去打（贴近了它反而不好射）。')
       }
-      L.push(`· 还手：\`mc_act {"action":"attack","who":"${threat?.name ?? '怪名'}"}\``
+      L.push(`· 还手：\`mc_act {"mode":"attack","who":"${threat?.name ?? '怪名'}"}\``
         + '（血 < 14、苦力怕/女巫/烈焰人、两只以上 → 别打，接着撤）')
-      L.push('· 继续撤：`mc_move` 到更远的安全点；旁边有玩家就跑过去（`mc_act {"action":"toward","who":"玩家名"}`）')
+      L.push('· 继续撤：`mc_move` 到更远的安全点；旁边有玩家就跑过去（`mc_act {"mode":"toward","who":"玩家名"}`）')
       L.push('· 看不清就先 `mc_observe {"distance":48}` 看"程序检测到"那段（坐标/距离/血量，隔墙也能定位），再决定。')
       L.push('选一个**直接做**，不用问我。')
     }
@@ -768,6 +926,65 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       s.lastError = `自保叫醒失败：${e?.message ?? e}`
       return 'throttled'
     }
+  }
+
+  /**
+   * 🔴 用户 2026-10-15 点名的"水下寻路"：**自动接管，但绝不偷偷接管**。
+   *
+   * 反射层发现"我在水里快憋死了"时，除了叫醒 AI，还会**自己去搜一个出口、走一条路线**：
+   * `recoverFromWater` 负责只读扫描 + 分层 BFS 挑出口（干燥落脚点 > 空气口袋 > 可通行水道）、
+   * 选路线、**复核进度**（不能仅凭移动函数返回成功就恢复原任务）。
+   * **执行仍然走现有接口**（`bot.walkTo` / `bot.swimUp`）—— 用户："实际移动仍通过现有接口执行，
+   * 避免另起一套按键控制、移动代次或资源锁"。并发安全靠现有的**移动代次**（`_moveGen`）：
+   * AI 随后自己叫一次 `mc_move` 会把代次顶掉，这边在飞的路线自己会让位。
+   *
+   * 走完**无论成没成**都给 AI 发一条 `agent.steer`，说清"我为什么动了、往哪游、结果如何" ——
+   * 用户原话（问"这个会不会遇到，反射层执行，AI 不知道的情况"）就是这条要求。
+   *
+   * @returns {boolean} 这次有没有真的启动（用来在叫醒文案里说实话）
+   */
+  const startWaterRecover = (s, sess, cfg, t, info) => {
+    if (s.waterRecoverBusy) return false
+    if (t - num(s.waterRecoverAt, 0) < WATER_RECOVER_GAP_MS) return false
+    const bot = sess?.bot
+    if (!bot || typeof bot.walkTo !== 'function') return false
+    s.waterRecoverBusy = true
+    s.waterRecoverAt = t
+    const trigger = info?.trigger ?? null
+    void (async () => {
+      let res = null
+      try {
+        res = await withTimeout(
+          recoverFromWater(bot, {}, {
+            walkTo: (self, p, o) => bot.walkTo({ x: p.x, y: p.y, z: p.z }, o ?? {}),
+            swimUp: (self, o) => bot.swimUp(o ?? {}),
+          }),
+          WATER_RECOVER_MAX_MS, '水下自救',
+        )
+      } catch (e) {
+        res = { ok: false, reason: 'error', note: `自救过程出错：${e?.message ?? e}`, tried: [], log: [] }
+      }
+      s.waterRecoverBusy = false
+      s.waterRecoverLast = { ...(res ?? {}), at: t }
+      s.stats.waterRecovers++
+      if (res?.ok) s.stats.waterEscapes++
+      try {
+        logLine(`mc_auto：水下自救 ${res?.ok ? '出来了' : '没出来'}（${res?.reason ?? '?'}）—— ${res?.note ?? ''}`)
+      } catch { /* 日志失败不影响 */ }
+      const agent = s.agent
+      if (!agent || typeof agent.steer !== 'function') return
+      try {
+        agent.steer(userMessage({
+          content: [{ type: 'text', text: waterReportText(res, trigger) }],
+          source: {
+            kind: 'plugin:dsh-mc-agent',
+            form: 'notice',
+            summary: res?.ok ? 'MC 自保：我自己从水里出来了一趟' : 'MC 自保：在水里没找到出口',
+          },
+        }))
+      } catch (e) { s.lastError = `水下自救通知失败：${e?.message ?? e}` }
+    })()
+    return true
   }
 
   /** 危险回避：踩到岩浆/火/仙人掌 → 后退（这个还是要动的，站里面会死）；
@@ -854,9 +1071,20 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       s.stats.alerts++
       // 急事（气快没了 / 已经在掉血）⇒ 6 秒就能再提醒；只是"头在水下有点久了" ⇒ 20 秒一次，别刷屏
       const urgent = hurtRecently || byHurt || (air != null && air <= DROWN_AIR)
+      /* 🔴 用户点名的"水下寻路"：叫醒 AI 的同时，反射层**自己也去搜出口、走一条路线**
+       *    （自动接管，但走完一定 `agent.steer` 报一条 —— 绝不偷偷接管）。 */
+      const recovering = startWaterRecover(s, sess, cfg, t, {
+        trigger: {
+          why: (air != null && air <= DROWN_AIR) ? 'oxygen-low'
+            : hurtRecently ? 'taking-damage'
+              : draining ? 'oxygen-dropping' : 'no-progress',
+          detail: air == null ? `头在水下 ${subSec || '?'} 秒` : `氧气 ${air}/20`,
+        },
+      })
       wakeForDanger(s, sess, cfg, t, {
         health, hurt: hurtRecently, drown: true, air, submerged, subSec, foes: [],
         gap: urgent ? DROWN_WAKE_GAP_MS : DROWN_SUBMERGE_GAP_MS,
+        waterRecover: recovering,
       })
       return
     }
@@ -950,6 +1178,38 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     return Math.max(0, Math.max(dueByTool, dueByWake) - t)
   }
 
+  /** 给空闲简报加一行"脚边长什么样"（mc_map 第二轮：让自主层也吃结构化地图数据）。
+   *
+   *  **只在叫醒 AI 时算一次**，半径压到 8 格 —— `floorMapOf()` 是逐列扫描（默认半径 32 ⇒ 4000+ 列），
+   *  每 tick 跑一次会拖慢主循环。这里要的是"我大概站在什么样的地方"，不是精确地图。
+   *  拿不到世界（没连上 / 假 bot / 区块没加载）就什么都不加，绝不因为"想多写一行"把叫醒搞崩。 */
+  const NAV_RADIUS = 8
+  const navLineOf = (sess) => {
+    try {
+      const b = sess?.bot?.bot
+      if (!b?.entity?.position) return ''
+      const map = floorMapOf(b, { radius: NAV_RADIUS })
+      const c = map?.counts
+      if (!c) return ''
+      const cells = (Number(map.radius) * 2) ** 2
+      const pct = cells ? Math.round(((c.walkable ?? 0) / cells) * 100) : 0
+      const bits = [`可站 ${c.walkable ?? 0}/${cells} 格（${pct}%）`]
+      if (c.drop) bits.push(`会掉下去 ${c.drop}`)
+      if (c.liquid) bits.push(`液体 ${c.liquid}`)
+      if (c.unknown) bits.push(`未加载 ${c.unknown}`)
+      let hzTxt = ''
+      try {
+        const hz = hazardCellsOf(map, { limit: 3 })
+        if (hz.length) {
+          hzTxt = '｜⚠️ 附近有危险：' + hz.map((h) => `${h.kind} 在 (${h.x}, ${h.z}) 约 ${h.d} 格`).join('、')
+        }
+      } catch { hzTxt = '' }
+      const bd = map.bounds ?? {}
+      return `🧭 脚下一层（x ${bd.minX}…${bd.maxX} · z ${bd.minZ}…${bd.maxZ}，半径 ${map.radius} 格）：`
+        + bits.join(' ｜ ') + hzTxt
+    } catch { return '' }
+  }
+
   /** 拼一段"该自己找点事做"的提示（带现状，省得 AI 先查一遍） */
   const idleText = (s, sess, cfg, t) => {
     const parts = []
@@ -978,6 +1238,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     } else {
       parts.push(`附近（${cfg.playerNearRadius} 格内）没有别的玩家`)
     }
+    /* 脚下一层的结构化摘要（mc_map 第二轮）：让 AI 不用先调 mc_map 就知道
+     * "我站在平地/沟边/岩浆边、哪边有危险"。算不出来就整段不加。 */
+    const navLine = navLineOf(sess)
+    if (navLine) parts.push(navLine)
     if (chatLines.length) {
       parts.push('💬 最近聊天：' + chatLines.map((c) => `${c.who ?? c.kind ?? '?'}：${c.text}`).join('｜'))
     }
@@ -985,15 +1249,54 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const idleSec = Math.round((t - s.lastToolAt) / 1000)
     const hasPlayer = (s.nearPlayers ?? 0) > 0
     const goal = (typeof cfg.standing === 'string' && cfg.standing.trim()) ? cfg.standing.trim() : DEFAULT_STANDING
+    /* 手上还有没有一条没做完的事（用户 2026-10-14 任务驱动第三步："待机计时到期 → 检查有没有
+     * 待执行的长期目标"）。台账落在磁盘上，**不依赖对话上下文** —— 断线、压缩、换一轮都还在。 */
+    let taskBlock = ''
+    try {
+      const at = activeTaskOf(sess)
+      if (at === undefined) {
+        taskBlock = '⚠️ 台账这次读不出来（磁盘/权限问题）—— **别当成"没有任务"**：'
+          + '先 `mc_task {action:"list"}` 自己看一眼再决定。\n'
+      } else if (at) {
+        taskBlock = `📋 我手上还有一条没做完的事：${taskBriefLine(at)}\n`
+          + '　接着做就 `mc_task {action:"run"}`（**一次推一步**，推完就回来，别想一口气干完）；'
+          + '也可以自己动手做，做完用 `mc_task {action:"step", status:"done"}` 记一笔。\n'
+          + '　改计划：`mc_task {action:"plan", steps:[{id:"…", op:"mc_dig", args:{…}}, …]}`；'
+          + '先看明细：`mc_task {action:"get"}`；不做了：`mc_task {action:"cancel"}`。\n'
+          + (at.status === 'paused'
+            ? '　⚠️ 这条是**断线前留下的**：先 `mc_task {action:"resume"}` 用背包复核一下再接着干，别从头重做。\n'
+            : '')
+          + (at.loopDetected || at.status === 'blocked'
+            ? '　⚠️ 它已经反复失败过：**别再用同样的参数重试** —— 换个地方 / 换个工具，或者先干别的。\n'
+            : '')
+      } else {
+        /* 🔴 2026-10-15 审计（报告 H 第 2 条）：这里原来教模型
+         *    `mc_task {action:"start", kind:"dig", item:"oak_log", total:16}` —— 但 `mc_task`
+         *    **根本没有 `start` 这个 action**（合法表见 `index.js`：list/run/get/resume/note/done/
+         *    cancel/forget/plan/step），未知 action 会被静默当成 `list`（不报错）⇒ 模型以为开了任务，
+         *    其实什么都没发生。开任务的正确姿势是**直接动手**：挖 4 个以上会自动开一条。 */
+        taskBlock = '📋 台账上没有没做完的事（`mc_task {action:"list"}` 自己看）—— 这一轮起个头：'
+          + '挑一件按长期目标该做的事，**直接动手**就行（比如 `mc_dig {name:"oak_log", count:16}` —— '
+          + '挖 4 个以上会自动开一条任务，不用先 start；想自己排步骤才用 `mc_task {action:"plan", steps:[…]}`）。\n'
+      }
+    /* 🟡 2026-10-15 审计（报告 H 第 11 条）：内层已经仔细区分了"读不出来(undefined)"与
+     *    "真没有(null)"，这里再空 catch 成 '' 就白费了 —— 一旦 `taskBriefLine` 之类抛错，
+     *    模型看到的是"完全没有任务段落"，会以为台账是空的。如实写出来。 */
+    } catch (e) {
+      taskBlock = `⚠️ 台账这次读不出来（${e?.message ?? e}）—— **别当成"没有任务"**：`
+        + '先 `mc_task {action:"list"}` 自己看一眼再决定。\n'
+    }
     return `【自主行动轮｜我已经 ${idleSec}s 没被安排了】Master 没在派活，这段时间归你自己安排。\n`
       + parts.join('\n') + '\n\n'
+      + (taskBlock ? `${taskBlock}\n` : '')
       + `🎯 长期目标（Master 随时可改，以最新的为准）：${goal}\n`
       + '　（Master 刚发话给了新指令/新目标 → 先 `mc_auto set {"standing":"<他那句新的>"}` 把长期目标改过来，再按新目标动手；他没发话就别自己改。）\n'
       + '　按**正常玩家的发育路线**一台阶一台阶往前推，别跳级：木头/石具 → 铁 → 钻石 → 下界（烈焰粉）→ 末地传送门 → 末影龙；装备没跟上就别急着去下界/末地。\n'
       + '　**先保命再发育**（Master 2026-10-06 定）：血少（< 12）、身边有两只以上怪、或者碰上**苦力怕 / 骷髅 / 女巫 / 末影人**这种不好惹的 → **不硬打，撤**（往 Master 那边跑，或者退到有光、有掩体、能封口的地方）；血满、手上有剑、只有一只近战小怪（僵尸/蜘蛛/史莱姆）才上去打。\n'
       + '　**出门前先看装备**：手上没剑就先做一把（木剑 → 石剑），有铁就做铁剑/盾/盔甲；天黑了别在露天乱走，进矿洞先插火把再往里走（黑的地方一定有怪）。被怪打死是**最亏的** —— 掉的东西要跑回去捡，还要重新做装备。\n\n'
       + '这一轮**按顺序做**：① 需要就先 `mc_observe` 看一眼（**不强制** —— 什么时候看你自己判断：要动手之前、找路、看不清周围、刚被卡住时看一眼最划算；心里有数就直接跳过，别为了看图而看图）；'
-      + '② 接着上一步的进度干（进度记在 `.dsh-mc-agent/` 的记忆里，别每轮从零想）；'
+      + '② 接着上一步的进度干（**先看台账**：`mc_task {action:"run"}` 把手上那条推进一步，或者 `get` 看明细；'
+      + '台账在磁盘上，断线 / 压缩都不会丢 —— 别每轮从零想）；'
       + '③ **真的动手做 2~4 个会改变世界的动作**（`mc_move` / `mc_dig` / `mc_build` / `mc_act` / `mc_give`）；'
       + '④ 干完往记忆里记一句"干到哪了"（`mc_kit_memory`），下次接着干。\n'
       + '　**走不动 / 卡住 / 掉坑里上不来**（`mc_move` 报 arrived 但人没动、或原地打转）→ 相信 `mineflayer-pathfinder` 的寻路结果；失败就换一个可达目标，别反复撞墙或盲跳。\n\n'
@@ -1162,7 +1465,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       // 有甲就穿（"变强"里最便宜的一步，跟打不打没关系）：AI 没在动手时才碰背包
       if (cfg.wearArmor !== false && t - num(s.lastArmorAt, 0) > 10_000) {
         s.lastArmorAt = t
-        wearArmor(sess?.bot?.bot).catch(() => {})
+        viaScheduler(sess, 'auto:armor', ['inventory'], () => wearArmor(sess?.bot?.bot)).catch(() => {})
       }
       if (!s.busy) {
         try {
@@ -1242,24 +1545,24 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       + '两层：① **反射层**（不花 token、常开）：AI 没调工具时我自己环顾、饿了吃、'
       + '捡掉落物、躲岩浆火仙人掌、跟随玩家。'
       + '**被怪打 / 有怪贴上来 → 立刻叫醒 AI 定策略**（还手/撤/垒方块都由 AI 决定）；'
-      + '**我自己不跑、不还手、不打断 AI 的动作**（叫醒文案带怪名/坐标/距离/血量）；**没人值守就只记档**。'
-      + '远程怪（骷髅/掠夺者/女巫…）22 格内、**且看得见我**才算威胁；'
-      + '挨打却看不到怪（隔墙/超远射）会报上次看到它在哪。'
-      + '**在水里憋气也会叫醒 AI 上浮**（单独判，文案写清"这不是被打"）：判据是**头在水下**——掉血或超过 10 秒；真要憋死了我只按住 jump 抬一下，不横向跑。'
-      + '**附近有玩家时我一直看着他/她**（不动位置、不碰东西）；'
-      + '任何工具调用后静默 6s；走路类只在 AI 这一轮跑完时才动（免得按旧画面行动）。\n'
-      + `② **空闲决策层**（花 token）：AI 一停下来（默认 ${AUTO_DEFAULTS.idleWakeSec} 秒没事干）且这一轮结束时，我用插件提示叫醒它，`
-      + '文案带"玩家在干什么"（距离/在动/手持/面向/最近聊天）+ **长期目标**，'
-      + '让它**按长期目标自己开工**（**看图不强制**；默认目标"像正常玩家一样发展、最后打末影龙"，路线木头/石具→铁→钻石→下界→末地；旁边有人就一起干）。'
+      + '**我自己不跑、不还手**，只把手里那件活先停下（`dangerStopWork` 可关；叫醒文案带怪名/坐标/距离/血量）；**没人值守就只记档**。'
+      + '远程怪（骷髅/掠夺者/女巫…）22 格内**且看得见我**才算威胁；挨打却看不到怪会报上次看到它在哪。'
+      + '**在水里憋气（头在水下）也会叫醒 AI 上浮**：掉血或超过 10 秒；真要憋死了我只按住 jump 抬一下，不横向跑。'
+      + '**附近有玩家时我一直看着他**（不动位置、不碰东西）；'
+      + '任何工具调用后静默 6s；走路类只在 AI 这一轮跑完时才动。\n'
+      + `② **空闲决策层**（花 token）：AI 停下来（默认 ${AUTO_DEFAULTS.idleWakeSec} 秒没事干）且这一轮结束时，我用插件提示叫醒它，`
+      + '文案带"玩家在干什么"（距离/在动/手持/面向/最近聊天）+ **长期目标** + **没做完的任务**，'
+      + '让它**按长期目标自己开工**（**看图不强制**；默认目标"像正常玩家一样发展、最后打末影龙"，路线木头/石具→铁→钻石→下界→末地；旁边有人一起干）。'
       + '**不许反问 Master"要我做什么"**（不回话 = 让它自己决定）；'
       + '只有要动 Master 的箱子/建筑时才 mc_say 问一句、问完不等。'
       + '叫醒 45s 后还没动手，我会再补一条"别问，直接做"的催促（每次叫醒最多一条，也占额度）。\n'
       + `每小时最多 ${AUTO_DEFAULTS.idleWakeMaxPerHour} 次；**叫醒后 AI 没做任何事就自动翻倍拉长间隔**`
       + '（封顶 30 分钟），做了事就复位。\n'
-      + '用法：`action:"status"`（默认）｜`"off"` 全停｜`"on"` 全开｜`"stay"` 站定（停跟随）｜'
+      + '用法：`action:"status"`（默认）｜`"off"` 关掉反射层（🔴 **不是"全停"**：空闲叫醒还开着，'
+      + '要用 `set {"idleWake":false}` 才全静音；自保 `avoid` 也是独立开关，要一起关得 `set {"avoid":false}`）｜`"on"` 全开｜`"stay"` 站定（停跟随）｜'
       + '`"follow"` + `who:"玩家名"` 跟着谁走｜`"wake"` 立刻叫醒一次（不等间隔）｜'
       + '`"set"` + `patch:{"standing":"先盖个小屋再挖矿","idleWakeSec":600}` 改参数（落 `.dsh-mc-agent/auto.json`）。\n'
-      + '**Master 在对话里改了主意 → 立刻用 `set` 把 `standing` 写成他那句新的**（这样后面每一轮自主行动都按新目标走）；他没发话就别自己改。\n'
+      + '**Master 在对话里改了主意 → 立刻用 `set` 把 `standing` 写成他那句新的**；他没发话就别自己改。\n'
       + '🔴 默认只做**无害动作**：不会自己拆别人建筑、动别人箱子、乱丢东西、跑太远。',
     parameters: {
       action: { type: 'string', description: 'status（默认）/ on / off / stay / follow / wake / set' },
@@ -1322,7 +1625,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       const lines = [
         `🤖 自主层：${cfg.enabled ? '反射层开' : '反射层关'}｜${cfg.idleWake ? `空闲 ${cfg.idleWakeSec}s 叫醒 AI（本小时上限 ${cfg.idleWakeMaxPerHour}）` : '空闲叫醒关'}`,
         `　环顾 ${cfg.lookAround ? '开' : '关'}｜自动吃 ${cfg.autoEat ? '开' : '关'}`
-          + `｜捡东西 ${cfg.pickup ? '开' : '关'}｜自保 ${cfg.avoid ? '开（被打了只叫醒 AI，不自己跑也不还手）' : '关'}`
+          + `｜捡东西 ${cfg.pickup ? '开' : '关'}｜自保 ${cfg.avoid ? `开（被打/憋气时叫醒 AI${cfg.dangerStopWork !== false ? ' + 先停下手里的事' : ''}，不自己跑也不还手）` : '关'}`
           + `｜自动穿甲 ${cfg.wearArmor === false ? '关' : '开'}`
           + `｜跟随 ${cfg.follow ?? '关'}`,
         `　🎯 长期目标：${cfg.standing || DEFAULT_STANDING}`
@@ -1340,6 +1643,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
           + `｜自保提醒 ${s.stats.alerts ?? 0}（叫醒 ${s.stats.dangerWakes ?? 0}）｜脱险 ${s.stats.escapes}`
           + `｜跟随 ${s.stats.follows}｜叫醒 ${s.stats.wakes}`
           + `（其中催促 ${s.stats.nudges ?? 0}）｜限流挡掉 ${s.stats.denied}`)
+        lines.push(`　🌊 水下自救 ${s.stats.waterRecovers ?? 0} 次（出来 ${s.stats.waterEscapes ?? 0} 次）`
+          + (s.waterRecoverLast
+            ? `｜上一次：${s.waterRecoverLast.ok ? '出来了' : '没出来'}（${s.waterRecoverLast.reason ?? '?'}）—— ${String(s.waterRecoverLast.note ?? '').slice(0, 80)}`
+            : '｜还没跑过'))
       } else {
         lines.push('　本会话：还没有 MC 会话（没连上时只能看/改配置）')
       }

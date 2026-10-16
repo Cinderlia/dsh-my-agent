@@ -19,6 +19,8 @@ import { pathToFileURL } from 'node:url'
 import { resolveHarnessHome } from './format.mjs'
 import { scaffoldingItemIds } from './place-items.mjs'
 import { patchDigTime } from './dig-speed.mjs'
+import { applyProfile, classifyTerrainCached, profileFor } from './terrain.mjs'
+import { avoidBlockIds } from './bridge.mjs'
 /**
  * ── 现成的 mineflayer 生态插件（PrismarineJS 官方/社区项目；**这些都不自己写**） ──────
  *
@@ -200,21 +202,52 @@ export async function setupPathfinder (self, { spec = null } = {}) {
 /**
  * 造一份 `Movements`（走路 / 寻路 / collectBlock / pvp 共用同一套配置，
  * 免得"我走的时候不乱跳、插件走的时候乱跳"）。
+ *
+ * `terrain` 是 `classifyTerrain()` 的结果（`src/terrain.mjs`，导航 P2）——
+ * 给了它就**按地形挑权重**（台阶上挖便宜一点、沟边垫方块便宜一点、岩浆边一格都不许跳），
+ * 不给就退回平地那套（= 改动前的全局值）。用户显式配置永远优先（见 `profileFor` 的 `over`）。
  */
-export function movements (self) {
+export function movements (self, { terrain = null } = {}) {
   const b = self.bot
   const { Movements } = self._pf ?? {}
   if (typeof Movements !== 'function') return null
   const mv = new Movements(b)
+  // 地形档案（导航 P2）：先铺一套，再用下面那几行把"跟地形无关的"补上
+  const profile = profileFor(terrain?.kind ?? 'unknown', self.cfg)
   mv.canDig = self.cfg.walkCanDig !== false        // 挡路的方块可以挖穿（不然掉坑里出不来）
-  mv.allowParkour = self.cfg.walkAllowParkour === true // 跳远（默认关：延迟下容易摔）
   mv.allowSprinting = true
-  mv.maxDropDown = Number(self.cfg.walkMaxDropDown ?? 3)
-  mv.liquidCost = 4                                // 尽量别下水
-  mv.digCost = Number(self.cfg.walkDigCost ?? 4)   // 挖一格比走一格贵 → 优先绕路
   mv.dontMineUnderFallingBlock = true
+  /* 危险方块进寻路黑名单（mc_map 第二轮）：`blocksToAvoid` 决定"这格能不能站"
+   * （`movements.js:233` 的 `b.safe`），上游只放了 fire/cobweb/web/lava ——
+   * 把仙人掌 / 细雪 / 甜浆果丛 / 岩浆块 / 营火补上，A* 会主动绕开。 */
+  for (const id of avoidBlockIds(b)) mv.blocksToAvoid.add(id)
+  // 垫方块（pathfinder 的 scaffolding）：上游默认 `placeCost = 1`，比挖一格（4）还便宜 4 倍
+  // ⇒ A* 有得垫就垫，下坡时表现为"横向往行进方向垫方块"（`movements.js:372-385` 的
+  // `getMoveForward`：斜前方下面那格是空气就计划 toPlace）。平地上调高到 12，让它变成最后手段：
+  // 掉进 1 格坑里垫出来那种仍然会垫（那时只有这一条路），下坡时改成绕路 / 挖穿。
+  // ⚠️ 不能靠清空 `scafoldingBlocks` 来治 —— `remainingBlocks === 0` 会把
+  // `getMoveUp`（1×1 柱子）那条路一起剪掉，机器人就爬不出坑了。
+  applyProfile(mv, profile)
   mv.scafoldingBlocks = scaffoldingItemIds(b)      // 背包里能垫的方块（**item id**，见该函数注释）
   return mv
+}
+
+/**
+ * 按当前地形**重挂**一份 `Movements`（`b.pathfinder.setMovements`），返回
+ * `{ terrain, profile, changed }`；没挂上 pathfinder 就回 `null`。
+ *
+ * 这是"地形变了就换策略"的唯一入口 —— `src/movement.mjs` 每次走路前调它。
+ */
+export function adaptMovements (self, { feet = null, radius = null } = {}) {
+  const b = self.bot
+  if (!b?.pathfinder || typeof b.pathfinder.setMovements !== 'function') return null
+  if (!self.pfReady) return null
+  const terrain = radius == null ? classifyTerrainCached(b, { feet }) : classifyTerrainCached(b, { feet, radius })
+  const mv = movements(self, { terrain })
+  if (!mv) return null
+  try { b.pathfinder.setMovements(mv) } catch { return null }
+  const profile = profileFor(terrain.kind, self.cfg)
+  return { terrain, profile, mv }
 }
 
 /**

@@ -26,6 +26,8 @@ import {
 } from './mc_util.mjs'
 import { withTimeout, CALL_MS } from '../src/core.mjs'
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
 /* 上面这些原来在本文件里定义，2026-10-06 搬到 `mc_util.mjs`（mc_chest / mc_furnace / mc_observe 也用
  * 同一份；箱子工具不该去 import 合成工具）。这里再导出一次，老的 `from './mc_craft.mjs'` 不用改。 */
 export { itemNameOf, itemIdOf, blockIdOf, canPlaceInto, blockAtXYZ, findPlaceSpot }
@@ -697,14 +699,19 @@ async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null
            *    在客户端模型里是空的、点不动 —— 这正是"材料卡在合成格里、背包里看不见"的主因）。
            *    3 秒是留给"正常但慢的合成"的余地，免得把还在干活的链刚放进去的原料抢走（审计 M1）。 */
           await closeContainer()
-          const age = Date.now() - (craftPendingAt.get(bot) ?? 0)
-          const grid = age > 3_000 ? await clearCraftGrid(bot, msLeft) : []
+          /* 🔴 报告 H5（2026-10-13）：以前这里算 `age = Date.now() - craftPendingAt.get(bot)` 再判
+           *    `age > 3_000`，但 `craftState()`（`:449-451`）在**真挂死**那条路上刚刚把时间戳
+           *    重置成 `Date.now()` ⇒ 这里的 `age ≈ 0` ⇒ `clearCraftGrid` 永远不跑 ——
+           *    而它正是"材料卡在合成格里、背包里看不见"的修法（那次修复实际是死代码）。
+           *    判据直接用 `craftState` 已经算好的结论：`st === 'stuck-cleared'` 才是真挂死
+           *    （`busy` 说明还没到 25 秒，别去抢它刚放进去的原料）。 */
+          const grid = st === 'stuck-cleared' ? await clearCraftGrid(bot, msLeft) : []
           throw new Error(`${why} —— 我**没有**开第二条链`
             + (grid.length
               ? `；顺手把合成格里压着的 ${grid.join('、')} 点回背包了`
               : '（只把合成窗口关掉了，格子里的东西服务端会退回背包）')
             + '。过一会儿再叫一次 mc_craft 重试；'
-            + '要是还卡，就用 mc_connect 重连一次（重连也会把合成格里的东西退回背包）。')
+            + '要是还卡，就先 mc_scan 复核一眼现场（每次动手前我都会先把合成格里的材料点回背包）。')
         }
         await closeMaybeWindow()
       }
@@ -829,19 +836,19 @@ export async function apply (api) {
       + '· `name` 可以写简称：`planks` 会自动选背包里那种原木对应的木板（选了哪个会写在结果里）。\n'
       + '· `list:true` 看配方/看当前能做什么；`dryRun:true` 只出计划不动手（拿不准就先 dryRun）。\n'
       + '· `count` 是"背包里**一共**要到几个"（默认 1）：已经够了就**一个都不做**，结果会如实说"一个都没做"。要"再做 4 个"就写 `{count:4, more:true}`。\n'
-      + '· 🔴 合成**连着两三次都"超时"**就先 `mc_connect` 重连一次再试：重连会把卡在合成格里的材料退回背包（我每次动手前也会先把合成格里的东西点回背包）。\n'
+      + '· 🔴 连着两三次都"超时"就先 `mc_scan` 复核现场（我每次动手前都会先把合成格里的材料点回背包）。\n'
       + '🔴 合成只动背包、不动世界，所以**不受 mc_observe 门禁限制**。',
     parameters: {
-      name: { type: 'string', description: '要合成的物品（英文 id 或简称，如 oak_planks / planks / stick / wooden_pickaxe / crafting_table / furnace）' },
+      name: { type: 'string', description: '要合成的物品（英文 id 或简称，如 planks / stick / wooden_pickaxe）' },
       count: { type: 'number', description: '合成后背包里**一共**要有几个（默认 1）。要"再做 N 个"就加 more:true' },
       more: { type: 'boolean', description: 'count 当"再做几个"（在现有基础上加，默认 false = count 是"一共要到几个"）' },
-      table: { type: 'boolean', description: '允许用/需要工作台（默认 true；false = 只做不用工作台的那些）' },
-      placeTable: { type: 'boolean', description: '附近没工作台时，是否把背包里的工作台放到脚边再用（默认 true）' },
+      table: { type: 'boolean', description: '允许用工作台（默认 true）' },
+      placeTable: { type: 'boolean', description: '附近没工作台时自己放一个（默认 true）' },
       x: { type: 'number', description: '指定工作台坐标 x（可选，和 y/z 一起给）' },
       y: { type: 'number', description: '指定工作台坐标 y（可选）' },
       z: { type: 'number', description: '指定工作台坐标 z（可选）' },
       radius: { type: 'number', description: '附近找工作台的半径（默认 4，最大 8）' },
-      list: { type: 'boolean', description: '只看配方，不合成（给了 name 看它的配方；没给 name 看当前背包能做什么）' },
+      list: { type: 'boolean', description: '只看配方，不合成' },
       dryRun: { type: 'boolean', description: '只出合成计划，不动手（默认 false）' },
     },
     output: {
@@ -934,9 +941,19 @@ export async function apply (api) {
             try {
               const r = await mc.placeBlock({ x: spot.x, y: spot.y, z: spot.z, name: 'crafting_table' })
               if (r?.placed) {
-                table = findTableBlock(bot, { x: spot.x, y: spot.y, z: spot.z })
-                placedNote = `（附近本来没有工作台，我把背包里的放到 (${spot.x},${spot.y},${spot.z}) 了）`
-                logLine(`mc_craft：自动放了工作台 (${spot.x},${spot.y},${spot.z})`)
+                /* 🔴 审计 G2：客户端收到方块更新晚一拍，放完**立刻**查常常还是 null ⇒
+                 * 旧代码这里直接 `table = findTableBlock(...)`（零轮询）⇒ `table` 是 null ⇒
+                 * 下面 `planCraft(bot, …, table)` 拿到 null ⇒ 计划没把工作台算进去，
+                 * 同一条回复里既说"我把工作台放好了"又说"缺工作台"。
+                 * `mc_chest.mjs` / `mc_furnace.mjs` 早就有这段轮询（6×150ms），照抄。 */
+                for (let i = 0; i < 6 && !table; i++) {
+                  table = findTableBlock(bot, { x: spot.x, y: spot.y, z: spot.z })
+                  if (!table) await sleep(150)
+                }
+                placedNote = table
+                  ? `（附近本来没有工作台，我把背包里的放到 (${spot.x},${spot.y},${spot.z}) 了）`
+                  : `（工作台放出去了，但客户端还没收到方块更新，读不到 (${spot.x},${spot.y},${spot.z}) 上的工作台 —— 过一会儿再叫我一次）`
+                logLine(`mc_craft：自动放了工作台 (${spot.x},${spot.y},${spot.z})${table ? '' : '（还没读到）'}`)
               } else {
                 placedNote = `（想放工作台但没成功：${r?.note ?? '未知原因'}）`
               }

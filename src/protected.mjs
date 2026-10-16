@@ -44,8 +44,12 @@ export function isProtectedPathArg (raw) {
   return segs.some((x) => /^\.?dsh[-_]mc[-_]agent$/i.test(x))
 }
 
-/** 会写文件的宿主工具（read|glob|grep|ls|cat|read_image 是只读的，放行） */
-export const WRITE_FILE_TOOLS = /^(write|edit)$/i
+/** 会写文件的宿主工具（read|glob|grep|ls|cat|read_image 是只读的，放行）
+ *  🔴 2026-10-15 审计（报告 C 第 3 条）：`ops_replace`（批量正则替换）**真能落盘**，
+ *    但原来既不在 `index.js` 的判定白名单里、也不在这里 ⇒ MC 模式可以拿它改写
+ *    RULES.md / AGENTS.md / config.json，而且"只能在记忆文件夹内"那条围栏也绕过去了。
+ *    凡是会写文件的工具都必须进这个名单。 */
+export const WRITE_FILE_TOOLS = /^(write|edit|ops_replace)$/i
 
 /** 会写文件的记忆工具动作（read/index/search/kinds 放行） */
 export const MEMORY_WRITE_ACTIONS = new Set(['append', 'write', 'delete', 'put', 'record'])

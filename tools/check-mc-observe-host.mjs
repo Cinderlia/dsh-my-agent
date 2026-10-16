@@ -150,8 +150,11 @@ console.log('— ① 工具注册 —')
   if (GATE_ON) {
     ok(spec && spec.description.includes('最多连着做 4 个动作'), '描述里写明了看一眼能做几个动作')
   } else {
-    ok(spec && !spec.description.includes('硬规则') && spec.description.includes('没有硬性门禁'),
-      '自主模式的描述里不再有"硬规则"，改成"没有硬性门禁"')
+    /* 🔴 2026-10-15：这句断言原来找的是"没有硬性门禁"四个字，而描述早就改成
+     *    "**什么时候看，你自己定**"了（`extensions\mc_observe.mjs` 的 gateEnabled 三元）
+     *    ⇒ 从改词那天起就一直红着。这里按**意图**断言：不宣称硬规则 + 明确交给模型自己定。 */
+    ok(spec && !spec.description.includes('硬规则') && spec.description.includes('什么时候看，你自己定'),
+      '自主模式的描述里不再有"硬规则"，改成"什么时候看，你自己定"')
   }
   ok(spec && spec.parameters && typeof spec.parameters === 'object', '有 parameters（平铺映射，和 mc_map 同款）')
   ok(spec && !Array.isArray(spec.parameters) && spec.parameters.width && spec.parameters.width.type === 'number', 'parameters.width 是 number')

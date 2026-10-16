@@ -743,8 +743,8 @@ console.log('— ⑧ 合成窗口失步（实机 2026-10-07：10 根橡木没了
     const t0 = Date.now()
     const r2 = await run({ name: 'oak_planks' }, { mc, id: 'S1' })
     const ms = Date.now() - t0
-    ok(/上一次合成还在跑/.test(r2.text) && /mc_connect/.test(r2.text),
-      '上一条还在跑时如实拒绝，并教它 mc_connect 重连', r2.text.split('\n').slice(0, 2).join(' ').slice(0, 170))
+    ok(/上一次合成还在跑/.test(r2.text) && /mc_scan/.test(r2.text) && !/mc_connect/.test(r2.text),
+      '上一条还在跑时如实拒绝，并教它 mc_scan 复核现场（**不再**劝它 mc_connect 重连）', r2.text.split('\n').slice(0, 2).join(' ').slice(0, 170))
     ok(f.calls.filter((c) => c.delayed).length === 1, '拒绝时不并行开第二条合成链', JSON.stringify(f.calls))
     ok(ms < 2200, `拒绝是"等一小会儿再拒绝"，不是干等（${ms}ms）`)
     const r1 = await p1

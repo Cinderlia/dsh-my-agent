@@ -253,7 +253,11 @@ export function makeSkin (input) {
   /** 披风面上一点的颜色（没有披风返回 null） */
   function sampleCape (face, u, v) {
     if (!cape) return null
-    const rect = CAPE_LAYOUT[face] ?? CAPE_LAYOUT.back
+    /* 审计 G10：认不出的 face 原来**静默**退回 back（披风背面），于是拼错的参数会拿到
+     * 一个"看起来对"的颜色，永远查不出问题。这里如实回 null（没有披风/没有这个面）。
+     * `CAPE_LAYOUT` 里的合法面见它自己的定义。 */
+    const rect = CAPE_LAYOUT[face]
+    if (!rect) return null
     const [rx, ry, rw, rh] = rect
     const sx = rx + Math.min(rw - 1, Math.max(0, Math.floor(u * rw)))
     const sy = ry + Math.min(rh - 1, Math.max(0, Math.floor(v * rh)))

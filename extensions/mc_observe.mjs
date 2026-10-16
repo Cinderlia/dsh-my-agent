@@ -31,7 +31,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { encodePng } from '../src/png.mjs'
-import { equipmentOf, equipmentText } from '../src/inventory.mjs'
+import { equipmentOf, equipmentText, toolDurability, durabilityText } from '../src/inventory.mjs'
 import { EXPRESS_DIR, OUT_DIR } from '../src/express.mjs'
 import { withTimeout, CALL_MS, CALL_BUDGET_MS } from '../src/core.mjs'
 import { VIEW_DEFAULTS, compassOf, isAirName, makePos, renderView } from './mc_view-render.mjs'
@@ -153,11 +153,11 @@ export async function apply (api) {
       + '① **我看到**（图里数出来的：像素占比、谁在哪一侧、准星压着什么、手里拿什么）；'
       + '② **程序检测到**（游戏数据：坐标/朝向/独立射线打到的方块/半径内实体带坐标·距离·血量/脚下）；'
       + '③ **不确定**（客户端预测的方块世界、没加载的区块、读不到的血量 —— **别把推测当事实**）。'
-      + '两套眼睛对不上时点名（以程序射线为准）；`image:false` 不画图，`percept:false` 不要文字。\n'
+      + '两套眼睛对不上时点名（以程序射线为准）。\n'
       + '图里：**玩家（人形，正版皮肤就贴真的）· 怪物（敌对红/被动黄）· 掉落物（黑描边）**、右下角手上的东西。\n'
       + (gateEnabled
-        ? '🔴 **硬规则：动手之前必须先看一眼**。动作类工具（mc_move / mc_act / mc_dig / mc_build / '
-          + 'mc_give / mc_command / mc_sequence）手上没有够新的图会被**直接拒绝**'
+        ? '🔴 **硬规则：动手之前必须先看一眼**。动作类工具（' + [...gated].join(' / ')
+          + '）手上没有够新的图会被**直接拒绝**'
           + `（让你先调 mc_observe）。看一眼后最多连着做 ${maxActions} 个动作${spanText}，超了再看一次。\n`
           + '嫌紧可以改（立即生效）：写 `.dsh-mc-agent/view.json`，如 {"maxActions":8} 或 {"gate":false}。\n'
         : '👁 **什么时候看，你自己定**：只读查询（mc_status / mc_inventory / '
@@ -167,7 +167,7 @@ export async function apply (api) {
       + (gateEnabled
         ? ''
         : '（想变回强制模式：写 `.dsh-mc-agent/view.json` 的 {"gate":true}。）\n')
-      + '图里：白色十字=准星；暗紫色块=区块没加载；越远越淡。\n'
+      + '图里：暗紫色块=区块没加载。\n'
       + `🔴 要让 **Master** 看到：\`out:"\\.dsh-mc-agent/${EXPRESS_DIR}/<子目录>/view.png"\` 写进发布区，`
       + '再用 `mc_kit_express` 取；默认落 `.dsh-mc-agent/' + OUT_DIR + '/`（不对外）。',
     parameters: {
@@ -321,6 +321,12 @@ export async function apply (api) {
       let equipment = null
       try { equipment = equipmentOf(bot) } catch { equipment = null }
       const eqText = (() => { try { return equipmentText(bot) } catch { return null } })()
+      /* 耐久（2026-10-15 用户点名要的）：会磨损的东西还剩多少。
+       * `tools` 是结构化列表（最危险的在最前），`durText` 是给正文用的一句话。 */
+      let tools = []
+      let durText = null
+      try { tools = toolDurability(bot) } catch { tools = [] }
+      try { durText = durabilityText(bot) } catch { durText = null }
 
       const out = {
         capturedAt: nowMs,
@@ -337,6 +343,8 @@ export async function apply (api) {
         gamemode: s.gamemode ?? null,
         held: s.held ?? null,
         equipment,
+        tools,
+        durability: durText,
         inventory: inv,
         crosshair: !wantImage
           ? { block: null, note: '这次没截图（image:false）—— 准星对着什么看 structured 里的程序射线' }
@@ -351,8 +359,13 @@ export async function apply (api) {
           headBlock: showBlock(blockAt(bot.world, fx, fy + 1, fz)),
           ahead: showBlock(blockAt(bot.world, fx + stepX, fy, fz + stepZ)),
           /* 🔴 只看 `e.isInWater` 会漏：泡在水柱里它读出来是 undefined（实机 (-31,59,261) 脚/头
-           *    两格都是 water 却报"没在水里"）⇒ 再看脚/头那两格的方块名。 */
-          inWater: Boolean(e.isInWater) || /water|lava/.test(String(blockAt(bot.world, fx, fy, fz)?.name ?? '')) || /water|lava/.test(String(blockAt(bot.world, fx, fy + 1, fz)?.name ?? '')),
+           *    两格都是 water 却报"没在水里"）⇒ 再看脚/头那两格的方块名。
+           *    🔴 审计 G1：`blockAt()` 回的是**方块名字符串**（见它自己的定义），
+           *    旧写法 `blockAt(...)?.name ?? ''` 在字符串上取 `.name` 恒得 `undefined` ⇒ 恒 `''`
+           *    ⇒ `/water|lava/.test('')` 恒 false —— 这段"修复"从来没生效过。 */
+          inWater: Boolean(e.isInWater)
+            || /water|lava/.test(String(blockAt(bot.world, fx, fy, fz) ?? ''))
+            || /water|lava/.test(String(blockAt(bot.world, fx, fy + 1, fz) ?? '')),
         },
         entities: frame?.stats.entities ?? [],
         crosshairEntity: frame?.stats.crosshairEntity ?? null,
@@ -393,8 +406,10 @@ export async function apply (api) {
           // （`config.memoryDir`），所以剥掉前缀挂到记忆根上；其余相对路径仍按工作区解析，
           // 绝对路径原样用。这样默认出图会跟着记忆根走，express 发布区（`<记忆根>/.express/`）才对得上。
           const memPrefix = /^\.dsh-mc-agent[\\/]/i
-          const abs = /^([A-Za-z]:[\\/]|[\\/])/.test(rel)
-          const file = abs
+          /* 审计 G12：这个变量是**布尔**（"是不是绝对路径"），不是路径本身 —— 原来叫 `abs`
+           * 读起来像"绝对路径"，改叫 `isAbs`。 */
+          const isAbs = /^([A-Za-z]:[\\/]|[\\/])/.test(rel)
+          const file = isAbs
             ? rel
             : memPrefix.test(rel)
               ? resolve(memRootFor(exec?.agent) ?? wsRoot, rel.replace(memPrefix, ''))
@@ -424,6 +439,13 @@ export async function apply (api) {
        * ①② 是两套眼睛（渲染 vs 游戏数据），③ 是"别把推测当事实"。
        * 传 `percept:false` 退回旧的一段式摘要（省 token）。 */
       let percept = null
+      // 背包那行（紧凑：最多 10 样，多的用 … 省 token）
+      const invText = inv?.error
+        ? `读不到（${inv.error}）`
+        : inv.items.length
+        ? `${inv.items.slice(0, 10).map((i) => `${i.name}×${i.count}`).join('、')}${inv.items.length > 10 ? '…' : ''}（共 ${inv.kinds} 样 / ${inv.stacks} 叠${inv.free != null ? `，空位 ${inv.free}` : ''}）`
+        : '空'
+
       if (args.percept !== false) {
         // ② 程序侧实体：带坐标/血量、隔墙也能报（原来 `mc_entities` 那条路，现在并进看图这一次调用）
         //    `entities:false` 时这条也一起关掉 —— 那个开关的语义是"这次别收集实体"，不是"只别画"
@@ -514,13 +536,6 @@ export async function apply (api) {
           : '结构化字段是**这一轮现采**的（看 capturedAt），别把几轮前的工具结果当成"现在"')
         const shown = uncertain.length > 6 ? [...uncertain.slice(0, 5), uncertain[uncertain.length - 1]] : uncertain
 
-        // 背包那行（紧凑：最多 10 样，多的用 … 省 token）
-        const invText = inv?.error
-          ? `读不到（${inv.error}）`
-          : inv.items.length
-            ? `${inv.items.slice(0, 10).map((i) => `${i.name}×${i.count}`).join('、')}${inv.items.length > 10 ? '…' : ''}（共 ${inv.kinds} 样 / ${inv.stacks} 叠${inv.free != null ? `，空位 ${inv.free}` : ''}）`
-            : '空'
-
         if (wantImage) {
           lines.push(
             `👁 **我看到**（图里数出来的，${width}×${height}）：命中 ${out.image.hitPct}% · 天空 ${out.image.skyPct}% · 未加载 ${out.image.unloadedPct}%`
@@ -554,6 +569,7 @@ export async function apply (api) {
             + ` · 模式 ${out.gamemode ?? '?'} · 手持 ${out.held ?? '空手'}`,
           `   · 🎒 背包：${invText}`,
           `   · 🛡 装备栏：${eqText ?? '读不到'}（这几格不在背包里，穿/脱用 mc_act {mode:"equip"}）`,
+          ...(out.durability ? [`   · ${out.durability}`] : []),
           `   · 脚下 ${out.surroundings.underFeet} · 脚内 ${out.surroundings.feetBlock} · 头上一格 ${out.surroundings.headBlock} · 正前方一格 ${out.surroundings.ahead}`
             + (out.surroundings.inWater ? ' · 泡在水里' : ''),
           '⚠️ **不确定**（别当成事实）：' + shown.map((t, i) => `${'①②③④⑤⑥⑦⑧⑨'[i] ?? '·'}${t}`).join('　'),
@@ -623,6 +639,7 @@ export async function apply (api) {
         }
         lines.push(`🎒 背包：${invText}`)
         lines.push(`🛡 装备栏：${eqText ?? '读不到'}（穿/脱用 mc_act {mode:"equip"}）`)
+        if (out.durability) lines.push(`🛠 ${out.durability}`)
         if (out.image && out.image.unloadedPct > 25) {
           lines.push('⚠️ 未加载像素偏多：区块可能还没加载完，可以稍等再 mc_observe 一次。')
         }
@@ -633,8 +650,10 @@ export async function apply (api) {
 
       // ④ 记下"本会话刚看过图"，放行接下来的动作（最多 maxActions 个 / maxAgeMs 毫秒）
       // 🔴 `image:false` 不算"看过"：门禁要的是真看过画面，不然拿"只看数据"就能把门禁糊弄过去
+      // 🔴 审计 G5：内联失败（`attachmentError`）也**不算看过** —— 旧写法只看 `wantImage`，
+      //    图没送出去也算数，门禁就被绕过了（模型手里其实没有画面）。
       const agentId = exec?.agent?.id
-      if (agentId && wantImage) viewed.set(String(agentId), { at: Date.now(), used: 0 })
+      if (agentId && wantImage && out.image?.attachment) viewed.set(String(agentId), { at: Date.now(), used: 0 })
       return out
     },
   }))

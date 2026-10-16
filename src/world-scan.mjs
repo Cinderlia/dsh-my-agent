@@ -51,7 +51,9 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
   }
   if (name) {
     found.sort((a, b2) => a.d - b2.d)
-    return { found: found.slice(0, limit).map((f) => f.pos), total: found.length, unloaded, nearest: found.length ? found[0] : null }
+    /* 🔴 2026-10-15 审计：`found` 是 `string[]`，而 `nearest` 以前塞的是内部的 `{pos,d}` 对象
+     *    ⇒ 两套形状，谁把它当字符串用就会拿到 `[object Object]`。统一成字符串坐标。 */
+    return { found: found.slice(0, limit).map((f) => f.pos), total: found.length, unloaded, nearest: found.length ? found[0].pos : null }
   }
   return {
     center: { x: c.x, y: c.y, z: c.z }, radius: R, height: H, unloaded,

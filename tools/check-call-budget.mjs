@@ -23,7 +23,7 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 
 // ── 断言小工具（和别的 check-*.mjs 一致）────────────────────────────────────────
 let pass = 0, fail = 0
@@ -408,12 +408,18 @@ section('⑨ core.mjs —— 长动作排 deadline 要算上"本轮已用掉的�
   const raw = readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8')
   // 只看代码，不看注释（注释里正是拿这些"反面写法"当例子讲道理的）
   const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
-  const n = [...src.matchAll(/Date\.now\(\) \+ (?:Math\.max\(0, )?this\.callLeft\(\)/g)].length
-  ok(n >= 2, `dig() / build() 都用 this.callLeft() 排 deadline（${n} 处）`, String(n))
+  /* 🔴 2026-10-15 审计：`dig()` / `build()` 早就搬进 `src/mining.mjs` / `src/build.mjs` 了
+   *    （那边是 `self.callLeft()`，不是 `this.`）⇒ 旧断言在 core.mjs 里数到 0 处，一直红着。 */
+  const minSrc = readFileSync(new URL('../src/mining.mjs', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const buildSrc = readFileSync(new URL('../src/build.mjs', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const n = [...(minSrc + buildSrc).matchAll(/Date\.now\(\) \+ (?:Math\.max\(0, )?self\.callLeft\(\)/g)].length
+  ok(n >= 2, `dig() / build() 都用 self.callLeft() 排 deadline（${n} 处）`, String(n))
   // 🔴 dig() 还要**留收尾时间**：`#cancelCollect` 等 collectBlock_finished 最多 1.5 秒、
   //    兜底原地挖、拼文本、DSH 序列化都排在预算之外 ⇒ 两个目标就冲出工具超时（2026-10-08 实机反馈：
   //    `Error: tool call timed out after 6000ms`，而方块其实早挖掉了）。
-  ok(/const deadline = Date\.now\(\) \+ Math\.max\(0, this\.callLeft\(\) - 900\)/.test(src),
+  ok(/const deadline = Date\.now\(\) \+ Math\.max\(0, self\.callLeft\(\) - 900\)/.test(minSrc),
     'dig() 的 deadline 留了 900ms 收尾（别再让它冲出工具超时）')
   /* 🔴 2026-10-08：`dig()` 不再把方块交给 collectBlock（"挖完又复原 + 之后几分钟走不了路"的根因），
    *    所以那条 `budgetMs: leftOf() - 200` 也没了。现在还要"限住取消动作"的地方只剩 `#grabDrops`
@@ -433,7 +439,8 @@ section('⑨ core.mjs —— 长动作排 deadline 要算上"本轮已用掉的�
     .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
   ok(/budgetAsked: callBudget\(budget\)/.test(movSrc), 'walkTo 把"调用方要的预算"传给寻路层（实现已搬到 src\\movement.mjs）')
   ok(/budgetAsked = null/.test(movSrc), '#walkPathfinder 接 budgetAsked（判"是不是被预算截断的"，实现已搬到 src\\movement.mjs）')
-  ok(/budget <= Number\(budgetAsked \?\? budget\) \+ 50/.test(movSrc), '被预算截断 ≠ 走不通（文案分流，实现已搬到 src\\movement.mjs）')
+  ok(/const cutByCall = Boolean\(e\?\.mcCallOver\) \|\| self\.msLeft\(\) <= 400/.test(movSrc)
+    && /const timeUp = cutByCall \|\| Boolean\(e\?\.mcTimeout\)/.test(movSrc), '被预算截断 ≠ 走不通（文案分流，实现已搬到 src\\movement.mjs）')
   ok(/from '\.\/movement\.mjs'/.test(src), 'core 确实从 movement.mjs 导入（搬走 + 忘接 = 假绿）')
   ok(/bumpGen: \(\) => \{ this\._moveGen\+\+ \}/.test(src), '薄包装里把移动代号往前推（模块不碰 this）')
   ok(/callLeft \(\) \{/.test(src), 'McBot 上有 callLeft() = min(一整轮, 本轮剩余)')
@@ -496,7 +503,7 @@ section('⑩ interruptMove() —— 自保反射抢 AI 那一步的移动（"动
   ok(/_ctrlLease = new Map\(\)/.test(src) && /holdControl \(key, ms = 300\) \{ return holdControlImpl\(this, key, ms\) \}/.test(src)
     && /export function releaseControls \(self\) \{/.test(runSrc) && /const until = self\._ctrlLease\.get\(k\) \?\? 0/.test(runSrc),
     '自保反射的控制位有租约，移动收尾跳过没过期的键（审计⑨；租约表留在 core，读写实现第四十一刀搬到 src\\runtime.mjs）')
-  ok(/const leftMs = this\.msLeft\(\)\r?\n\s*if \(leftMs <= 100\)/.test(src) && !/Math\.max\(150, Math\.min\(callBudget\(budget\), this\.msLeft\(\)\)\)/.test(src),
+  ok(/const leftMs = self\.msLeft\(\)\r?\n\s*if \(leftMs <= 100\)/.test(movSrc) && !/Math\.max\(150, Math\.min\(callBudget\(budget\), self\.msLeft\(\)\)\)/.test(movSrc),
     '本轮时间用完就别再开始走（不再被外层 Math.max(150/300) 白送时间，审计⑦）')
   ok(/Promise\.resolve\(self\.interruptMove\('用户中断'\)\)/.test(runSrc) && /from '\.\/runtime\.mjs'/.test(src),
     '用户点停止（signal abort）⇒ 立刻真停（interruptMove 不再死代码，审计④）')

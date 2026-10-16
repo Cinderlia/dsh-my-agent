@@ -7,6 +7,9 @@
  * `taskDone` / `taskCancel` / `taskForget`）并了进来：它们全是"读 `self.tasks` 记一笔"的记账动作，
  * 与下面三个是同一层（收工报告要知道这一轮属于哪条任务）。
  *
+ * 2026-10-14（用户"任务驱动"设计第一步）再加两个：`taskPlan`（写/看步骤表）与 `taskStep`
+ * （推进当前那一步）。它们**只记账、不下发动作** —— 谁来推进由调用方（模型或以后的执行器）决定。
+ *
  * 为什么这三个放一起：它们是同一条链上的三件事 ——
  *   干活前看"现在手里有几个"（`taskHave`）→ 收工时判"这一轮成了没"（`verdictLine`）
  *   → 再把结果记到任务上、附一行进度（`taskSettle`）。
@@ -94,8 +97,8 @@ export function taskSettle (self, task, out, okCount, wantTotal) {
  * 形状：全是"读 self.tasks、读 self.position、必要时读一下现场背包"⇒ 按迁移规矩第 27 条收 `self`；
  * `self.#taskHave` 是私有方法，模块里直接调同模块的 `taskHave(self.bot, …)`（不需要 ctx）。
  */
-export function taskStart (self, { kind = 'task', goal = null, item = null, total = null, unit = '个', params = {} } = {}) {
-  const t = self.tasks.start({ kind, goal, item, total, unit, params })
+export function taskStart (self, { kind = 'task', goal = null, item = null, total = null, unit = '个', params = {}, steps = null } = {}) {
+  const t = self.tasks.start({ kind, goal, item, total, unit, params, steps })
   // 开工时把现场也记下来：以后 resume 才有"我从哪开始"的锚点
   self.tasks.checkpoint(t.taskId, {
     position: self.position,
@@ -130,6 +133,42 @@ export function taskResume (self, { taskId = null } = {}) {
     })
   }
   return r
+}
+
+/**
+ * 步骤台账（2026-10-14 "任务驱动"第一步）：`steps` 给了就**重写**计划，没给就当"看一眼"。
+ * 只记账，不下发动作。
+ */
+export function taskPlan (self, { taskId = null, steps = null } = {}) {
+  const id = taskId ?? self.tasks.current()?.taskId ?? null
+  if (!id) return { ok: false, reason: '现在没有在做的事' }
+  const t = steps ? self.tasks.setSteps(id, steps) : self.tasks.get(id)
+  if (!t) return { ok: false, reason: '没有这个任务' }
+  return { ok: true, task: taskBrief(t), wrote: Boolean(steps) }
+}
+
+/**
+ * 推进当前那一步。`status`：`done`（默认）/ `running` / `failed` / `skipped` / `pending`。
+ * `failed` 只是**记一次重试**，超上限（`maxAttempts`）才把任务标 `blocked`。
+ * `pending` = 把这一步**放回"还没做"**（不记失败、也不记完成）—— 给"动作被打断 / 结果未知"用。
+ */
+export function taskStep (self, { taskId = null, step = null, status = 'done', why = null } = {}) {
+  const id = taskId ?? self.tasks.current()?.taskId ?? null
+  if (!id) return { ok: false, reason: '现在没有在做的事' }
+  const t0 = self.tasks.get(id)
+  if (!t0) return { ok: false, reason: '没有这个任务' }
+  if (!(t0.steps ?? []).length) return { ok: false, reason: '这个任务还没有步骤表（先 mc_task {action:"plan", steps:[…]} 写一张）' }
+  const st = String(status ?? 'done').toLowerCase()
+  if (!['running', 'done', 'failed', 'skipped', 'pending'].includes(st)) {
+    return { ok: false, reason: `status 只能是 running / done / failed / skipped / pending（给的是 ${st}）` }
+  }
+  const r = st === 'running' ? self.tasks.stepBegin(id, step)
+    : st === 'done' ? self.tasks.stepDone(id, step, why)
+      : st === 'failed' ? self.tasks.stepFail(id, step, why)
+        : st === 'skipped' ? self.tasks.stepSkip(id, step, why)
+          : self.tasks.stepReset(id, step, why)
+  if (!r) return { ok: false, reason: step ? `没有这一步：${step}` : '没有可推进的步骤' }
+  return { ok: true, status: st, ...r, task: taskBrief(r.task) }
 }
 
 export function taskNote (self, { taskId = null, text = '' } = {}) {

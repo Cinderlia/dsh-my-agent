@@ -21,7 +21,11 @@
  *      `t` 的兜底写成"直接 await"，自写冒烟就不必造真闸门。
  */
 import { Vec3 } from 'vec3'
-import { sleep } from './async-util.mjs'
+import { sleep, waitUntil } from './async-util.mjs'
+/* 🔴 报告 H1（2026-10-13）：`toward` 那条路用了 `callBudget(...)` 却**没 import** ——
+ *    `mc_act {mode:"toward"}` 必抛 `ReferenceError: callBudget is not defined`。
+ *    拆分时（第二十/二十七刀）漏掉的。 */
+import { callBudget } from './budget.mjs'
 import { aimAt } from './camera.mjs'
 import { CONTAINER_RE, TOGGLE_RE } from './block-names.mjs'
 import { entityNameOf, pickEntity } from './entity-names.mjs'
@@ -77,13 +81,17 @@ export async function useBlock (b, { x, y, z, who = null } = {}, ctx = {}) {
   const at = { x: pos.x, y: pos.y, z: pos.z }
   const props0 = { ...(blk.getProperties?.() ?? {}) }
   aimAt(b, new Vec3(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5))
+  /* 🔴 2026-10-15 审计（报告 C 第 7 条）：容器类必须记"使用**之前**是哪个窗口" ——
+   *   本来就已经开着别的窗口时，服务端会忽略这次使用（本文件下面 `:286-287` 的注释自己写着），
+   *   于是旧代码会拿"上一次留下的旧窗口"当成本次的证据。**必须在 activateBlock 之前取快照**。 */
+  const win0 = b.currentWindow
   await t(Promise.resolve(b.activateBlock(blk)), 'act', `使用 ${blk.name}`)
   // ① 容器类：窗口该弹出来 —— 这是唯一硬证据
   if (CONTAINER_RE.test(blk.name)) {
     for (let i = 0; i < 10; i++) {
       await sleep(120)
       const w = b.currentWindow
-      if (w && w !== b.inventory) {
+      if (w && w !== b.inventory && w !== win0) {
         return {
           usedBlock: blk.name, at, opened: w.type,
           ...(typeof w.containerItems === 'function' ? { slots: w.containerItems().length } : {}),
@@ -189,10 +197,12 @@ export async function interact (self, args = {}) {
     if (!args.who) throw new Error('toward 需要 who（玩家名）')
     const r = await self.lookAt({ who: args.who })
     if (args.approach !== false) {
-      const target = b.entity.position.clone()
-      const eye = { x: r.lookingAt.x, y: target.y, z: r.lookingAt.z }
+      /* 🟡 2026-10-15 审计（报告 C 第 8 条）：这里原来写 `const target = b.entity.position.clone()`
+       *   —— 那是**机器人自己**的坐标，于是走过去的 y 用的是"我脚下那一格"，目标在楼上/楼下时会走错层。
+       *   `lookAt()` 返回的 `lookingAt` 才是目标的实际坐标（`src/camera.mjs:96`），直接用它的 y。
+       *   另外原来在这里和后面各 `lookAt` 了一次、最后 return 又调一次（共 3 次），中间那次是多余的。 */
+      const eye = { x: r.lookingAt.x, y: r.lookingAt.y, z: r.lookingAt.z }
       await self.walkTo(eye, { arrive: 3, budget: callBudget(args.budgetMs) })
-      await self.lookAt({ who: args.who })
     }
     return { mode, ...(await self.lookAt({ who: args.who })), position: self.position }
   }
@@ -234,6 +244,7 @@ export async function equip (self, { name = null, to = null } = {}, ctx = {}) {
     const now = readSlot(slot)
     return {
       to: dest,
+      equipped: !now,                     // 🟡 2026-10-15 审计（报告 C 第 1 条）：脱成功了 = 那一格空了
       now: now ? `${now.name}x${now.count}` : '空',
       tookOff: `${was.name}x${was.count}`,
       held: heldText(b),
@@ -255,6 +266,10 @@ export async function equip (self, { name = null, to = null } = {}, ctx = {}) {
   const held = heldText(b)
   return {
     to: d,
+    /* 🟡 2026-10-15 审计（报告 C 第 1 条）：`equip()` 原来**没有任何"成没成"的字段**，
+     *   调用方只能看 `held` 猜（`src/sequence.mjs` 的 `stepOk` 就是因此恒判成功）。
+     *   这里把已经复核过的结论如实写出来。 */
+    equipped: got,
     ...(isHand ? {} : { now: now ? `${now.name}x${now.count}` : '空' }),
     ...(before && before.name !== now?.name ? { swappedOut: `${before.name}x${before.count}` } : {}),
     ...(beforeHeld !== held ? { beforeHeld } : {}),
@@ -368,10 +383,14 @@ export async function enchantTable (self, args = {}, ctx = {}) {
   // ⑤ 等三个选项到位（服务端用 craft_progress_bar 的属性包填，通常一个 tick 就到）
   const shortName = (s) => String(s ?? '?').replace(/^minecraft:/, '')
   const enName = (id) => (id == null || Number(id) < 0 ? '?' : shortName(b.registry?.enchants?.[id]?.name ?? `#${id}`))
-  const ready = () => Array.isArray(table.enchantments) && table.enchantments.length > 0
-    && table.enchantments.every((x) => Number(x?.level) >= 0)
-  const until = Date.now() + 1_200
-  while (!ready() && Date.now() < until) await sleep(80)
+  /* 🔴 2026-10-15 审计（报告 C 第 2 条）：这里原来要求三个选项 `level >= 0` **全成立**才算"到齐"，
+   *   而 vanilla 用 `level = -1` 表示"这一项不可用"（经验不够 / 没青金石 / 这件东西不能附魔）——
+   *   同文件下面的 `optLine` 自己就是这么解释 `level < 0` 的。于是"经验不够"（极常见）时
+   *   `ready()` 恒假 ⇒ 真附魔分支**永远走不到**，只会反复回"三个选项还没到齐，再叫一次"。
+   *   到齐的判据改成"三个槽位都在"；具体那一项能不能用，留到 ⑦ 按所选项单独判。 */
+  const optsReady = () => Array.isArray(table.enchantments) && table.enchantments.length === 3
+  /* 2026-10-15 异步方案 ②：手写轮询收口到 `waitUntil`（同一个"等到某条件成立"只写一遍） */
+  await waitUntil(optsReady, { ms: 1_200, pollMs: 80, label: '等附魔选项' })
 
   const opts = Array.isArray(table.enchantments) ? table.enchantments : []
   const optLine = (x, i) => (Number(x?.level) < 0
@@ -395,17 +414,36 @@ export async function enchantTable (self, args = {}, ctx = {}) {
   if (option == null) {
     return {
       ...base,
-      ...(ready() ? {} : { note: '三个选项还没全到（窗口刚开，服务端要一个 tick 才发属性包）—— 再叫一次 mc_act {mode:"enchant"}' }),
+      ...(optsReady() ? {} : { note: '三个选项还没全到（窗口刚开，服务端要一个 tick 才发属性包）—— 再叫一次 mc_act {mode:"enchant"}' }),
       text: `🔮 附魔台 (${at})：槽 0 = ${target ?? '空'}，槽 1 = ${lapis ?? '空'}\n${opts.map(optLine).join('\n')}`,
     }
   }
 
   // ⑦ 真附魔
-  if (!ready()) {
+  if (!optsReady()) {
     return {
       ...base,
       enchanted: false,
-      note: `三个选项还没到齐，这一轮没动手 —— 再叫一次 mc_act {mode:"enchant", option:${option}}（窗口还开着）`,
+      note: '三个选项还没到齐（窗口刚开，服务端要一个 tick 才发属性包），这一轮没动手 —— 再叫一次 mc_act {mode:"enchant", option:' + option + '}（窗口还开着）',
+    }
+  }
+  /* 🔴 2026-10-15 审计（报告 C 第 2 条）：到齐 ≠ 这一项能用。`level < 0` = 服务端说"这一项不可用"，
+   *   这时候调 `table.enchant(option)` 会白忙（上游会拒/报错）。如实说清是哪种不可用。 */
+  const chosen = opts[option] ?? null
+  if (!chosen) {
+    return {
+      ...base,
+      enchanted: false,
+      note: `没有 ${option} 号选项（现在只有 ${opts.length} 个：0..${Math.max(0, opts.length - 1)}）`,
+    }
+  }
+  if (Number(chosen?.level) < 0) {
+    return {
+      ...base,
+      enchanted: false,
+      option,
+      note: `${option} 号这一项**不可用**（经验不够 / 没有青金石 / 这件东西不能附魔）—— 这一轮没动手。`
+        + '换一个选项，或者先去攒经验/补青金石再回来。',
     }
   }
   const newItem = await t(Promise.resolve(table.enchant(option)), 'act', `附魔选项 ${option}`)
@@ -683,9 +721,8 @@ export async function smithingTable (self, args = {}, ctx = {}) {
   await move(baseSlot, 1, base?.item?.name ?? wantBase ?? '底座')
   await move(add.slot, 2, wantAdd)
 
-  // 等成品（服务端一个 tick 就算出来）
-  const until = Date.now() + 1_200
-  while (!slotName(3) && Date.now() < until) await sleep(80)
+  // 等成品（服务端一个 tick 就算出来）—— 2026-10-15 异步方案 ②：收口到 `waitUntil`
+  await waitUntil(() => slotName(3), { ms: 1_200, pollMs: 80, label: '等铁砧成品' })
   const out = table.slots?.[3] ?? null
   if (!out) {
     await close()

@@ -53,18 +53,108 @@ export const EQUIP_SLOTS = [
   [45, 'off-hand', '副手'],
 ]
 
-/** 身上穿着什么：`{ head: 'iron_helmetx1' | null, torso, legs, feet, 'off-hand' }` */
+/** 身上穿着什么：`{ head: 'iron_helmetx1 · 耐久 120/165（73%）' | null, torso, legs, feet, 'off-hand' }` */
 export function equipmentOf (b) {
   const slots = b?.inventory?.slots
   const out = {}
   for (const [i, dest] of EQUIP_SLOTS) {
     const it = Array.isArray(slots) ? slots[i] : null
-    out[dest] = it ? `${it.name}x${it.count}` : null
+    out[dest] = it ? `${it.name}x${it.count}${durSuffix(it)}` : null
   }
   return out
 }
 
-/** 装备栏一行字（`头 空 · 身 铁胸甲x1 · 腿 空 · 脚 空 · 副手 空`） */
+/* ───────────────────────── 耐久（2026-10-15 用户点名要的） ─────────────────────────
+ *
+ * 以前只能看到"我有一把 iron_pickaxe"，看不到"它只剩 3 下了"。于是 AI 会一直用一把快断的镐
+ * 挖到它断掉，然后以为"这个方块挖不动"（真实案例：`mc_dig` 报"挖不动"，其实是镐断了）。
+ *
+ * mineflayer 的 `Item` 上：`durabilityUsed`（已用掉多少）+ `maxDurability`（上限）。
+ * 工具/武器/盔甲/盾有这两个字段；方块、食物、材料没有。
+ * ⚠️ `maxDurability` 为 0/undefined 时**不能**拿它当分母（`0/0` 是 `NaN`，而 `NaN <= 0.2`
+ *    恒为 false ⇒ "快坏了"永远不报警 —— 一个静默失效的判据）。所以先判 `max > 0`。
+ */
+
+/** 一件东西还剩多少耐久：`{ used, max, left, pct }`；**不会磨损的东西回 `null`** */
+export function durabilityOf (it) {
+  if (!it) return null
+  const used = Number(it.durabilityUsed)
+  const max = Number(it.maxDurability)
+  if (!Number.isFinite(max) || max <= 0) return null
+  const u = Number.isFinite(used) ? Math.max(0, Math.min(used, max)) : 0
+  const left = max - u
+  return { used: u, max, left, pct: left / max }
+}
+
+/** 耐久的人话：`120/250（48%）`；不会磨损的回 `null` */
+export function durText (it) {
+  const d = durabilityOf(it)
+  return d ? `${d.left}/${d.max}（${Math.round(d.pct * 100)}%）` : null
+}
+
+/** 拼在名字后面的短尾巴（` · 耐久 120/250`）；不会磨损的回空串 */
+const durSuffix = (it) => { const s = durText(it); return s ? ` · 耐久 ${s}` : '' }
+
+/** 低于或等于这个比例算"快坏了"（20% —— 铁镐 250 耐久 ⇒ 剩 50 下就该提醒了） */
+export const DUR_LOW = 0.2
+/** 低于或等于这个比例算"马上就没"（5%） */
+export const DUR_CRITICAL = 0.05
+
+/** 这件东西的告警档：`'critical'` / `'low'` / `null`（还好，或压根不会磨损） */
+export function durWarnOf (it, { low = DUR_LOW, critical = DUR_CRITICAL } = {}) {
+  const d = durabilityOf(it)
+  if (!d) return null
+  if (d.pct <= critical) return 'critical'
+  if (d.pct <= low) return 'low'
+  return null
+}
+
+/**
+ * 背包 + 装备栏里**所有会磨损的东西**还剩多少耐久，**最危险的在最前**。
+ *
+ * 两处都要收：`b.inventory.items()` 只回背包那 9–44 格，**身上穿的 5/6/7/8/45 不在里面**
+ * （和 `EQUIP_SLOTS` 的注释是同一个坑）—— 不收就会"穿着快碎的头盔看不见"。
+ */
+export function toolDurability (b, { low = DUR_LOW, critical = DUR_CRITICAL } = {}) {
+  const out = []
+  const push = (it, where, slot) => {
+    const d = durabilityOf(it)
+    if (!d) return
+    out.push({
+      name: it.name, count: it.count ?? 1, slot: slot ?? null, where,
+      left: d.left, max: d.max, pct: Math.round(d.pct * 100) / 100,
+      warn: durWarnOf(it, { low, critical }),
+    })
+  }
+  try { for (const i of b?.inventory?.items?.() ?? []) push(i, 'bag', i.slot) } catch { /* 假 bot 没有就算了 */ }
+  const slots = b?.inventory?.slots
+  for (const [idx, dest] of EQUIP_SLOTS) {
+    if (Array.isArray(slots) && slots[idx]) push(slots[idx], 'equipped', dest)
+  }
+  out.sort((a, c) => a.pct - c.pct || a.left - c.left)
+  return out
+}
+
+/**
+ * 上面那行的**文字版**（给 `mc_inventory` / `mc_observe` 用）：
+ * - 全都好好的 ⇒ 一句"都还好，最紧的是 X"（**不报具体数字堆**，免得占地方）；
+ * - 有快坏的 ⇒ 只列快坏的，`🔴 马上要坏` / `⚠️ 快坏了`，并标明是不是穿在身上；
+ * - 一件会磨损的都没有 ⇒ `null`（调用方别 push 空行）。
+ */
+export function durabilityText (b, opts = {}) {
+  const list = toolDurability(b, opts)
+  if (!list.length) return null
+  const bad = list.filter((i) => i.warn)
+  if (!bad.length) {
+    const w = list[0]
+    return `耐久：${list.length} 件会磨损的东西都还好（最紧的是 ${w.name} ${w.left}/${w.max}，${Math.round(w.pct * 100)}%）`
+  }
+  const head = bad.some((i) => i.warn === 'critical') ? '🔴 马上要坏' : '⚠️ 快坏了'
+  return `${head}：` + bad.map((i) =>
+    `${i.name} ${i.left}/${i.max}（${Math.round(i.pct * 100)}%${i.where === 'equipped' ? '，穿在身上' : ''}）`).join('、')
+}
+
+/** 装备栏一行字（`头 空 · 身 铁胸甲x1 · 耐久 200/240 · 腿 空 · 脚 空 · 副手 空`） */
 export function equipmentText (b) {
   const eq = equipmentOf(b)
   return EQUIP_SLOTS.map(([, dest, label]) => `${label} ${eq[dest] ?? '空'}`).join(' · ')
@@ -139,6 +229,25 @@ export function countOf (b, name) {
 }
 
 /**
+ * 背包里每样东西各有多少（`{ 物品名: 数量 }`）。
+ * 任务执行器判"目标达成没"读的就是这张表（`src\task-exec.mjs` 的 `goalDone`）——
+ * 现场数出来的数，不是上一步工具返回的 `ok:true`。
+ * 读不到返回 `null`：空对象 `{}` 的意思是"背包确实是空的"，跟"读不到"不是一回事。
+ */
+export function invCounts (b) {
+  if (!b?.inventory?.items) return null
+  const out = {}
+  try {
+    for (const i of b.inventory.items()) {
+      const n = String(i?.name ?? '')
+      if (!n) continue
+      out[n] = (out[n] ?? 0) + (Number(i.count) || 0)
+    }
+  } catch { return null }
+  return out
+}
+
+/**
  * 选一个槽位放取来的物品。优先级：
  *   ① 已经放着**同一种**东西的槽（重复取同款不占新格，也不会覆盖别的）
  *   ② 快捷栏（36–44）的空槽
@@ -196,7 +305,12 @@ export function inventoryView (b) {
    * 用 `mc_act {mode:"equip", name, to}` 往里穿；`to` 就是这里的 head/torso/legs/feet/off-hand。 */
   const equipment = equipmentOf(b)
   lines.push(`装备栏：${equipmentText(b)}（这几格不占背包位，穿装备用 mc_act {mode:"equip"}）`)
-  return { text: lines.join('\n'), held, items, equipment }
+  /* 耐久（2026-10-15 用户点名要的）：只看"快坏的"，全都好好的就一句话带过。
+   * 以前没有这一行 —— AI 会拿一把剩 3 下的镐一直挖，挖到断掉还以为"方块挖不动"。 */
+  const tools = toolDurability(b)
+  const durLine = durabilityText(b)
+  if (durLine) lines.push(durLine)
+  return { text: lines.join('\n'), held, items, equipment, tools }
 }
 
 /**
@@ -226,7 +340,13 @@ export async function giveItem (b, { name, count = 1, slot = null } = {}, ctx = 
     ? Math.min(Math.max(Math.floor(asked), 9), 44)
     : freeSlot(b, itemName)
 
-  const item = ctx.makeItem ? ctx.makeItem(type, n) : null
+  /* 🟢 2026-10-15 审计（报告 E 第 12 条）：原来 `ctx.makeItem ? ctx.makeItem(type, n) : null`
+   *   会把 **null 传给 `setInventorySlot`** —— 那不是"什么都不做"，而是**清空那一格**。
+   *   缺 makeItem 时宁可如实报错，也别悄悄把玩家背包里那格的东西抹掉。 */
+  if (typeof ctx.makeItem !== 'function') {
+    throw new Error('创造模式取物需要 ctx.makeItem，但这次调用没给 —— 这是插件内部 bug，请报告（不要当成"取物失败"重试）')
+  }
+  const item = ctx.makeItem(type, n)
   await t(b.creative.setInventorySlot(target, item, 800), 'give', `取物 ${itemName}`)
   await sleep(120)
   const nowItem = b.inventory.slots?.[target] ?? null
@@ -283,6 +403,9 @@ export async function tossItem (b, { name = null, count = 1 } = {}, ctx = {}) {
   const lost = (snap.get(item.name) ?? 0) - (invSnap(b).get(item.name) ?? 0)
   return {
     tossed: `${item.name}x${n}`,
+    /* 🟡 2026-10-15 审计（报告 C 第 1 条）：`tossed` 永远是 `"名字xN"` 字符串（少丢时只加 `note`），
+     *   所以调用方拿 `tossed !== false` 判成功是**恒真**的。这里补一个如实的结果位。 */
+    ok: lost === n,
     ...(lost === n ? {} : { note: `背包里只少了 ${Math.max(0, lost)} 个（想丢 ${n} 个）—— 东西可能还在地上或没丢出去，用 mc_inventory 看一眼` }),
   }
 }
@@ -304,6 +427,10 @@ export async function tossItem (b, { name = null, count = 1 } = {}, ctx = {}) {
  *    所以这里还会比较"换成背包里最快的工具能快多少"，快 1.4 倍以上就换。
  */
 export async function equipFor (self, b, blk, label = '换工具', ctx = {}) {
+  /* 🟢 2026-10-15 审计（报告 E 第 12 条）：同文件其它动作（`:229`/`:268`/`:288`）都有
+   *   `const t = ctx.t ?? ((p) => p)` 兜底，只有这里直接用 `ctx.t(...)` —— 缺 ctx.t 时
+   *   TypeError 会被下面那个"换不上就照旧"的 catch 吞掉，表现为"静默不换工具"。 */
+  const t = ctx.t ?? ((p) => p)
   const heldBefore = heldText(b)
   const canNow = canHarvestNow(b, blk)
   const nowMs = digMsFor(b, blk, b?.heldItem?.type ?? null)
@@ -313,12 +440,12 @@ export async function equipFor (self, b, blk, label = '换工具', ctx = {}) {
   if (canNow && !faster) return { heldBefore, held: heldBefore, changed: false }
   try {
     if (faster) {
-      await ctx.t(b.equip(best.item, 'hand'), 'equip', label)
+      await t(b.equip(best.item, 'hand'), 'equip', label)
     } else if (self.mcPlugins?.tool && typeof b.tool?.equipForBlock === 'function') {
-      await ctx.t(b.tool.equipForBlock(blk, { requireHarvest: false }), 'equip', label)
+      await t(b.tool.equipForBlock(blk, { requireHarvest: false }), 'equip', label)
     } else {
       const pick = best?.item ?? (b.inventory?.items?.() ?? []).find((it) => blk?.harvestTools?.[it.type])
-      if (pick && b.heldItem?.name !== pick.name) await ctx.t(b.equip(pick, 'hand'), 'equip', label)
+      if (pick && b.heldItem?.name !== pick.name) await t(b.equip(pick, 'hand'), 'equip', label)
     }
   } catch { /* 换不上就照旧：调用方按"手上还是不对"如实拒绝 */ }
   const held = heldText(b)

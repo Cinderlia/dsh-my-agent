@@ -209,8 +209,8 @@ export async function apply (api) {
       x: { type: 'number', description: '指定箱子坐标 x（可选，和 y/z 一起给）' },
       y: { type: 'number', description: '指定箱子坐标 y（可选）' },
       z: { type: 'number', description: '指定箱子坐标 z（可选）' },
-      radius: { type: 'number', description: '附近找箱子的半径（默认 8，最大 32）' },
-      placeChest: { type: 'boolean', description: '附近没箱子时，是否把背包里的箱子放到脚边再用（默认 true）' },
+      radius: { type: 'number', description: '找箱子的半径（默认 8，最大 32）' },
+      placeChest: { type: 'boolean', description: '附近没箱子时自己放一个（默认 true）' },
       dryRun: { type: 'boolean', description: '只出计划，不动手（默认 false）' },
     },
     output: {

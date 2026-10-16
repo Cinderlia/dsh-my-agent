@@ -14,13 +14,27 @@
  * ⇒ 第一参数收 `self`；`#beginMove` 是私有方法、模块够不着 ⇒ 由 core 的薄包装塞进 `ctx.bumpGen`
  *（迁移规矩第 28 条；`_moveGen` 本身是下划线公开字段，模块里照旧读它判"还是不是我"）。
  */
-import { sleep, raceAbort, abortError, withTimeout } from './async-util.mjs'
+import { sleep, raceAbort, abortError, withTimeout, DESYNC_HINT } from './async-util.mjs'
 import vec3pkg from 'vec3'
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 import { callBudget, callSecText, budgetSecText, CALL_BUDGET_MS } from './budget.mjs'
 import { inWaterNow } from './world-observer.mjs'
 import { heldText, invSnap, invUsed } from './inventory.mjs'
 import { isAir, isLiquid, isPassable } from './block-names.mjs'
+import { classifyTerrainCached } from './terrain.mjs'
+import { recoverFromWater } from './water-recovery.mjs'
+
+/**
+ * 给水下恢复控制器用的执行器 —— **就是这一层已有的 `walkTo` / `swimUp`**，不另起一套按键。
+ * 用户 2026-10-15 的约束原话："实际移动仍通过现有接口执行，避免另起一套按键控制、移动代次或资源锁"。
+ * `noWaterRecover` 防递归：恢复过程中再走一次路时不许再次触发恢复。
+ */
+function recoverCtxOf (self, ctx) {
+  return {
+    walkTo: (s, p, o = {}) => walkTo(s, p, { arrive: o.arrive, budget: o.budget }, { ...ctx, noWaterRecover: true }),
+    swimUp: (s, o) => swimUp(s, o, ctx),
+  }
+}
 
 /**
  * 把走路目标的 y 收到底面：那个 y **站不住**时，往下找最近能站的一层。
@@ -277,6 +291,26 @@ export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.mo
   if (inWaterNow(b)) {
     const swim = await walkSwim(self, target, { arrive, budget }, ctx)
     const canWalk = self.pfReady && typeof b.pathfinder?.goto === 'function'
+    /* 🔴 用户点名的"水下寻路"就接在这里（2026-10-15）：**游不动了**（还泡在水里、没到目标）
+     * 就交给恢复控制器 —— 它负责**找出口、选路线、复核进度**；
+     * 真正移动仍然走这一层已有的 `walkTo` / `swimUp`，**不另起一套游泳按键控制**
+     * （用户："建议新增模块只管理水域导航策略。实际移动仍通过现有接口执行"）。
+     * `noWaterRecover` 防递归：恢复过程中再走一次路时，不许再次触发恢复。
+     * 🔴 时间不够就**别开这一趟**（用户："继续用现有预算与取消机制，避免一次出口搜索
+     *    耗尽整个工具调用预算"）—— 剩不到 1.5 秒时老实把"还在水里"报回去。 */
+    if (swim.stuck && !ctx.noWaterRecover && self.msLeft() > 1_500) {
+      const rec = await recoverFromWater(self, { budgetMs: Math.min(12_000, Math.max(0, self.msLeft() - 900)) }, recoverCtxOf(self, ctx))
+      const out = !inWaterNow(b)
+      return {
+        ...swim,
+        stuck: !out,
+        outOfWater: out,
+        waterRecover: rec,
+        hint: rec?.ok
+          ? `我**自己从水里出来了一趟**（${rec.note}）—— 原来的目标还要不要接着走，你看一眼再定。`
+          : `还在水里，而且没找到出口（${rec?.reason ?? 'unknown'}）：${rec?.note ?? ''}`,
+      }
+    }
     if (swim.arrived || !swim.outOfWater || !canWalk) return swim
     const left = self.msLeft()
     if (left < 500) return swim
@@ -357,11 +391,13 @@ export async function flyTo (self, x, y, z, { budget = CALL_BUDGET_MS } = {}, ct
    *    现在领号 + 每轮查号 + 可中断 sleep + finally 只在还是自己时 `stopFlying()`。 */
   const gen = ctx.beginMove()
   let preempted = false
+  let flying = false                       // 这次调用有没有真的 startFlying（收尾要认它，不认号）
   let last = b.entity.position.clone()
   let lastProgress = Date.now()
   self._selfMovingAt = Date.now()          // 别把自己飞当成"被传送"
   try {
     b.creative.startFlying()
+    flying = true
     while (Date.now() - t0 < bd) {
       if (self.abortSignal?.aborted) throw abortError('飞行', self.abortSignal)
       if (self._moveGen !== gen) { preempted = true; break }
@@ -383,8 +419,12 @@ export async function flyTo (self, x, y, z, { budget = CALL_BUDGET_MS } = {}, ct
     }
   } finally {
     // 🔴 必须恢复重力：否则之后走路全废（见上面 ②）
-    /* 🔴 报告⑥：只在**还是自己**的时候收飞行 —— 被接管了就别动接管者的状态。 */
-    if (self._moveGen === gen) { try { b.creative.stopFlying() } catch { /* 忽略 */ } }
+    /* 🔴 报告⑥：被接管了就别动接管者的状态。
+     * 🔴 报告 H7（2026-10-13）：但 `startFlying()` 是**这次调用**做的，重力必须由这次调用恢复 ——
+     *    以前这里也带 `_moveGen === gen` 守卫，被抢占那条路（号变了）会跳过它，而全仓没有第二处
+     *    `stopFlying` ⇒ `physics.gravity` 永久为 0（之后走路/跳跃全废，只能重连）。
+     *    判据改成"我起过飞就我收"，跟号无关：别人接管的是"继续移动"，不是"替我恢复重力"。 */
+    if (flying) { try { b.creative.stopFlying() } catch { /* 忽略 */ } }
     self._selfMovingAt = Date.now()
   }
   const p = b.entity.position
@@ -401,6 +441,164 @@ export async function flyTo (self, x, y, z, { budget = CALL_BUDGET_MS } = {}, ct
           : '创造模式直飞是**客户端位移**，服务端未必接受（反作弊/延迟）——可改用 mc_move{mode:"walk"}，或挑更近的点位。'),
     }),
   }
+}
+
+/* ══ P0-1 移动进度监控 + 自动脱困阶梯（用户 2026-10-15 方案）══════════════════
+ *
+ * 为什么要有这一层：vendor 的 pathfinder 只在"**3.5 秒没走到下一个路径节点**"时
+ * 自己 `resetPath('stuck')`（`mineflayer-pathfinder/index.js:632`）——那只是**重算**，
+ * 既不换策略，也不如实告诉模型"我卡住了"。实机表现就是用户报的：能走到附近，
+ * 但绕路、卡方块边缘、反复跳跃，最后要么谎报到达、要么无限重试。
+ *
+ * 判据（**用户特别点名的坑**："不要只根据速度为零判断卡住"）：
+ *   · 只认"**既没挪动、也没靠近**"——`剩余距离`连续 `MOVE_STUCK_MS` 没有改善才算卡住；
+ *   · 跳跃、落地、等方块更新时位置本来就不前进 ⇒ "正在挖 / 正在放 / 悬空"算**正常等待**，
+ *     把进度时钟往后推（最多推 `MOVE_BUSY_MAX_MS`，免得一直挖个不停就永远不判卡）。
+ *
+ * 脱困阶梯三级（见 `MOVE_ESCAPES`）：重算路径 → 跳跃脱困 → 后退再寻路；三级用完还是
+ * 没进展就明确报 `unreachable`，**不再无限重试**。
+ */
+export const MOVE_SAMPLE_MS = 600       // 采样间隔（用户建议 500–1000ms）
+export const MOVE_STUCK_MS = 2400       // 连续这么久"既没挪动也没靠近" ⇒ 卡住（用户建议 2–3 秒）
+export const MOVE_PROGRESS_EPS = 0.35   // 靠近这么多格才算"有进展"
+export const MOVE_BUSY_MAX_MS = 6000    // 一直挖/一直悬空超过这么久，就不再当"正常等待"
+export const MOVE_JUMP_MS = 320         // 跳跃脱困按住 jump 多久
+export const MOVE_BACK_MS = 420         // 后退脱困按住 back 多久
+/* P1：一次 `goto` 里路径被**失效**这么多次 ⇒ 别再等"没进展"了，直接进脱困阶梯。
+ * 依据：vendor 自己会在 3.5s 无节点进展时 `resetPath('stuck')`，但它只会**重算同一条**；
+ * 一个 goto 里失效这么多次，说明"光重算没用"（世界在变 / 一直被人挡），换策略才有意义。 */
+export const MOVE_RESET_LIMIT = 4
+/** 脱困阶梯（第 1 级 = `MOVE_ESCAPES[0]`）。走完还没进展 ⇒ 报 `unreachable`。 */
+export const MOVE_ESCAPES = ['repath', 'jump', 'backoff']
+
+/** 第 `n` 级脱困动作（0 起）；超出阶梯返回 `null`（= 该认输了）。 */
+export function escapeStepOf (n) { return MOVE_ESCAPES[n] ?? null }
+
+/** 脱困动作的中文名（日志 / 返回值文案用）。 */
+export function escapeTextOf (step) {
+  return step === 'repath' ? '重算路径'
+    : step === 'jump' ? '跳跃脱困'
+      : step === 'backoff' ? '后退再寻路'
+        : '放弃'
+}
+
+/**
+ * "现在算不算正常等待" —— 挖着 / 放着 / 悬空（跳跃落地中）时位置不前进是正常的。
+ * 防假 bot：字段缺了当 false（不是"忙"，照常判卡）。
+ */
+export function moveBusyNow (b) {
+  try {
+    const pf = b?.pathfinder
+    if (pf?.isMining?.() === true || pf?.isBuilding?.() === true) return true
+    return b?.entity?.onGround === false
+  } catch { return false }
+}
+
+/**
+ * 移动进度采样器（P0-1）。每 `sampleMs` 看一眼"离目标还有多远"，判卡住时 **reject**
+ * 一个带 `mcStuck: true` 的错误；其余情况永远 pending，由 `stop()` 收尾。
+ *
+ * ⚠️ 不自己按控制位：`pathfinder` 每个 physicsTick 都会把 `forward/jump/sprint`
+ *    按回去（vendor `monitorMovement`），采样器里按什么都会被立刻覆盖 —— 脱困动作
+ *    必须由调用方在"pathfinder 已经停掉"的窗口里做（见 `escapeMove`）。
+ *
+ * 注入 `now` / `setTimer` / `clearTimer` 是为了离线测试能拿假时钟驱动它。
+ *
+ * @returns {{ promise: Promise<void>, stop: () => void, info: () => object }}
+ */
+export function moveProgressWatcher (b, target, {
+  arrive = 1.6, ty = null,
+  sampleMs = MOVE_SAMPLE_MS, stuckMs = MOVE_STUCK_MS,
+  busyMaxMs = MOVE_BUSY_MAX_MS, progressEps = MOVE_PROGRESS_EPS,
+  resetsOf = null, resetLimit = MOVE_RESET_LIMIT,
+  now = () => Date.now(),
+  setTimer = (fn, ms) => setInterval(fn, ms),
+  clearTimer = (h) => clearInterval(h),
+} = {}) {
+  const goalVec = new Vec3(target.x, ty ?? target.y, target.z)
+  const distOf = () => {
+    try { return b.entity.position.distanceTo(goalVec) } catch { return Infinity }
+  }
+  let stopped = false
+  let reject = null
+  let best = distOf()
+  let lastProgressAt = now()
+  let busySince = null
+  let stuckInfo = null
+  const promise = new Promise((_, rej) => { reject = rej })
+  // ⚠️ 竞速可能先结束、采样器随后才 reject ⇒ 自己吞掉，否则是"未处理拒绝"（会炸宿主）。
+  promise.catch(() => {})
+  /** 路径被失效了几次（`resetsOf` 抛错就当 0 —— 判卡不该因为数数失败而失效）。 */
+  const resetsNow = () => { try { return resetsOf ? Number(resetsOf()) || 0 : 0 } catch { return 0 } }
+  /**
+   * 认输：收掉定时器 + reject 一个带 `mcStuck` 的错误。
+   * `thrash` = 成因是"路径一直被失效"（而不是"2.4 秒没进展"）—— 两者给模型的下一步不一样。
+   */
+  const giveUp = (d, { ms = 0, thrash = false } = {}) => {
+    stopped = true
+    try { clearTimer(timer) } catch {}
+    stuckInfo = { ms, remaining: Number(d.toFixed(2)), ...(thrash ? { thrash: true, resets: resetsNow() } : {}) }
+    const err = new Error(thrash
+      ? `路径被反复失效（这一次 goto 里被重算了 ${resetsNow()} 次）—— 光重算没用（离目标还有 ${d.toFixed(1)} 格）`
+      : `移动卡住：${(stuckMs / 1000).toFixed(1)} 秒里既没挪动、也没靠近（离目标还有 ${d.toFixed(1)} 格）`)
+    err.mcStuck = true
+    err.remaining = Number(d.toFixed(2))
+    if (thrash) err.mcPathThrash = true
+    reject(err)
+  }
+  const timer = setTimer(() => {
+    if (stopped) return
+    const t = now()
+    const d = distOf()
+    if (d <= arrive + 0.6 || d < best - progressEps) {
+      // 到了 / 真的靠近了 —— 有进展，进度时钟归零（**在进展面前，失效次数不算数**：
+      // 一直被打断但还在往前挪，那就让它挪）
+      best = Math.min(best, d)
+      lastProgressAt = t
+      busySince = null
+      return
+    }
+    if (moveBusyNow(b)) {
+      // 挖着 / 放着 / 悬空：算正常等待，推后进度时钟（但最多推 busyMaxMs）
+      if (busySince == null) busySince = t
+      if (t - busySince < busyMaxMs) { lastProgressAt = t; return }
+    } else busySince = null
+    /* P1：**路径失效重算** —— vendor 自己会 `resetPath('stuck')` 重算，但它只重算**同一条**。
+     * 一个 `goto` 里"没进展 + 又失效了太多次" ⇒ 世界在变 / 一直被挡，"光重算没用"，
+     * 直接进脱困阶梯换策略，不用再等满 `stuckMs`。 */
+    if (resetsOf && resetLimit > 0 && resetsNow() >= resetLimit) { giveUp(d, { ms: t - lastProgressAt, thrash: true }); return }
+    if (t - lastProgressAt >= stuckMs) giveUp(d, { ms: t - lastProgressAt })
+  }, sampleMs)
+  return {
+    promise,
+    stop () { if (stopped) return; stopped = true; try { clearTimer(timer) } catch {} },
+    info: () => ({ best: Number(best.toFixed(2)), stuck: stuckInfo }),
+  }
+}
+
+/**
+ * 走一级脱困动作（P0-1）。**必须在"pathfinder 已经停掉"的窗口里跑**：
+ * 先 `ctx.stopPathing(b)`（`setGoal(null)` ⇒ `resetPath` + `clearControlStates`），
+ * 否则 vendor 每个 physicsTick 都会把 `forward/jump` 按回去，我们按什么都被立刻覆盖；
+ * 顺带让上一轮的 `goto` 以 `GoalChanged` 收场（调用方已经 `.catch(()=>{})`）。
+ *
+ * ⚠️ 三级动作**都不换 goal 对象** —— vendor 的 `goto` 监听 `goal_updated`，换了对象
+ *    就直接以 `GoalChanged` 拒绝（`lib/goto.js:35`），等于把这次走路判死。
+ */
+export async function escapeMove (b, goal, step, ctx = {}) {
+  try { ctx.stopPathing?.(b) } catch {}
+  await sleep(60)                       // 让 pathfinder 的 physicsTick 把控制位松开
+  if (step === 'jump') {
+    try { b.setControlState('jump', true) } catch {}
+    await sleep(MOVE_JUMP_MS)
+    try { b.setControlState('jump', false) } catch {}
+  } else if (step === 'backoff') {
+    // 贴墙/贴角时原地重算还是同一条死路 —— 先退开半步再重算
+    try { b.setControlState('back', true) } catch {}
+    await sleep(MOVE_BACK_MS)
+    try { b.setControlState('back', false) } catch {}
+  }
+  // 'repath' 不做额外动作：重新 `goto` 本身就是一次重算
 }
 
 /**
@@ -421,8 +619,15 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   const ty = standableY(b, target.x, target.y, target.z)
   const goal = new goals.GoalNear(Math.floor(target.x), ty, Math.floor(target.z),
     Math.max(0, Math.round(arrive - 0.6)))
-  const mv = ctx.movements()
+  // 地形分类（导航 P2，用户 m02868 的"地形分类 + 路径评分"）：
+  // **只换权重，不换算法** —— 台阶上把挖穿调便宜一点、沟边把垫方块调便宜一点、
+  // 岩浆边一格都不许往下跳。看错了顶多走回原来的路，不会让机器人做危险动作。
+  const terrain = classifyTerrainCached(b)
+  const mv = ctx.movements(terrain)
   if (!mv) throw new Error('pathfinder 的 Movements 造不出来（插件没挂上？）')
+  if (terrain.kind !== 'flat' && terrain.kind !== 'unknown') {
+    self.log(`🧭 脚边是${terrain.text}（${terrain.note}）—— 按这一类调寻路权重`)
+  }
   // 🔴 上一次 `mc_dig` 超时可能留下一个还在后台跑的采集任务（它按着 forward、
   //    占着 pathfinder）—— 不先停掉，这次走路会和它抢控制权：实机表现是
   //    "15 秒只挪 0.03 格、reason:stuck"。见 #cancelCollect 的注释。
@@ -458,7 +663,18 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
      *    到不了的点。这里把"空路径的 noPath"单独记下来。 */
     if (r?.status === 'noPath' && Array.isArray(r?.path) && r.path.length === 0) emptyNoPath = true
   }
-  const onReset = (reason) => { why = reason }
+  /* P1：**路径失效计数** —— vendor 会在 3.5s 无节点进展时 `resetPath('stuck')`，另外还有
+   * `block_updated` / `path_stopped` / `goal_updated` 等理由。同一个 `goto` 里反复失效
+   * = 这条路一直在被世界变化（别人放的方块、实体、岩浆流）打断，**光重算没用**。 */
+  let pathResets = 0                 // 本轮 goto（每一轮都归零）
+  let pathResetsTotal = 0            // 整次调用
+  const resetReasons = {}
+  const onReset = (reason) => {
+    why = reason
+    pathResets++; pathResetsTotal++
+    const k = String(reason ?? 'unknown')
+    resetReasons[k] = (resetReasons[k] ?? 0) + 1
+  }
   const onDig = () => { dug++ }
   const onBlock = (oldB, newB) => { if (oldB && newB && oldB.boundingBox !== 'block' && newB.boundingBox === 'block') placed++ }
   // ⚠️ 事件名要防着"假 bot"（自检里的最小物理 bot 没有 on/removeListener）
@@ -466,16 +682,72 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   const listen = (ev, fn) => { if (typeof b.on === 'function') { b.on(ev, fn); off.push([ev, fn]) } }
   listen('path_update', onUpdate); listen('path_reset', onReset)
   listen('diggingCompleted', onDig); listen('blockUpdate', onBlock)
-  const work = b.pathfinder.goto(goal)
-  work.catch(() => {})                             // 下面 race 可能先结束：别让它变成"未处理拒绝"（会炸宿主）
+  /* P0-1：一次 `goto` 到底不够 —— 卡住时按阶梯换策略再试（见上面的常量注释）。
+   * 每一轮都是**全新的 `goto(同一个 goal 对象)`**：重发前先由 `escapeMove` 把上一轮真停掉，
+   * 所以不会攒下重复的 `goal_reached` 监听器。 */
+  let repathCount = 0
+  /* P1：其中有多少次是**因为路径被反复失效**而进阶梯的（不是"没进展"）—— 分开报，
+   * 因为给模型的下一步不同：一个该换目标点，一个该先看看世界在变什么。 */
+  let pathThrash = 0
+  let watch = null
+  /** 脱困次数（P0-1）与路径失效次数（P1）：>0 才报 —— 模型据此知道"这次走得磕磕绊绊"。
+   *  外加地形分类（P2）：只有不是平地时才报（平地是默认，报了纯占地方）。 */
+  const moveInfo = () => ({
+    ...(terrain.kind === 'flat' || terrain.kind === 'unknown' ? {} : { terrain: terrain.kind }),
+    ...(repathCount ? { repathCount } : {}),
+    ...(pathThrash ? { pathThrash } : {}),
+    ...(pathResetsTotal >= 2 ? { pathResets: pathResetsTotal, pathResetReasons: { ...resetReasons } } : {}),
+  })
   try {
-    await raceAbort(withTimeout(work, budget, '寻路'), self.abortSignal, '寻路')
+    for (let attempt = 0; ; attempt++) {
+      if (attempt > 0) {
+        const step = escapeStepOf(attempt - 1)
+        if (!step) {
+          // 阶梯走完还是没进展 —— 如实认输，**不再无限重试**
+          const err = new Error(`脱困阶梯用完了（重算 ${repathCount} 次）还是走不动`)
+          err.mcStuck = true
+          err.mcExhausted = true
+          throw err
+        }
+        repathCount++
+        self.log(`🔁 走不动了 → 第 ${attempt} 级脱困：${escapeTextOf(step)}（累计重算 ${repathCount} 次）`)
+        await escapeMove(b, goal, step, ctx)
+      }
+      pathResets = 0                               // 本轮重新数（脱困动作自己也会 reset 一次）
+      const work = b.pathfinder.goto(goal)
+      work.catch(() => {})                         // race 可能先结束：别让它变成"未处理拒绝"（会炸宿主）
+      // `ctx.watchOpts` 是给离线测试注入假时钟用的（不然一套断言要真等 2.4 秒 × 4 轮）
+      watch = moveProgressWatcher(b, target, {
+        arrive, ty, resetsOf: () => pathResets, ...(ctx.watchOpts ?? {}),
+      })
+      try {
+        await Promise.race([
+          // 总时间仍以 `budget` 为界（脱困动作也吃时间，所以这里用**剩余**预算）
+          raceAbort(withTimeout(work, Math.max(200, budget - (Date.now() - t0)), '寻路'),
+            self.abortSignal, '寻路'),
+          watch.promise,
+        ])
+        watch.stop(); watch = null
+        break                                      // 正常结束（到了 / 普通失败）⇒ 下面照旧复核距离
+      } catch (e) {
+        watch.stop(); watch = null
+        if (e?.mcPathThrash) pathThrash++          // P1：这次是被"路径反复失效"逼进阶梯的
+        if (e?.mcStuck) continue                   // 卡住 ⇒ 下一轮走脱困阶梯
+        throw e
+      }
+    }
     const end = b.entity.position
     // 复核距离要用**收过的 ty**（不然目标 y 在半空时，明明站到它脚下了也会被判成"还差 9 格"）
     const left = end.distanceTo(new Vec3(target.x, ty, target.z))
+    /* P1：**到达判定分两轴看** —— 只看三维距离会漏掉一种假成功：水平已经到位、垂直却差着一两格
+     * （站在目标正上方/正下方，比如目标格旁边有个坑），三维距离照样小于阈值 ⇒ 被报成"到了"。
+     * 水平仍用 `arrive + 1.0`（宽松，允许"到附近"）；垂直卡在 ±1.5 格（一步台阶以内）。 */
+    const horiz = Math.hypot(end.x - target.x, end.z - target.z)
+    const vert = end.y - ty
+    const vertBad = vert < -1.5 || vert > 1.5
     // ⚠️ 现成的插件报"到了"，也**自己核一遍距离**：`goal_reached` 个别情况会早一点
     //    （目标格被占住 / 站在半砖上 / 只到附近），盲信就又变成"谎报 arrived"。
-    if (left > arrive + 1.0) {
+    if (left > arrive + 1.0 || vertBad) {
       // 🔴 先分清"插件真的早报"还是"别人的 goal_reached 把我这次 goto 一起 resolve 了"。
       //    vendor 的 lib/goto.js:60 监听的是 bot 上的**全局** `goal_reached`，`goalReached()`
       //    连事件带的 goal 参数都不看 ⇒ 自主层的逃跑/跟随同时在走时，**它**到点会顺手把
@@ -494,7 +766,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           remaining: Number(left.toFixed(2)),
           moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
           via: 'pathfinder', stuck: true, reason: 'preempted',
-          ...roadInfo(),
+          ...roadInfo(), ...moveInfo(),
           hint: `这次走路被**另一次移动**接管了（旁边有怪时是自保反射先跑，也可能是又发了一次 mc_move）：`
             + `我从 ${startRemaining.toFixed(1)} 格挪到了 ${left.toFixed(1)} 格，但走到目标的是那一份。`
             + '等它结束，再叫一次 mc_move 往同一个目标走就行，**不是走不通**。',
@@ -505,6 +777,23 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
        *    · `mine === false`：vendor 的 `goal_reached` 是**全局**事件（`lib/goto.js:60`），
        *      自主层的逃跑/跟随到点时会顺手把我这次 goto resolve 掉 ⇒ 只是被别人的到点顶了。
        *    旧代码两种都报 `preempted` + "不是走不通"，把"死路"说成"再叫一次就行"。 */
+      /* P1：**"站错层"要优先于"别人的锅"报出来** —— 水平已经到位（`horiz` 落在"到附近"以内）
+       * 却差了 1.5 格以上的高度时，成因是**这一层站错了**，不是"另一次寻路到点把我顶掉"、
+       * 也不是"没路"。⚠️ 旧代码在这条路上会一路落进下面 `mine === false` 那条诊断：插件自己的
+       * `GoalNear` 是**三维球**（半径 `round(arrive-0.6)`），人站在上层它当然不满足 ⇒ `mine` 为假，
+       * 于是把"高度不对"说成"别人的锅"，模型就一直重叫同一个目标。 */
+      if (vertBad && horiz <= arrive + 1.0) {
+        return {
+          arrived: false, position: at(end), ms: Date.now() - t0,
+          remaining: Number(left.toFixed(2)),
+          moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
+          via: 'pathfinder', stuck: true, reason: 'goal_reached-but-far', ...moveInfo(),
+          // P1：把两个轴分开报 —— 否则"水平到了但高了两格"看起来和"还差 5 格"一模一样
+          horiz: Number(horiz.toFixed(2)), vert: Number(vert.toFixed(2)),
+          hint: `寻路插件说到了，但**高度不对**：水平只差 ${horiz.toFixed(1)} 格，垂直差了 ${Math.abs(vert).toFixed(1)} 格`
+            + `（我${vert > 0 ? '站在目标上方' : '站在目标下方'}）—— 先 \`mc_move\` 走到目标**同一层**，或换个目标点。`,
+        }
+      }
       if (emptyNoPath || mine === false) {
         return {
           arrived: false, position: at(end), ms: Date.now() - t0,
@@ -512,10 +801,12 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
           via: 'pathfinder', stuck: true,
           reason: emptyNoPath ? 'NoPath' : 'goal-reached-elsewhere',
-          ...roadInfo(),
+          ...roadInfo(), ...moveInfo(),
           hint: emptyNoPath
             ? `寻路**没路可走**（被墙 / 水 / 悬崖挡住，或目标在实心方块里）：离目标还有 ${left.toFixed(1)} 格。`
-              + '换个目标点，或先挖开挡路的那块方块 —— 再叫一次 mc_move 也还是走不通。'
+              + '先 `mc_scan` 看挡路的是什么：是方块就 `mc_act{mode:"break"}` 挖开；'
+              + '**是沟/缺口就 `mc_act{mode:"bridge"}`**（寻路插件不会水平搭桥，只会报没路）——'
+              + '朝对岸那一格铺过去（x/y/z 给对岸**脚下一层**的坐标）。换个目标点再叫 mc_move 也一样走不通。'
             : `寻路插件报的"到了"**不是我这次的目标**（另一次寻路到点时顺手把我这次 goto 一起 resolve 掉了）`
               + `—— 我还在 ${left.toFixed(1)} 格外：等它结束，再叫一次 mc_move 往同一个目标走就行，**不是走不通**。`,
         }
@@ -524,7 +815,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         arrived: false, position: at(end), ms: Date.now() - t0,
         remaining: Number(left.toFixed(2)),
         moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
-        via: 'pathfinder', stuck: true, reason: 'goal_reached-but-far',
+        via: 'pathfinder', stuck: true, reason: 'goal_reached-but-far', ...moveInfo(),
         hint: `寻路插件说到了，但离目标还有 ${left.toFixed(1)} 格（可能被占住或只到附近）—— 再走一次，或换个目标点。`,
       }
     }
@@ -537,15 +828,22 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
        * 测试脚本只能打 `-`，看着像"谎报到达"）。 */
       remaining: Number(left.toFixed(2)),
       via: 'pathfinder',
-      ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(),
+      ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(), ...moveInfo(),
     }
   } catch (e) {
     if (e?.mcAborted) throw e
     const end = b.entity.position
     const moved = Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2))
     const remaining = Number(end.distanceTo(new Vec3(target.x, ty, target.z)).toFixed(2))
-    const nm = e?.mcTimeout ? `走了 ${Math.round((Date.now() - t0) / 1000)} 秒还没到`
-      : e?.name === 'NoPath' ? '寻路说**没路可走**（被墙/水/悬崖挡住，或目标在实心方块里）'
+    /* P0-1：`mcStuck` = 采样器判卡住（脱困阶梯走完还没进展）—— 这跟"时间用完了"、
+     * "被抢占"、"没路可走"都是**不同结局**，必须分开报，否则模型会继续原地重发。 */
+    const exhausted = Boolean(e?.mcStuck)
+    const nm = exhausted
+      ? (pathThrash
+        ? `**路一直在被改 / 一直被挡**（脱困 ${repathCount} 次，其中 ${pathThrash} 次是"路径被反复失效"）`
+        : `**真的走不动了**（原地试了 ${repathCount} 次脱困：重算路径 / 跳跃 / 后退，位置都没改善）`)
+      : e?.mcTimeout ? `走了 ${Math.round((Date.now() - t0) / 1000)} 秒还没到`
+      : e?.name === 'NoPath' ? '寻路说**没路可走**（被墙/水/悬崖/沟挡住，或目标在实心方块里）'
         : e?.name === 'Timeout' ? '寻路想路线超时'
           : e?.name === 'PathStopped' || e?.name === 'GoalChanged' ? '寻路被打断'
             : `寻路失败（${e?.name ?? '错误'}：${String(e?.message ?? '').slice(0, 80)}）`
@@ -555,7 +853,15 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     //    一整轮时，预算到点的 `msLeft()` 还剩 ~1 秒 → 判成"真走不通"，
     //    于是模型被告知"换个目标点"，明明再叫一次就能接着走。
     const cutByCall = Boolean(e?.mcCallOver) || self.msLeft() <= 400
-      || (Boolean(e?.mcTimeout) && budget <= Number(budgetAsked ?? budget) + 50)
+    /* 🔴 2026-10-15 审计（报告 C 第 4 条）：这里原来还有第三个析取
+     *    `Boolean(e?.mcTimeout) && budget <= Number(budgetAsked ?? budget) + 50` ——
+     *    而 `budget = min(callBudget(budgetAsked), leftMs)` **恒 ≤ budgetAsked**；`budgetAsked` 缺省时
+     *    退化成 `budget <= budget + 50`，也恒真 ⇒ 整个条件**恒真**（`reason: 'timeout'` 那条分支
+     *    因此永远走不到）。副作用更糟：下面 `noProgress && !cutByCall` 那条"真没走通"永远为假，
+     *    一格没挪也会被告知"这一轮的走路时间用完了、**不是走不通**" —— 正是 2026-10-08 那次审计
+     *    要修的病。改成如实区分两件事：`cutByCall`（这一轮的时间用完了）与 `timeUp`（预算到点）。
+     *    注意 `timeUp` **不能**再退回"恒真" —— 它只用于选文案，判据是"内部计时器真的响过"。 */
+    const timeUp = cutByCall || Boolean(e?.mcTimeout)
     // 被抢占（自保反射先跑 / 又发了一次 mc_move）：编号已经不是我的了。
     // 这跟"走不通"完全是两回事 —— 必须说清楚，否则模型会以为目标不可达。
     const preempted = self._moveGen !== gen
@@ -574,6 +880,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
      *    10 秒明明正常挪了 32 格、只是预算到点，模型看到 "path-reset" 却会以为路被重置了、
      *    以为走不通。时间到点 + 有进展 ⇒ 如实报 budget/timeout。 */
     const reasonOut = preempted ? 'preempted'
+      : exhausted ? 'unreachable'
       : (e?.mcTimeout && !noProgress ? (cutByCall ? 'budget' : 'timeout')
         : (why ? (REASON_TEXT[why] ?? 'path-reset') : (PF_ERR.has(String(e?.name)) ? String(e.name) : 'walk-failed')))
     return {
@@ -585,22 +892,42 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       via: 'pathfinder',
       stuck: true,
       reason: reasonOut,
-      ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(),
+      ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(), ...moveInfo(),
       hint: `${nm}（从 ${startRemaining.toFixed(1)} 格变成 ${remaining.toFixed(1)} 格，挪了 ${moved} 格）`
+         // 地形那一句（导航 P2）：只在**真有用**的时候说 —— 沟要说"用 bridge"，
+         // 危险地形要说"别走这边"，平地/未知不说（说了纯占地方）
+         + (!preempted && terrain.kind === 'gap'
+           ? `—— 你脚边是**${terrain.text}**（${terrain.note}）：别绕着试了，直接 \`mc_act {mode:"bridge"}\` 朝目标搭过去。`
+           : !preempted && terrain.kind === 'hazard'
+             ? `—— 你脚边是**${terrain.text}**（${terrain.note}）：别从这边走，换个方向绕。`
+             : '')
          + (preempted
            ? '—— 这次走路被**另一次移动**打断了（旁边有怪时是自保反射先跑，也可能是又发了一次 mc_move）：等它结束，再叫一次 mc_move 往同一个目标走就行，**不是走不通**。'
-           : noProgress && !cutByCall
+           : exhausted
+             ? (pathThrash
+               ? `—— 这一轮**路径被重算了 ${pathResetsTotal} 次**`
+                 + `（${Object.entries(resetReasons).map(([k, v]) => `${REASON_TEXT[k] ?? k}×${v}`).join('、')}）：`
+                 + '说明**路一直在被世界变化打断**（别人放的方块 / 走过来的实体 / 岩浆流 / 方块更新），'
+                 + '不是"找不到路"——光重算没用，所以停了。**换个走法**：'
+               : '') + `—— **别原地重试了**（已经替你换过 ${repathCount} 次策略都没用）：把长路**拆成几段**，`
+               + '先走到中间一个能站住的点、再走下一段；或者用 `mc_scan` 看挡在中间的是什么（墙 / 水 / 栅栏 / 半砖）。'
+               + '　要是"脚下明明没东西却还是走不动"，可能是我这边的世界和服务端对不上（客户端预测的方块缓存）——'
+               + '走远 32 格再回来让区块重发。'
+               + DESYNC_HINT
+             : noProgress && !timeUp
              ? '—— **是真没走通**（一格没挪、也没靠近）：先 `mc_act {mode:"jump"}` 蹦一下（可能是卡在方块里 / 台阶上），再 `mc_scan` 看脚下和目标那格是什么；换个近一点的目标点通常更快。'
                   + '　要是"脚下明明没东西却还是走不动"，可能是我这边的世界和服务端对不上（客户端预测的方块缓存）——'
-                  + '`mc_connect {force:true}` 重连一次刷新区块。（2026-10-08 实机见过一次"11 秒挪 0.01 格"，'
-                  + '两种几何各试 4 次都没能复现，先留着这条排查建议。）'
-             : cutByCall
+                  + '走远 32 格再回来让区块重发。'
+                  + DESYNC_HINT
+             : timeUp
                ? `—— 这一轮的走路时间用完了（单次调用最多 ${budgetSecText()}），**不是走不通**：直接再叫一次 mc_move 往同一个目标走，会接着走。`
                : noProgress
                  ? '—— 这一轮**一格没挪**（时间到了，但也没靠近）：再叫一次 mc_move 试试；两次都一样就换个目标点。'
                  : '—— 换个能走到的目标点，或先解除挡住它的方块。'),
     }
   } finally {
+    // P0-1：采样器的定时器必须收掉 —— 留着会把进程钉住（也会在返回之后误判"卡住"）。
+    try { watch?.stop() } catch {}
     for (const [ev, fn] of off) { try { b.removeListener?.(ev, fn) } catch {} }
     // 🔴 只有"我还是最新那次移动"才允许收尾（停 pathfinder + 松控制位）。
     //    被抢占时绝不能动：否则会把正在走的那一份一起停掉 —— 实机表现就是

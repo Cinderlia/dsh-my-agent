@@ -11,7 +11,7 @@
  *   · 读宽容（坏文件按空跑、绝不抛）、写克制（失败只记 `lastError`）。
  * ============================================================================
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** 文件名（与 accounts.json / config.json 同在状态目录根级） */
@@ -26,6 +26,8 @@ export class ServerHistory {
     this.file = join(dir, SERVERS_FILE)
     this.data = { version: 1, recent: [] }
     this.lastError = null
+    this._loadFailed = false
+    this._loadError = null
     this.load()
   }
 
@@ -40,13 +42,22 @@ export class ServerHistory {
     } catch (e) {
       this.data = { version: 1, recent: [] }
       this.lastError = `服务器历史读取失败（已按空跑）：${e.message}`
+      /* 🟡 2026-10-15 审计（报告 E 第 9 条）：`lastError` 全仓无人读 ⇒ 读失败静默按空跑。
+       *   另开一对只读访问器给 UI 用（见 `loadFailed` / `loadError`）。 */
+      this._loadFailed = true
+      this._loadError = this.lastError
     }
   }
 
   save () {
     try {
       if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true })
-      writeFileSync(this.file, JSON.stringify(this.data, null, 2) + '\n', 'utf8')
+      /* 🟡 2026-10-15 审计（报告 E 第 9 条）：原来直接 `writeFileSync` —— 写一半断电/被杀就留下
+       *   半个 JSON（下次启动就是"读失败"，历史全空）。与 `src/wsconfig.mjs:112-116` 统一成
+       *   先写临时文件再 rename（同分区上原子）。 */
+      const tmp = `${this.file}.tmp`
+      writeFileSync(tmp, JSON.stringify(this.data, null, 2) + '\n', 'utf8')
+      renameSync(tmp, this.file)
       return true
     } catch (e) {
       this.lastError = `服务器历史写入失败：${e.message}`
@@ -57,12 +68,18 @@ export class ServerHistory {
   /** 最近优先的地址列表（副本） */
   list () { return this.data.recent.slice() }
 
+  /** 读失败过没有（`load()` 里按空跑时的原因）—— UI 用它提示"历史可能丢了" */
+  get loadFailed () { return Boolean(this._loadFailed) }
+  get loadError () { return this._loadError ?? null }
+
   /** 记一条（去重、最近优先、封顶）。空串忽略。返回最新列表。 */
   record (address) {
     const addr = String(address ?? '').trim()
     if (!addr) return this.list()
     this.data.recent = [addr, ...this.data.recent.filter((a) => a !== addr)].slice(0, MAX_SERVERS)
-    this.save()
+    /* 🟡 2026-10-15 审计（报告 E 第 9 条）：`save()` 失败只记 `lastError`，全仓无人读 ——
+     *   用户以为记下了，其实没落盘。这里补一行日志（有 logger 才打）。 */
+    if (!this.save()) try { this.logger?.warn?.(this.lastError) } catch { /* 日志失败无所谓 */ }
     return this.list()
   }
 

@@ -30,7 +30,7 @@
  *
  * 本模块不 import `core.mjs`（只认 `{ _client }` 这一样）。
  */
-import { sleep, abortError } from './async-util.mjs'
+import { sleep, abortError, waitUntil } from './async-util.mjs'
 import { isLiquid } from './block-names.mjs'
 import { stateNameOf } from './world-observer.mjs'
 
@@ -160,10 +160,11 @@ export async function awaitServerBreak (b, watch, { maxMs = 1_200, callLeft = nu
   const raw = typeof callLeft === 'function' ? callLeft() : callLeft
   const left = Number.isFinite(Number(raw)) ? Number(raw) : 11_000
   const cap = Math.max(0, Math.min(Number(maxMs) || 0, left - 500))
-  const t0 = Date.now()
-  while (!watch.hit() && Date.now() - t0 < cap) {
-    if (signal?.aborted) throw abortError('等挖掘回包')
-    await sleep(60)
-  }
+  /* 🔴 2026-10-15 审计：服务端已经发了**复原包**（`restored()` 非 null）就说明这次破坏被拒了，
+   *    再等满 `cap` 只是白花预算（`dig` 里每个失败目标约 1.2s）—— 提前收工。
+   * 2026-10-15 异步方案 ②：手写轮询收口到 `waitUntil`（两个收工条件合成一个判据）。 */
+  const r = await waitUntil(() => watch.hit() || watch.restored?.() != null,
+    { ms: cap, pollMs: 60, signal, label: '等挖掘回包' })
+  if (r.reason === 'aborted') throw abortError('等挖掘回包')
   return watch.hit()
 }

@@ -21,7 +21,7 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 
 let pass = 0, fail = 0
 const ok = (cond, label, extra = '') => {
@@ -282,7 +282,11 @@ const useSrc = strip(readFileSync(new URL('../src/world-use.mjs', import.meta.ur
   /* `bot.lookAt(point, force)`：**force=true** 时 mineflayer 立刻 return（physics.js:352-356）；
    * 不带 force 才会 `await lookingTask.promise` —— 那个 promise 只在物理循环发出 look 包时 finish，
    * 站着不动/骑乘/刚死时物理循环 early return（physics.js:158-162）⇒ 永远挂着。 */
-  const lookLines = coreSrc.split('\n').filter((l) => /b\.lookAt\(/.test(l))
+  /* 🔴 2026-10-15 审计：这些 `b.lookAt(...)` 的调用点早就搬到 `src\movement.mjs` /
+   *    `src\place.mjs` 了（`core.mjs` 里一处都没有 ⇒ 旧断言 `lookLines.length > 0` 一直红着）。 */
+  const lookLines = ['../src/movement.mjs', '../src/place.mjs', '../src/camera.mjs', '../src/world-use.mjs']
+    .flatMap((f) => strip(readFileSync(new URL(f, import.meta.url), 'utf8')).split('\n'))
+    .filter((l) => /b\.lookAt\(/.test(l))
   ok(lookLines.length > 0 && lookLines.every((l) => /, true\)/.test(l)),
     'b.lookAt(...) 一律带 force=true（不带会在"站着不动/骑乘/刚死"时挂住）',
     lookLines.map((l) => l.trim().slice(0, 34)).join(' | '))
@@ -308,9 +312,12 @@ const useSrc = strip(readFileSync(new URL('../src/world-use.mjs', import.meta.ur
     && /from '\.\/mining\.mjs'/.test(coreSrc),
     'dig 兜底分支如实说"没挖成"（实现已搬到 src\\mining.mjs，core 有薄包装且确实导入）')
   /* 路线图第 ④ 条第二十七刀：`equip` 已搬进 `src\world-use.mjs`（core 只剩薄包装）。 */
+  /* 🔴 2026-10-15 审计（报告 C 第 1 条）：`equip()` 以前只返回 `held`，"换没换上"看不出来
+   *    （`stepOk` 只能拿"字段存在"当成功）⇒ 现在**真的复核**，并如实返回 `equipped`。 */
   ok(/export function heldText \(b\)/.test(invSrc) && /heldText\(b\)/.test(mineSrc)
-    && /const ok = b\.heldItem\?\.name === item\.name/.test(useSrc),
-    'equip 的 held 读回来（heldText 在 inventory.mjs，equip 实现在 world-use.mjs）')
+    && /const got = isHand \? b\.heldItem\?\.name === item\.name : now\?\.name === item\.name/.test(useSrc)
+    && /equipped: got,/.test(useSrc),
+    'equip 的 held 读回来，并且如实返回 equipped（heldText 在 inventory.mjs，equip 实现在 world-use.mjs）')
   // 路线图第 ④ 条第三十六/三十七刀：`walkTo` / `#walkPathfinder` 已搬进 `src\movement.mjs`。
   const movSrc = strip(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8'))
   ok(/const noProgress = moved < 0\.6/.test(movSrc) && /是真没走通/.test(movSrc)

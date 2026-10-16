@@ -176,7 +176,9 @@ const runSrc = readFileSync(new URL('src/runtime.mjs', root), 'utf8')
   ok(/globalThis\.__dshMcAgentLogged/.test(logSrc), 'logOnce 用 globalThis 判重（跨模块实例）')
   ok(/function logLimits \(\)/.test(logSrc) && /process\.env\.MC_LOG_MAX_BYTES/.test(logSrc) && /\.slice\(keep\)/.test(logSrc),
     '轮转上限是**现读**环境变量（搬进单例模块后不能在加载时读死）')
-  ok(/if \(!this\.stopped\) this\.log\('连接结束'/.test(coreSrc), '主动下线不再打「连接结束」两行')
+  /* 🔴 2026-10-15：这行代码早就搬进 `src/connection.mjs`（而且实例变量改名成了 `self.`）
+   *    ⇒ 旧断言在 `core.mjs` 里找 `this.` 版，从拆分那天起一直红着。 */
+  ok(/if \(!self\.stopped\) self\.log\('连接结束'/.test(connSrc), '主动下线不再打「连接结束」两行（实现已搬到 src/connection.mjs）')
   ok(/已进入 \$\{sub \|\| '主服'\}/.test(connSrc) && /后重连 \$\{sub \|\| '主服'\}/.test(connSrc),
     '`sub` 为空时显示「主服」（不再出现双空格）')
   ok(/这一轮的时间用完了（还剩/.test(runSrc) && /from '\.\/runtime\.mjs'/.test(coreSrc),

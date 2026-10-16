@@ -132,6 +132,7 @@ const clone = (v) => JSON.parse(JSON.stringify(v))
 /** 事件类型 → 中文标签（写进给 AI 的消息里） */
 const LABEL = {
   mention: '有人喊我',
+  topical: '延续话题',              // 🟡 2026-10-15 审计（报告 H 第 6 条）：原来借用 mention 的标签，会印成"有人喊我"
   nearbySpeech: '身边有人说话',
   anyChat: '有人说话',
   damage: '我受到攻击/低血',
@@ -433,8 +434,12 @@ export class Watchdog {
         })
         return
       }
-      // 不会重连了：关掉看门狗（notify 默认开 → AI 会收到"你已不在 MC 里"的提示）
-      try { this.disarm(`连接断开：${reason}`) } catch { /* 关不掉也不能让它把流程带走 */ }
+      // 不会重连了：关掉看门狗
+      // 🔴 2026-10-15 审计（报告 H 第 1 条）：这里原来写 `this.disarm(\`连接断开：${reason}\`)`，
+      //    而 `disarm(reason, { notify = false })` 的 notify **默认 false** ⇒ 下面 `if (notify && …)`
+      //    永不成立 ⇒ 掉线时 AI 收不到"你已经不在 MC 里了"（旧注释写的"notify 默认开"是假的）。
+      //    掉线是最该通知的一种情况，必须显式传。
+      try { this.disarm(`连接断开：${reason}`, { notify: true }) } catch { /* 关不掉也不能让它把流程带走 */ }
     })
 
     on('chat', ({ who, text }) => {
@@ -445,7 +450,9 @@ export class Watchdog {
       const why = []
       if (called.length && this.config.wakeOn.mention) why.push('mention')
       if (near && this.config.wakeOn.nearbySpeech) why.push('nearbySpeech')
-      if (!why.length && topical) why.push('mention')          // 延续话题
+      // 🟡 2026-10-15 审计（报告 H 第 6 条）：延续话题原来 push('mention')，于是注入标题会印成
+      //    【有人喊我】—— 其实这次根本没点名，只是刚醒过、话题还没断。给它自己的标签。
+      if (!why.length && topical) why.push('topical')
       // 兜底：任何玩家说话都叫醒（2026-10-06 用户要求，理由见文件头）。放最后：
       // 前面几条都没命中时才用，标签是"有人说话"，AI 看得出这次不是被点名。
       if (!why.length && this.config.wakeOn.anyChat) why.push('anyChat')
@@ -461,9 +468,22 @@ export class Watchdog {
 
     on('damage', (e) => {
       if (!this.config.wakeOn.damage) return this.#suppress('damage')
-      // 在水里掉血**多半是憋气**（溺水），不是被打 —— 写清楚，免得 AI 跑去找一个不存在的远程怪
+      // 在水里掉血**多半是憋气**（溺水），不是被打 —— 写清楚，免得 AI 跑去找一个不存在的远程怪。
+      // 🟡 2026-10-15 审计（报告 H 第 5 条）：判据原来是 `entity.isInWater`，而
+      //    `extensions/mc_auto.mjs:244` 的实机注释已经证明它**在水柱里读出来是 undefined**
+      //    （prismarine-physics 的入水 AABB 从底部缩了 0.401）⇒ 憋气掉血时这里一声不响，
+      //    AI 反而去找不存在的远程怪。改成"头（眼睛）那一格是不是液体"，与 mc_auto 一致。
       let wet = ''
-      try { if (this.sess?.bot?.bot?.entity?.isInWater) wet = '（我在水里：可能是憋气，用 mc_move {"mode":"swim"} 上浮换气）' } catch { /* 忽略 */ }
+      try {
+        const b = this.sess?.bot?.bot
+        const p = b?.entity?.position
+        if (p) {
+          const eye = b.blockAt(p.offset(0, 1.6, 0))
+          if (/water|lava|bubble_column|kelp/.test(String(eye?.name ?? ''))) {
+            wet = '（我头在水下：是憋气，不是被打 —— 用 mc_move {"mode":"swim"} 上浮换气）'
+          }
+        }
+      } catch { /* 忽略 */ }
       this.#fire(['damage'], { kind: 'damage', text: `血量降到 ${e.health}${wet}` })
     })
     on('death', () => {
@@ -548,6 +568,10 @@ export class Watchdog {
           + '没出什么事。你可以选择继续挂机（重新挂 mc_watch 或什么都不做），或主动做点什么。', 'heartbeat')
         this.lastWakeAt = now
         this.lastWakeKind = 'heartbeat'
+        // 🟡 2026-10-15 审计（报告 H 第 9 条）：心跳也把"刚被叫醒"的时钟重置了，却**没清**
+        //    `_followedUp` ⇒ 上一次唤醒已经补过提醒的话，之后这次心跳的"等不到下文补提醒"
+        //    永远不触发（只有 `#flush` 才清）。这里一并清掉。
+        this._followedUp = false
         this.stats.fired++
       }
     }

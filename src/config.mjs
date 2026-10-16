@@ -143,15 +143,22 @@ export const DEFAULT_CONFIG = {
 
 /**
  * preset id 必须是**目录名**：与宿主 `agent-presets/src/preset.ts` 的 `PRESET_ID` 同规则。
- * 🔴 这条很要命：默认名单里的 `dsh-mc-agent` **带下划线，永远不可能是 preset id**
- * （所以"自动建 MC 模式 preset"只能建 `minecraft` 那种）。
+ * 🔴 2026-10-15 审计（报告 E 第 5 条）：这里原来写"默认名单里的 `dsh-mc-agent` **带下划线**、
+ *   永远不可能是 preset id" —— **这句是错的**：`dsh-mc-agent` 用的是连字符，完全匹配下面这条正则。
+ *   后果：用户把 `mcModePresets` 只留 `dsh-mc-agent` 时，`pickPresetTarget()` 会返回**插件自己的
+ *   bundle id**，`index.js` 就照着它建一个与插件同名的 preset 目录（撞名）。
+ *   现在显式把插件自己的 id 排除掉。
  */
 export const PRESET_ID_RE = /^[a-z0-9][a-z0-9-]*$/
+
+/** 插件自己的 bundle/包 id —— 不是一个能当 preset 目录用的名字（会撞名） */
+export const SELF_BUNDLE_ID = 'dsh-mc-agent'
 
 /** 从 `mcModePresets` 里挑一个**能当目录名**的 id；都不合法就 null */
 export function pickPresetTarget (wanted) {
   const list = Array.isArray(wanted) ? wanted : []
-  return list.map((x) => String(x ?? '').trim()).find((id) => PRESET_ID_RE.test(id)) ?? null
+  return list.map((x) => String(x ?? '').trim())
+    .find((id) => PRESET_ID_RE.test(id) && id !== SELF_BUNDLE_ID) ?? null
 }
 
 /** 复制源的优先级：越简的工具面越适合 MC 模式（MC 的 persona/指导由插件注入） */
@@ -617,14 +624,19 @@ export class PluginConfig {
       const e = String(entry).trim()
       if (!e) continue
       if (e === '*') return true
-      if (e.startsWith('/') && e.lastIndexOf('/') > 0) {
+      // 正则写法：`/^gi.*/` 或 `/^gi.*/i`（首尾都有 `/`）
+      if (e.length > 1 && e.startsWith('/') && e.lastIndexOf('/') > 0) {
         const end = e.lastIndexOf('/')
         try {
           if (new RegExp(e.slice(1, end), e.slice(end + 1) || 'i').test(name)) return true
         } catch { /* 坏正则忽略 */ }
         continue
       }
-      if (e.toLowerCase() === name) return true
+      /* 🟡 2026-10-15 审计（报告 E 第 6 条）：`/tp` 这种"带前导斜杠的指令名"原来**静默失效** ——
+       *   正则分支要求 `lastIndexOf('/') > 0`（`/tp` 的是 0），于是落到下面那句精确比较，
+       *   `'/tp' !== 'tp'` 永远不成立。用户按直觉写 `/tp` 会以为放行了，其实一条都放不过。
+       *   这里把前导斜杠剥掉再比（正则那种首尾都有斜杠的已在上面 `continue` 掉）。 */
+      if (e.replace(/^\//, '').toLowerCase() === name) return true
     }
     return false
   }

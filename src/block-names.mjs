@@ -32,26 +32,56 @@ export const SOFT_ROOF = /_leaves$|_log$|_wood$|^bamboo|^snow|_snow$|cactus|^mos
  */
 export const CAVE_GLYPH = {
   cave_wall: '#', cave_open: '·', cave_step: '↓', cave_drop: 'v',
-  cave_water: '~', cave_lava: '≈', cave_ore: '*', cave_void: '?',
+  cave_water: '~', cave_lava: '≈', cave_ore: '*', cave_void: '?', cave_deep: 'V',
 }
 
 /** 洞穴层视图的中文标签（图例 / 文案用） */
 export const CAVE_LABEL = {
   cave_wall: '墙', cave_open: '能站', cave_step: '低一格', cave_drop: '会掉下去',
-  cave_water: '水', cave_lava: '岩浆', cave_ore: '矿石', cave_void: '未加载',
+  cave_water: '水', cave_lava: '岩浆', cave_ore: '矿石', cave_void: '未加载', cave_deep: '探不到底',
 }
+
+/**
+ * **"脚下方块那一层"（地板层视图）**的合成名 → 字符（2026-10-15 用户需求）。
+ *
+ * 和洞穴层视图（`CAVE_GLYPH`）的区别：洞穴图问"我站在这格行不行"（以我**脚下那层**为中心
+ * 往上下看），地板图问"**这一层本身**是什么、站上去会不会掉"。两者判据不同，所以另起一套键。
+ */
+export const FLOOR_GLYPH = {
+  floor_walk: '·', floor_wall: '#', floor_drop: 'v',
+  floor_water: '~', floor_lava: '≈', floor_void: '?',
+}
+
+/** 地板层视图的中文标签 */
+export const FLOOR_LABEL = {
+  floor_walk: '能站', floor_wall: '墙', floor_drop: '会掉下去',
+  floor_water: '水', floor_lava: '岩浆', floor_void: '未加载',
+}
+
+/**
+ * 这块方块算不算**实心、能托住我**。
+ *
+ * 🔴 与 `isPassable()` 互补但**不等价**：`isPassable` 只认花草火把那类小东西，
+ *    水和岩浆在它眼里同样"不可穿过" —— 所以液体必须单独排掉，否则岩浆会被当成地板。
+ * 判据只用方块名（与这个文件里其它判据一致），不依赖 `boundingBox`
+ * （`check-core-map.mjs` 的假方块就只有 `name`）。
+ */
+export const isSolidBlock = (n) => Boolean(n) && !isAir(n) && !isLiquid(n) && !isPassable(n)
 
 /** 方块名 → 单字符（给没有视觉的模型"看"地形） */
 export function glyphOf (name) {
   if (!name) return '?'
   if (CAVE_GLYPH[name]) return CAVE_GLYPH[name]
+  if (FLOOR_GLYPH[name]) return FLOOR_GLYPH[name]
   if (isAir(name)) return ' '
   if (/_water$|water|_ice$|^ice$/.test(name)) return '~'
   if (/sand/.test(name)) return '.'
   if (/_leaves$|grass_block|short_grass|tall_grass|_flower|fern|bush|cactus|moss/.test(name)) return '"'
   if (/_log$|_wood$|_planks$|fence|door|sign|stairs|slab|bookshelf|crafting_table|chest/.test(name)) return 'T'
   if (/stone|cobble|deepslate|brick|concrete|terracotta|copper|iron|gold|diamond|obsidian|quartz|purpur|anvil|enchant/.test(name)) return ':'
-  if (/snow|white_|quartz|glass|iron_block/.test(name)) return '#'
+  /* 🔴 2026-10-15 审计：这里原来还写了 `quartz|iron_block`，但上一行已经先匹配 `quartz` 和
+   *    `iron` 并返回 `':'` ⇒ 那两个分支永远不可达。删掉，别再让读的人以为它们会走到。 */
+  if (/snow|white_|glass/.test(name)) return '#'
   if (/dirt|podzol|mud|gravel|clay|farmland|wheat|carrot|potato|beetroot/.test(name)) return '_'
   return '+'
 }
@@ -60,7 +90,10 @@ export const COLORS = {
   // 洞穴层视图（`mode:'cave'`）：能走 = 亮，墙 = 暗，掉下去 = 偏蓝，水/岩浆/矿石各自一色
   cave_wall: [95, 95, 100], cave_open: [205, 205, 195], cave_step: [165, 165, 150],
   cave_drop: [125, 125, 175], cave_water: [51, 76, 178], cave_lava: [222, 110, 40],
-  cave_ore: [190, 155, 70], cave_void: [40, 40, 48],
+  cave_ore: [190, 155, 70], cave_void: [40, 40, 48], cave_deep: [70, 55, 90],
+  // 地板层视图（`mode:'floor'`，2026-10-15）：能站 = 亮，墙 = 暗，掉下去 = 偏蓝
+  floor_walk: [205, 205, 195], floor_wall: [95, 95, 100], floor_drop: [125, 125, 175],
+  floor_water: [51, 76, 178], floor_lava: [222, 110, 40], floor_void: [40, 40, 48],
   grass_block: [106, 170, 64], dirt: [134, 96, 67], sand: [219, 207, 163], suspicious_sand: [200, 185, 140],
   sandstone: [216, 203, 155], smooth_sandstone: [214, 200, 150], stone: [125, 125, 125], cobblestone: [110, 110, 110],
   water: [51, 76, 178], ice: [160, 180, 240], snow_block: [250, 250, 250], oak_log: [110, 84, 50],

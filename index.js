@@ -32,12 +32,22 @@ import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CAL
 import { defineTool, toolDefKind } from './src/tool-def.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
+import { runText } from './src/task-exec.mjs'
+import { PRIORITY, DEFAULT_WAIT_MS } from './src/action-scheduler.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
   readVersionPrompt, writeVersionPrompt, resetVersionPrompt, syncVersionPrompt,
 } from './src/version-prompt.mjs'
 import { EXPRESS_DIR, OUT_DIR, expressRootOf, outRootOf, parseExpressPath, safeExpressTarget, mimeOf, SANDBOX_TYPES, expressRefFor, EXPRESS_OFF_TEXT, EXPRESS_NEED_BASE_TEXT, normalizeExpressBase, onlineUrlOf } from './src/express.mjs'
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
+/* 2026-10-15：`mc_map` 默认改成"脚下方块那一层"（地板层视图）—— 直接调 `src/map-render.mjs`
+ * 的新函数，**不往 `core.mjs` 加薄包装**（那个文件已经贴着 `check-module-load` 的 1000 行上限）。 */
+import { floorMapOf, navSummaryOf, hazardCellsOf } from './src/map-render.mjs'
+/* 2026-10-15：事件循环延迟 / CPU 占用监测（用户「异步与多线程优化」方案第 1 步）——
+ * **用数据决定要不要上 Worker 线程**，`mc_diag` 的 `perf` 段直接给结论。 */
+import { perfWrap, perfSnapshot, perfText, perfReset } from './src/perf-monitor.mjs'
+import { terrainCacheStats } from './src/terrain.mjs'
+import { workerPoolStats } from './src/worker-pool.mjs'
 import { MemoryStore } from './src/memory.mjs'
 import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, personaTextKeyOf, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS } from './src/config.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
@@ -106,15 +116,37 @@ function sendJson(res, status, body) {
   res.end(data)
 }
 
+/** 请求体上限（**字节**，不是字符）。 */
+const MAX_BODY_BYTES = 1_000_000
+
 function readJsonBody(req) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let data = ''
+    let bytes = 0
+    let settled = false
+    const done = (fn, v) => { if (!settled) { settled = true; fn(v) } }
     req.on('data', (chunk) => {
+      if (settled) return
+      bytes += Buffer.byteLength(chunk)
+      /* 🔴 审计：旧写法 `if (data.length > 1_000_000) req.destroy()` 有两个毛病 ——
+       *  ① `resolve` 只挂在 `'end'`/`'error'` 上，而 `destroy()` 只发 `'close'`/`'aborted'`
+       *     ⇒ promise **永不 settle**，调用方 `await readJsonBody(req)` 永久挂起（协程 + 闭包泄漏），
+       *     前端拿到的是网络错误而不是一个能看懂的 JSON。
+       *  ② `data.length` 是 UTF-16 字符数不是字节数（中文约 3MB 才触发），跟"防大包"本意差一截。
+       * 现在按字节数算，超限**明确拒绝**并带 413。 */
+      if (bytes > MAX_BODY_BYTES) {
+        const err = new Error(`请求体太大（超过 ${MAX_BODY_BYTES} 字节）`)
+        err.statusCode = 413
+        err.code = 'BODY_TOO_LARGE'
+        done(reject, err)
+        try { req.destroy() } catch { /* 已经断了就算了 */ }
+        return
+      }
       data += chunk
-      if (data.length > 1_000_000) req.destroy()      // 防手滑发大包
     })
-    req.on('end', () => { try { resolve(JSON.parse(data || '{}')) } catch { resolve({}) } })
-    req.on('error', () => resolve({}))
+    req.on('end', () => { try { done(resolve, JSON.parse(data || '{}')) } catch { done(resolve, {}) } })
+    req.on('error', () => done(resolve, {}))
+    req.on('close', () => done(resolve, {}))
   })
 }
 
@@ -180,6 +212,7 @@ class McSession {
     this.waitInterruptedAt = 0
     this.waitInterruptReason = null
     this._wired = false
+    this._wiredHandlers = []
   }
 
   /**
@@ -198,23 +231,46 @@ class McSession {
     this._wired = true
     const self = this
 
-    this.bot.on('log', (line) => pluginCtx.logger?.info?.(`[${self.agentId}] ${line}`))
-    this.bot.on('spawn', (e) => self.#pushEvent('lifecycle', `已上线 ${e.sub} @ ${JSON.stringify(e.position)}`))
-    this.bot.on('death', (e) => self.#pushEvent('lifecycle', `我死了 @ ${JSON.stringify(e.position)}`))
-    this.bot.on('reconnect', (e) => self.#pushEvent('lifecycle', `已重连 ${e.sub}`))
+    /* 🔴 审计：这些监听挂在 `this.bot` 上，销毁时必须摘掉 —— 否则销毁后的 session 还被
+     * bot 一直持有（闭包里的 self / pluginCtx 跟着活着），bot 断开时还会往已经没人看的
+     * `events` 里写。用 `on()` 统一登记，`#unwire()` 里摘。 */
+    const on = (ev, fn) => { this.bot.on(ev, fn); this._wiredHandlers.push([ev, fn]) }
+
+    on('log', (line) => pluginCtx.logger?.info?.(`[${self.agentId}] ${line}`))
+    on('spawn', (e) => self.#pushEvent('lifecycle', `已上线 ${e.sub} @ ${JSON.stringify(e.position)}`))
+    on('death', (e) => self.#pushEvent('lifecycle', `我死了 @ ${JSON.stringify(e.position)}`))
+    on('reconnect', (e) => self.#pushEvent('lifecycle', `已重连 ${e.sub}`))
     // 🔴 断线也要进事件队列（2026-09-19）：`mc_events` 里看得见，AI 才不会以为"一直在线"。
-    this.bot.on('offline', (e) => self.#pushEvent('lifecycle',
+    on('offline', (e) => self.#pushEvent('lifecycle',
       `连接断开：${e?.reason ?? '连接结束'}${e?.willReconnect ? '（正在自动重连）' : '（不会自动重连）'}`))
-    this.bot.on('chat', ({ who, text }) => self.#pushEvent('chat', `<${who}> ${text}`, { who }))
-    this.bot.on('system', ({ text }) => self.#pushEvent('system', text))
-    this.bot.on('damage', (e) => self.#pushEvent('damage', `血量降到 ${e.health} @ ${JSON.stringify(e.position)}`))
+    on('chat', ({ who, text }) => self.#pushEvent('chat', `<${who}> ${text}`, { who }))
+    on('system', ({ text }) => self.#pushEvent('system', text))
+    on('damage', (e) => self.#pushEvent('damage', `血量降到 ${e.health} @ ${JSON.stringify(e.position)}`))
+  }
+
+  /** 摘掉 `ensureWired()` 挂上的全部 bot 监听（销毁时调用，防止 session 被 bot 反向持有）。 */
+  #unwire() {
+    for (const [ev, fn] of this._wiredHandlers) {
+      try { this.bot.off(ev, fn) } catch { /* 摘不掉也不影响销毁 */ }
+    }
+    this._wiredHandlers = []
   }
 
   /* ── 清理 ── */
 
   destroy() {
     try { this.watchdog?.disarm('会话结束') } catch {}
-    try { this.bot.disconnect('会话结束') } catch {}
+    try { this.#unwire() } catch {}
+    // 🔴 审计：`McBot.disconnect()` 是 **async**（src/core.mjs → src/connection.mjs），
+    // 旧写法 `try { … } catch {}` 只挡同步抛出，抓不到 promise 的拒绝 —— 一旦断开过程里抛错
+    // 就是"未处理拒绝"，宿主是 fail-loud（会 exit(1)，插件自己在别处也记过这条）。
+    try {
+      void Promise.resolve(this.bot.disconnect('会话结束')).catch((e) => {
+        try { logLine(`销毁会话时退出游戏失败（不影响清理）：${e?.message ?? e}`) } catch {}
+      })
+    } catch (e) {
+      try { logLine(`销毁会话时退出游戏失败（不影响清理）：${e?.message ?? e}`) } catch {}
+    }
     this.watchdog = null
     this.events = []
   }
@@ -269,15 +325,14 @@ class McSession {
 
   /* ── "喊我"判定 ── */
 
-  mentionRegex() {
-    if (this._mentionRe?.source !== this.config.mentions.join('|')) {
-      this._mentionRe = new RegExp(this.config.mentions.map((p) => `(?:${p})`).join('|'), 'i')
-    }
-    return this._mentionRe
-  }
+  /* 🔴 审计：这里原来还有一对 `mentionRegex()` / `isCalled()`，两个毛病：
+   *  ① `mentionRegex()` 的缓存判据是 `this._mentionRe?.source !== this.config.mentions.join('|')`，
+   *     但它赋值的是 `mentions.map((p) => `(?:${p})`).join('|')` —— `.source` 永远带 `(?:)` 包装，
+   *     跟裸 `join('|')` **恒不相等** ⇒ 恒真条件，每次调用都重建正则；
+   *  ② 全仓（含 client.js / selfcheck.mjs / tools/）**没有任何调用点**，真正在用的是 `calledBy()`。
+   * 两个都删了。 */
 
-  isCalled(text) { return this.mentionRegex().test(String(text ?? '')) }
-
+  /** 这段文本里出现了哪几个"喊我"的叫法（按 mentions 的书写顺序，返回命中的模式原文）。 */
   calledBy(text) {
     const s = String(text ?? '')
     return this.config.mentions.filter((p) => { try { return new RegExp(`(?:${p})`, 'i').test(s) } catch { return false } })
@@ -686,7 +741,15 @@ export function apply(ctx, rawConfig) {
    * 🔴 LLM 永远拿不到密码/token：工具只回基本信息；凭据只在这两个 helper 里出现，且不外传。
    * ------------------------------------------------------------------------ */
   const accounts = new AccountStore({ dir: stateDir, logger: ctx.logger ?? null })
-  accounts.ensureDefaults()
+  /* 🔴 2026-10-15 审计（报告 E 第 1 条）：账户库读失败时**绝不能** `ensureDefaults()` + 写盘 ——
+   *    那会把用户的账户库覆盖成"空库 + 一个默认离线号"，账户**永久丢失**（旧代码就是这么干的，
+   *    而且一声不响）。读失败时只报错、不动盘，让人去修文件或从备份恢复。 */
+  if (accounts.loadFailed) {
+    logLine(`🔴 账户库读取失败，已按空库运行但**不会写盘**：${accounts.loadError ?? '原因不明'}`
+      + `\n　　→ 请先修好 ${accounts.file}（比如从备份恢复）；在那之前「MC设置」里的账户列表是空的，且任何改动都不会保存。`)
+  } else {
+    accounts.ensureDefaults()
+  }
   /** 「连接到MC」弹窗的服务器地址历史（**全局**，只存地址；见 src/serverhistory.mjs） */
   const serverHistory = new ServerHistory({ dir: stateDir })
   // 凭据服务可能晚就绪 → 必须 ctx.inject 等（老教训：apply() 时 ctx.get() 常是 undefined）
@@ -815,7 +878,10 @@ export function apply(ctx, rawConfig) {
     const out = {
       sessionId, reason, order: [],
       stoppedLLM: false, finalStopLLM: false, stopLLMError: null,
-      quit: null, kicked: false, killedJobs: [],
+      /* 🔴 审计：这个字段原来是 `kicked`（"被踢"），但它其实只在**主动优雅退出成功**时置真
+       * （真正的异常在下面的 catch 里记 `quitError`）—— 名字跟语义反了，而且 `out` 会 JSON
+       * 给前端看。改名 `quitOk`。 */
+      quit: null, quitOk: false, killedJobs: [],
     }
 
     /** 停 LLM：优先 sessionController.cancel（宿主正路），退到 agent.cancel */
@@ -855,7 +921,7 @@ export function apply(ctx, rawConfig) {
     if (sess) {
       try {
         out.quit = await sess.bot.disconnect(reason)
-        out.kicked = true
+        out.quitOk = true
       } catch (e) { out.quitError = String(e?.message ?? e) }
       sess.mode = 'standby'
       out.order.push('quit-game')
@@ -880,9 +946,13 @@ export function apply(ctx, rawConfig) {
         for (const j of jobs.list(sessionId) ?? []) {
           const id = j?.id ?? j?.jobId
           if (!id) continue
-          const ownerOf = j?.ownerSession ?? j?.owner
+          /* 🔴 审计：`owner` 在宿主里是**对象**（`{ id, … }`），旧写法直接拿它跟 sessionId
+           * 字符串比 ⇒ 恒不相等 ⇒ `mc_stop` 的 `killedJobs` 永远是空的、job 其实还在跑，
+           * 而外层 `catch {}` 把一切吞掉，界面上却显示"已清理"。两种形状都认。 */
+          const o = j?.ownerSession ?? j?.owner
+          const ownerOf = (o && typeof o === 'object') ? (o.id ?? o.sessionId ?? null) : (o ?? null)
           if (ownerOf !== sessionId) continue          // 无主 job / 别人的 job：不归我们管
-          try { jobs.kill(id, sessionId, reason); out.killedJobs.push(id) } catch {}
+          try { jobs.kill(id, sessionId, reason); out.killedJobs.push(id) } catch {}     // eslint-disable-line no-empty
         }
       } catch (e) { out.jobsError = String(e?.message ?? e) }
     }
@@ -1045,7 +1115,20 @@ export function apply(ctx, rawConfig) {
      * 绝不能挂在 `settingsGate` 后面 —— 否则浏览器拿不到名单就静默退回兜底值，
      * 按钮显示与否会和服务端口径不一致（2026-09-16 自查出来的自伤）。 */
     if (path === '/api/mc/presets' && req.method === 'GET') {
-      return ok({ mcModePresets: pluginConfig.mcModePresets })
+      /* 🟢 2026-10-15 审计（client.js 报告第 10 条）：顺手带上**支持版本范围**。
+       *    客户端的「版本不匹配就别连」那道门以前是 `MC_VERSION_IN_RANGE = () => null`
+       *    —— 一个永远"未知"的桩，于是拦截与红标**一行都到不了**。
+       *    范围来自 mineflayer 的 `lib/version.js`（`libraryInfo()` 已经 import 好了，
+       *    不新增端点、不连服、无副作用）。
+       *    注意 `testedVersions` 是**稀疏的实测清单**，上游只用它定**上界拒绝**，
+       *    所以客户端那边是"比 latest 新才算不支持"，不是 `includes`。 */
+      const lib = libraryInfo()
+      return ok({
+        mcModePresets: pluginConfig.mcModePresets,
+        testedVersions: lib.testedVersions,
+        oldestVersion: lib.oldest,
+        latestVersion: lib.latest,
+      })
     }
 
     /* ── 「连接到MC」弹窗（2026-10-04）：服务器地址历史 + 局域网探测 ──────────────
@@ -1065,10 +1148,28 @@ export function apply(ctx, rawConfig) {
       return ok(await probeLan({ seconds: body.seconds }))
     }
 
+    /**
+     * 客户端报上来的 `cwd` 能不能当工作区用。
+     *
+     * 🔴 审计（唯一一条 🔴）：原来只验 `isAbsolute` + `statSync().isDirectory()` —— 于是
+     * **任意一个已存在的目录**都能被当成工作区：
+     *   · `DELETE /api/mc/express?cwd=C:\任意目录`（不带 sessionId）→ `clearShared()` 里
+     *     `rmSync(root, { recursive: true, force: true })` 会把那个目录下的 `.dsh-mc-agent/.express` 整个删掉；
+     *   · `PUT /api/mc/agents-md` 之类还会在任意目录 `mkdirSync('.dsh-mc-agent')` 并写进
+     *     README.md / RULES.md / config.json。
+     * 而 `:1214` 附近的注释还写着"目录由服务端推导，前端传不了路径"——那句话是假的。
+     * 现在要求它**在宿主的工作区注册表里**（`workspaceIdOfCwd`），或者至少已经带着我们建过的
+     * `.dsh-mc-agent/`（说明以前真的把它当工作区用过）。注册表没就绪时也不会误放行任意目录。
+     * 说明：这条要先拿到本机同源请求才触发（栅栏挡跨站/非回环），不是远程可利用，但边界必须是真的。
+     */
     const usableWorkspace = (p) => {
       const s = String(p ?? '').trim()
       if (!s || !isAbsolute(s)) return null
-      try { return statSync(s).isDirectory() ? s : null } catch { return null }
+      try { if (!statSync(s).isDirectory()) return null } catch { return null }
+      if (workspaceIdOfCwd(s)) return s
+      // 注册表里没有（或还没就绪）：只认"已经是我们用过的工作区"——目录里已有 `.dsh-mc-agent/`。
+      try { if (statSync(join(s, '.dsh-mc-agent')).isDirectory()) return s } catch { /* 没有就不认 */ }
+      return null
     }
     /**
      * 解析"这次请求属于哪个工作区"（**可空、不报错、不建档**）。
@@ -1097,6 +1198,15 @@ export function apply(ctx, rawConfig) {
       const r = await resolveWorkspaceCwd(sessionId, cwdHint)
       if (!r) {
         const sid = String(sessionId ?? '').trim()
+        const hinted = String(cwdHint ?? '').trim()
+        // 传了 cwd 却被拒：多半是"注册表里没这个目录"（审计修的 🔴，防的是任意目录被当工作区）。
+        if (hinted) {
+          return {
+            ok: false,
+            error: `这个目录不能当工作区用：\`${hinted}\` 不在宿主的工作区列表里（也没见它带过 \`.dsh-mc-agent/\`）。`
+              + '请先把这个文件夹**添加为工作区**再打开「MC设置」。',
+          }
+        }
         return {
           ok: false,
           error: sid
@@ -1211,7 +1321,8 @@ export function apply(ctx, rawConfig) {
      * 分享**模式与 base** 是全局配置（走 `/api/mc/config`）；这两个接口是**按工作区**的：
      *   · GET    看发布区在哪、攒了多少（页面上显示，省得用户去翻文件夹）；
      *   · DELETE 「清除分享数据」—— 前端必须**先让用户确认**再调它（不可撤销）。
-     * 目录由服务端推导，前端传不了路径。
+     * 目录由服务端推导：客户端只能报 `sessionId`（或一个**注册表里认得的工作区** `cwd`），
+     * 其余一律拒绝 —— 见 `usableWorkspace()` 的注释（2026-10-15 审计修的 🔴）。
      * ------------------------------------------------------------------------ */
     if (path === '/api/mc/express' && req.method === 'GET') {
       const gate = await gateOf()
@@ -1552,7 +1663,8 @@ export function apply(ctx, rawConfig) {
       } catch (e) {
         const err = { ok: false, error: String(e?.message ?? e) }
         if (e?.needUserAction) { err.needUserAction = true; if (e.hint) err.hint = String(e.hint) }
-        return sendJson(res, 200, err)
+        // 审计：请求体超限等错误自带 statusCode，别一律回 200。
+        return sendJson(res, Number(e?.statusCode) || 200, err)
       }
     }
 
@@ -1570,7 +1682,7 @@ export function apply(ctx, rawConfig) {
       }
       try { await handleMcApi(req, res) } catch (e) {
         ctx.logger?.warn?.(`[dsh-mc-agent] /api/mc 处理失败：${e instanceof Error ? e.message : String(e)}`)
-        sendJson(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
+        sendJson(res, Number(e?.statusCode) || 500, { ok: false, error: e instanceof Error ? e.message : String(e) })
       }
     },
   }
@@ -1705,7 +1817,9 @@ export function apply(ctx, rawConfig) {
    */
   const fileToolPath = (exec) => {
     const name = String(exec?.name ?? '')
-    if (!/^(read|write|edit|glob|grep|read_image)$/i.test(name)) return null
+    /* 🔴 2026-10-15 审计（报告 C 第 3 条）：`ops_replace`（批量正则替换）会**真的写盘**，
+     *   必须跟 write/edit 走同一套围栏（受保护文件只读 + 只能在记忆文件夹内）。它的路径参数也叫 `path`。 */
+    if (!/^(read|write|edit|glob|grep|read_image|ops_replace)$/i.test(name)) return null
     const args = exec?.arguments ?? {}
     const v = args.path ?? args.file_path ?? args.dir ?? args.directory
     if (v === undefined || v === null) return ''
@@ -1736,8 +1850,81 @@ export function apply(ctx, rawConfig) {
    *    例外见 `LONG_TOOLS`：那些"一次调用就是要把握手/连接做完"或纯本地算图的。
    */
   const LONG_TOOLS = new Set(['mc_connect', 'mc_disconnect', 'mc_map', 'mc_kit_image'])
+  /* 工具处理器表：`mc_task {action:"run"}` 的任务执行器靠它"干活"。
+   * 为什么不让执行器直接调 `bot` 的方法（2026-10-14 "任务驱动"第二步）：
+   * 任务层的分工是"看现场 → 决定下一步 → 干活 → 读结果"，干活必须走**和模型调用
+   * 完全同一条路**（同一套参数、同一套 `lossless`），否则"执行器做的"和"模型做的"
+   * 会慢慢分叉 —— 模型试出来的参数能行、执行器照抄却不行。
+   * 存的是**裸 `execute`**（不是 `asTool` 包过的那层）：外面那层每次都会
+   * `setCallDeadline(CALL_MS)` 重新给 11 秒，会把执行器自己那一轮的预算冲掉。 */
+  const TOOL_HANDLERS = new Map()
+
+  /**
+   * 写动作统一走**动作调度器**（用户 2026-10-14 设计「统一动作调度」的**阶段 P0：只记账**）。
+   *
+   * 这一层只做四件事：给动作编号、登记它占了哪些资源、撞车时记一笔（或挡住）、
+   * 让子步骤复用父动作的 `actionId`。**它不碰** `interruptMove()` / `_moveGen` / `_ctrlLease` ——
+   * 抢占仍然只有 `interruptMove` 一条路（用户特意点名：不要再造第二套移动代次）。
+   *
+   * 只读工具（`resourceSpecOf()` 认不出）**根本不进这里**，行为与改动前逐字一致；
+   * 写动作的返回值也原样透传（`r.result`），异常原样重抛 —— 所以 `observe-only` 模式下
+   * "现有抢占和动作结果与改动前一致"是**结构上**成立的，不靠运气。
+   */
+  const runScheduled = async (sess, name, args, exec, fn, parent = null) => {
+    const spec = sess.bot.actionSpecOf(name, args)
+    if (!spec) return await fn(args, exec)
+    /* 🔴 审计 F9：`TOOL_SPEC` 里没有一条写过 `priority` ⇒ `spec.priority` 恒 `undefined`，
+     * 调度器把**所有**动作都当 `task`(30)。于是 `enforce` 模式下用户直接下的 `mc_move`
+     * 抢不动任务执行器正在跑的 `mc_dig`（两者同级）。这里按调用来源分：
+     * **顶层调用 = 用户指令**（`PRIORITY.user`），**任务执行器调出去的子步骤 = 任务**。 */
+    const priority = spec.priority ?? (parent ? PRIORITY.task : PRIORITY.user)
+    /* 🔴 阶段 P1 的排队预算（用户方案第 ③ 条）：
+     *   · **子步骤一律 `0`（不排队）** —— 这是"等自己"那道死锁的结构性防线：子步骤要等的是
+     *     它自己的父动作，而父动作不会在它退出前释放资源。子步骤只记账、不排队。
+     *   · 顶层动作愿意等，但**不能等穿这一轮的调用预算** —— 留 800ms 给"等到之后真的干活"，
+     *     否则等到最后 1ms 才拿到资源、动作一起步就被 `callLeft()` 掐掉，白排。 */
+    const waitMs = parent
+      ? 0
+      : Math.max(0, Math.min(DEFAULT_WAIT_MS, Number(sess.bot.msLeft?.() ?? DEFAULT_WAIT_MS) - 800))
+    const r = await sess.bot.actionScheduler().run({
+      name,
+      owner: agentIdOf(exec?.agent) ?? null,
+      resources: spec.resources,
+      priority,
+      parent,
+      waitMs,
+      signal: exec?.signal ?? null,
+      execute: async ({ actionId, signal: schedSignal }) => {
+        /* 把"当前动作"放在 exec 上：`mc_task {action:"run"}` 要拿它当父动作，
+         * 好让执行器调出去的子工具**继承同一个 actionId**。存旧值再还原 ——
+         * 子动作退出时不能把父动作的 id 抹掉（否则后面的兄弟步骤就变成顶层动作了）。 */
+        const prev = exec && typeof exec === 'object' ? exec.__actionId : undefined
+        if (exec && typeof exec === 'object') exec.__actionId = actionId
+        /* 🔴 阶段 P1：把调度器的信号**接进 bot 的中断链**。不接的话 `#preempt()` 的
+         * `.abort()` 谁也看不见 —— 动作照跑、资源照占，抢占就成了"只写了行日志"。
+         * 调度器的 controller 本来就转发宿主的 `exec.signal`，所以这一句是**包含**关系，不是替换。 */
+        try { if (schedSignal) sess.bot.setAbortSignal(schedSignal) } catch { /* 接不上就算了 */ }
+        try { return await fn(args, exec) } finally {
+          if (exec && typeof exec === 'object') exec.__actionId = prev ?? null
+        }
+      },
+    })
+    if (r.status === 'failed') throw r.error
+    if (r.status === 'busy') return { busy: true, blockedBy: r.blockedBy, note: r.note, waitedMs: r.waitedMs ?? 0 }
+    return r.result
+  }
+
   const asTool = (spec) => {
     if (spec?.name && !ourToolNames.includes(spec.name)) ourToolNames.push(spec.name)
+    /* 表里存的是**包过调度器**的 handler（仍然不重置 `setCallDeadline`，预算没被冲掉）：
+     * 任务执行器调出去的子工具因此也走同一条路，不会"绕开锁直接改状态"。
+     * 父动作从 `exec.__actionId` 取 —— 模型直接调时它是空的（顶层动作）。 */
+    if (spec?.name && typeof spec.execute === 'function') {
+      TOOL_HANDLERS.set(spec.name, (args, exec) => runScheduled(
+        getSession(exec), spec.name, args, exec, spec.execute,
+        (exec && typeof exec === 'object' ? exec.__actionId : null) ?? null
+      ))
+    }
     const timeoutMs = LONG_TOOLS.has(spec?.name)
       ? spec?.timeoutMs
       : Math.min(Number(spec?.timeoutMs) || CALL_MS + 1_000, CALL_MS + 1_000)
@@ -1754,7 +1941,7 @@ export function apply(ctx, rawConfig) {
          * 掉线、重连、换一轮对话回来都还在，不只在模型的对话上下文里。
          * 拿不到工作区/记忆根（理论上不会）就让 `setTaskDir(null)` 退化成只在内存里记。 */
         try { sess.bot.setTaskDir(memoryRootFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent))) } catch { /* 记不了就不记 */ }
-        return lossless(await spec.execute(args, exec))
+        return lossless(await perfWrap(spec.name, () => runScheduled(sess, spec.name, args, exec, spec.execute, null)))
       },
     })
   }
@@ -1847,13 +2034,9 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_lan',
-    description: '探测**局域网里的 Minecraft 服务器**（只读：不连接、不进服）。\n'
-      + '原理就是**原版那一件事**：谁是"对局域网开放"的，谁就会往多播 `224.0.2.60:4445` 上周期性发\n'
-      + '`[MOTD]…[/MOTD][AD]端口[/AD]`（重发周期 1.5 秒）。**只听这个公告**，听到就拿到对方地址+端口+MOTD；\n'
-      + '🔴 不扫端口、不发任何探测包（原版客户端也不扫），所以**恒定在 `seconds` 秒内返回**（默认 3，上限 15）。\n'
-      + '拿到 host/port 后用 `mc_connect` 进服（版本 / 人数那些进服后自然知道）。\n'
-      + '没听到时：确认对方真的开了"对局域网开放"（或服务端开了 `enable-lan-visibility`）；\n'
-      + '有些网络（部分 WiFi / VPN / 容器）会挡多播，那种情况原版客户端自己也看不到——请直接问对方地址。',
+    description: '探测**局域网里的 Minecraft 服务器**（只读：不连接、不进服）。只听原版"对局域网开放"那条多播公告（`224.0.2.60:4445`，`[MOTD]…[/MOTD][AD]端口[/AD]`，1.5 秒一次），听到就拿到地址+端口+MOTD。\n'
+      + '🔴 不扫端口、不发探测包，所以**恒定在 `seconds` 秒内返回**（默认 3，上限 15）；拿到 host/port 后用 `mc_connect` 进服。\n'
+      + '没听到时：确认对方真开了"对局域网开放"（或 `enable-lan-visibility`）；部分 WiFi / VPN / 容器会挡多播，那种直接问对方地址。',
     parameters: {
       mode:    { type: 'string', description: '探测模式。目前只有 `broadcast`（默认）：听局域网公告' },
       seconds: { type: 'number', description: '听多久（默认 3 秒，上限 15）' },
@@ -1881,12 +2064,9 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_ping',
-    description: '【单地址探测】**已知地址**时，先问一句"你是谁、通不通"——发一次 Minecraft STATUS ping：\n'
-      + '拿 **通不通**（能不能拿到状态响应）/ **版本** / **协议号** / **MOTD** / **人数** / **延迟**。\n'
-      + '🔴 **不登录、不用账户、不进服**，拿到就断；超时自己兜（见 timeoutMs），**不会挂住**。\n'
-      + '和 `mc_connect` 的分工：先用 `mc_ping` 确认地址与版本（**推荐**），再 `mc_connect` 真进服；\n'
-      + '连不上时它会把原因说成人话（ECONNREFUSED=端口没人听 / ENOTFOUND=域名拼错 / 超时=防火墙或 enable-status=false）。\n'
-      + '和 `mc_lan` 的分工：`mc_lan` 是"不知道地址"时听局域网公告；`mc_ping` 是"知道地址"时主动探一次。',
+    description: '【单地址探测】**已知地址**时先问一句"你是谁、通不通"——发一次 Minecraft STATUS ping，拿 **通不通** / **版本** / **协议号** / **MOTD** / **人数** / **延迟**。\n'
+      + '🔴 **不登录、不用账户、不进服**，拿到就断；超时自己兜，**不会挂住**。连不上时把原因说成人话（ECONNREFUSED=端口没人听 / ENOTFOUND=域名拼错 / 超时=防火墙或 enable-status=false）。\n'
+      + '分工：先用 `mc_ping` 确认地址与版本（推荐）再 `mc_connect` 进服；不知道地址时用 `mc_lan` 听局域网公告。',
     parameters: {
       address:   { type: 'string', description: '地址，认 `example.com` / `example.com:25566` / `[::1]:25565`（必填）' },
       port:      { type: 'number', description: '端口（默认 25565）；address 里已经带 `:端口` 时以 address 为准' },
@@ -1909,7 +2089,10 @@ export function apply(ctx, rawConfig) {
     name: 'mc_connect',
     description: '连接到 MC 服务器。**这里没有账号密码**——用哪个账户由「MC设置」里维护的账户决定：\n'
       + '先用 `mc_accounts` 看有哪些账户（用 `action:"use"` 选定，或用本工具的 `account` 参数指名 innerID）。\n'
-      + '服务器地址/端口/子服由你传（不传就用插件配置里的 fallback）；连接成功后会等区块加载完成。\n'
+      /* 🔴 审计：原来写"不传就用插件配置里的 fallback" —— 那是 0.1 时代的遗留说法，
+       * 那些字段 2026-10-02 已清除（见文件顶部注释），本工具只把 args 透传下去。
+       * 真正的兜底是环境变量 MC_HOST。 */
+      + '服务器地址/端口/子服由你传（`host` 不传就看环境变量 `MC_HOST`，两个都没有会直接报错）；连接成功后会等区块加载完成。\n'
       + '登录失败时会明确说"需要用户处理"——那就告诉用户去「MC设置」里重新登录或点「刷新」。',
     parameters: {
       host:      { type: 'string', description: '服务器地址（如 example.com）' },
@@ -1917,7 +2100,7 @@ export function apply(ctx, rawConfig) {
       subserver: { type: 'string', description: '子服域名（Velocity fakeHost 路由，如 mc.example.com）' },
       account:   { type: 'string', description: '（可选）用哪个账户：innerID（mc_accounts 里能看到）；不传就用本会话选定的/默认账户' },
       version:   { type: 'string', description: 'MC 版本（如 1.20.4 / 1.21.4）。**默认不传 = 自动探测**（发 STATUS ping 按服务端上报的协议号反查），这是推荐用法；只有探测失败时才手填。' },
-      force:     { type: 'boolean', description: '已经连着也要**先断开再连**（已连着时普通 mc_connect 是空操作、不会重连）。挖方块老报"那里本来就是空气"、方块/实体视图不刷新时用 —— 那是客户端缓存旧了。' },
+      force:     { type: 'boolean', description: '已经连着也要**先断开再连**（普通 mc_connect 在已连着时是空操作）。⚠️ 这是**真退出游戏再进服**：服务器会广播「你离开了游戏」，玩家会看到你消失几秒。**别拿它当「刷新区块」的常规手段** —— 视图不刷新时先想是不是自己垫脚/搭高放的方块，再走远 32 格回来让区块重发；非做不可就先 mc_say 说一声。' },
     },
     output: text(),
     async execute(args, exec) {
@@ -2334,18 +2517,21 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_map',
-    description: '看周围地形。'
-      + '**在地下会自动切成"洞穴层视图"**（以我为中心、上下各看几格，像地图模组的洞穴模式）：'
-      + '# 墙 · 能站 ↓ 低一格 v 会掉下去 ~ 水 ≈ 岩浆 * 矿石 ? 未加载（区块没到）。'
-      + '地面上给**地表图**：@ 我 · ~ 水 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田 · # 白 · ? 未加载。'
-      + 'mode="auto"（默认）/ "surface"（强制地表）/ "cave"（强制洞穴层）；slab = 洞穴层上下各看几格（默认 2）。'
-      + 'format="chars"（默认）给字符地形图；format="image" 额外生成**俯视图像**（有视觉的模型直接能看，并落盘）。'
+    description: '看周围地形。**默认给"脚下方块那一层"**（地板层图：这一层哪里是实心地面、哪里是坑/岩浆/未加载）：'
+      + '· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载。'
+      + 'mode="floor"（默认）/ "auto"（地下自动切洞穴层：# 墙 · 能站 ↓ 低一格 v 会掉下去 * 矿石）'
+      + '/ "surface"（地表：@ 我 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田）/ "cave"；slab = 洞穴层上下各看几格（默认 2）。'
+      + 'format="image" 额外生成**俯视图像**（有视觉的模型能直接看，并落盘）。'
       + `🔴 要让 **Master** 看到图：给 \`out:"\\.dsh-mc-agent/${EXPRESS_DIR}/<子目录>/map.png"\` 写进发布区，`
-      + '再用 `mc_kit_express` 取那一行（按「文件分享」模式返回路径 / URL / 或一句提示），自己拼进回复。'
-      + 'format="both" 两者都给。字符图省 token 且坐标精确；形状/外观问题用图像。',
+      + '再用 `mc_kit_express` 取那一行，自己拼进回复。'
+      + '字符图省 token 且坐标精确；形状/外观问题用图像。',
     parameters: {
       radius: { type: 'number', description: '半径（默认 32，上限 96）' },
-      mode: { type: 'string', description: 'auto（默认，在地下自动切洞穴层）/ surface（强制地表）/ cave（强制洞穴层）' },
+      mode: { type: 'string', description: 'floor（默认，脚下方块那一层）/ auto（地下自动切洞穴层）/ surface / cave' },
+      purpose: { type: 'string', description: 'overview（默认）/ navigation（加目标方位）/ hazards（先列危险格）' },
+      target: { type: 'string', description: '（可选）目标坐标 "x,y,z"（mc_scan 给的），只算距离方位' },
+      layer: { type: 'number', description: 'floor 层的 y（默认 feetY-1）' },
+      depth: { type: 'number', description: 'floor 层往下探几格找地面（默认 4，0–8）' },
       slab: { type: 'number', description: '洞穴层上下各看几格（默认 2，范围 1–8；5 = 上下各 5 格）' },
       glyphStep: { type: 'number', description: '字符图抽稀步长（默认 2；1 最细）' },
       yTop: { type: 'number', description: '地表搜索起始高度偏移（默认 +10，仅地表图用）' },
@@ -2373,22 +2559,48 @@ export function apply(ctx, rawConfig) {
       const format = String(args.format ?? 'chars').toLowerCase()
       const step = Math.max(1, Number(args.glyphStep ?? 2))
       const modeArg = String(args.mode ?? '').toLowerCase()
-      const mode = modeArg === 'surface' || modeArg === 'cave' ? modeArg : 'auto'
+      /* 🔴 2026-10-15（用户需求）：**默认给"脚下方块那一层"**（地板层视图）。
+       *    老行为一个都没丢：`mode:"auto"`（地下自动切洞穴层）/ `"surface"` / `"cave"` 原样保留 ——
+       *    传了就用传的那个；不传、或传了不认识的值 ⇒ `floor`。 */
+      const mode = modeArg === 'auto' || modeArg === 'surface' || modeArg === 'cave' ? modeArg : 'floor'
       const slab = Math.min(Math.max(Number(args.slab ?? 2) || 2, 1), 8)
-      const hm = sess.bot.heightmap({ radius: args.radius, yTop: args.yTop, yBottom: args.yBottom, mode, slab })
+      /* `floor` 走新函数（直接 import `src/map-render.mjs`，不经过 `core.mjs` 的薄包装 —— 那文件贴着 1000 行上限）；
+       * 其余三条仍走 `sess.bot.heightmap()`。 */
+      const hm = mode === 'floor'
+        ? floorMapOf(sess.bot.requireBot(), { radius: args.radius, layer: args.layer, depth: args.depth })
+        : sess.bot.heightmap({ radius: args.radius, yTop: args.yTop, yBottom: args.yBottom, mode, slab })
+      const purposeArg = String(args.purpose ?? '').toLowerCase()
+      const purpose = purposeArg === 'navigation' || purposeArg === 'hazards' ? purposeArg : 'overview'
+      const nav = navSummaryOf(hm, { purpose, target: args.target })
 
       const out = {
         center: hm.center, radius: hm.radius, unloadedTiles: hm.unloaded, mode: hm.mode,
         ...(hm.layer ? { layer: hm.layer } : {}),
         legend: hm.legend.slice(0, 15),
         format,
+        /* ── 2026-10-15 结构化地图数据 ──
+         * `cellSize` = 字符图每一格代表几个方块（= `glyphStep`）：字符图上的"第 i 行第 j 列"
+         * 要用 `origin + 行列 × cellSize` 才换得回世界坐标，**别拿抽稀过的格子当精确坐标**。
+         * `bounds` / `hazards` / `nearbyTargets` 里的坐标**已经是真实世界坐标**。 */
+        purpose,
+        cellSize: step,
+        origin: { x: hm.originX ?? (hm.center.x - hm.radius), z: hm.originZ ?? (hm.center.z - hm.radius) },
+        bounds: hm.bounds ?? {
+          minX: hm.center.x - hm.radius, maxX: hm.center.x + hm.radius - 1,
+          minZ: hm.center.z - hm.radius, maxZ: hm.center.z + hm.radius - 1,
+        },
+        complete: hm.complete ?? !hm.truncated,
+        hazards: (hm.hazards ?? hazardCellsOf(hm, { limit: 12 })).slice(0, 12),
+        nearbyTargets: nav.nearbyTargets,
       }
+      if (mode === 'floor' && hm.counts) out.tiles = hm.counts
       if (format === 'chars' || format === 'both') {
         out.glyphMap = McBot.glyphMap(hm.names, step, { x: hm.radius, y: hm.radius })
       }
       if (format === 'image' || format === 'both') {
-        const img = sess.bot.mapImage({
+        const img = await sess.bot.mapImageAsync({
           radius: args.radius, yTop: args.yTop, yBottom: args.yBottom, scale: args.scale, mode, slab,
+          layer: args.layer, depth: args.depth,
         })
         const png = encodePng(img.width, img.height, img.rgba)
         out.image = { width: img.width, height: img.height, bytes: png.length, scale: img.scale }
@@ -2443,17 +2655,25 @@ export function apply(ctx, rawConfig) {
         .map((e) => (e?.glyph ? `${e.glyph}${e.name}×${e.count}` : `${e?.name ?? '?'}×${e?.count ?? 0}`))
         .join(' ')
       const lines = [
-        hm.mode === 'cave'
-          ? `🕳️ 洞穴层图 中心 (${hm.center.x}, ${hm.center.z}) ｜ 我这一层 y=${hm.layer.y}，上下各 ${hm.layer.slab} 格 ｜ 半径 ${hm.radius} ｜ 未加载 ${hm.unloaded} 格`
-          : `🗺️ 地形图 中心 (${hm.center.x}, ${hm.center.z}) ｜ 半径 ${hm.radius} ｜ 未加载 ${hm.unloaded} 格`,
+        hm.mode === 'floor'
+          ? `🪨 地板层图（脚下方块那一层）y=${hm.layer.y} ｜ 中心 (${hm.center.x}, ${hm.center.z}) ｜ 半径 ${hm.radius} ｜ 未加载 ${hm.unloaded} 格`
+          : (hm.mode === 'cave'
+            ? `🕳️ 洞穴层图 中心 (${hm.center.x}, ${hm.center.z}) ｜ 我这一层 y=${hm.layer.y}，上下各 ${hm.layer.slab} 格 ｜ 半径 ${hm.radius} ｜ 未加载 ${hm.unloaded} 格`
+            : `🗺️ 地形图 中心 (${hm.center.x}, ${hm.center.z}) ｜ 半径 ${hm.radius} ｜ 未加载 ${hm.unloaded} 格`),
         `图例 ${legendText}`,
       ]
-      if (hm.mode === 'cave') {
+      if (hm.mode === 'floor') {
+        const t = hm.counts ?? {}
+        lines.push(`能站 ${t.walkable ?? 0} 格 ｜ 墙 ${t.blocked ?? 0} ｜ 会掉下去 ${t.drop ?? 0} ｜ 液体 ${t.liquid ?? 0} ｜ 未加载 ${t.unknown ?? 0}`)
+        lines.push('（· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载；想看老视图就 mode:"auto"（地下自动切洞穴层）/ "surface"（地表）/ "cave"）')
+      } else if (hm.mode === 'cave') {
         lines.push('（# 墙 · 能站 ↓ 低一格 v 会掉下去 ~ 水 ≈ 岩浆 * 矿石 ? 未加载；想强制看地表就 mode:"surface"）')
       }
+      /* 2026-10-15：`purpose` 的紧凑摘要（导航/危险）—— 让模型不用自己从几十行字符图里数 */
+      for (const l of nav.lines) lines.push(l)
       if (out.glyphMap) lines.push(out.glyphMap)
       if (out.image) {
-        lines.push(`🖼️ ${hm.mode === 'cave' ? '洞穴层俯视图' : '俯视图'} ${out.image.width}×${out.image.height}（每格 ${out.image.scale}px，${out.image.bytes} B）`
+        lines.push(`🖼️ ${hm.mode === 'floor' ? '地板层俯视图' : (hm.mode === 'cave' ? '洞穴层俯视图' : '俯视图')} ${out.image.width}×${out.image.height}（每格 ${out.image.scale}px，${out.image.bytes} B）`
           + `${out.image.file ? ` 落盘：${out.image.file}` : ''}${out.image.attachment ? '（已内联）' : ''}`)
         if (out.image.attachmentError) lines.push(`（内联失败：${out.image.attachmentError}）`)
         if (out.image.fileError) lines.push(`（落盘失败：${out.image.fileError}）`)
@@ -2530,12 +2750,13 @@ export function apply(ctx, rawConfig) {
     description: '与游戏世界互动（**优先用它，别用服务器指令**）。mode：\n'
       + '· look   看向坐标(x,y,z)或玩家(who)："看向我" = look + who\n'
       + '· toward 看向并走近某个玩家(who)\n'
-      + '· place  放方块到 (x,y,z)；悬空先垫脚（=搭高）；带 used/held\n'
+      + '· place  放方块到 (x,y,z)；悬空先垫脚（=搭高）\n'
+      + '· bridge 搭路：朝 (x,y,z) 一格格铺（铺在脚下一层），**每块等服务端确认了才走**；有坠落/岩浆风险就停\n'
       + '· break  破坏 (x,y,z)：**先自动换对的工具**；换不上就拒绝\n'
-      + '· use    使用方块或实体(who)：开门、按钮、拉杆、喂动物；**都不给 = 用手上的东西**\n'
+      + '· use    使用方块或实体(who)：开门、按钮、拉杆、喂动物；都不给=用手上的东西\n'
       + '· useitem 用手上的东西：扔眼睛/雪球、拉弓、喝药水\n'
-      + '· attack 打实体：给 who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。约 10 秒，没打死再叫一次\n'
-      + '· equip  装备(name)：护甲自动穿到对应格（头盔/胸甲/护腿/靴子/盾→副手），其余拿到手上；to 指定格子\n'
+      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。约 10 秒\n'
+      + '· equip  装备(name)：护甲自动穿到对应格（盾→副手），其余拿到手上；to 指定格子\n'
       + '· enchant 附魔台：自动开窗放料；option:0-2 真附魔，不给只报选项\n'
       + '· anvil   铁砧：action:combine(默认) / rename；item + name\n'
       + '· smithing 锻造台：item 底座、name 附加、template 模板\n'
@@ -2565,6 +2786,10 @@ export function apply(ctx, rawConfig) {
         case 'look':    return { mode, ...(await bot.lookAt(args)) }
         case 'toward':  return { mode, ...(await bot.interact(args)) }
         case 'place':   return withOutcome({ mode, ...(await bot.placeBlock(args)) }, { expect: 'placed' })
+        /* P0-2（用户 m02868）：搭路是**独立状态机** —— 每格"放一块 → 等服务端确认 → 才走"，任何一处
+         * 对不上（脚下悬空 / 前方致命 / 血量太低 / 回读没确认）立刻停，绝不继续往下铺。
+         * `x/y/z` 是**终点那一格**（铺在脚下一层），方向与格数由 `bridgeDirTo()` 反推。 */
+        case 'bridge':  return withOutcome({ mode, ...(await bot.bridge({ x: args.x, y: args.y, z: args.z, name: args.name })) })
         case 'break':   return withOutcome({ mode, ...(await bot.breakBlock(args)) })
         case 'use': {
           // 没给坐标也没给 who ⇒ 不是"右键某个东西"，而是"用手上的东西"（对着空气用）
@@ -2579,7 +2804,7 @@ export function apply(ctx, rawConfig) {
         case 'anvil':   return { mode, ...(await bot.anvilTable({ action: args.action, item: args.item, name: args.name, x: args.x, y: args.y, z: args.z })) }
         case 'smithing': return { mode, ...(await bot.smithingTable({ item: args.item, name: args.name, template: args.template, x: args.x, y: args.y, z: args.z })) }
         case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
-        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/break/use/useitem/attack/equip/enchant/toss）`)
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/attack/equip/enchant/anvil/smithing/toss）`)
       }
     },
   }))
@@ -2674,21 +2899,33 @@ export function apply(ctx, rawConfig) {
         name: args.name ? String(args.name) : null, pos,
         maxDistance: args.maxDistance ?? 16, count: args.count,
       })
-      return { result: lines }
+      /* 🔴 审计 F1：`dig()` 回的是**字符串数组**，这里必须同时给 `result`（结构化保留）
+       * 和 `text`（拼好的正文）。`outcomeOf()` 与任务执行器的"失败分类"都只看
+       * `error/reason/note/why/hint/text` —— 只回 `result` 的话它们**一个字都读不到**，
+       * 于是"挖成功 / 服务端拒了 / 时间到"三种结局在台账里长得一模一样（每轮记一次失败，
+       * 3 轮后任务被误判成 blocked）。`text()` 渲染器优先用 `text`，模型看到的也更清爽。 */
+      return { result: lines, text: lines.join('\n') }
     },
   }))
 
   ctx.tools.register(asTool({
     name: 'mc_task',
-    description: '长活儿的进度台账（挖 4 个以上会自动开一条）：进度落在记忆根的 tasks.json 里，'
-      + '**掉线、重连、换一轮对话回来都还在**，不只在你的对话上下文里。\n'
-      + '`resume` 会用**现场背包**复核进度，并给出下一步该调哪个工具；`list` 看在做的事；`cancel` 取消。',
+    description: '长活儿进度台账（挖 4 个以上自动开），存记忆根 tasks.json，掉线重连都还在。\n'
+      + '`run` 一轮推进一步；`resume` 复核；`plan`/`step` 记账。',
     parameters: {
-      action: { type: 'string', description: 'list（默认）| get | resume | note | done | cancel | forget' },
-      taskId: { type: 'string', description: '任务 id（默认最近一件在做的事）' },
-      text: { type: 'string', description: 'note 要记的一句话' },
-      all: { type: 'boolean', description: 'list 时连已完成/取消的也列出来' },
-      limit: { type: 'number', description: 'list 最多几条（默认 10）' },
+      action: { type: 'string', description: 'list（默认）| run | get | resume | note | done | cancel | forget | plan | step' },
+      taskId: { type: 'string', description: '任务 id（默认最近一件）' },
+      text: { type: 'string', description: 'note 的话 / step 原因' },
+      all: { type: 'boolean', description: 'list 含已完成' },
+      limit: { type: 'number', description: 'list 条数 / run 步数上限' },
+      step: { type: 'string', description: '步骤 id（默认当前）' },
+      status: { type: 'string', description: 'done（默认）| running | failed | skipped | pending（放回没做）' },
+      /* 🟡 2026-10-15 审计（报告 H 第 8 条）：这里原来写 `items: { type: 'string' }`，
+       *    但注入文案与 `src/task-runner.mjs:113 normSteps()` 都认**对象**
+       *    （`[{id:"挖木头", op:"mc_dig", args:{name:"oak_log"}}, …]`）⇒ 模型照文案传对象会被
+       *    宿主的参数校验直接拒掉。与 `mc_sequence` 的 `steps` 保持同一种写法。 */
+      steps: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '步骤表：[{id:"…", op:"mc_dig", args:{…}}, …]（也认纯字符串 id）' },
+      force: { type: 'boolean', description: 'run 强行继续' },
     },
     output: text(),
     async execute(args, exec) {
@@ -2701,17 +2938,73 @@ export function apply(ctx, rawConfig) {
         const t = bot.taskGet({ taskId: id })
         if (!t) return { text: '📋 没有这个任务（`mc_task {action:"list"}` 看看在做的是哪些）' }
         lines.push(t.line)
+        for (const s of t.steps ?? []) lines.push(`  ${s.status === 'done' ? '✅' : s.status === 'failed' ? '❌' : s.status === 'running' ? '▶' : s.status === 'skipped' ? '⏭' : '·'} ${s.id}${s.attempts ? `（试过 ${s.attempts} 次）` : ''}`)
         if (t.checkpoint) lines.push(`上次现场：${JSON.stringify(t.checkpoint)}`)
         if (t.lastError) lines.push(`上次卡在：${t.lastError.kind} —— ${t.lastError.reason ?? ''}`)
         if (t.loopDetected) lines.push(`⚠️ 同一个动作连着失败 ${t.loopDetected.count} 次 —— 别再原地重试，换个办法或取消`)
         for (const h of t.history ?? []) lines.push(`  · ${new Date(h.at).toTimeString().slice(0, 8)} ${h.text}`)
         return { text: lines.join('\n') }
       }
+      if (action === 'plan') {
+        const r = bot.taskPlan({ taskId: id, steps: Array.isArray(args.steps) ? args.steps : null })
+        if (!r?.ok) return { text: `📋 ${r?.reason ?? '没做成'}` }
+        const t = r.task
+        lines.push(`📋 ${t.taskId} · ${t.goal}${r.wrote ? '（步骤表已重写）' : ''}`)
+        if (t.step) lines.push(`现在：${t.step}`)
+        for (const s of t.steps ?? []) lines.push(`  ${s.status === 'done' ? '✅' : s.status === 'failed' ? '❌' : s.status === 'running' ? '▶' : s.status === 'skipped' ? '⏭' : '·'} ${s.id}${s.attempts ? `（试过 ${s.attempts} 次）` : ''}${s.note ? ` · ${s.note}` : ''}`)
+        return { text: lines.join('\n') }
+      }
+      if (action === 'step') {
+        const r = bot.taskStep({
+          taskId: id,
+          step: args.step ? String(args.step) : null,
+          status: args.status ? String(args.status) : 'done',
+          why: args.text ? String(args.text) : null,
+        })
+        if (!r?.ok) return { text: `📋 ${r?.reason ?? '没做成'}` }
+        const t = r.task
+        const tail = r.exhausted
+          ? `\n⚠️ 这一步试了 ${r.attempts}/${r.max} 次都没成 —— 任务标成"卡住了"，别再原地重试，换个办法或问玩家`
+          : ''
+        return { text: `📋 ${t.step}${r.next ? ` ⇒ 下一步 ${r.next}` : ''}${tail}` }
+      }
+      if (action === 'run') {
+        /* 任务执行器（2026-10-14 "任务驱动"第二步）：**一轮只推进一个可验证的步骤**。
+         * 预算夹在"本轮还剩多少"以内 —— 宁可少推一步带着进度返回，也不要把这次调用挂住。 */
+        const left = Math.max(0, Number(bot.msLeft?.() ?? 0))
+        /* 🔴 审计 F7：原来是 `Math.max(1000, Math.min(args.budgetMs || 8000, left - 900))` ——
+         * 先 min 再 max ⇒ `left < 1900` 时外层那个 1000 下限又把它**抬回去**，
+         * 本轮只剩 0ms 也硬跑 1000ms（注释说的"夹在本轮剩余以内"根本不成立）。
+         * 现在：剩余不足 1000ms 就直接如实说没时间了，别硬开一轮。 */
+        if (left < 1000) {
+          return { text: `⏳ 这一轮没时间了（只剩 ${Math.round(left)}ms）—— 等下一轮再 mc_task {action:"run"}` }
+        }
+        const budgetMs = Math.min(Math.max(500, Number(args.budgetMs) || 8000), left - 900)
+        const r = await bot.taskRun({
+          taskId: id,
+          budgetMs,
+          maxRounds: args.limit ?? null,
+          force: Boolean(args.force),
+          signal: exec?.signal ?? null,
+          call: async (tool, targs) => {
+            if (tool === 'mc_task') return { error: '任务执行器不能再调 mc_task' }
+            const h = TOOL_HANDLERS.get(tool)
+            if (!h) return { error: `没有 ${tool} 这个工具` }
+            try {
+              return await h(targs, exec)
+            } catch (e) {
+              return { error: String(e?.message ?? e) }
+            }
+          },
+        })
+        return { text: runText(r) }
+      }
       if (action === 'resume') {
         const r = bot.taskResume({ taskId: id })
         if (!r?.ok) return { text: `📋 没有可恢复的任务（${r?.reason ?? '现在没有在做的事'}）。要开一件：直接 mc_dig {count:16} 这类"一次干一批"的调用，会自动开工。` }
         const t = r.task
         lines.push(`📋 ${t.taskId} · ${t.kind} · ${t.goal ?? ''} · ${t.status}`)
+        if (r.step) lines.push(`步骤：${r.step}${r.stepAttempts ? `（当前这步试过 ${r.stepAttempts} 次）` : ''}`)
         lines.push(`现场复核：${r.verified ? `背包里有 ${r.have} 个，还差 ${r.need} 个` : `复核不了（${r.verifyNote ?? '读不到背包'}）`}`)
         lines.push(`下一步：${r.next} —— ${r.hint}`)
         if (r.action) lines.push(`现在就可以调：\`${r.action.tool}\` ${JSON.stringify(r.action.args)}`)
@@ -2727,8 +3020,10 @@ export function apply(ctx, rawConfig) {
         return { text: t ? `📋 收工：${t.taskId}（${t.progress.done}${t.progress.unit ?? '个'}）` : '📋 没有活跃任务' }
       }
       if (action === 'cancel') {
-        const t = bot.taskCancel({ taskId: id, why: args.text ? String(args.text) : '模型取消' })
-        return { text: t ? `📋 取消：${t.taskId}` : '📋 没有活跃任务' }
+        // 🔴 先让底下那件事停下（停寻路 / 停采集 / 松控制位）再改状态 ——
+        //    反过来的话任务说"已取消"，机器人还在挖，下一个动作就会跟它抢控制位。
+        const t = await bot.taskRunCancel({ taskId: id, reason: args.text ? String(args.text) : '模型取消' })
+        return { text: t ? `📋 取消：${t.taskId}（底下那件事也停了）` : '📋 没有活跃任务' }
       }
       if (action === 'forget') {
         const n = bot.taskForget({ taskId: id })
@@ -3409,7 +3704,9 @@ export function apply(ctx, rawConfig) {
     if (!items.length) return { delivered: false, todo: [], queued: 0, reason: 'no-items' }
 
     const ledger = ledgerOf(agent)
-    const preset = lastPresetSeen.get(agent) ?? String(agent?.ctx ? '' : '')
+    /* 🔴 审计：这里原来是 `?? String(agent?.ctx ? '' : '')` —— 两支都是 `''`，等于什么都没兜。
+     * preset 还没认出来时指纹就是 `|<版本>`（对照 1536/3777 用的 `?? null`）。 */
+    const preset = lastPresetSeen.get(agent) ?? ''
     const fp = `${preset}|${PLUGIN_VERSION}`
     if (ledger.fp !== fp) { ledger.fp = fp; ledger.rel = []; ledger.items = new Map() }
 
@@ -4101,8 +4398,9 @@ export function apply(ctx, rawConfig) {
         return
       }
 
-      // preset id 必须是目录名（宿主 `PRESET_ID = /^[a-z0-9][a-z0-9-]*$/`）——
-      // 所以默认名单里的 `dsh-mc-agent`（下划线）**永远不可能是 preset id**，只能建 `minecraft` 这种。
+      // preset id 必须是目录名（宿主 `PRESET_ID = /^[a-z0-9][a-z0-9-]*$/`）。
+      // 🔴 2026-10-15 审计（报告 E 第 5 条）：这里原来写"`dsh-mc-agent` 带下划线、永远不可能是
+      //    preset id"——错的（它是连字符，完全合法）。`pickPresetTarget` 现在会把插件自己的 id 排除掉。
       const target = pickPresetTarget(wanted)
       if (!target) {
         logLine(`没找到 MC 模式 preset，而 mcModePresets 里没有**合法**的 preset id（${wanted.join(' / ')}）→ 跳过`)
@@ -4256,14 +4554,19 @@ export function apply(ctx, rawConfig) {
       // 非 MC 模式：mc_* / mc_kit_* 从可见面摘掉；mc_admin_* 例外（它的用途就是在普通会话里管理）
       try {
         const t = scopedTools(agent.ctx)
-        if (!t) { logDebug('非 MC 模式：拿不到 scoped tools，跳过 mc 工具隐藏（guard 仍会硬拒）'); return }
+        /* 🔴 报告 H14（2026-10-13）：`mcPolicyKind` 在 `:4252` 就记下了 —— 如果这里拿不到
+         *    scoped tools 就 return，下一次 `applyMcModePolicy` 会在 `:4245` 因为"kind 没变"
+         *    直接短路，**永远不再重试**（MC 分支同理 ⇒ 白名单一次没套上就再也不会套，pwsh 一直能用）。
+         *    失败路径上把缓存删掉，让下一次调用重试。 */
+        if (!t) { mcPolicyKind.delete(agent); logDebug('非 MC 模式：拿不到 scoped tools，跳过 mc 工具隐藏（guard 仍会硬拒，下次再试）'); return }
         const deny = ourToolNames.filter((n) =>
           n.startsWith('mc_kit_') || (n.startsWith('mc_') && !n.startsWith('mc_admin_')))
         if (!deny.length) return
         mcRestrictRelease.set(agent, t.restrict({ deny }))
         logDebug(`非 MC 模式：mc / mc_kit 工具已从可见面摘掉（mc_admin_* 保留）${agent.id ? `（${agent.id}）` : ''}`)
       } catch (e) {
-        logLine(`非 MC 模式隐藏 mc 工具失败（${String(e?.message).slice(0, 160)}）—— guard 仍会硬拒`)
+        mcPolicyKind.delete(agent)
+        logLine(`非 MC 模式隐藏 mc 工具失败（${String(e?.message).slice(0, 160)}）—— guard 仍会硬拒，下次再试`)
       }
       return
     }
@@ -4290,7 +4593,7 @@ export function apply(ctx, rawConfig) {
     //      + 配置里额外允许的其它工具。
     try {
       const t = scopedTools(agent.ctx)
-      if (!t) { logLine('MC 模式：拿不到 scoped tools，跳过可见性限制（guard 仍会硬拒）'); return }
+      if (!t) { mcPolicyKind.delete(agent); logLine('MC 模式：拿不到 scoped tools，跳过可见性限制（guard 仍会硬拒，下次再试）'); return }
       const { allowOtherTools, hideAdminTools } = pluginConfig.mcMode
       const adminNames = ourToolNames.filter((n) => n.startsWith('mc_admin_'))
       const wanted = [
@@ -4323,7 +4626,9 @@ export function apply(ctx, rawConfig) {
       mcRestrictRelease.set(agent, release)
       logDebug(`MC 模式：工具白名单已生效（${agent.id}）：${allow.join(', ')}`)
     } catch (e) {
-      logLine(`MC 模式工具白名单**没生效**（${String(e?.message).slice(0, 160)}）—— 管理工具与文件越界仍由 guard 兜底`)
+      /* H14：白名单没套上 ⇒ 别把 kind 留在缓存里（否则 `:4245` 会短路、再不重试） */
+      mcPolicyKind.delete(agent)
+      logLine(`MC 模式工具白名单**没生效**（${String(e?.message).slice(0, 160)}）—— 管理工具与文件越界仍由 guard 兜底，下次再试`)
     }
   }
 
@@ -4403,7 +4708,7 @@ export function apply(ctx, rawConfig) {
         return 'MC 模式会话不能读取或修改 dsh-mc-agent 配置——请在普通会话里用 mc_admin_config 改。'
       }
 
-      if (/^(read|edit|write|glob|grep|ls|cat|read_image|mc_kit_memory)$/i.test(name)) {
+      if (/^(read|edit|write|ops_replace|glob|grep|ls|cat|read_image|mc_kit_memory)$/i.test(name)) {
         const args = exec?.arguments ?? {}
         // 受保护文件（RULES.md / AGENTS.md / config.json，src/protected.mjs）：**可读不可写**。
         // 宿主文件工具里只有 write|edit 会写；记忆工具按 action 判定（memory.mjs 内还有一道兜底）。
@@ -4662,7 +4967,7 @@ export function apply(ctx, rawConfig) {
     if (g2.length) out.personalGrid = g2
     if (out.grid || out.personalGrid) {
       out.note = '合成格里有东西：它们在合成格里、`bot.inventory` 看不见（所以会报"缺料"）。'
-        + '叫一次 mc_craft（或 mc_connect 重连）会把格子里的东西退回背包。'
+        + '叫一次 mc_craft 会把格子里的东西退回背包。'
     }
     return Object.keys(out).length ? out : null
   }
@@ -4670,11 +4975,19 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register(asTool({
     name: 'mc_diag',
     description: '诊断：当前会话的机器人内部状态（物理/控制位/收包/事件队列/合成窗口与合成格）——排查"走不动/收不到消息/合成说缺料"用。'
-      + '同时报**提示词注入状态**（`promptInjection`：三段提示词各自会不会注入、为什么不会）。',
-    parameters: {},
+      + '同时报**提示词注入状态**（`promptInjection`：三段提示词各自会不会注入、为什么不会），'
+      + '以及**性能监测**（`perf`：每个动作的墙钟 / CPU / 期间事件循环延迟 —— 判断"要不要把某个动作搬进 Worker 线程"就看它）。',
+    parameters: {
+      resetPerf: { type: 'boolean', description: '顺手清空性能样本（换场景重测用）' },
+    },
     output: text(),
     async execute(args, exec) {
       const sess = getSession(exec)
+      if (args?.resetPerf) perfReset()
+      const perf = perfSnapshot()
+      // 导航缓存（导航 P2）：命中率低了说明"每次都重扫"，可以据此判断缓存到底有没有用
+      const terrainCache = terrainCacheStats(sess.bot.bot)
+      const workers = workerPoolStats()
       const injection = promptInjectionStatus(exec?.agent)
       const b = sess.bot.bot
       /* 🔴 审计报告 F3：以前只判 `b?.entity`，不看 `_client.ended` —— 断线后 mineflayer 会留下
@@ -4686,6 +4999,7 @@ export function apply(ctx, rawConfig) {
         return {
           online: false, ghost: Boolean(b?.entity) && b?._client?.ended === true,
           lastError: sess.bot.lastError, mode: sess.mode, promptInjection: injection,
+          perf, terrainCache, workers,
           hint: '连接已经结束了（bot.entity 只是 mineflayer 的残留）——要回到游戏里请重新 mc_connect',
         }
       }
@@ -4704,10 +5018,17 @@ export function apply(ctx, rawConfig) {
         })(),
         position: { x: Math.floor(b.entity.position.x), y: Math.floor(b.entity.position.y), z: Math.floor(b.entity.position.z) },
         pendingEvents: sess.events.length, mode: sess.mode, stats: sess.bot.stats,
+        terrainCache,
+        workers,
         connection: sess.bot.connectionView(),
         crafting: windowView(b),
+        /* 统一动作调度器（阶段 P0：只记账）：谁在占什么、撞过几次车。
+         * 排查"两个动作互相踩"（合成 / 熔炼 / 开箱子抢同一个窗口、走路被挖矿抢控制位）用。 */
+        scheduler: sess.bot.actionSnapshot(),
         watching: sess.watchdog?.status() ?? null,
         promptInjection: injection,
+        /* 2026-10-15：性能监测 —— `verdict` 里就是"哪个动作该搬 Worker"的中文结论 */
+        perf,
       }
     },
   }))

@@ -451,9 +451,6 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       return e
     }
 
-    /** 拼一行的调试文本（**只放状态码**，绝不回显请求体 —— 里面有密码） */
-    const describe = (e, status) => `${e?.message ?? e}${status ? `（HTTP ${status}）` : ''}`
-
     async function apiFetch(path, opts) {
       const init = Object.assign({ headers: { accept: 'application/json' } }, opts)
       if (init.body !== undefined && init.body !== null) {
@@ -494,9 +491,20 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      * 现有：状态条（3s 轮询 /api/mc/status）
      * ================================================================== */
 
-    /** 轮询本会话的 MC 状态；不在游戏里就不渲染 */
-    function useMcStatus(sessionId) {
+    /**
+     * 轮询本会话的 MC 状态；不在游戏里就不渲染。
+     *
+     * 🔴 2026-10-15 审计（报告第 6 条）：原来 `.catch(() => { if (alive) setState(null) })`
+     *    —— **一次**轮询失败（服务端重启、瞬时 5xx、网络抖动）就把状态清成 null，
+     *    而渲染门是 `if (!state || state.active !== true) return null` ⇒
+     *    整个状态条（**含唯一入口「强制停止」**）凭空消失，用户既看不到状态、也没法停。
+     *    现在：**失败保留上一次读到的状态**，只累加"连续失败次数"，
+     *    由 `McStatusBar` 把这件事说出来（读不到 ≠ 不在游戏里）。
+     * @returns {[object|null, Function, number]} [状态, setState, 连续失败次数]
+     */
+    function useMcStatus(sessionId, nonce) {
       const [state, setState] = React.useState(null)
+      const [pollFail, setPollFail] = React.useState(0)
       React.useEffect(() => {
         if (!sessionId) return undefined
         let alive = true
@@ -505,14 +513,19 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             headers: { accept: 'application/json' },
           })
             .then((r) => (r.ok ? r.json() : null))
-            .then((j) => { if (alive) setState(j) })
-            .catch(() => { if (alive) setState(null) })
+            .then((j) => {
+              if (!alive) return
+              if (j && typeof j === 'object') { setPollFail(0); setState(j) }
+              // 非 200 / 空体：**不动 state**，只记一次失败
+              else setPollFail((n) => n + 1)
+            })
+            .catch(() => { if (alive) setPollFail((n) => n + 1) })
         }
         tick()
         const timer = setInterval(tick, 3000)
         return () => { alive = false; clearInterval(timer) }
-      }, [sessionId])
-      return [state, setState]
+      }, [sessionId, nonce])          // nonce 变一次 = 立刻重读一次（强制停止后不用等 3s）
+      return [state, setState, pollFail]
     }
 
     /**
@@ -536,24 +549,38 @@ select[data-wc-in]{appearance:none;padding-right:22px;
     function McStatusBar(props) {
       // session scope 的标准 props；兼容 session 对象形态
       const sessionId = props?.sessionId ?? props?.session?.id
-      const [state, setState] = useMcStatus(sessionId)
+      const [pollNow, setPollNow] = React.useState(0)
+      const [state, , pollFail] = useMcStatus(sessionId, pollNow)
       const [busy, setBusy] = React.useState(false)
+      // 🔴 报告第 5 条：强制停止原来 `.catch(() => {})` —— 连"服务端说没停成"都看不见。
+      const [stopErr, setStopErr] = React.useState('')
 
       // 只有一个动作：强制停止（用户 2026-09-16："移除停止，只剩强行停止"）。
       // 后端顺序：停 LLM → 优雅退游戏 → 清该会话后台任务 → 再停一次 LLM。
       const stop = React.useCallback(() => {
         if (!sessionId) return
         setBusy(true)
+        setStopErr('')
         fetch('/api/mc/stop', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ sessionId, reason: '用户强制停止' }),
         })
-          .catch(() => {})
+          .then(async (r) => {
+            let j = null
+            try { j = await r.json() } catch (e) { j = null }
+            // 🔴 报告第 5 条：HTTP 层与业务层都要判 —— 以前两个都不看，
+            //    服务端回了 `{ok:false, error:…}` 界面上也像"成功"。
+            if (!r.ok) throw new Error(`服务端返回 HTTP ${r.status}`)
+            if (!j || j.ok !== true) throw new Error(String(j?.error ?? j?.message ?? '服务端没有确认停止'))
+            // 停完立刻重读一次状态，别等下一个 3s 轮询（用户点完要马上看到变化）
+            setPollNow((n) => n + 1)
+          })
+          .catch((e) => { setStopErr(String(e?.message ?? e ?? '停止失败')) })
           .finally(() => { setBusy(false) })
       }, [sessionId])
 
-      // 不在游戏里 → 不占位
+      // 不在游戏里 → 不占位（⚠️ 读不到状态**不算**不在游戏里，见 useMcStatus）
       if (!sessionId || !state || state.active !== true) return null
 
       const online = state.online === true
@@ -562,15 +589,22 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const shown = address.length > 26 ? address.slice(0, 25) + '…' : address
       const timeouts = Number(state.timeouts ?? 0)
       const stale = timeouts > 0
+      // 连续失败 ≥2 次（约 6s）才提示"读不到"，单次抖动不打扰
+      const pollBad = pollFail >= 2
       // 🔴 断线但正在自动重连（2026-09-19）：状态条要**说出**这件事，
       //    不能因为 online=false 就整个消失（用户会以为插件把状态忘了、AI 也以为还在游戏里）。
       const reconnecting = !online && state.reconnecting === true
       const label = online ? '在游戏中' : (reconnecting ? '重连中…' : '未上线')
-      const tip = online
+      const tip0 = online
         ? `${address ? address + '：' : ''}在游戏中${stale ? `（有 ${timeouts} 次操作超时，可能已失步）` : ''}`
         : (reconnecting
           ? `连接断了${address ? '（' + address + '）' : ''}，插件正在自动重连…`
           : (address ? `已连接 ${address} 但角色不在线` : '已连接但角色不在线'))
+      const tip = [
+        tip0,
+        pollBad ? `状态读不到（连续 ${pollFail} 次）—— 显示的是最后一次读到的状态` : '',
+        stopErr ? `强制停止失败：${stopErr}` : '',
+      ].filter(Boolean).join('\n')
 
       return React.createElement(
         'div',
@@ -578,16 +612,19 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           'data-mc-status': '',
           ...(busy ? { 'data-mc-busy': '' } : {}),
           ...(reconnecting ? { 'data-mc-reconnecting': '' } : {}),
+          ...(pollBad || stopErr ? { 'data-mc-warn': '' } : {}),
           title: tip,
         },
         React.createElement('span', { 'data-mc-dot': '', ...(online && !stale ? {} : { 'data-mc-warn': '' }) }),
-        React.createElement('span', { 'data-mc-text': '' }, label),
+        React.createElement('span', { 'data-mc-text': '' }, pollBad ? '状态读不到' : label),
         address ? React.createElement('span', { 'data-mc-sub': '', title: address }, shown) : null,
+        stopErr ? React.createElement('span', { 'data-mc-sub': '', title: stopErr }, '停止失败') : null,
         React.createElement('button', {
           type: 'button', 'data-mc-btn': '', 'data-mc-danger': '',
+          disabled: busy,
           title: '强制停止：中断当前生成并让机器人退出游戏',
           onClick: () => stop(),
-        }, '强制停止'),
+        }, busy ? '停止中…' : '强制停止'),
       )
     }
 
@@ -617,22 +654,69 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      * 服务端 `/api/mc/mode` 仍保留，供排查与测试用，前端不再依赖它。
      * ================================================================== */
     const MC_PRESETS_FALLBACK = ['minecraft', 'minecraft-plus', 'dsh-mc-agent']
-    let mcPresetIds = MC_PRESETS_FALLBACK.slice()
-    let mcPresetIdsAsked = false
+    /**
+     * 🔴 2026-10-15 审计（报告第 9 条）：这里原来是一个**模块级可变变量** `mcPresetIds`，
+     *    由异步 `fetch` 就地改写；而读它的地方是 `useMcSettingsGate` 里的
+     *    `localShow = … && mcPresetIds.includes(preset)` —— **普通变量不是 React state，
+     *    改了不会触发重渲染**。于是 `/api/mc/presets` 晚到（哪怕只晚一帧）时，
+     *    门控会一直拿兜底名单算下去，直到碰巧有别的 state 变化才"突然正确"。
+     *    现在改成：模块级只做**一次性的请求缓存**（`mcPresetIdsCache` + 共享的 in-flight Promise），
+     *    真正的名单进 hook 的 state —— 晚到也会重渲染。
+     */
+    let mcPresetIdsCache = null
+    let mcPresetIdsPromise = null
 
+    /**
+     * 🟢 2026-10-15 审计（报告第 10 条）：同一个接口现在**也带支持版本范围**
+     *    （`testedVersions` / `oldestVersion` / `latestVersion`）。以前客户端的版本门控是
+     *    `MC_VERSION_IN_RANGE = () => null` —— 一个永远"未知"的桩，于是"版本不匹配"的拦截
+     *    与红标**一行都到不了**。现在真判，所以缓存整个门控信息（名单 + 版本范围）。
+     */
+    let mcGateInfoCache = null
+    let mcGateInfoPromise = null
+
+    /**
+     * 拉「门控信息」：`{ presets, tested, oldest, latest }`。
+     *
+     * 一次性缓存 + 共享 in-flight Promise（同 `loadMcPresetIds` 的老规矩）：
+     * 空结果/失败都把 promise 置 null，允许下次挂载重试 —— **别让一次网络抖动
+     * 把门控永久钉在兜底值上**（2026-09-16 踩过）。
+     */
+    function loadMcGateInfo() {
+      if (mcGateInfoCache) return Promise.resolve(mcGateInfoCache)
+      if (mcGateInfoPromise) return mcGateInfoPromise
+      mcGateInfoPromise = Promise.resolve()
+        .then(() => fetch('/api/mc/presets', { headers: { accept: 'application/json' } }))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j) => {
+          const presets = Array.isArray(j?.mcModePresets) ? j.mcModePresets.map(String).filter(Boolean) : []
+          const tested = Array.isArray(j?.testedVersions) ? j.testedVersions.map(String).filter(Boolean) : []
+          const latest = typeof j?.latestVersion === 'string' && j.latestVersion
+            ? j.latestVersion
+            : (tested[tested.length - 1] ?? null)
+          if (!presets.length && !tested.length) {
+            mcGateInfoPromise = null            // 空结果不算数，允许下次挂载再试
+            return null
+          }
+          mcGateInfoCache = { presets, tested, oldest: j?.oldestVersion ?? tested[0] ?? null, latest }
+          return mcGateInfoCache
+        })
+        .catch(() => { mcGateInfoPromise = null; return null })   // 失败允许下次挂载再试
+      return mcGateInfoPromise
+    }
+
+    /** 只要 preset 名单（老调用点用的就是它）。 */
     function loadMcPresetIds() {
-      if (mcPresetIdsAsked) return
-      mcPresetIdsAsked = true
-      try {
-        fetch('/api/mc/presets', { headers: { accept: 'application/json' } })
-          .then((r) => (r.ok ? r.json() : null))
-          .then((j) => {
-            const list = Array.isArray(j?.mcModePresets) ? j.mcModePresets.map(String).filter(Boolean) : []
-            if (list.length) mcPresetIds = list
-            else mcPresetIdsAsked = false
-          })
-          .catch(() => { mcPresetIdsAsked = false })   // 失败允许下次挂载再试
-      } catch { mcPresetIdsAsked = false }
+      if (mcPresetIdsCache) return Promise.resolve(mcPresetIdsCache)
+      if (mcPresetIdsPromise) return mcPresetIdsPromise
+      mcPresetIdsPromise = loadMcGateInfo()
+        .then((info) => {
+          if (info && info.presets.length) { mcPresetIdsCache = info.presets; return info.presets }
+          mcPresetIdsPromise = null            // 空结果不算数，允许下次挂载再试
+          return null
+        })
+        .catch(() => { mcPresetIdsPromise = null; return null })   // 失败允许下次挂载再试
+      return mcPresetIdsPromise
     }
 
     /**
@@ -650,8 +734,14 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const sessionId = props?.sessionId ?? props?.session?.id
       const useSessions = props?.useSessions
       const [serverMode, setServerMode] = React.useState(null)
+      // 🔴 报告第 9 条：名单必须是 state，异步回来才会重渲染
+      const [presetIds, setPresetIds] = React.useState(MC_PRESETS_FALLBACK)
 
-      React.useEffect(() => { loadMcPresetIds() }, [])
+      React.useEffect(() => {
+        let alive = true
+        loadMcPresetIds().then((list) => { if (alive && list) setPresetIds(list) })
+        return () => { alive = false }
+      }, [])
 
       // ⚠️ useSessions 是宿主注入的标准 prop（官方标签也用它），组件生命周期内恒定存在，
       //    所以这两个条件调用不会改变 hook 数量。选择器只返回**原始值**，避免每次渲染造新对象。
@@ -695,7 +785,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         return () => { alive = false; if (timer) clearTimeout(timer) }
       }, [needServer, sessionId])
 
-      const localShow = known && blank === wantBlank && mcPresetIds.includes(preset)
+      const localShow = known && blank === wantBlank && presetIds.includes(preset)
 
       /**
        * 🔴 2026-09-16 用户："没有选中工作区，则拒绝发起 MC 模式会话和设置。"
@@ -749,7 +839,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      * 当前会话（或新对话页那个 blank 会话）**选中的工作区**。
      * 🔴 2026-09-16：新对话页还没开聊时，会话在服务端可能还没落盘 ——
      *    但**工作区是已经选好了的**，所以把它一起报给服务端（`cwd` 兜底参数），
-     *    免得"明明选了工作区却被拒绝"。服务端只认绝对路径且必须真实存在的目录。
+     *    免得"明明选了工作区却被拒绝"。服务端只认绝对路径、真实存在、**而且要在宿主的工作区
+     *    注册表里**（或已经带过 `.dsh-mc-agent/`）的目录 —— 2026-10-15 审计收紧了这条，
+     *    以前"任意存在的目录"都会被当工作区（能被 `DELETE /api/mc/express?cwd=…` 递归删）。
      */
     function useWorkspaceCwd(props) {
       const sessionId = props?.sessionId ?? props?.session?.id
@@ -943,7 +1035,16 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         return { btn, attr: s.attr, refresh, iconRoot }
       })
       const ordered = entries.slice().sort((a, b) => (HERO_BTN_ORDER[a.attr] ?? 99) - (HERO_BTN_ORDER[b.attr] ?? 99))
-      const refresh = () => { for (const e of entries) e.refresh() }
+      /**
+       * 🔴 2026-10-15 审计（报告第 3 条）：`dispose()` 原来只 `clearTimeout` + `observer.disconnect()`
+       *    + 摘掉按钮，**没有"已经销毁"的标志**。而 MutationObserver 的回调是
+       *    `Promise.resolve().then(...)` **微任务**：如果销毁正好发生在"变更已排队、微任务还没跑"
+       *    这一瞬间，那个微任务照样会执行 `place()`（`insertAdjacentElement` 把按钮**插回 DOM**）
+       *    和 `track()`（`observer.observe(...)` **重新武装**）—— 卸载之后按钮又冒出来、
+       *    观察者又开始常驻空转。加 `disposed` 标志，所有异步续跑点都先查它。
+       */
+      let disposed = false
+      const refresh = () => { if (disposed) return; for (const e of entries) e.refresh() }
 
       /**
        * 幂等放置：按 order 依次**紧贴前一个**地排在锚点后面（每个按钮必须紧跟它的前驱）。
@@ -951,6 +1052,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
        *    任何"往上找兄弟行"式的猜测都被 2026-09-16 的事故否掉了 —— 不重蹈。
        */
       const place = () => {
+        if (disposed) return
         const anchor = document.querySelector(HERO_CHIP_ANCHOR)
         const row = anchor === null ? null : anchor.parentElement
         if (anchor === null || row === null) return
@@ -986,6 +1088,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         return document.querySelector('[data-composer-seat]') ?? document.querySelector('[data-composer-card]')
       }
       const track = () => {
+        if (disposed) return
         const target = watchTarget()
         if (target === null || target === observed) return
         observer.disconnect()
@@ -993,18 +1096,23 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         observed = target
       }
       const observer = new MutationObserver(() => {
-        if (queued) return
+        if (disposed || queued) return
         queued = true
-        Promise.resolve().then(() => { queued = false; place(); track(); refresh() })
+        Promise.resolve().then(() => {
+          if (disposed) return          // 🔴 报告第 3 条：销毁后这个微任务不能再 place/track
+          queued = false; place(); track(); refresh()
+        })
       })
       track()
       // 首帧锚点可能比本组件晚挂上（React 提交顺序不保证）→ 多补几次；有上限，别常驻空转。
       let tries = 0
       let retry = null
       const tick = () => {
+        if (disposed) return
         place()
         track()
         refresh()
+        if (disposed) return
         if (document.querySelector(HERO_CHIP_ANCHOR) !== null) return   // 已就位，收工
         if (++tries >= 10) return
         retry = setTimeout(tick, 300)
@@ -1012,7 +1120,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       retry = setTimeout(tick, 120)
 
       const dispose = () => {
+        disposed = true
         if (retry) clearTimeout(retry)
+        retry = null
         observer.disconnect()
         for (const e of entries) {
           if (e.iconRoot) e.iconRoot.unmount()
@@ -1118,11 +1228,48 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      * 只是**提示**，不影响开关可用性（开关始终用于改配置）。
      */
     /**
-     * **预留**：判断一个 MC 版本号是否在本插件支持范围内。
-     * 目前**未实现** → 返回 `null`（未知），调用方按"在范围内"处理（版本号显示绿色）。
-     * 实现后应返回 `true` / `false`；`false` → 版本号标红，点它弹错误框。
+     * 版本号 → 数字段（`"1.21.4"` → `[1,21,4]`；`"26.1"` → `[26,1,0]`）。
+     * 拿不出数字段（空、`"未知"`、纯文字）⇒ `null`。
      */
-    const MC_VERSION_IN_RANGE = () => null
+    function mcVersionParts(v) {
+      const s = String(v ?? '').trim()
+      if (!s) return null
+      const m = s.match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?/)
+      if (!m) return null
+      return [Number(m[1]) || 0, Number(m[2]) || 0, Number(m[3]) || 0]
+    }
+
+    /**
+     * 判断一个 MC 版本号是否在本插件支持范围内。
+     *
+     * 🟢 2026-10-15 审计（报告第 10 条）：以前是 `() => null` 的桩 —— 一个**永远"未知"**的
+     * 函数，于是调用方 `lanVersionOk = (s) => MC_VERSION_IN_RANGE(s?.version) !== false`
+     * 恒为 `true`：`setError('版本不匹配：…')` 的拦截和局域网列表里 `data-wc-cn-bad` 的红标
+     * **一行都到不了**（死代码）。
+     *
+     * 判据与**上游真实行为**对齐：mineflayer 拿 `latestSupportedVersion` 做**上界拒绝**
+     * （见 `src/core.mjs` 的 `libraryInfo()` 注释），而 `testedVersions` 是**稀疏的实测清单**
+     * （`1.8.8` / `1.9.4` / … / `1.21.11` / `26.1`，共 28 项）—— 直接 `includes` 会把
+     * `1.21.10` 这类"没被单独测过、但协议兼容"的中间版本误标成不支持。
+     * 所以：**规范化成数字段后逐段比大小，比 `latest` 新才 `false`**。
+     *
+     * 拿不到范围信息（接口没回来 / 失败）或版本号解析不出来 ⇒ `null`（未知），
+     * 调用方按"在范围内"处理 —— **宁可漏报，不可误拦**。
+     *
+     * @returns true=在范围内 / false=比实测上界还新 / null=未知
+     */
+    function MC_VERSION_IN_RANGE(v) {
+      const want = mcVersionParts(v)
+      const info = mcGateInfoCache
+      if (!want || !info) return null
+      const latest = mcVersionParts(info.latest)
+      if (!latest) return null
+      for (let i = 0; i < 3; i++) {
+        if (want[i] > latest[i]) return false
+        if (want[i] < latest[i]) return true
+      }
+      return true
+    }
 
     /**
      * 「运行」图标 = DSH 裸三角（`IconTriangleRightFillRegular` 的几何）**描边成空心**
@@ -1345,8 +1492,21 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [dragging, setDragging] = React.useState(false)
       // 🔴 密码**不进 state**：非受控 input + ref，提交时读一次就丢；也不进任何 data-*
       const passRef = React.useRef(null)
+      /**
+       * 🔴 2026-10-15 审计（报告第 4 条）：`submit()` 的守卫是
+       *    `if (!u || !login.trim() || !p) return` —— **含密码**；而「创建」按钮的
+       *    `disabled` 只判 `!url.trim() || !login.trim()` —— **不含密码**。
+       *    于是密码空着时按钮是亮的，点下去**静默无反应**（Enter 也一样），用户只会以为坏了。
+       *    修法：用一个**布尔**记住"密码框非空"（布尔不是密码，不违反上面那条纪律），
+       *    让按钮的禁用条件与提交守卫完全一致，并且**提前把还差哪几项写出来**。
+       */
+      const [hasPass, setHasPass] = React.useState(false)
       const busy = busyKey === 'new:yggdrasil'
       const pickedSrv = picked === null ? null : (servers.find((s) => s.id === picked) ?? null)
+      const missing = []
+      if (!url.trim()) missing.push('认证服务器地址')
+      if (!login.trim()) missing.push('账号')
+      if (!hasPass) missing.push('密码')
 
       /** 拖入 authlib-injector 卡片：交给后端解析、加进缓存，然后自动选中并填进输入框 */
       const onDropCard = (e) => {
@@ -1429,14 +1589,21 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         h(Field, { label: '密码' },
           h('input', {
             'data-wc-in': '', type: 'password', ref: passRef, disabled: busy, autoComplete: 'off',
+            onChange: (e) => { const v = e.target.value; setHasPass((prev) => ((v.length > 0) === prev ? prev : v.length > 0)) },
             onKeyDown: (e) => { if (e.key === 'Enter') submit() },
           })),
+        // 🔴 报告第 4 条：把"还差什么"提前说出来，别让用户对着亮着的按钮猜
+        (missing.length && !busy)
+          ? h('p', { 'data-wc-hint': '', 'data-wc-dirty': '' }, '还差：' + missing.join('、'))
+          : null,
         h('div', { 'data-wc-acts': '' },
           h(Switch, { label: '设为默认账户', on: asDefault, onToggle: setAsDefault }),
           h('span', { 'data-wc-spacer': '' }),
           h('button', {
             type: 'button', 'data-wc-btn': '', 'data-wc-primary': '',
-            disabled: busy || !url.trim() || !login.trim(),
+            // 与 `submit()` 的守卫**完全一致**（含密码），不再出现"亮着但点了没反应"
+            disabled: busy || missing.length > 0,
+            title: missing.length ? '还差：' + missing.join('、') : '',
             onClick: submit,
           }, busy ? '创建中…' : '创建'),
         ),
@@ -1491,11 +1658,17 @@ select[data-wc-in]{appearance:none;padding-right:22px;
     /* ---------------------------------------------------------- 页 2：指令白名单 */
 
     function WhitelistPane(props) {
-      const { wlText, allowAll, busyKey, onWlText, onAllowAll, onSave } = props
+      const { wlText, allowAll, busyKey, cfgOk, onWlText, onAllowAll, onSave } = props
       const busy = busyKey !== null
       const saveBusy = busyKey === 'wl:save'
       // 开关**一拨就存**（用户 2026-09-16 定）；下面那份白名单仍然要点「保存」
       const allowBusy = busyKey === 'cfg:allowAll'
+      /**
+       * 🔴 2026-10-15 审计（报告第 2 条）：`/api/mc/config` 没读出来 ⇒ `wlText` 是初始空串。
+       *    「保存」在那种状态下会把服务端真实白名单**清空**，所以这里硬禁用。
+       *    （开关是单键写入、写的是用户明确选的值，不具破坏性，不禁用。）
+       */
+      const cfgBad = cfgOk === false
 
       return React.createElement(
         'div',
@@ -1508,6 +1681,10 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             onToggle: (next) => onAllowAll(next),
           }),
           React.createElement('div', { 'data-wc-h': '' }, '指令白名单（一行一条）'),
+          cfgBad
+            ? React.createElement('div', { 'data-wc-warnnote': '' },
+              '配置没读出来，白名单内容不可信 —— 「保存」已禁用（现在保存会清空服务端真实白名单）。关掉再打开这个窗口重试。')
+            : null,
           allowAll
             ? React.createElement('div', { 'data-wc-warnnote': '' }, '已允许所有指令，白名单不再生效。')
             : null,
@@ -1534,7 +1711,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             { 'data-wc-acts': '' },
             React.createElement('button', {
               type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
-              disabled: busy, onClick: onSave,
+              disabled: busy || cfgBad,
+              title: cfgBad ? '配置没读出来，先别保存' : '',
+              onClick: onSave,
             }, saveBusy ? '保存中…' : '保存'),
           ),
         ),
@@ -1545,7 +1724,11 @@ select[data-wc-in]{appearance:none;padding-right:22px;
 
     function PromptPane(props) {
       const {
-        mdText, wsExists, rulesExists, injectStatus,
+        /* 🔴 报告 H8（2026-10-13）：`:1584` 用了 `mdPath`，但这里以前**没解构它** ——
+         *    `mdPath` 声明在**兄弟函数** `McSettingsModal`（`:2066`）里，不在本函数的闭包链上
+         *    ⇒ 渲染「提示词」页必抛 `ReferenceError: mdPath is not defined`。
+         *    上层已经把 `mdPath` 当 prop 传进来了（`:2349`），补上解构即可。 */
+        mdText, mdSource, mdPath, wsExists, rulesExists, injectStatus,
         injectWc, injectWs, busyKey, onMdText, onSave, onReset, onInjectWc, onInjectWs,
         followVersion, rulesVersion, pluginVersion, versionPrompt, onFollowVersion, hasWorkspace,
         vpText, onVpText, onVpSave, onVpReset,
@@ -1719,7 +1902,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      */
     function SharePane(props) {
       const {
-        on, base, share, busyKey, hasWorkspace,
+        on, base, share, busyKey, hasWorkspace, cfgOk,
         onToggle, onSaveBase, onUseCurrent, onClear,
       } = props
       const busy = busyKey !== null
@@ -1730,6 +1913,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const baseBusy = busyKey === 'share:base'
       const clearBusy = busyKey === 'share:clear'
       const dirty = (baseText ?? '') !== (base ?? '')
+      // 🔴 报告第 2 条：配置没读出来 ⇒ `base` 是 ''，存下去会把已配好的地址抹掉。
+      const cfgBad = cfgOk === false
 
       return React.createElement(
         'div',
@@ -1750,6 +1935,10 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         // base 只在「开启」时可用：关闭时**禁用**（但保留可见，别让人以为设置消失了）
         React.createElement('div', { 'data-wc-sec': '' },
           React.createElement('div', { 'data-wc-h': '' }, 'base 地址'),
+          cfgBad
+            ? React.createElement('div', { 'data-wc-warnnote': '' },
+              '配置没读出来，base 内容不可信 —— 「保存 base」已禁用（现在保存会把服务端已配好的地址抹掉）。关掉再打开这个窗口重试。')
+            : null,
           React.createElement('div', { 'data-wc-field': '' },
             React.createElement('input', {
               'data-wc-in': '', value: baseText, spellCheck: false, disabled: busy || !on,
@@ -1764,7 +1953,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           React.createElement('div', { 'data-wc-acts': '' },
             React.createElement('button', {
               type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
-              disabled: busy || !on || !dirty, onClick: () => onSaveBase(baseText.trim()),
+              disabled: busy || !on || !dirty || cfgBad,
+              title: cfgBad ? '配置没读出来，先别保存' : '',
+              onClick: () => onSaveBase(baseText.trim()),
             }, baseBusy ? '保存中…' : '保存 base'),
             React.createElement('button', {
               type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '',
@@ -1844,6 +2035,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [error, setError] = React.useState('')
       const [settingsOpen, setSettingsOpen] = React.useState(false)
       const pickRef = React.useRef(null)
+      // 🟢 报告第 10 条：支持版本范围晚到时，催一次重渲染（值本身不读，只当"版本号"用）
+      const [, setGateTick] = React.useState(0)
 
       // 打开时：拉账户 + 历史，并发探测局域网（关闭就丢弃结果）
       React.useEffect(() => {
@@ -1859,8 +2052,43 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         apiGet('/api/mc/servers').then((s) => { if (alive) setServers(Array.isArray(s.servers) ? s.servers : []) }).catch(() => {})
         apiPost('/api/mc/lan', {}).then((r) => { if (alive) setLan(Array.isArray(r.servers) ? r.servers : []) })
           .catch(() => { if (alive) setLan([]) })
+        /**
+         * 🟢 报告第 10 条：顺手把**支持版本范围**拉回来。
+         *
+         * 以前 `MC_VERSION_IN_RANGE` 是 `() => null` 的桩，不需要任何数据；现在真判了 ——
+         * 若等用户点了「扫描局域网」才拉，第一批结果会按"未知"渲染（不标红、点了也不拦），
+         * 看起来就像"这道门时灵时不灵"。接口有一次性缓存，重复调用只发一次请求。
+         * 拉不到也不报错：门控退化成"未知 ⇒ 放行"，与以前的行为一致。
+         * 结果落在模块级缓存里（`MC_VERSION_IN_RANGE` 直接读它），这里只催一次重渲染。
+         */
+        loadMcGateInfo().then((info) => { if (alive && info) setGateTick((n) => n + 1) })
         return () => { alive = false }
       }, [open])
+
+      /**
+       * 🔴 2026-10-15 审计（报告第 8 条）：上面那个 effect 的依赖只有 `[open]`。
+       *    「添加/管理」是在**本弹窗之上**叠一个受控的 `McSettingsModal`（`initialTab='accounts'`），
+       *    用户在那里新建 / 删除 / 刷新账户后关掉它，本弹窗的 `accts` **还是打开那一刻的旧快照** ——
+       *    刚建的账户不在下拉里，刚删的还在、选中它还会连失败。
+       *    这里盯 `settingsOpen` 的 **true → false** 沿：一关就重读一次账户（只重读账户，
+       *    不重探局域网，免得平白闪一下）。同时把已经失效的选中项落到默认/第一个。
+       */
+      const prevSettingsOpen = React.useRef(false)
+      React.useEffect(() => {
+        const was = prevSettingsOpen.current
+        prevSettingsOpen.current = settingsOpen
+        if (!open || !was || settingsOpen) return undefined
+        let alive = true
+        apiGet('/api/mc/accounts').then((a) => {
+          if (!alive) return
+          const list = Array.isArray(a.accounts) ? a.accounts : []
+          setAccts(list)
+          setAccountId((cur) => (list.some((x) => x.innerID === cur)
+            ? cur
+            : (a.defaultAccount || list[0]?.innerID || '')))
+        }).catch(() => { /* 读不到就保持原样，别把下拉清空 */ })
+        return () => { alive = false }
+      }, [settingsOpen, open])
 
       // 账户下拉：点外面 / Esc 关掉
       React.useEffect(() => {
@@ -2061,6 +2289,15 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [defaultAccount, setDefaultAccount] = React.useState(null)
       const [wlText, setWlText] = React.useState('')
       const [allowAll, setAllowAll] = React.useState(false)
+      /**
+       * 🔴 2026-10-15 审计（报告第 2 条）：`/api/mc/config` **读成功过没有**。
+       *    config 分支的 `.catch` 只 `setError` 就吞掉了 rejection ⇒ `Promise.all` 恒 resolve
+       *    ⇒ `.then(() => setLoaded(true))` 恒执行，页面看起来"加载好了"，但
+       *    `wlText` / `shareBase` 还是初始 `''`。这时点「保存」会发
+       *    `commandWhitelist: []` / `expressBase: ''` —— **把服务端真实配置覆盖成空**。
+       *    所以：读失败 ⇒ `cfgOk = false` ⇒ 所有"会把配置写小"的按钮禁用、调用也硬拒。
+       */
+      const [cfgOk, setCfgOk] = React.useState(false)
       const [mdText, setMdText] = React.useState('')
       const [mdSource, setMdSource] = React.useState('default')
       const [mdPath, setMdPath] = React.useState('')
@@ -2093,6 +2330,21 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [error, setError] = React.useState('')
       const [saved, setSaved] = React.useState('')
       const [busyKey, setBusyKey] = React.useState(null)
+      /**
+       * 🔴 2026-10-15 审计（报告第 7 条）：`busyKey` 是**单值**，而 `run()` 的 `finally`
+       *    里**无条件** `setBusyKey(null)`。两个动作重叠时（例：拨「允许所有指令」的同时
+       *    点「保存」）后一个会盖掉前一个的 key，任一个先结束就把它清成 null ⇒
+       *    另一个明明还在跑，所有按钮却都解锁了（`busy = busyKey !== null` 是全局门）。
+       *    改成按 key 计数的**在飞表**，对外仍暴露一个字符串：
+       *      · 0 个在飞 → `null`（不忙）
+       *      · 1 个在飞 → 那个 key（对应的按钮显示"保存中…"）
+       *      · ≥2 个在飞 → `'*'`（不匹配任何 `busyKey === 'x'`，但 `!== null` ⇒ 全局仍算忙）
+       */
+      const inflightRef = React.useRef(new Map())
+      const syncBusy = React.useCallback(() => {
+        const keys = [...inflightRef.current.keys()]
+        setBusyKey(keys.length === 0 ? null : (keys.length === 1 ? keys[0] : '*'))
+      }, [])
 
       // 关闭函数（点遮罩 / × / Esc 共用；也供下面的订阅使用）
       const close = React.useCallback(() => {
@@ -2117,6 +2369,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const load = React.useCallback(() => {
         setLoading(true)
         setLoadError('')
+        setCfgOk(false)                       // 每次重读都先当作"没读到"，成功了再翻 true
         return Promise.all([
           apiGet(withSid('/api/mc/accounts')).then((a) => {
             setAccounts(Array.isArray(a.accounts) ? a.accounts : [])
@@ -2124,6 +2377,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             setDefaultAccount(a.defaultAccount ?? null)
           }),
           apiGet(withSid('/api/mc/config')).then((c) => {
+            setCfgOk(true)                    // 🔴 报告第 2 条：这一句就是"白名单可以安全保存"的凭证
             const hasWs = c.hasWorkspace === true
             setHasWorkspace(hasWs)
             setWorkspaceName(String(c.workspaceName ?? ''))
@@ -2138,7 +2392,14 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             return apiGet(withSid('/api/mc/express')).then((s) => {
               setShareInfo(s ?? null)
             }).catch((e) => { setError(errorText(e)) })
-          }).catch((e) => { setError(errorText(e)) }),
+          }).catch((e) => {
+            // 🔴 报告第 2 条：这里**必须**留下"读失败"的痕迹（以前只有 setError，
+            //    错误提示 3 秒后不会消失但按钮照样可点）。cfgOk=false 让
+            //    「保存白名单」「保存 base」两个破坏性写入彻底走不通。
+            setCfgOk(false)
+            setError('配置没读出来（' + errorText(e) + '）—— 白名单 / 分享 base 先别保存，'
+              + '现在保存会用空值把服务端真实配置覆盖掉。')
+          }),
           apiGet(agentsMdPath).then((m) => {
             setMdText(String(m.text ?? ''))
             setMdSource(m.source === 'custom' ? 'custom' : 'default')
@@ -2187,7 +2448,10 @@ select[data-wc-in]{appearance:none;padding-right:22px;
 
       /** 所有动作的统一出口：置忙 → 跑 → 刷新 → 归一化错误 */
       const run = React.useCallback((key, fn, okMsg) => {
-        setBusyKey(key)
+        // 🔴 报告第 7 条：登记到在飞表（按 key 计数），结束时只减自己的那一份
+        const m = inflightRef.current
+        m.set(key, (m.get(key) ?? 0) + 1)
+        syncBusy()
         setError('')
         setSaved('')
         return Promise.resolve()
@@ -2201,8 +2465,12 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             // 出错时也刷新——后端可能已经改了一半（例如"设为默认"成功但回读失败）
             return load().then(() => false, () => false)
           })
-          .finally(() => { setBusyKey(null) })
-      }, [load])
+          .finally(() => {
+            const n = (m.get(key) ?? 1) - 1
+            if (n <= 0) m.delete(key); else m.set(key, n)
+            syncBusy()
+          })
+      }, [load, syncBusy])
 
       const patchAccount = React.useCallback((innerID, patch, key) =>
         run(key, () => apiPatch(withSid('/api/mc/accounts'), { innerID, ...patch }), '账户已更新'), [run])
@@ -2249,27 +2517,43 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           .then((ok) => { if (!ok) setAllowAll(prev); return ok })   // 失败回滚
       }, [run, allowAll])
 
-      const saveWhitelist = React.useCallback(() =>
-        run('wl:save', () => apiPatch(withSid('/api/mc/config'), {
+      const saveWhitelist = React.useCallback(() => {
+        // 🔴 报告第 2 条：配置没读出来时 `wlText` 还是初始 ''，存下去就是清空白名单。
+        if (!cfgOk) {
+          setError('配置没读出来，先别保存 —— 现在保存会把服务端真实白名单清空。'
+            + '先关掉再打开这个窗口重试。')
+          return Promise.resolve(false)
+        }
+        return run('wl:save', () => apiPatch(withSid('/api/mc/config'), {
           commandWhitelist: textToWhitelist(wlText),
-        }), '指令白名单已保存'), [run, wlText])
+        }), '指令白名单已保存')
+      }, [run, wlText, cfgOk])
 
-      /* ── 页 3：提示词：保存 / 恢复默认 / 两个注入开关 ── */
+      /* ── 页 3：提示词：保存 / 恢复默认 / 两个注入开关 ──
+       * 🔴 2026-10-15 审计（报告第 1 条）：这四处原来写死 `'/api/mc/agents-md'`，**只把
+       *    `sessionId` 塞进 body** —— 而服务端的 `gateOf()` 是
+       *    `settingsGate(query.sessionId ?? b?.sessionId, query.cwd ?? b?.cwd)`，它**认 `cwd`**。
+       *    会话还没落盘时（新对话页）`sessionId` 定位不到工作区 ⇒ 服务端只能回
+       *    "这个会话没有选中工作区"，用户看到的是"提示词看得到、存不进去"。
+       *    同文件其它十几处设置写操作全都用了 `withSid`（把 sessionId + cwd 拼进 query），
+       *    只有这四处漏了。改成和 GET（`agentsMdPath`）走同一条路。 */
       const saveAgentsMd = React.useCallback(() =>
-        run('md:save', () => apiPut('/api/mc/agents-md', { text: mdText, sessionId }), '已保存'), [run, mdText, sessionId])
+        run('md:save', () => apiPut(withSid('/api/mc/agents-md'), { text: mdText, sessionId }), '已保存'),
+      [run, mdText, sessionId, wsCwd])
 
       const resetAgentsMd = React.useCallback(() =>
-        run('md:reset', () => apiDelete('/api/mc/agents-md', { sessionId }), '已恢复默认'), [run, sessionId])
+        run('md:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId }), '已恢复默认'),
+      [run, sessionId, wsCwd])
 
       /* 版本提示**文件**（`<记忆根>/版本提示.md`）：同一组接口，`target:'version'` 选它。
        * 注入只投一行指针、正文由会话自己去读 ⇒ 改完**立刻生效**（不用重启）。 */
       const saveVersionPrompt = React.useCallback(() =>
-        run('vp:save', () => apiPut('/api/mc/agents-md', { text: vpText, sessionId, target: 'version' }),
-          '版本提示已保存'), [run, vpText, sessionId])
+        run('vp:save', () => apiPut(withSid('/api/mc/agents-md'), { text: vpText, sessionId, target: 'version' }),
+          '版本提示已保存'), [run, vpText, sessionId, wsCwd])
 
       const resetVersionPrompt = React.useCallback(() =>
-        run('vp:reset', () => apiDelete('/api/mc/agents-md', { sessionId, target: 'version' }),
-          '版本提示已恢复默认'), [run, sessionId])
+        run('vp:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId, target: 'version' }),
+          '版本提示已恢复默认'), [run, sessionId, wsCwd])
 
       const toggleInjectWc = React.useCallback((next) =>
         run('cfg:wc', () => apiPatch(withSid('/api/mc/config'), { injectDshMcAgentAgentsMd: next === true }),
@@ -2319,9 +2603,17 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           .then((ok) => { if (!ok) setShareOn(prev); return ok })    // 失败回滚
       }, [run, shareOn, shareBase, fetchCurrentBase])
 
-      const saveShareBase = React.useCallback((text) =>
-        run('share:base', () => apiPatch(withSid('/api/mc/config'), { expressBase: String(text ?? '') }),
-          'base 已保存'), [run])
+      const saveShareBase = React.useCallback((text) => {
+        // 🔴 报告第 2 条：同 `saveWhitelist` —— 配置没读出来时 `shareBase` 是 ''，
+        //    存下去等于把已经配好的分享地址抹掉。
+        if (!cfgOk) {
+          setError('配置没读出来，先别保存 base —— 现在保存会把服务端已配好的地址抹掉。'
+            + '先关掉再打开这个窗口重试。')
+          return Promise.resolve(false)
+        }
+        return run('share:base', () => apiPatch(withSid('/api/mc/config'), { expressBase: String(text ?? '') }),
+          'base 已保存')
+      }, [run, cfgOk])
 
       /** 「获取当前」：填进输入框并立即保存（拿不到就明确报错，别存一个空值） */
       const useCurrentBase = React.useCallback(() =>
@@ -2340,7 +2632,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
 
       const pane = tab === 'whitelist'
         ? React.createElement(WhitelistPane, {
-          wlText, allowAll, busyKey,
+          wlText, allowAll, busyKey, cfgOk,
           onWlText: setWlText, onAllowAll: toggleAllowAll, onSave: saveWhitelist,
         })
         : (tab === 'prompt'
@@ -2356,7 +2648,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           : (tab === 'share'
             ? React.createElement(SharePane, {
               key: 'share:' + (shareOn ? 'on' : 'off') + ':' + shareBase,
-              on: shareOn, base: shareBase, share: shareInfo, busyKey, hasWorkspace,
+              on: shareOn, base: shareBase, share: shareInfo, busyKey, hasWorkspace, cfgOk,
               onToggle: toggleShare, onSaveBase: saveShareBase, onUseCurrent: useCurrentBase, onClear: clearShare,
             })
             : React.createElement(AccountsPane, {

@@ -95,6 +95,26 @@ function mkBot (inv = {}, opts = {}) {
       if (!n) return { name: 'air', boundingBox: 'empty', position: { x, y, z } }
       return { name: n, boundingBox: 'block', position: { x, y, z } }
     },
+    /* 🔴 2026-10-15：`extensions/mc_furnace.mjs:480` 用 `bot.findBlocks(...)`（复数）扫
+     *    "给的坐标上不是熔炉，附近还有哪些熔炉" —— 假 bot 原来只实现了 `findBlock`（单数）
+     *    ⇒ 那条分支一跑到就 `TypeError: bot.findBlocks is not a function`。
+     *    真 mineflayer 两个都有：复数版返回**坐标数组**（`{x,y,z}[]`，不是方块对象），
+     *    `matching` 既可以是 id 数组、也可以是 `(block) => boolean`。这里照实模拟。 */
+    findBlocks ({ matching, maxDistance = 4, count = 1 } = {}) {
+      const isFn = typeof matching === 'function'
+      const arr = Array.isArray(matching) ? matching : null
+      const out = []
+      for (const [k, n] of world.map) {
+        const [x, y, z] = k.split(',').map(Number)
+        const d = Math.hypot(x - pos.x, y - pos.y, z - pos.z)
+        if (d > maxDistance) continue
+        const blk = { name: n, boundingBox: 'block', position: { x, y, z } }
+        if (isFn ? !matching(blk) : (arr ? !arr.includes(blockIdIn(n)) : false)) continue
+        out.push({ x, y, z, d })
+      }
+      out.sort((a, b) => a.d - b.d)
+      return out.slice(0, Math.max(1, Number(count) || 1)).map(({ x, y, z }) => ({ x, y, z }))
+    },
     findBlock ({ matching, maxDistance = 4 }) {
       let best = null
       let bestD = Infinity

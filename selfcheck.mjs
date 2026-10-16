@@ -525,13 +525,13 @@ console.log('\n--- 看门狗 v2 ---')
 
     // 三处链路都得在（删掉任何一处就等于又把状态丢了）
     const idxSrc = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
-    console.log(`  ${/bot\.on\('offline'/.test(idxSrc) && /连接断开：/.test(idxSrc) ? '✅' : '❌'} 会话把 offline 转进事件队列（mc_events 能看到）`)
+    console.log(`  ${/on\('offline',/.test(idxSrc) && /连接断开：/.test(idxSrc) ? '✅' : '❌'} 会话把 offline 转进事件队列（mc_events 能看到）`)
     console.log(`  ${/reconnecting: Boolean\(this\.bot\.reconnecting \|\| this\.bot\.reconnectPending\)/.test(idxSrc) && /Boolean\(sess\.bot\.reconnecting \|\| sess\.bot\.reconnectPending\)/.test(idxSrc) ? '✅' : '❌'} 🔴 modeView 与 /api/mc/status 都带上"正在重连"（含"正在尝试连接"那段，否则状态条会中途退回"未上线"）`)
     const cliSrc = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
     console.log(`  ${/重连中/.test(cliSrc) && /data-mc-reconnecting/.test(cliSrc) ? '✅' : '❌'} 🔴 状态条会显示"重连中…"（不再假装在游戏中）`)
     // 「断线期」标记的生命周期：掉线时置位、**真重连成功**才清（只看 reconnecting 会在尝试连接的 45s 里退回"未上线"）
-    const coreSrc3 = readFileSync(new URL('./src/core.mjs', import.meta.url), 'utf8')
-    console.log(`  ${/if \(willReconnect\) this\.reconnectPending = true/.test(coreSrc3) && /this\.reconnectPending = false/.test(coreSrc3) ? '✅' : '❌'} 🔴 断线期标记：掉线置位 →（重连成功 / 手动进服）才清`)
+    const connSrc3 = readFileSync(new URL('./src/connection.mjs', import.meta.url), 'utf8')
+    console.log(`  ${/if \(willReconnect\) self\.reconnectPending = true/.test(connSrc3) && /self\.reconnectPending = false/.test(connSrc3) ? '✅' : '❌'} 🔴 断线期标记：掉线置位 →（重连成功 / 手动进服）才清`)
   }
 
   // ── 等待会不会"堵住唤醒"（2026-09-19 用户实测：等到消息、提及了也没唤醒，空等特别久）──
@@ -685,8 +685,8 @@ try {
   const params = Object.keys(tools.get('mc_stop').parameters?.properties ?? {})
   console.log(`  ${!params.includes('hard') && params.includes('reason') ? '✅' : '❌'} mc_stop 参数面已无 hard（普通停止移除）：[${params.join(', ')}]`)
   const r = await tools.get('mc_stop').execute({ reason: '自检' }, A)
-  const ok = r && 'kicked' in r && 'killedJobs' in r && 'stoppedLLM' in r && 'finalStopLLM' in r && Array.isArray(r.order)
-  console.log(`  ${ok ? '✅' : '❌'} mc_stop 返回结构完整（kicked/killedJobs/stoppedLLM/finalStopLLM/order）：${JSON.stringify(r).slice(0, 110)}`)
+  const ok = r && 'quitOk' in r && 'killedJobs' in r && 'stoppedLLM' in r && 'finalStopLLM' in r && Array.isArray(r.order)
+  console.log(`  ${ok ? '✅' : '❌'} mc_stop 返回结构完整（quitOk/killedJobs/stoppedLLM/finalStopLLM/order）：${JSON.stringify(r).slice(0, 110)}`)
   console.log(`  ${r?.order?.join(' → ') === 'quit-game → kill-jobs' ? '✅' : '❌'} AI 自己调（cancelTurn:false）不动 LLM、顺序 = 退游戏 → 清任务：${r?.order?.join(' → ')}`)
 }
 
@@ -752,7 +752,7 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
   const want = 'stop-llm → quit-game → kill-jobs → stop-llm-final'
   console.log(`  ${body.order?.join(' → ') === want ? '✅' : '❌'} 后端顺序 = ${want}${body.order?.join(' → ') === want ? '' : `｜实际：${body.order?.join(' → ')}`}`)
   console.log(`  ${body.stoppedLLM === true && body.finalStopLLM === true ? '✅' : '❌'} 停了两遍 LLM（首 + 尾，避免状态异常）：首=${body.stoppedLLM} 尾=${body.finalStopLLM}`)
-  console.log(`  ${body.kicked === true ? '✅' : '❌'} 先尝试退出游戏（bot.disconnect 被调用）：${JSON.stringify(body.quit)}`)
+  console.log(`  ${body.quitOk === true ? '✅' : '❌'} 先尝试退出游戏（bot.disconnect 被调用）：${JSON.stringify(body.quit)}`)
   console.log(`  ${body.killedJobs?.length === 2 ? '✅' : '❌'} 该会话后台任务被清空：${JSON.stringify(body.killedJobs)}`)
   // 🔴 2026-09-24（PR #2 报的隐患）：**只准杀自己的** —— 无主 job 与别的会话的 job 一个都不许碰
   console.log(`  ${body.killedJobs?.includes('job-watch') && body.killedJobs?.includes('job-other') ? '✅' : '❌'} 自己的两个 job 都被清掉`)
@@ -2293,13 +2293,15 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   {
     const { readFileSync: rd } = await import('node:fs')
     const coreSrc = rd(new URL('./src/core.mjs', import.meta.url), 'utf8')
-    console.log(`  ${/if \(this\.listenerCount\('error'\) > 0\) this\.emit\('error', err\)/.test(coreSrc) ? '✅' : '❌'} 🔴 上报错误前先看有没有监听者（EventEmitter 无监听者时 emit('error') 会直接 throw）`)
+    // 统一错误上报口在 2026-10 拆模块时搬到了 src/runtime.mjs（core 只留 `#reportError` 薄包装）
+    const rtSrc = rd(new URL('./src/runtime.mjs', import.meta.url), 'utf8')
+    console.log(`  ${/if \(self\.listenerCount\('error'\) > 0\) self\.emit\('error', err\)/.test(rtSrc) ? '✅' : '❌'} 🔴 上报错误前先看有没有监听者（EventEmitter 无监听者时 emit('error') 会直接 throw）`)
     console.log(`  ${/#reportError \(e\)/.test(coreSrc) ? '✅' : '❌'} 有统一错误上报口 #reportError（lastError + 日志 + 受保护的 emit）`)
     // 找"代码里"的裸 emit：排除注释（注释里会引用事故原文，那是记录不是代码）
-    const codeOnly = coreSrc.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
-    const bareEmits = (codeOnly.match(/this\.emit\('error'/g) ?? []).length
-    const guarded = (codeOnly.match(/if \(this\.listenerCount\('error'\) > 0\) this\.emit\('error', err\)/g) ?? []).length
-    console.log(`  ${bareEmits === guarded && bareEmits > 0 ? '✅' : '❌'} 🔴 代码里每一处 this.emit('error') 都带"有监听者才发"的保护（emit ${bareEmits} 处 / 受保护 ${guarded} 处）`)
+    const codeOnly = rtSrc.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+    const bareEmits = (codeOnly.match(/self\.emit\('error'/g) ?? []).length
+    const guarded = (codeOnly.match(/if \(self\.listenerCount\('error'\) > 0\) self\.emit\('error', err\)/g) ?? []).length
+    console.log(`  ${bareEmits === guarded && bareEmits > 0 ? '✅' : '❌'} 🔴 代码里每一处 self.emit('error') 都带"有监听者才发"的保护（emit ${bareEmits} 处 / 受保护 ${guarded} 处）`)
 
     // 真连接：连一个刚关掉的端口（必然 ECONNREFUSED），**故意不订阅 'error'**（真实工具路径就是这样）
     const { createServer } = await import('node:net')
@@ -3118,7 +3120,9 @@ console.log('\n--- 未处理拒绝（fail-loud → 整个 DSH exit(1)）防护 -
   console.log(`  ${ygg.haveCredentials === true && ygg.useAccessToken === true ? '✅' : '❌'} 皮肤站账户：haveCredentials=true + 带 accessToken（要跟 session server 报备）`)
   const idxSrc = rf(new URL('./index.js', import.meta.url), 'utf8')
   const coreSrc = rf(new URL('./src/core.mjs', import.meta.url), 'utf8')
-  console.log(`  ${/const flags = sessionFlags\(auth\.mode\)/.test(coreSrc) && !/options\.haveCredentials = true/.test(coreSrc) ? '✅' : '❌'} 🔴 连接时按账户类型取开关（没有"无条件 true"了）`)
+  // 连接流程拆到 src/connection.mjs 之后，取开关的那行也在那边（`ctx.auth.sessionFlags`）
+  const connSrc = rf(new URL('./src/connection.mjs', import.meta.url), 'utf8')
+  console.log(`  ${/const flags = ctx\.auth\.sessionFlags\(auth\.mode\)/.test(connSrc) && !/options\.haveCredentials = true/.test(coreSrc + connSrc) ? '✅' : '❌'} 🔴 连接时按账户类型取开关（没有"无条件 true"了）`)
   console.log(`  ${/process\.on\('unhandledRejection'/.test(idxSrc) ? '✅' : '❌'} 装上了"遗言"记录器（宿主 exit(1) 之前把栈写进插件日志）`)
 }
 
@@ -3294,7 +3298,7 @@ console.log('\n--- 结构不变量：事件队列单一写入方 ---')
   console.log(`  ${!wdSessPush ? '✅' : '❌'} 看门狗不直接 push sess.events`)
 
   // index.js 里 ensureWired 必须仍然是写入方（别把它也删了，否则 mc_events 空了）
-  const wired = /this\.bot\.on\('chat',[\s\S]{0,120}#pushEvent\('chat'/.test(idxSrc)
+  const wired = /on\('chat',[\s\S]{0,120}#pushEvent\('chat'/.test(idxSrc)
   console.log(`  ${wired ? '✅' : '❌'} ensureWired 仍是唯一写入方（mc_events 事件来源）`)
 
   // 看门狗构造签名里不该再收 onFire
@@ -3478,13 +3482,14 @@ console.log('\n--- 放置可行性判据 ---')
   // 路线图第 ④ 条第八刀：CONTAINER_RE / TOGGLE_RE / canPlaceInto 搬到 src/block-names.mjs
   // （判据本身在那边，所以这里要连新模块一起读，否则会误报 ❌）
   const blockNamesSrc = readFileSync(fileURLToPath(new URL('./src/block-names.mjs', import.meta.url)), 'utf8')
+  const placeSrc = readFileSync(fileURLToPath(new URL('./src/place.mjs', import.meta.url)), 'utf8')
   const both = src + '\n' + blockNamesSrc
 
   console.log(`  ${/boundingBox === 'empty'/.test(both) ? '✅' : '❌'} 判据用 boundingBox==='empty'（不占空间 = 可放）`)
   console.log(`  ${/isLiquid/.test(both) ? '✅' : '❌'} 液体被认作可放 —— 旧版只认 air，水里建不了（码头/桥全废）`)
   console.log(`  ${/canPlaceInto/.test(src) ? '✅' : '❌'} canPlaceInto 已就位`)
-  console.log(`  ${/未加载（区块还没到）/.test(src) ? '✅' : '❌'} 未加载的坐标明确拒绝（不盲放）`)
-  console.log(`  ${/占住，放不进去/.test(src) ? '✅' : '❌'} 被占住时报错说清是哪个方块`)
+  console.log(`  ${/未加载（区块还没到）/.test(placeSrc) ? '✅' : '❌'} 未加载的坐标明确拒绝（不盲放）`)
+  console.log(`  ${/占住，放不进去/.test(placeSrc) ? '✅' : '❌'} 被占住时报错说清是哪个方块`)
 
   // 从**解析到的** mineflayer 位置取它的依赖树（与插件里 requireFromMineflayer 同一手法）
   const requireHere = (await import('node:module')).createRequire(import.meta.url)
@@ -3724,7 +3729,11 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['MC设置按会话 preset 本地门控（useSessions）', /useSessions/.test(code) && /projectionValues\?\.agentPreset/.test(code)],
     ['新会话页入口走正经插槽（conversation.input.right）', /conversation\.input\.right/.test(code) && /dsh-mc-agent-mc-settings-hero/.test(code)],
     ['两个入口按 blank 互斥（不会同时挂两个模态框）', /useMcSettingsGate\(props, false\)/.test(code) && /useMcSettingsGate\(props, true\)/.test(code) && /s\.blank === true/.test(code)],
-    ['本地 preset 是主判据（不必等网络）', /const localShow = known && blank === wantBlank && mcPresetIds\.includes\(preset\)/.test(code)],
+    // 🟡 2026-10-15 审计（client.js 报告第 9 条）：名单以前是**模块级可变变量** `mcPresetIds`，
+    //    异步 `fetch` 就地改写 —— 普通变量改了**不会触发重渲染**，接口晚到时门控一直拿兜底值算。
+    //    现在模块级只留一次性请求缓存，真名单进 hook 的 state。
+    ['本地 preset 是主判据（不必等网络）', /const localShow = known && blank === wantBlank && presetIds\.includes\(preset\)/.test(code)],
+    ['🔴 preset 名单进 state（不是模块级可变变量）', /const \[presetIds, setPresetIds\] = React\.useState\(MC_PRESETS_FALLBACK\)/.test(code) && !/^\s*let mcPresetIds = /m.test(code)],
     // 🔴 2026-09-18 用户改口径：**有没有工作区，只要新对话选中了 MC 模式就显示按钮**；
     //    工作区改到**点击那一刻**再检查，没有就用**原生**提示让用户先选。
     ['新对话入口不再因"没工作区"隐藏（wantBlank 分支恒真）', /if \(localShow\) return true/.test(code) && !/return wantBlank \? true/.test(code)],
@@ -3763,7 +3772,15 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['按钮里的运行图标用**负外边距**收掉方框透明边（不然左边距看着很大）', /\[data-wc-btn\] \.wc-runicon\{margin-left:-4px/.test(code)],
     ['🔴 局域网卡片整体是按钮，运行图标**无缝嵌入**（不再是独立按钮）', /'data-wc-cn-lan': ''/.test(code) && /data-wc-cn-run/.test(code) && !/\['data-wc-cn-lan'\] \[data-wc-cn-actions\]/.test(code)],
     ['局域网行：**版本号在人数左边**，各自可标红（data-wc-cn-bad）', /data-wc-cn-ver/.test(code) && /data-wc-cn-count/.test(code) && /data-wc-cn-bad/.test(code)],
-    ['版本支持范围**预留**（MC_VERSION_IN_RANGE 未实现 → null，按在范围内处理）', /const MC_VERSION_IN_RANGE = \(\) => null/.test(code)],
+    // 🟢 2026-10-15 审计（client.js 报告第 10 条）：以前是 `const MC_VERSION_IN_RANGE = () => null`
+    //    的**占位实现** —— 永远"未知"，而调用点是 `… !== false` ⇒ 恒真
+    //    ⇒ 版本不匹配的拦截与红标**一行都到不了**（死代码）。现在真判。
+    //    ⚠️ 判据是"比实测上界新才拦"，**不是** `testedVersions.includes` ——
+    //    上游那份清单是**稀疏的实测清单**（1.21.10 不在里面但它能连）。
+    ['版本支持范围**真判**（不是占位：比 latest 新才拦）',
+      /function MC_VERSION_IN_RANGE\(v\)/.test(code) && /function mcVersionParts\(v\)/.test(code)
+      && /const latest = mcVersionParts\(info\.latest\)/.test(code)
+      && !/const MC_VERSION_IN_RANGE = \(\) => null/.test(code)],
     ['版本不符 / 人满 → 点它弹错误框且**不发起连接**', /const clickLan/.test(code) && /版本不匹配/.test(code) && /服务器已满/.test(code)],
     ['🔴 新对话页走**模拟玩家发言**（asUser + `[system] `）；对话中仍用插件提示行', /asUser: true/.test(code) && /asUser: false/.test(code) && /asUser: props\?\.asUser === true/.test(code)],
     ['输入框 box-sizing:border-box（否则比按钮高一点点）', /\[data-wc-cn-input\]\{box-sizing:border-box/.test(code)],
@@ -3793,7 +3810,11 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['「提示词」页显示注入状态（会不会注入 + 为什么不会）', /data-wc-injectstatus/.test(code) && /injectStatus\?\.segments/.test(code) && /data-wc-note/.test(code)],
     ['服务端兜底只给标题条且带重试（不是一次性请求）', /const needServer = !known && !wantBlank/.test(code) && /\+\+tries < 20/.test(code) && /setTimeout\(tick, 3000\)/.test(code)],
     ['名单来自 /api/mc/presets 的 mcModePresets（带默认值兜底；含 MC+）', /mcModePresets/.test(code) && /MC_PRESETS_FALLBACK = \['minecraft', 'minecraft-plus', 'dsh-mc-agent'\]/.test(code)],
-    ['/api/mc/presets 不带闸门（门控名单不能被"没工作区"挡住）', /path === '\/api\/mc\/presets'[\s\S]{0,220}return ok\(\{ mcModePresets/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))],
+    ['/api/mc/presets 不带闸门（门控名单不能被"没工作区"挡住）', /path === '\/api\/mc\/presets'[\s\S]{0,1400}return ok\(\{\s*mcModePresets/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))],
+    // 🟢 报告第 10 条：这个"不需要工作区"的小接口顺手也带上支持版本范围 ——
+    //    客户端的版本门控要真判就必须拿得到它（`libraryInfo()` 已经 import 好了，不新增端点）。
+    ['/api/mc/presets 带上了支持版本范围（供客户端版本门控）',
+      /path === '\/api\/mc\/presets'[\s\S]{0,1400}testedVersions: lib\.testedVersions[\s\S]{0,200}latestVersion: lib\.latest/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))],
     ['判不了就不渲染（return null）', /if \(!show\) return null/.test(code)],
     ['调用 /api/mc/accounts', src.includes('/api/mc/accounts')],
     ['调用 /api/mc/authservers', src.includes('/api/mc/authservers')],

@@ -20,13 +20,67 @@
 import vec3pkg from 'vec3'
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 
-import { sleep } from './async-util.mjs'
+import { sleep, DESYNC_HINT } from './async-util.mjs'
 import { isAir, isLiquid } from './block-names.mjs'
-import { heldText, canHarvestNow, toolKinds } from './inventory.mjs'
+import { heldText, canHarvestNow, toolKinds, countOf } from './inventory.mjs'
 import { digMsFor } from './dig-speed.mjs'
 import { blockReachOf, slowDigWhy, stateNameOf, dropHint } from './world-observer.mjs'
 import { classifyRestore } from './server-break.mjs'
 import { callBudget, callSecText } from './budget.mjs'
+
+/* 「挖到刚好够合成就不挖了」—— 收工时补一句（用户 2026-10-13 报的毛病）。
+ *
+ * 判据**不是**"手头有几个"，而是**附近还有没有同一种矿**（用户后来改的：
+ * 不要定数量，让它把同一条矿脉挖干净）。所以只在"刚挖掉的那一格附近还有同一串矿"
+ * 时提醒，并且报出**还剩几块**，让模型自己决定挖到哪：
+ *   - 附近一块都不剩（或只剩一块孤零零的）⇒ 不啰嗦，它已经挖干净了；
+ *   - 手头已经很多也不管 —— 矿脉就在旁边，顺手挖完永远是对的。
+ * `mc_dig` 一轮挖不完时本来就会说"还有 N 个没挖"，所以预算用光那条路不再补这句。
+ */
+const VEIN_RE = /(_ore$|^ancient_debris$)/
+const VEIN_RADIUS = 12
+const VEIN_LEFT_MIN = 2
+/** 矿 → 挖出来会变成什么（用来报"手头有多少"，只报背包里真有的）。 */
+const VEIN_HAVE = {
+  diamond_ore: ['diamond'],
+  deepslate_diamond_ore: ['diamond'],
+  iron_ore: ['raw_iron', 'iron_ingot'],
+  deepslate_iron_ore: ['raw_iron', 'iron_ingot'],
+  gold_ore: ['raw_gold', 'gold_ingot'],
+  deepslate_gold_ore: ['raw_gold', 'gold_ingot'],
+  nether_gold_ore: ['raw_gold', 'gold_ingot'],
+  coal_ore: ['coal', 'charcoal'],
+  deepslate_coal_ore: ['coal', 'charcoal'],
+  copper_ore: ['raw_copper', 'copper_ingot'],
+  deepslate_copper_ore: ['raw_copper', 'copper_ingot'],
+  lapis_ore: ['lapis_lazuli'],
+  deepslate_lapis_ore: ['lapis_lazuli'],
+  emerald_ore: ['emerald'],
+  deepslate_emerald_ore: ['emerald'],
+  redstone_ore: ['redstone'],
+  deepslate_redstone_ore: ['redstone'],
+  ancient_debris: ['ancient_debris'],
+}
+
+/**
+ * 收工提醒：这次挖的是矿石、而且**附近 12 格内还剩两块以上同一种矿**时，返回一句话；否则 null。
+ * 扫的是机器人**当前站位**附近（它刚站在这条矿脉边上）。
+ */
+export function veinHint (b, minedName) {
+  const nm = String(minedName ?? '')
+  if (!VEIN_RE.test(nm)) return null
+  let left = 0
+  try {
+    const hits = b?.findBlocks?.({ matching: (blk) => blk?.name === nm, maxDistance: VEIN_RADIUS, count: 64 })
+    left = Array.isArray(hits) ? hits.length : 0
+  } catch { return null }
+  if (left < VEIN_LEFT_MIN) return null
+  const got = (VEIN_HAVE[nm] ?? []).map((k) => [k, countOf(b, k) ?? 0]).filter(([, v]) => v > 0)
+  const label = got.length ? `（手头 ${got.map(([k, v]) => `${k}×${v}`).join(' + ')}）` : ''
+  return `　💡 附近 ${VEIN_RADIUS} 格内还有 **${left} 块 ${nm}**${label} —— 把这条矿脉挖干净再走：`
+    + `接着 \`mc_dig {name:"${nm}", count:8, maxDistance:${VEIN_RADIUS}}\`，直到结果里出现"附近找不到 ${nm}"。`
+    + '回头补料比多挖几块贵得多。'
+}
 
 export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
   const b = self.requireBot()
@@ -37,8 +91,8 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
     return {
       broken: null, at: { x: pos.x, y: pos.y, z: pos.z },
       note: '那里本来就是空气（**我这边**读到的）—— 要么已经挖掉了，要么客户端的区块缓存旧了：'
-        + '`mc_connect {force:true}` 真重连一次（普通的 mc_connect 在已连着时是空操作、不会重连），'
-        + '或走远 32 格再回来（区块会重发）；也可以 `mc_scan` 看看附近实际有什么。',
+        + '先 `mc_scan` 看看附近实际有什么。'
+        + DESYNC_HINT,
     }
   }
   const name = blk.name
@@ -122,7 +176,8 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
       ...(t.changed ? { tool: `${t.heldBefore} → ${t.held}` } : {}),
       ...(digMs != null ? { digMs } : {}),
       note: `服务端把这块**改回了 ${back}**（复原）—— 这次破坏服务端没认（多半是我离得远，或客户端区块旧了）。`
-        + '先 `mc_move` 走到它旁边（3 格以内）再叫一次；连着两三次都这样就用 `mc_connect {force:true}` 重连刷新区块。',
+        + '先 `mc_move` 走到它旁边（3 格以内）再叫一次。'
+        + DESYNC_HINT,
     }
   }
   if (rest?.kind === 'other') {
@@ -135,7 +190,8 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
       ...(t.changed ? { tool: `${t.heldBefore} → ${t.held}` } : {}),
       ...(digMs != null ? { digMs } : {}),
       note: `服务端说这一格是 **${back}**，和我这边看到的 **${name}** 不一样（客户端区块旧了）—— 这次破坏没被认。`
-        + '先 `mc_connect {force:true}` 重连刷新区块，再 `mc_scan` 复核一眼，别照着旧方块继续动手。',
+        + '先 `mc_scan` 复核一眼，别照着旧方块继续动手。'
+        + DESYNC_HINT,
     }
   }
   /* 真挖掉了 ⇒ 掉落物就在脚边。用户 2026-10-08 原话："挖完方块…老是忘记走过去拾取"。
@@ -159,13 +215,16 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
     ...(localGone && confirmed === false ? {
       note: '本地世界已经清掉了，但**没收到服务端的破坏回包** —— 服务端很可能拒了这次破坏'
         + '（领地保护 / 权限 / 反作弊 / 太远），客户端这边却把方块写成空气了。'
-        + '用 `mc_scan` 或 `mc_observe` 再确认一下，**别在空气上盖房、别走进你以为挖穿的墙**；'
-        + '真没挖掉就 `mc_connect {force:true}` 重连刷新区块。',
+        + '用 `mc_scan` 或 `mc_observe` 再确认一下，**别在空气上盖房、别走进你以为挖穿的墙**。'
+        + DESYNC_HINT,
     } : {}),
     ...(localGone ? {} : {
+      /* 🔴 审计 F2：这句必须让"预算用完"能被**文本**认出来（`timeout`/`budget` 规则），
+       *    而且**不能**出现"没挖掉"三个字 —— 那三个字会先命中"明确失败"那条正则，
+       *    于是真·时间到被记成"这一步失败了"，3 轮之后任务被误判成 blocked。 */
       note: timedOut
-        ? `挖了 ${callSecText()}还没挖掉（手上是 ${held}${digMs != null ? `，这块按手上的东西要 ${(digMs / 1000).toFixed(1)} 秒` : ''}）`
-          + '—— 换个对的工具，或换个更近的点位；别当成"服务端拒绝"。'
+        ? `这一轮的时间用完了（挖了 ${callSecText()}，方块还在，手上是 ${held}${digMs != null ? `；这块按手上的东西要 ${(digMs / 1000).toFixed(1)} 秒` : ''}）`
+          + '—— **这不是失败**，再叫一次 `mc_dig` 接着挖就行；换个对的工具、或换个更近的点位会更顺。'
         : `方块还在（${now}）—— 服务端可能拒了这次破坏，别当成挖掉了`,
     }),
   }
@@ -284,12 +343,13 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
    *    现在统一成一条路：**自己走到方块旁边**（`walkTo` 的 pathfinder 带 canDig，能挖穿挡路的），
    *    再按"眼睛→方块中心"复核，够得着才 `bot.dig()`，而且**认服务端的破坏回包**；
    *    掉落物由 `#grabDrops` 捡（原来靠 collectBlock 顺手捡）。 */
+  let okCount = 0   // 这一轮挖到几个（下面那条兜底路径也要用，所以放在块外）
+  let budgetCut = false   // 是不是"时间用完了"提前收工的（那条路自己会说"还有 N 个没挖"）
   {
     /* 🔴 2026-10-08 审计④：`interruptMove()` 以前是**死代码**（定义了没人调），而文档说 mc_dig 靠它抢占。
      *    走路/采集会按着 forward、占着 pathfinder ⇒ 先把还在跑的移动真停掉，再领号。 */
     await self.interruptMove()
     ctx.beginMove()
-    let okCount = 0
     let seen = 0
     const reachMax = b.game?.gameMode === 'creative' ? 5.0 : 4.5
     for (const target of targets) {
@@ -299,6 +359,7 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
       if (left < 900) {
         out.push(`—— 这一轮的 ${callSecText()}用完了（挖到 ${okCount}/${targets.length}），`
           + `还有 ${targets.length - seen + 1} 个没挖：再叫一次 mc_dig 接着挖`)
+        budgetCut = true
         break
       }
       // 🔴 别让**一个**够不着的目标吃掉整轮：单个目标最多给"剩余时间的一大半"，
@@ -313,14 +374,31 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
        * 🔴 走到方块**自己那一格**（x+0.5 / y / z+0.5）再复核：走过去这一路 pathfinder 可能顺手
        *    把它挖穿（`canDig`），所以到地方必须重新读一次方块。 */
       let fresh = b.blockAt(p)
-      if (!fresh || fresh.name !== nm) continue
+      /* 🔴 2026-10-15 审计：以前这里是一句 `continue` —— 方块读不到（区块卸载）或已经不在时
+       *    一个字都不输出，模型只看到结果里少了一项，不知道是"没这块"还是"插件跳过了"。 */
+      if (!fresh) {
+        out.push(`${nm} @ ${p} 读不到（区块没加载）—— 先 \`mc_move\` 靠近让区块加载，再叫我挖`)
+        continue
+      }
+      if (fresh.name !== nm) {
+        out.push(`${nm} @ ${p} 已经不在了（现在 ${fresh.name}）—— 别人挖走了，或刚才已经挖掉`)
+        continue
+      }
       if (blockReachOf(b, fresh) > reachMax) {
         const w = await self.walkTo({ x: p.x + 0.5, y: p.y, z: p.z + 0.5 }, { arrive: 2.2, budget })
         fresh = b.blockAt(p)
-        if (!fresh || fresh.name !== nm) {
+        /* 🔴 2026-10-15 审计：`b.blockAt(p)` 在**区块卸载**时返回 null，而以前 `!fresh` 和
+         *    `fresh.name !== nm` 走同一条路 ⇒ 把"读不到"当成"走过去顺手挖掉了"，`okCount++`
+         *    虚增、还把 `?` 当证据写进同一条消息。这两件事必须分开。 */
+        if (!fresh) {
+          out.push(`${nm} @ ${p} 走过去以后读不到了（区块没加载）—— **这一格没算挖掉**，`
+            + '先 `mc_move` 靠近让区块加载再叫我复核')
+          continue
+        }
+        if (fresh.name !== nm) {
           okCount++
           if (task) self.tasks.progress(task.taskId, { add: 1 })
-          out.push(`走过去的时候顺手挖掉了 ${nm} @ ${p} → 现在 ${b.blockAt(p)?.name ?? '?'}`)
+          out.push(`走过去的时候顺手挖掉了 ${nm} @ ${p} → 现在 ${fresh.name}`)
           const got = await ctx.grabDrops(b)
           if (got > 0) out.push(`　（顺手捡回 ${got} 个掉落物）`)
           else {
@@ -364,14 +442,15 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
             const back = rest.name ?? stateNameOf(b, watch.restored()) ?? b.blockAt(p)?.name ?? '别的方块'
             self.log(`⚠️ 服务端把 ${nm} 复原了（${p}）—— 这次破坏没被认`)
             out.push(`没挖掉 ${nm} @ ${p}：服务端把这块**改回了 ${back}**（复原）`
-              + ' —— 多半是我离得远，或客户端区块旧了。先 `mc_move` 走到它旁边（3 格以内）再叫一次 mc_dig；'
-              + '连着两三次都这样就用 `mc_connect {force:true}` 重连刷新区块')
+              + ' —— 多半是我离得远，或客户端区块旧了。先 `mc_move` 走到它旁边（3 格以内）再叫一次 mc_dig。'
+              + DESYNC_HINT)
           } else if (rest?.kind === 'other') {
             await sleep(150)
             const back = rest.name ?? '别的方块'
             self.log(`⚠️ 服务端说 ${p} 是 ${back}，和我以为的 ${nm} 不一样 —— 客户端区块旧了？`)
             out.push(`没挖掉 ${nm} @ ${p}：服务端说这一格是 **${back}**，和我这边看到的 **${nm}** 不一样`
-              + '（客户端区块旧了）—— 先 `mc_connect {force:true}` 重连刷新区块，再 `mc_scan` 复核一眼')
+              + '（客户端区块旧了）—— 先 `mc_scan` 复核一眼。'
+              + DESYNC_HINT)
           } else if (now !== nm) {
             okCount++
             if (task) self.tasks.progress(task.taskId, { add: 1 })
@@ -384,7 +463,8 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
                 + `${rest?.kind === 'liquid' ? '：液体立刻涌了进来，这次破坏是成功的' : ''}）`)
             } else out.push(`本地读到 ${nm} @ ${p} 已经变成 ${now}，但**没收到服务端的破坏回包**`
               + ' —— 服务端很可能拒了这次破坏（够不着 / 领地保护 / 权限 / 反作弊）：别当成挖掉了，'
-              + '先 `mc_scan` 复核，真没挖掉就 `mc_connect {force:true}` 重连刷新区块')
+              + '先 `mc_scan` 复核。'
+              + DESYNC_HINT)
             /* 🔴 原地挖绕过了 collectBlock（它平时挖完还会把掉落物捡回来）⇒ 得自己去捡，
              *    否则"挖到 3 根原木、背包里只有 1 根"（2026-10-08 实机）。 */
             const got = await ctx.grabDrops(b)
@@ -397,7 +477,8 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
               if (hint) out.push(`　（${hint}）`)
             }
           } else out.push(`没挖成 ${nm} @ ${p}（原地挖完了，但那里**还是 ${now}**）`
-            + ' —— 服务端没认这次破坏（失步 / 领地保护 / 工具不对）：先 `mc_scan` 复核，再 `mc_connect {force:true}` 重连清一下客户端缓存')
+            + ' —— 服务端没认这次破坏（失步 / 领地保护 / 工具不对）：先 `mc_scan` 复核。'
+            + DESYNC_HINT)
         } catch (e) {
           /* 🔴 被新指令抢占（`interruptMove` / abort）：**这不是失败**，进度留着 —— 用户
            * 2026-10-08 路线图原话"玩家发出新命令可取消或抢占旧任务"。 */
@@ -415,11 +496,14 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
     /* 以前这里还有一条"够不着就交给 collectBlock"的路 + 一个"② 退回：原地挖"的兜底循环 ——
      * 2026-10-08 全部删掉：那条路正是"挖完又复原 + 之后几分钟走不了路"的来源（见本函数开头的注释）。
      * 够不着就如实说，让模型自己 `mc_move` 过去再挖。 */
+    /* 「这条矿脉还没挖干净」—— 收工前补一句（`veinHint` 的判据见本文件开头）。
+     * 时间用完那条路自己会说"还有 N 个没挖"，不重复。 */
+    if (okCount > 0 && !budgetCut) {
+      const h = veinHint(b, targets[0]?.name ?? name)
+      if (h) out.push(h)
+    }
     ctx.taskSettle(task, out, okCount, targets.length)
     ctx.verdictLine(out, okCount, targets.length)
     return ctx.withHeld(out, b, held0)
   }
-
-  ctx.verdictLine(out, okCount, targets.length)
-  return ctx.withHeld(out, b, held0)
 }

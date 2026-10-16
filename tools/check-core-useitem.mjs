@@ -23,7 +23,7 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 
 // ── 断言小工具（和别的 check-*.mjs 一致）────────────────────────────────────────
 let pass = 0, fail = 0
@@ -229,7 +229,8 @@ section('⑦ 工具层接线 —— mc_act{useitem} 与"use 不给目标"都要�
     '没给目标时 `use` 退回 useItem（对着空气用手上的东西）')
   ok(/· useitem 用手上的东西/.test(idx), '工具描述里有 useitem 一行')
   ok(/hold: \{ type: 'number'/.test(idx), 'schema 里有 hold 参数')
-  ok(/可用 look\/toward\/place\/break\/use\/useitem\/attack\/equip\/toss/.test(idx),
+  /* 2026-10-15：清单里陆续多了 `enchant`（附魔台）和 `bridge`（搭路）—— 只钉"必须列出来"，不钉顺序。 */
+  ok(/可用 [^）]*useitem[^）]*toss/.test(idx),
     '未知 mode 的报错文案里列出了 useitem')
   ok(/useitem\(hold\)/.test(idx), 'mc_sequence 的描述里列出了 useitem(hold)')
 }

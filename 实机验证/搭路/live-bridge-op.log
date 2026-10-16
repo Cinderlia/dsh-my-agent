@@ -1,0 +1,49 @@
+(node:33520) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Mineflayer detected that you are using a deprecated event (physicTick)! Please use this event (physicsTick) instead.
+✅ 连上：1.21.9 / creative / 落点 (204.5,66,202.5)
+
+── 搭测试平台 ──
+  [服务端] Successfully filled 55 block(s)
+  [服务端] Successfully filled 220 block(s)
+  [服务端] No blocks were filled
+  [服务端] Teleported bridge_test to 204.500000, 101.000000, 202.500000
+平台路面 (204,100,202) = stone
+人已就位 (204.5,101,202.5)
+
+══ 场景 A：正常沟，有料 ⇒ 期望搭过去 ══
+  [服务端] Successfully filled 60 block(s)
+  [服务端] Removed 64 item(s) from player bridge_test
+  [服务端] Gave 64 [Dirt] to bridge_test
+  [服务端] Teleported bridge_test to 204.500000, 101.000000, 202.500000
+  沟：205..207 × y97..100 已挖空；站位 (204.5,101,202.5)；背包 dirtx64
+  返回（3399ms）：{"ok":true,"dir":"东(+x)","count":4,"from":{"x":204,"y":101,"z":202},"to":{"x":208,"y":101,"z":202},"placed":3,"walked":4,"placedAt":["205,100,202:dirt","206,100,202:dirt","207,100,202:dirt"],"skipped":1,"skippedWhy":"这 1 格本来就有方块（不是空档），没重铺：208,100,202:stone","held":"dirtx64"}
+  桥面三格：dirt / dirt / dirt；人站在 (208,101,202)
+  ✅ 返回 ok:true —— ok=true
+  ✅ 三格桥面都铺上了 —— dirt/dirt/dirt
+  ✅ 人真走到对岸 —— (208,101,202)
+  ✅ 没被标成 stopped —— stopped=undefined why=-
+
+══ 场景 B：沟里有岩浆 ⇒ 期望危险停止、一块不放 ══
+  [服务端] Successfully filled 3 block(s)
+  [服务端] Changed the block at 206, 98, 202
+  [服务端] Removed 64 item(s) from player bridge_test
+  [服务端] Gave 64 [Dirt] to bridge_test
+  [服务端] Teleported bridge_test to 204.500000, 101.000000, 202.500000
+  沟：205..207 × y97..100 已挖空（沟里放了岩浆）；站位 (204.5,101,202.5)；背包 dirtx64
+  返回：{"ok":false,"stopped":true,"why":"前方 (205,100,202) 下方 2 格是 岩浆(lava)——搭过去也会掉进去，**不搭**","dir":"东(+x)","count":4,"from":{"x":204,"y":101,"z":202},"cells":[{"x":205,"y":100,"z":202},{"x":206,"y":100,"z":202},{"x":207,"y":100,"z":202},{"x":208,"y":100,"z":202}],"placed":0,"walked":0,"held":"dirtx64","hint":"先解决上面那条，再叫一次 mc_act{mode:\"bridge\"}（已经铺好的格子会跳过，不用重铺）。"}
+  沟面三格：air / air / air
+  ✅ 没有 ok:true（危险时不该硬上） —— ok=false
+  ✅ 一块都没放 —— air/air/air
+  ✅ 说清了原因（提到岩浆/危险） —— 前方 (205,100,202) 下方 2 格是 岩浆(lava)——搭过去也会掉进去，**不搭**
+
+══ 场景 C：跳过 —— 现在是创造模式，placeBlock 会自动取物，"没材料"根本走不到 ══
+
+── 拆平台 ──
+  [服务端] Successfully filled 223 block(s)
+  [服务端] No blocks were filled
+拆完：(204,100,202)=air / (200,96,200)=air
+
+══ 结果：7 ✅ / 0 ❌ ══
+
+已断开

@@ -268,12 +268,82 @@ section('⑦ 设置页：版本提示从"只读展示"改成"可编辑"')
 {
   const src = stripComments(rd(SRC.client) ?? '')
   ok(src.includes('vpText, onVpText, onVpSave, onVpReset'), 'PromptPane 收了这四个 props')
-  ok(src.includes("run('vp:save', () => apiPut('/api/mc/agents-md', { text: vpText, sessionId, target: 'version' })"), '保存走 target:"version"')
-  ok(src.includes("run('vp:reset', () => apiDelete('/api/mc/agents-md', { sessionId, target: 'version' })"), '恢复默认走 target:"version"')
+  /* 🔴 2026-10-15 审计（client.js 报告第 1 条）：四个写接口以前写死 `'/api/mc/agents-md'`
+     且只把 `sessionId` 塞进 body —— 服务端 `gateOf()` 是
+     `settingsGate(query.sessionId ?? b?.sessionId, query.cwd ?? b?.cwd)`，**它认 `cwd`**。
+     会话还没落盘时（新对话页）定位不到工作区，用户看到"提示词看得到、存不进去"。
+     现在统一走 `withSid(...)`（它把 `sessionId` + `cwd` 都拼进 query）。 */
+  ok(src.includes("run('vp:save', () => apiPut(withSid('/api/mc/agents-md'), { text: vpText, sessionId, target: 'version' })"), '保存走 target:"version"')
+  ok(src.includes("run('vp:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId, target: 'version' })"), '恢复默认走 target:"version"')
+  ok(src.includes("run('md:save', () => apiPut(withSid('/api/mc/agents-md'), { text: mdText, sessionId })"), 'RULES.md 保存也走 withSid（带上 cwd）')
+  ok(src.includes("run('md:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId })"), 'RULES.md 恢复默认也走 withSid')
+  ok(!src.includes("apiPut('/api/mc/agents-md'") && !src.includes("apiDelete('/api/mc/agents-md'"),
+    '🔴 四个写接口不再有裸路径（裸路径 = 不带 cwd ⇒ 新会话页存不进去）')
   ok(src.includes('setVpText(String(m.versionPrompt?.text ?? \'\'))'), 'load() 把文件内容灌进输入框')
   ok(src.includes('看内置默认（「恢复默认」用的就是这一份）'), '给了"看内置默认"的折叠')
   ok(src.includes('注入只投一行指针，正文由会话自己去读'), '界面把"只投指针"写清了')
   ok(src.includes("mark(seg['version-prompt'])"), '"本会话注入"那行也显示 版本提示.md 的状态')
+}
+
+/* ─────────────── ⑧ 静态接线：client.js 审计 10 条（2026-10-15） ─────────────── */
+section('⑧ client.js 审计修复的静态接线')
+{
+  const src = stripComments(rd(SRC.client) ?? '')
+  const idx = rd(SRC.index) ?? ''
+
+  /* 🔴 第 2 条：config 读失败被 `.catch` 吞掉 ⇒ `Promise.all` 恒 resolve ⇒ `setLoaded(true)`
+     恒执行，而 `wlText` 还是初始 `''` ⇒ 点「保存」会发 `commandWhitelist: []`，
+     **把服务端真实白名单清空**。凭证是 `cfgOk`。 */
+  ok(src.includes('const [cfgOk, setCfgOk] = React.useState(false)'), '🔴 有 cfgOk 凭证（默认 false）')
+  ok(src.includes('setCfgOk(true)'), 'config 读成功才翻 true')
+  ok(src.includes('setCfgOk(false)'), 'load() 开头与失败分支都翻回 false')
+  ok(src.includes('const cfgBad = cfgOk === false'), 'UI 按 cfgBad 提示')
+  ok(/if \(!cfgOk\) \{[\s\S]{0,220}?return Promise\.resolve\(false\)/.test(src),
+    '🔴 保存白名单 / base 在没读到配置时**硬拒**（不是只把按钮变灰）')
+  ok(src.includes('cfgOk, onWlText') && src.includes('hasWorkspace, cfgOk'),
+    'cfgOk 传给了 WhitelistPane 与 SharePane')
+
+  /* 🟡 第 3 条：hero 注入按钮 dispose 竞态 */
+  ok(src.includes('let disposed = false'), '🟡 hero 注入器有 disposed 标志')
+  ok((src.match(/if \(disposed\) return/g) ?? []).length >= 3, 'place/track/微任务回调都查 disposed')
+
+  /* 🟡 第 4 条：空密码「创建」静默无反应 */
+  ok(src.includes('const [hasPass, setHasPass] = React.useState(false)'), '🟡 密码只记布尔（不进 state）')
+  ok(src.includes('const missing = []') || src.includes('missing.length'), '🟡 按钮按"还差什么"禁用')
+
+  /* 🟡 第 5 条：强制停止不检查结果 */
+  ok(src.includes('const [stopErr, setStopErr] = React.useState('), '🟡 停止失败有地方显示')
+  ok(src.includes("j.ok !== true") && src.includes('服务端没有确认停止'),
+    '🟡 强制停止**两层都判**（HTTP 与业务 ok）')
+
+  /* 🟡 第 6 条：一次轮询失败就把状态清空 ⇒ 状态条（含唯一入口「强制停止」）消失 */
+  ok(src.includes('const [pollFail, setPollFail] = React.useState(0)'), '🟡 轮询失败单独计数，不动 state')
+  ok(src.includes('return [state, setState, pollFail]') && src.includes('useMcStatus(sessionId, pollNow)'),
+    '🟡 轮询失败不再把 state 置 null')
+  ok(src.includes('const pollBad = pollFail >= 2'), '连续失败才提示，且提示"显示的是最后一次读到的状态"')
+
+  /* 🟡 第 7 条：busyKey 单值互相清忙碌态 */
+  ok(src.includes('const inflightRef = React.useRef(new Map())'), '🟡 在飞动作按 key 计数')
+  ok(src.includes('const syncBusy = React.useCallback('), '🟡 对外忙碌态由计数推出（不是无条件置 null）')
+
+  /* 🟡 第 8 条：连接弹窗账户状态不同步 */
+  ok(src.includes('const prevSettingsOpen = React.useRef(false)'), '🟡 盯 settingsOpen 的 true→false 沿')
+  ok(src.includes('prevSettingsOpen.current = settingsOpen'), '沿检测实现')
+
+  /* 🟡 第 9 条：preset 名单是模块级变量 ⇒ 异步回来不重渲染 */
+  ok(src.includes('const [presetIds, setPresetIds] = React.useState(MC_PRESETS_FALLBACK)'),
+    '🟡 preset 名单进 state')
+  ok(src.includes('presetIds.includes(preset)'), '门控读 state（不是模块级变量）')
+  ok(!/^\s*let mcPresetIds = /m.test(src), '模块级不再有可变的 mcPresetIds')
+
+  /* 🟢 第 10 条：版本门控原来是 `() => null` 的桩 ⇒ 拦截与红标一行都到不了 */
+  ok(!src.includes('const describe = '), '🟢 删掉死代码 describe')
+  ok(src.includes('function MC_VERSION_IN_RANGE(v)') && src.includes('function mcVersionParts(v)'),
+    '🟢 版本门控真实现了（逐段比数字，不是 includes）')
+  ok(src.includes("const lanVersionOk = (s) => MC_VERSION_IN_RANGE(s?.version) !== false"),
+    '调用点仍是"只有明确 false 才拦"')
+  ok(idx.includes('testedVersions: lib.testedVersions') && idx.includes('latestVersion: lib.latest'),
+    '🟢 服务端 /api/mc/presets 带上了支持版本范围')
 }
 
 /* ─────────────── 收尾 ─────────────── */

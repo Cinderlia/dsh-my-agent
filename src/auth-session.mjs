@@ -66,18 +66,26 @@ export async function makeSession (self, auth) {
   const base = normalizeBaseUrl(auth.authUrl)
   if (!base) throw new Error('认证端点为空（authUrl）——这是插件内部 bug，请报告')
 
+  let refreshErr = null
   if (auth.accessToken) {
     try {
       const refreshed = await refresh({ authUrl: base, accessToken: auth.accessToken, clientToken: auth.clientToken })
       if (refreshed?.accessToken) return refreshed
-    } catch (e) { self.log(`token 刷新失败，改用密码重新登录：${e.message}`) }
+    } catch (e) { refreshErr = e; self.log(`token 刷新失败，改用密码重新登录：${e.message}`) }
   }
   if (auth.authUser && auth.authPass) {
     return authenticate({ authUrl: base, authUser: auth.authUser, authPass: auth.authPass })
   }
-  const err = new Error('这个账户的登录状态已失效，而且没有保存密码')
+  /* 🟡 2026-10-15 审计（报告 E 第 8 条）：上面那个 catch 把网络抖动/认证站 5xx 降级成一行日志，
+   *   这里再统一报"登录状态已失效" —— 用户于是跑去重新登录，其实等一会儿重试就好。
+   *   把真实原因带出来，并给出与之匹配的下一步。 */
+  const err = new Error(refreshErr
+    ? `这个账户的登录状态**没能刷新**（${refreshErr.message}），而且没有保存密码可用`
+    : '这个账户的登录状态已失效，而且没有保存密码')
   err.needUserAction = true
-  err.hint = '请让用户在「MC设置」里重新登录这个账户（或点该账户的「刷新」手动刷一次）'
+  err.hint = refreshErr
+    ? '如果只是网络/认证站一时不通，让用户稍后在「MC设置」点该账户的「刷新」重试一次；一直不行才需要重新登录。'
+    : '请让用户在「MC设置」里重新登录这个账户（或点该账户的「刷新」手动刷一次）'
   throw err
 }
 

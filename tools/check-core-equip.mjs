@@ -26,7 +26,7 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 
 // ── 断言小工具（和别的 check-*.mjs 一致）────────────────────────────────────────
 let pass = 0, fail = 0
@@ -213,7 +213,11 @@ section('④ 时间不够 ⇒ **一个挖矿包都不发**（进度清零白费�
   ok(fake2.calls.dig === 1, '时间够就开始挖（`b.dig` 调了一次）', `dig=${fake2.calls.dig}`)
   ok(ms2 < 4000, '到点就返回（没有一直挂着）', `${ms2}ms`)
   ok(r2?.broken === false, '如实报 broken=false', JSON.stringify(r2))
-  ok(/还没挖掉/.test(r2?.note ?? ''), 'note 说"还没挖掉"', String(r2?.note).slice(0, 90))
+  /* 🔴 2026-10-15 审计（报告 F 第 2 条）：超时文案以前写"还没挖掉" —— 那三个字会先命中
+   *    任务台账里"明确失败"的正则，于是"这一轮时间到了"被记成"这一步失败了"，
+   *    3 轮之后整条任务被误判成 blocked。现在如实说"时间用完了"，并明说**这不是失败**。 */
+  ok(/时间用完了/.test(r2?.note ?? '') && !/没挖掉/.test(r2?.note ?? ''),
+    'note 说"这一轮的时间用完了"（不再写"还没挖掉"，那会让台账把它记成失败）', String(r2?.note).slice(0, 90))
   ok(/0\.3 秒/.test(r2?.note ?? ''), 'note 带上"这块按手上的东西要 0.3 秒"', String(r2?.note).slice(0, 140))
   ok(!/服务端可能拒/.test(r2?.note ?? ''), '**不再**赖"服务端可能拒了这次破坏"', String(r2?.note).slice(0, 120))
   ok(r2?.held === 'iron_pickaxex1', 'note 之外也带 held', String(r2?.held))
@@ -263,6 +267,7 @@ const buildSrc = stripComments(await (await import('node:fs/promises')).readFile
   // 路线图第 ④ 条第十四刀：挖掘速度那一层（digMsFor/digToolKindOf/digToolSpeedOf/fixDigMs/
   // patchDigTime/bestToolFor）搬到了 `src/dig-speed.mjs`。
   const dsSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/dig-speed.mjs', import.meta.url), 'utf8'))
+  const woSrc = stripComments(await (await import('node:fs/promises')).readFile(new URL('../src/world-observer.mjs', import.meta.url), 'utf8'))
   ok(/export function digMsFor \(b, blk, itemType = null\) \{/.test(dsSrc), 'dig-speed 有 digMsFor')
   ok(/export function fixDigMs \(b, blk, itemType\) \{/.test(dsSrc), 'dig-speed 有 fixDigMs（上游缺倍率的兜底）')
   ok(/export function patchDigTime \(b\) \{/.test(dsSrc) && /export function bestToolFor \(b, blk\) \{/.test(dsSrc),
@@ -313,9 +318,13 @@ const buildSrc = stripComments(await (await import('node:fs/promises')).readFile
   // 估成 5650ms，白拒一次。所以判据取"**真在下落**"：离地 **且** 竖直速度明显为负。
   // （2026-10-08 熔炼验证：掉进 7 格深的坑、在下落途中挖原木 ⇒ 真 digTime 是 3 秒 ×5 = 15 秒，
   //   按"站着"估成 3 秒就放行 ⇒ `bot.dig()` 挂满整轮预算只回一句"超时"。）
-  ok(/const vY = Number\(b\?\.entity\?\.velocity\?\.y \?\? 0\)/.test(dsSrc)
-    && /const notOnGround = !b\?\.entity\?\.onGround && vY < -0\.02/.test(dsSrc),
-    'digMsFor 只在"真在下落"（离地 + 竖直速度为负）时按空中估')
+  /* 🔴 2026-10-15 审计（报告 D 第 5 条）：这个判据原来在 dig-speed.mjs 里写了一份、
+   *    world-observer.mjs 的 slowDigWhy 又写了一份**不一样**的 ⇒ 文案说"我在空中挖得慢"，
+   *    而那个 ms 根本没乘 5。现在两处共用 fallingNow(b)。 */
+  ok(/fallingNow\(b\)/.test(dsSrc) && /export function fallingNow \(b\)/.test(woSrc)
+    && /const vY = Number\(b\?\.entity\?\.velocity\?\.y \?\? 0\)/.test(woSrc)
+    && /onGround === false && vY < -0\.02/.test(woSrc),
+    'digMsFor 只在"真在下落"（离地 + 竖直速度为负）时按空中估，且与 slowDigWhy 共用 fallingNow')
   ok(!/const notOnGround = !b\?\.entity\?\.onGround\s*$/.test(dsSrc),
     '没有只看 `!b.entity.onGround`（瞬时浮空会把估计放大 5 倍、白拒一次）')
   ok(/const roadInfo = \(\) => \{/.test(movSrc) && /pillaredWith: used\[0\]\.name/.test(movSrc)
@@ -328,10 +337,11 @@ const buildSrc = stripComments(await (await import('node:fs/promises')).readFile
     && /from '\.\/build\.mjs'/.test(coreSrc),
     'build 只把**复核过真放上去**的算 placed（placed:false 不再计数；实现已搬到 src\\build.mjs）')
   ok(!/held: b\.heldItem\?\.name \?\? null/.test(coreSrc), 'placeBlock 不再只回方块名（要带数量）')
-  ok(/const held = heldText\(b\)/.test(useSrc) && /const ok = b\.heldItem\?\.name === item\.name/.test(useSrc)
-    && /\.\.\.\(before !== held \? \{ before \} : \{\}\)/.test(useSrc),
+  ok(/const held = heldText\(b\)/.test(useSrc) && /const got = isHand \? b\.heldItem\?\.name === item\.name : now\?\.name === item\.name/.test(useSrc)
+    && /equipped: got,/.test(useSrc)
+    && /\.\.\.\(beforeHeld !== held \? \{ beforeHeld \} : \{\}\)/.test(useSrc),
     'equip 的 held **读回来**（换手失败会如实说；实现已搬到 src\\world-use.mjs）')
-  ok(/import \{ useBlock, useItem, interact, equip \} from '\.\/world-use\.mjs'/.test(coreSrc)
+  ok(/import \{ useBlock, useItem, interact, equip[^}]*\} from '\.\/world-use\.mjs'/.test(coreSrc)
     && /async equip \(opts = \{\}\) \{ return await equip\(this, opts, \{ t: \(p, k, l\) => this\.#t\(p, k, l\) \}\) \}/.test(coreSrc),
     'core 有 equip 薄包装、并且确实从 world-use.mjs 导入（ctx.t 塞的是本轮的 11 秒闸门）')
 }

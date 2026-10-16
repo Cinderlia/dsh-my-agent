@@ -20,6 +20,16 @@
  *   - **不抢控制权**：移动编号（`#beginMove`）、控制位租约、11 秒预算、服务端破坏确认都还在 core 里，
  *     这里只记账，绝不下发动作；
  *   - **不猜**：背包数不出来就如实标 `verified: false`，不让"进度"变成假数据。
+ *
+ * 2026-10-14（用户"任务驱动"设计的第一步）：**只加数据模型，不加执行器**。
+ *   · `goalSpec` —— 机器可读的目标 `{ type, item, count, unit }`。`goal` 那句人话**保持字符串不动**
+ *     （`taskLine` / `mc_task` / 磁盘上的旧任务文件都还在读它），两份一起存在；
+ *   · `steps[]` —— 每一步的状态（`pending` / `running` / `done` / `failed` / `skipped`）+ 自己的重试次数。
+ *     以前只有自由文本的 `phase`，"拆到哪一步了"只活在模型的对话上下文里，一压缩就没了；
+ *   · `maxAttempts` —— 单步重试上限（默认 3）。超了把任务标 `blocked`（与循环检测同一个语义：
+ *     "停下来等指示"，**不是**终态的 `failed`）。
+ *   🔴 这一版**仍然不下发任何动作**：`steps` 是台账，谁推进它（模型，还是以后的执行器）由调用方决定。
+ *      所以 `start()` **不会**自动塞一套模板步骤 —— 没人推进的步骤表就是假数据。
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs'
@@ -38,6 +48,125 @@ export const STATUSES = ['running', 'waiting', 'paused', 'blocked', 'failed', 'd
 /** "还在做"的状态（`current()` 只认这些） */
 export const LIVE_STATUSES = ['running', 'waiting', 'paused', 'blocked']
 
+/* ── 目标 / 步骤的数据模型（2026-10-14 用户"任务驱动"设计第一步） ── */
+
+/** 目标类型：`type` 是"要达成什么"，`kind` 是"怎么干"（一个 kind 只对应一种 type） */
+export const GOAL_TYPES = ['obtain_item', 'reach', 'kill', 'custom']
+/** 步骤状态（`skipped` 也算走完了） */
+export const STEP_STATUSES = ['pending', 'running', 'done', 'failed', 'skipped']
+/** 单步重试上限：超了把任务标 `blocked` 等指示（和 `LOOP_LIMIT` 同一个语义） */
+export const DEFAULT_MAX_ATTEMPTS = 3
+
+/**
+ * 任务"代次"（epoch）的起点。
+ * 🔴 干什么用的（2026-10-15，用户点名的异步方案 ⑤）：
+ *    `TaskExecutor.run` 会 `await this.call(tool, args, …)` —— 那可能好几秒。
+ *    在这几秒里，模型完全可能 `mc_task {action:"plan"}` 重排步骤表、或者 `cancel` 掉任务。
+ *    等那个 await 回来，手里那份结果就是**上一代**的了：步骤 id 可能还在，但含义已经变了，
+ *    照写就会"把新计划里的某一步标成完成，而它其实没做"。
+ *    ⇒ 每次"换了这一代要干什么"（重排步骤表 / 取消 / 收工）就把 `epoch` +1；
+ *    执行器在动手前记下代次，写账前对一次，**对不上就整份丢掉**。
+ */
+export const TASK_EPOCH_START = 1
+/** 一个任务最多记多少步（防手滑塞进来几千条） */
+export const STEP_MAX = 24
+
+/** `kind`（动作类型）→ `type`（目标类型） */
+export function goalTypeOf (kind) {
+  switch (String(kind ?? '').toLowerCase()) {
+    case 'dig': case 'craft': case 'smelt': case 'chest': case 'gather': case 'collect': return 'obtain_item'
+    case 'move': case 'travel': case 'goto': return 'reach'
+    case 'attack': case 'kill': case 'hunt': return 'kill'
+    default: return 'custom'
+  }
+}
+
+/** 目标那句人话。`goal` 一直是字符串；万一旧任务没有，就按 `goalSpec` / `kind` 拼一个 */
+export function goalTextOf (t) {
+  const g = t?.goal
+  if (typeof g === 'string' && g) return g
+  const s = t?.goalSpec
+  if (s?.item) return `${s.type ?? 'obtain_item'} ${s.item}${s.count != null ? ` ×${s.count}` : ''}`
+  return String(t?.kind ?? '任务')
+}
+
+/** 机器可读的目标规格。旧任务文件里没有 `goalSpec` ⇒ 按 `kind` / `params` / `progress` 现推 */
+export function goalSpecOf (t) {
+  const s = t?.goalSpec
+  if (s && typeof s === 'object') return s
+  const n = t?.progress?.total
+  return {
+    type: goalTypeOf(t?.kind),
+    item: t?.params?.item ?? null,
+    count: n == null ? null : Number(n),
+    unit: t?.progress?.unit ?? '个',
+  }
+}
+
+/**
+ * 这类活的步骤骨架（**只写形状**，材料链条仍然交给 `mc_craft` / `mc_furnace` 的规划器，不在这里重写）。
+ * 🔴 现在**没有**任何地方自动套用这张表：等第二步的执行器上来，由它 `setSteps()` 填。
+ */
+const STEP_TEMPLATE = {
+  dig: ['locate', 'approach', 'dig', 'pickup', 'verify'],
+  craft: ['check-inventory', 'gather-materials', 'craft', 'verify'],
+  smelt: ['check-inventory', 'fuel', 'load', 'wait', 'take', 'verify'],
+  chest: ['find-container', 'transfer', 'verify'],
+  move: ['plan-route', 'walk', 'arrive'],
+  attack: ['locate', 'engage', 'confirm'],
+}
+
+export function defaultSteps (kind = null) {
+  const ids = STEP_TEMPLATE[String(kind ?? '').toLowerCase()] ?? null
+  return ids ? ids.map((id) => ({ id, status: 'pending', attempts: 0 })) : []
+}
+
+/** 把外来的步骤数组洗干净（字符串也认；认不出的一律丢掉，别把假数据记进台账） */
+export function normSteps (raw) {
+  if (!Array.isArray(raw)) return []
+  const out = []
+  for (const s of raw.slice(0, STEP_MAX)) {
+    const o = typeof s === 'string' ? { id: s } : (s && typeof s === 'object' ? s : null)
+    const id = String(o?.id ?? o?.label ?? '').trim().slice(0, 40)
+    if (!id) continue
+    /* `op` / `args`：这一步**交给哪个工具、带什么参数**（2026-10-14 第二步）。
+     * 没有 `op` 的步骤是"人工步骤" —— 执行器不替模型猜，原样交回。 */
+    const op = o?.op ? String(o.op).trim().slice(0, 40) : null
+    const args = o?.args && typeof o.args === 'object' && !Array.isArray(o.args) ? o.args : null
+    out.push({
+      id,
+      op,
+      args,
+      status: STEP_STATUSES.includes(o.status) ? o.status : 'pending',
+      attempts: Math.max(0, Number(o.attempts) || 0),
+      note: o.note ? String(o.note).slice(0, 120) : null,
+      at: o.at ?? null,
+    })
+  }
+  return out
+}
+
+/** 一行"现在走到哪一步了"（没步骤表就返回 null —— 输出跟以前一模一样） */
+export function stepLine (t) {
+  const steps = t?.steps ?? []
+  if (!steps.length) return null
+  const cur = steps.find((s) => s.status === 'running') ?? steps.find((s) => s.status === 'pending') ?? null
+  const i = cur ? steps.indexOf(cur) + 1 : steps.length
+  const done = steps.filter((s) => s.status === 'done' || s.status === 'skipped').length
+  const failed = steps.filter((s) => s.status === 'failed').length
+  return `第 ${i}/${steps.length} 步 ${cur ? cur.id : '（都走完了）'} · 已完成 ${done}${failed ? ` · 失败 ${failed}` : ''}`
+}
+
+/** 磁盘上的旧任务补齐新字段（读的时候补，**不要求重写文件**） */
+export function migrateTask (t) {
+  if (!t || typeof t !== 'object') return t
+  if (!t.goalSpec || typeof t.goalSpec !== 'object') t.goalSpec = goalSpecOf(t)
+  if (!Array.isArray(t.steps)) t.steps = []
+  if (!Number.isFinite(Number(t.maxAttempts))) t.maxAttempts = DEFAULT_MAX_ATTEMPTS
+  if (!Number.isFinite(Number(t.epoch)) || Number(t.epoch) < TASK_EPOCH_START) t.epoch = TASK_EPOCH_START
+  return t
+}
+
 /**
  * 失败分类表。`next` 是"下一步该干什么"，直接变成给模型的建议动作名。
  * 🔴 `budget` / `timeout` / `preempted` **都是 retryable**：它们不代表动作失败 ——
@@ -47,7 +176,7 @@ export const FAIL_KINDS = {
   'no-tool': { retryable: false, next: 'craft-tool', hint: '背包里没有能用的工具 —— 先 mc_craft 一把（木镐 = 3 木板 + 2 木棍）再继续' },
   'no-target': { retryable: false, next: 'scan', hint: '附近找不到目标了 —— mc_scan / mc_move 换个方向或扩大范围，别在原地反复试' },
   unreachable: { retryable: true, next: 'move-closer', hint: '够不着 —— 先 mc_move 走到它旁边（3 格以内）再动手' },
-  'server-refused': { retryable: true, next: 'reconnect', hint: '服务端没认这次动作（方块复原 / 没收到回包）—— 复核一次，连着两三次就 mc_connect {force:true} 重连刷新区块' },
+  'server-refused': { retryable: true, next: 'reconnect', hint: '服务端没认这次动作（方块复原 / 没收到回包）—— 先 mc_scan 复核，并且先想一下那格是不是自己垫脚放上去的（别顺手 mc_connect {force:true}，那会让玩家看到你退出游戏）' },
   budget: { retryable: true, next: 'continue', hint: '这一轮的 11 秒用完了（**不是失败**）—— 用同样的参数再叫一次接着做' },
   timeout: { retryable: true, next: 'continue', hint: '超时了（**不等于没做成**：服务端可能已经执行）—— 先复核现场，再决定要不要重做' },
   preempted: { retryable: true, next: 'continue', hint: '被新的指令抢占了 —— 先把玩家要的事做完，再回来看这个任务' },
@@ -75,7 +204,10 @@ const FAIL_RULES = [
  */
 export function classifyFailure (input) {
   const given = String(input?.kind ?? '').trim()
-  const reason = String(input?.reason ?? input?.message ?? input ?? '').trim()
+  /* 🔴 `error` 也要认：工具失败时回的就是 `{error:'…'}`（`src\task-exec.mjs` 就是这么喂进来的）。
+   *    只认 `reason`/`message` 的话，`String({error:'…'})` 会变成 `'[object Object]'`，
+   *    任何分类都匹配不上 ⇒ 明确失败被当成"说不清"（冒烟 I 抓出来的）。 */
+  const reason = String(input?.reason ?? input?.error ?? input?.message ?? input ?? '').trim()
   let kind = given && FAIL_KINDS[given] ? given : null
   if (!kind) {
     for (const [re, k] of FAIL_RULES) { if (re.test(reason)) { kind = k; break } }
@@ -136,14 +268,17 @@ export function taskLine (t) {
   const prog = p.total != null ? `${p.done ?? 0}/${p.total}` : String(p.done ?? 0)
   const st = { running: '进行中', waiting: '等条件', paused: '暂停', blocked: '卡住了', failed: '失败', done: '完成', cancelled: '取消' }[t.status] ?? t.status
   const err = t.lastError ? ` · 上次卡在：${t.lastError.kind}${t.lastError.reason ? `（${String(t.lastError.reason).slice(0, 60)}）` : ''}` : ''
-  return `${t.taskId} · ${t.kind} · ${t.goal ?? t.params?.item ?? ''} · ${prog}${p.unit ?? ''} · ${st}${err}`
+  const sp = stepLine(t)
+  return `${t.taskId} · ${t.kind} · ${goalTextOf(t)} · ${prog}${p.unit ?? ''} · ${st}${sp ? ` · ${sp}` : ''}${err}`
 }
 
 /** 给工具返回用的紧凑对象（不塞历史） */
 export function taskBrief (t) {
   if (!t) return null
   return {
-    taskId: t.taskId, kind: t.kind, goal: t.goal, phase: t.phase, status: t.status,
+    taskId: t.taskId, kind: t.kind, goal: goalTextOf(t), goalSpec: goalSpecOf(t),
+    phase: t.phase, status: t.status, steps: t.steps ?? [], step: stepLine(t),
+    maxAttempts: Number(t.maxAttempts ?? DEFAULT_MAX_ATTEMPTS),
     progress: t.progress, lastError: t.lastError, loopDetected: t.loopDetected ?? null,
     checkpoint: t.checkpoint ?? null, updatedAt: t.updatedAt, startedAt: t.startedAt,
   }
@@ -160,31 +295,53 @@ export function taskBrief (t) {
  *   · unknown   —— 时间到/被抢占/超时，读不到证据（**服务器可能已经做了**）
  */
 export const OUTCOMES = ['confirmed', 'failed', 'unknown']
-export const OUTCOME_LABEL = { confirmed: '已确认成功', failed: '动作失败', unknown: '结果未知' }
+export const OUTCOME_LABEL = { confirmed: '已确认成功', failed: '动作失败', unknown: '结果未知', stale: '这一步作废了' }
 
-/** 把一个动作的返回值判成三种结局之一（判不出就如实说 unknown，绝不硬判成成功） */
+/** 把一个动作的返回值判成四种结局之一（判不出就如实说 unknown，绝不硬判成成功） */
 export function outcomeOf (res, { expect = null } = {}) {
   const r = res ?? {}
   const s = (x) => String(x ?? '')
   const num = (x) => (Number.isFinite(Number(x)) ? Number(x) : null)
   const blob = `${s(r.error)} ${s(r.reason)} ${s(r.note)} ${s(r.why)} ${s(r.hint)}`
 
+  /* 🔴 代次过期（2026-10-15，用户点名的异步方案 ⑤）：这一步的结果属于**上一代**。
+   *    它既不是成功、也不是失败，更不是"结果未知、服务器可能已经做了" ——
+   *    而是**作废**（执行器压根没往台账上写）。必须排在所有判据最前面：
+   *    否则它会掉进下面的 `unknown`，被说成"先 mc_observe 看一眼再决定"，
+   *    而实际上这一步在新计划里可能**根本不存在**。 */
+  if (r.stale === true) return 'stale'
+
   // ① 明确失败：被拒 / 够不着 / 服务端复原 / 路不通
   if (r.restored === true) return 'failed'
   if (r.broken === false && r.refused === true) return 'failed'
   if (r.placed === 0 && r.refused === true) return 'failed'
-  if (/复原|够不着|没有能挖|不在线|NoPath|unreachable|refused|拒绝|缺少|先 mc_craft/i.test(blob)) return 'failed'
+  /* 🔴 报告 H4（2026-10-13）：`placeBlock` 只在"放完复核没过"时回 `placed:false`（`place.mjs:189`），
+   *    那是明确失败 —— 以前它落到最后变成"结果未知"，模型会以为还有机会。 */
+  if (r.placed === false) return 'failed'
+  /* 🔴 审计 F2：**结构化**的"时间到 / 被抢占"必须排在下面那条**文本**失败正则之前。
+   *    原来顺序反了 ⇒ `mc_move` 带着 `{mcTimeout:true}` 回来时，只要 note 里出现"够不着"
+   *    之类字样就先被判成 'failed'，"结果未知"那条永远走不到。 */
+  if (r.mcTimeout === true || r.cutByCall === true || r.preempted === true) return 'unknown'
+  if (/复原|够不着|没有能挖|不在线|NoPath|unreachable|refused|拒绝|缺少|先 mc_craft|没挖成|没挖掉/i.test(blob)) return 'failed'
 
   // ② 明确成功：有证据
+  /* 🔴 报告 H4：`placed` / `broken` 成功时是**方块名字符串**（`place.mjs:189` / `mining.mjs:145`），
+   *    而这里以前用 `num(...) > 0` ⇒ `Number('cobblestone')` 是 NaN ⇒ 成功的放置/挖掘一路掉到
+   *    "结果未知"，模型以为没做成、可能重做。名字符串同样算成功证据。 */
+  const pos = (x) => (typeof x === 'string' && x.length > 0 ? 1 : (num(x) ?? 0))
+  /* 🔴 审计 F1：`mc_dig` 回的是字符串数组（`index.js` 里包成 `{result, text}`），
+   *    没有 `dug`/`broken` 这类字段 ⇒ 挖成功了也一路掉到"结果未知"，被任务执行器记成失败。
+   *    它唯一的成功证据就是这一句（`mining.mjs` 只在**收到服务端破坏包**时才写）。 */
+  if (/（服务端已确认/.test(blob)) return 'confirmed'
   if (Array.isArray(r.dug) && r.dug.length > 0) return 'confirmed'
-  if (num(r.dug) > 0 || num(r.placed) > 0 || num(r.got) > 0) return 'confirmed'
-  if (r.broken === true || r.arrived === true || r.killed === true || r.done === true || r.ok === true) return 'confirmed'
+  if (pos(r.dug) > 0 || pos(r.placed) > 0 || pos(r.got) > 0) return 'confirmed'
+  if (r.broken === true || pos(r.broken) > 0) return 'confirmed'
+  if (r.arrived === true || r.killed === true || r.done === true || r.ok === true) return 'confirmed'
 
   // ③ 时间到 / 被抢占 / 超时 → 结果未知（不是失败）
-  if (r.mcTimeout === true || r.cutByCall === true || r.preempted === true) return 'unknown'
   if (/budget|timeout|preempted|时间不够|用完了|被打断|抢占/i.test(blob + ' ' + s(r.status))) return 'unknown'
 
-  if (expect != null && num(r[expect]) === 0) return 'failed'
+  if (expect != null && pos(r[expect]) === 0) return 'failed'
   return 'unknown'
 }
 
@@ -194,6 +351,12 @@ export function verdictText (outcome, detail = null) {
   const tail = detail ? `（${detail}）` : ''
   if (outcome === 'confirmed') return `✅ ${label}${tail}`
   if (outcome === 'failed') return `❌ ${label}${tail}`
+  /* 代次过期：**别叫模型去复核现场** —— 那一步已经不在新计划里了，看一眼也是白看。
+   * 要做的是"看现在的步骤表"。 */
+  if (outcome === 'stale') {
+    return `♻️ ${label}${tail} —— 你在这中间把任务改过了（重排步骤 / 取消），`
+      + '这一份结果**没往台账上写**：先 `mc_task {action:"get"}` 看**现在**的步骤表，再决定要不要接着跑。'
+  }
   return `❓ ${label}${tail} —— 时间到了/被打断，但**服务器可能已经做了**：先看一眼`
     + '（`mc_observe` / `mc_inventory` / `mc_status`）再决定，别直接重做。'
 }
@@ -236,7 +399,7 @@ export class TaskRunner {
     try {
       if (!existsSync(this.file)) return this.data
       const raw = JSON.parse(readFileSync(this.file, 'utf8'))
-      if (raw && Array.isArray(raw.tasks)) this.data = { version: 1, seq: Number(raw.seq ?? 0) || 0, tasks: raw.tasks }
+      if (raw && Array.isArray(raw.tasks)) this.data = { version: 1, seq: Number(raw.seq ?? 0) || 0, tasks: raw.tasks.map(migrateTask) }
     } catch (e) {
       // 文件坏了不能让整个插件崩：留一条日志，从空任务表开始
       this.log(`任务文件读不了（${String(e?.message ?? e).slice(0, 80)}）—— 从空表开始：${this.file}`)
@@ -290,16 +453,23 @@ export class TaskRunner {
 
   /* ── 写 ── */
 
-  start ({ kind = 'task', goal = null, item = null, total = null, unit = '个', params = {}, meta = {}, phase = 'planning' } = {}) {
+  start ({ kind = 'task', goal = null, item = null, total = null, unit = '个', params = {}, meta = {}, phase = 'planning', steps = null } = {}) {
     const d = this.#load()
     const now = this.now()
     const t = {
       taskId: newTaskId(now, ++d.seq),
       kind, goal: goal ?? (item ? `${kind} ${item}` : kind), phase,
+      /* 机器可读的目标 + 步骤台账（2026-10-14）：`steps` 只有调用方明确给了才写 ——
+       * 没人推进的模板步骤表就是假数据（见文件头）。 */
+      goalSpec: { type: goalTypeOf(kind), item: item ?? params.item ?? null, count: total == null ? null : Number(total), unit },
+      steps: steps ? normSteps(steps) : [],
+      maxAttempts: DEFAULT_MAX_ATTEMPTS,
       progress: { done: 0, total: total == null ? null : Number(total), unit },
       checkpoint: null, lastError: null, loopDetected: null,
       status: 'running', params: { ...params, item: item ?? params.item ?? null },
       attempts: {}, history: [], meta: { ...meta },
+      /* 代次：见 `TASK_EPOCH_START` 的注释 —— 换了这一代要干什么就 +1 */
+      epoch: TASK_EPOCH_START, epochWhy: null, epochAt: now,
       startedAt: now, updatedAt: now,
     }
     d.tasks.push(t)
@@ -336,6 +506,41 @@ export class TaskRunner {
     Object.assign(t, patch, { updatedAt: this.now() })
     this.save()
     return t
+  }
+
+  /**
+   * 换一代（见 `TASK_EPOCH_START`）。**只该在"这一代要干什么"变了的时候调** ——
+   * 重排步骤表、取消、收工。普通的记进度 / 记失败 / 换状态**不算**换代，
+   * 否则执行器每轮都会被自己刚写的账判成"过期"。
+   */
+  #bump (t, why = null) {
+    if (!t) return null
+    t.epoch = (Number(t.epoch) || TASK_EPOCH_START) + 1
+    t.epochWhy = why == null ? null : String(why).slice(0, 120)
+    t.epochAt = this.now()
+    return t.epoch
+  }
+
+  /** 当前代次（任务不存在 ⇒ `null`） */
+  epochOf (taskId) {
+    const t = this.get(taskId)
+    return t ? (Number(t.epoch) || TASK_EPOCH_START) : null
+  }
+
+  /**
+   * 手里这份结果是哪一代的？给执行器写账前对一次。
+   * @returns {{stale:boolean, epoch:number|null, why:string|null, at:number|null}}
+   */
+  staleOf (taskId, epoch) {
+    const t = this.get(taskId)
+    const now = t ? (Number(t.epoch) || TASK_EPOCH_START) : null
+    const want = Number(epoch) || null
+    return {
+      stale: !t || want == null || now !== want,
+      epoch: now,
+      why: t?.epochWhy ?? null,
+      at: t?.epochAt ?? null,
+    }
   }
 
   progress (taskId, { add = 0, done = null, total = null, note = null } = {}) {
@@ -393,7 +598,11 @@ export class TaskRunner {
       }
     } else {
       t.attempts[key] = { count: 1, lastReason: c.reason, firstAt: now, at: now, uncounted: true }
-      if (t.status === 'blocked') t.status = 'running'    // 时间不够不是"卡住"，别让任务一直挂在 blocked
+      /* 时间不够不是"卡住"，别让任务一直挂在 blocked。
+       * 🔴 审计 F10：这里把 blocked 拉回 running 时必须**顺手清掉 `loopDetected`** ——
+       *    那个字段是"卡住了"的凭据，留着的话下一次 `list()`/`get()` 还会把它当成卡住的
+       *    原因报给模型（`mc_task` 的输出里就带着 `loopDetected`），自相矛盾。 */
+      if (t.status === 'blocked') { t.status = 'running'; t.loopDetected = null }
     }
     t.updatedAt = now
     this.save()
@@ -440,6 +649,7 @@ export class TaskRunner {
     t.phase = ok ? 'done' : 'failed'
     t.endedAt = this.now()
     t.updatedAt = t.endedAt
+    this.#bump(t, ok ? '任务已收工' : '任务已判失败')
     if (note) this.note(taskId, note, { save: false })
     this.log(`任务${ok ? '完成' : '失败'} ${taskLine(t)}`)
     this.save()
@@ -452,6 +662,7 @@ export class TaskRunner {
     t.status = 'cancelled'
     t.endedAt = this.now()
     t.updatedAt = t.endedAt
+    this.#bump(t, `任务被取消：${why}`)
     this.note(taskId, `取消：${why}`, { save: false })
     this.save()
     return t
@@ -463,6 +674,158 @@ export class TaskRunner {
     d.tasks = d.tasks.filter((t) => t.taskId !== String(taskId))
     if (d.tasks.length !== before) this.save()
     return before - d.tasks.length
+  }
+
+  /* ── 步骤台账（只记账，不下发动作 —— 2026-10-14） ── */
+
+  /**
+   * 当前那步：`stepId` 不给就先看 `phase`（那才是"做到哪了"的权威），
+   * 再依次找 running / failed / 第一个 pending。
+   * 🔴 一定要先认 `phase`：`stepFail` 会把还能重试的步骤放回 `pending`，
+   *    只按"第一个 pending"找会退回到更早那一步上去重试。
+   */
+  #stepOf (t, stepId = null) {
+    const steps = t?.steps ?? []
+    if (!steps.length) return null
+    const id = stepId ? String(stepId) : null
+    if (id) return steps.find((s) => s.id === id) ?? null
+    const ph = t.phase ? steps.find((s) => s.id === t.phase) : null
+    if (ph && ph.status !== 'done' && ph.status !== 'skipped') return ph
+    return steps.find((s) => s.status === 'running')
+      ?? steps.find((s) => s.status === 'failed')
+      ?? steps.find((s) => s.status === 'pending')
+      ?? null
+  }
+
+  /** 某一步**后面**第一个还没做的（找不到再从头找 —— 乱序推进也别卡死） */
+  #nextStep (t, from) {
+    const steps = t?.steps ?? []
+    const i = steps.indexOf(from)
+    const after = i >= 0 ? steps.slice(i + 1).find((x) => x.status === 'pending') : null
+    return after ?? steps.find((x) => x.status === 'pending') ?? null
+  }
+
+  /** 一次列全步骤（字符串数组也认）；空数组 = 清掉。执行器将来就靠这个填计划 */
+  setSteps (taskId, steps = []) {
+    const t = this.get(taskId)
+    if (!t) return null
+    t.steps = normSteps(steps)
+    /* 🔴 重排步骤表 = 换了一代：在飞的那一步的结果不能再往新表上写 */
+    this.#bump(t, '步骤表被重排')
+    t.updatedAt = this.now()
+    this.note(taskId, `步骤：${t.steps.map((s) => s.id).join(' → ') || '（清空）'}`, { save: false })
+    this.save()
+    return t
+  }
+
+  /**
+   * 只读地问一句"现在该做哪一步"（执行器 `src\task-exec.mjs` 用它选步）。
+   * 判据与 `#stepOf` 完全一致：先认 `phase` → running → failed → 第一个 pending。
+   * @returns {object|null} 步骤对象（**原件的引用**，别在外面改它）
+   */
+  currentStep (taskId = null, stepId = null) {
+    const t = this.get(taskId)
+    if (!t) return null
+    return this.#stepOf(t, stepId)
+  }
+
+  /**
+   * 把某一步放回"还没做"（**结果未知**时用）。
+   * 为什么单独一个方法：`stepFail` 会记一次失败、`stepDone` 会记成做过，
+   * 而"时间到了 / 被抢占"这两种情况**两样都不是** —— 服务器可能已经做了，
+   * 也可能没做，得先复核现场。所以这里既不记失败也不记成功，只把状态收回来。
+   */
+  stepReset (taskId, stepId = null, note = null) {
+    const t = this.get(taskId)
+    if (!t) return null
+    const s = this.#stepOf(t, stepId)
+    if (!s) return null
+    s.status = 'pending'
+    if (note) s.note = String(note).slice(0, 120)
+    t.updatedAt = this.now()
+    this.save()
+    return { task: t, step: s, stepLine: stepLine(t) }
+  }
+
+  /** 把某一步标成"正在做"（顺手把别的 running 收回 pending） */
+  stepBegin (taskId, stepId = null) {
+    const t = this.get(taskId)
+    if (!t) return null
+    const s = this.#stepOf(t, stepId)
+    if (!s) return null
+    for (const x of t.steps) if (x !== s && x.status === 'running') x.status = 'pending'
+    s.status = 'running'
+    s.at = this.now()
+    t.phase = s.id
+    /* 🔴 审计 F10：拉回 running 时一并清 `loopDetected`（它是"卡住了"的凭据，
+     *    不清的话 `mc_task` 的输出里会同时说"正在跑"和"同一个动作连着失败 N 次"。 */
+    if (t.status === 'blocked' || t.status === 'waiting') { t.status = 'running'; t.loopDetected = null }
+    t.updatedAt = s.at
+    this.save()
+    /* `epoch` 一起回给调用方：执行器拿它当"我这一步是哪一代的"，写账前对一次 */
+    return { task: t, step: s, stepLine: stepLine(t), epoch: Number(t.epoch) || TASK_EPOCH_START }
+  }
+
+  /** 这步做完了 ⇒ 推进到下一步 */
+  stepDone (taskId, stepId = null, note = null) {
+    const t = this.get(taskId)
+    if (!t) return null
+    const s = this.#stepOf(t, stepId)
+    if (!s) return null
+    s.status = 'done'
+    s.at = this.now()
+    if (note) s.note = String(note).slice(0, 120)
+    const nx = this.#nextStep(t, s)
+    t.phase = nx ? nx.id : t.phase
+    t.updatedAt = s.at
+    this.note(taskId, `步骤 ${s.id} 完成${nx ? ` ⇒ 下一步 ${nx.id}` : '（没有下一步了）'}`, { save: false })
+    this.save()
+    return { task: t, step: s, next: nx ? nx.id : null, stepLine: stepLine(t) }
+  }
+
+  /**
+   * 这步没成：记一次重试。超上限 ⇒ 把任务标 `blocked`（**停下来等指示**，不是终态 `failed`）。
+   * 和 `fail()` 的循环检测是同一个语义，只是粒度落到"步骤"上。
+   */
+  stepFail (taskId, stepId = null, reason = null) {
+    const t = this.get(taskId)
+    if (!t) return null
+    const s = this.#stepOf(t, stepId)
+    if (!s) return null
+    const max = Math.max(1, Number(t.maxAttempts ?? DEFAULT_MAX_ATTEMPTS) || DEFAULT_MAX_ATTEMPTS)
+    s.attempts = Math.max(0, Number(s.attempts) || 0) + 1
+    s.at = this.now()
+    if (reason) s.note = String(reason).slice(0, 120)
+    const exhausted = s.attempts >= max
+    s.status = exhausted ? 'failed' : 'pending'
+    t.updatedAt = s.at
+    if (exhausted) {
+      t.status = 'blocked'
+      t.loopDetected = { key: `step:${s.id}`, count: s.attempts, reason: s.note ?? '这一步反复没做成', at: s.at }
+      this.note(taskId, `步骤 ${s.id} 试了 ${s.attempts} 次都没成 ⇒ 停下来等指示`, { save: false })
+      this.log(`任务卡住 ${taskLine(t)}`)
+    } else {
+      this.note(taskId, `步骤 ${s.id} 第 ${s.attempts}/${max} 次没成${s.note ? `：${s.note}` : ''}`, { save: false })
+    }
+    this.save()
+    return { task: t, step: s, attempts: s.attempts, max, exhausted, stepLine: stepLine(t) }
+  }
+
+  /** 跳过这步（比如"手上已经有熔炉，不用再合成"） */
+  stepSkip (taskId, stepId = null, why = null) {
+    const t = this.get(taskId)
+    if (!t) return null
+    const s = this.#stepOf(t, stepId)
+    if (!s) return null
+    s.status = 'skipped'
+    s.at = this.now()
+    if (why) s.note = String(why).slice(0, 120)
+    const nx = this.#nextStep(t, s)
+    if (nx) t.phase = nx.id
+    t.updatedAt = s.at
+    this.note(taskId, `跳过步骤 ${s.id}${why ? `：${why}` : ''}`, { save: false })
+    this.save()
+    return { task: t, step: s, next: nx ? nx.id : null, stepLine: stepLine(t) }
   }
 
   /* ── 恢复 ── */
@@ -499,12 +862,20 @@ export class TaskRunner {
     const le = t.lastError
     const cls = le ? (FAIL_KINDS[le.kind] ?? FAIL_KINDS.unknown) : null
     const next = need === 0 && total != null ? 'done' : (cls?.next ?? 'continue')
+    /* 步骤台账：卡在哪一步比"上次失败原因"更具体，有就说它 */
+    const cur = this.#stepOf(t)
+    const max = Math.max(1, Number(t.maxAttempts ?? DEFAULT_MAX_ATTEMPTS) || DEFAULT_MAX_ATTEMPTS)
+    const stepHint = cur && cur.status === 'failed'
+      ? `第 ${t.steps.indexOf(cur) + 1} 步「${cur.id}」试了 ${cur.attempts}/${max} 次都没成 —— 换个做法，或者问一下玩家`
+      : null
 
     return {
       ok: true, task: taskBrief(t), have, need, verified, verifyNote,
-      next, hint: cls?.hint ?? '接着做（用同样的参数再叫一次就好）',
+      next, hint: stepHint ?? cls?.hint ?? '接着做（用同样的参数再叫一次就好）',
       action: suggestAction(t, need),
       loopDetected: t.loopDetected ?? null,
+      step: stepLine(t), stepId: cur?.id ?? null,
+      stepAttempts: cur ? `${cur.attempts}/${max}` : null,
     }
   }
 }
@@ -518,7 +889,10 @@ export function suggestAction (t, need = null) {
     case 'dig':
       return { tool: 'mc_dig', args: { name: item, count: n ?? 8, maxDistance: t.params?.maxDistance ?? 16 } }
     case 'craft':
-      return { tool: 'mc_craft', args: { name: item, ...(n ? { times: n } : {}) } }
+      /* 🔴 审计 F3：`mc_craft` 的参数叫 `count`，**没有** `times` —— 传 `times:8` 会被
+       * `extensions\mc_craft.mjs` 静默忽略（`Number(args.count) || 1` ⇒ 只保证 1 个）。
+       * 和下面 `smelt` 那条口径对齐。 */
+      return { tool: 'mc_craft', args: { name: item, ...(n ? { count: n } : {}) } }
     case 'smelt':
       return { tool: 'mc_furnace', args: { name: item, ...(n ? { count: n } : {}) } }
     case 'chest':

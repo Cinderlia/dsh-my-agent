@@ -27,13 +27,16 @@ const only = onlyIdx >= 0 ? String(args[onlyIdx + 1] ?? '') : ''
 const ORDER = [
   'check-core-dig.mjs', 'check-core-digtime.mjs', 'check-core-place.mjs', 'check-core-entities.mjs', 'check-core-attack.mjs', 'check-core-useitem.mjs',
   'check-core-swim.mjs', 'check-core-map.mjs', 'check-core-inventory.mjs', 'check-core-equip.mjs', 'check-core-evidence.mjs',
-  'check-call-budget.mjs', 'check-token-budget.mjs', 'check-mc-pathfinder.mjs',
+  'check-call-budget.mjs', 'check-token-budget.mjs', 'check-async-util.mjs', 'check-worker-pool.mjs', 'check-mc-pathfinder.mjs',
+  'check-action-scheduler.mjs', 'check-perf-monitor.mjs', 'check-move-progress.mjs', 'check-bridge.mjs', 'check-terrain.mjs',
+  'check-water-navigation.mjs', 'check-water-recovery.mjs', 'check-task-epoch.mjs',
   'check-mc-craft.mjs', 'check-mc-furnace.mjs', 'check-mc-chest.mjs',
   'check-mc-observe-host.mjs', 'check-mc-view-render.mjs', 'check-mc-skin.mjs',
   'check-mc-auto.mjs', 'check-mc-deps.mjs',
   'check-session-memory.mjs', 'check-rules-file.mjs', 'check-logging.mjs', 'check-watch-chat.mjs', 'check-audit-session.mjs',
   'check-module-load.mjs',
   'check-core.mjs',
+  'check-standalone-import.mjs',
 ]
 
 const all = readdirSync(HERE).filter((f) => /^check-.*\.mjs$/.test(f) && f !== 'check-all.mjs')

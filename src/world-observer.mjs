@@ -38,11 +38,22 @@ export function inWaterNow (b) {
   } catch { return false }
 }
 
+/** 我**真在下落**吗（空中挖慢 5 倍的那个判据）。
+ *  🔴 不能只看 `entity.onGround === false`：走路下台阶、贴着斜坡边缘时它也会瞬间为 false
+ *  （2026-10-08 实机把"木镐挖石头"估成 5650ms，真实只要 1125ms ⇒ 白拒一次本来挖得完的挖掘）。
+ *  ⇒ 判据是"离地 **且** 竖直速度明显为负"。
+ *  ⚠️ 这个判据必须和 `src\dig-speed.mjs` 里估时用的那个**是同一个** —— 2026-10-15 审计发现
+ *  `slowDigWhy` 说"我在空中，挖方块慢 5 倍"时，那个 ms 其实根本没乘 5，文案在骗模型。 */
+export function fallingNow (b) {
+  const vY = Number(b?.entity?.velocity?.y ?? 0)
+  return b?.entity?.onGround === false && vY < -0.02
+}
+
 /** 挖得慢的现成理由（水里 / 空中各慢 5 倍）—— 用来把"时间不够"说清楚 */
 export function slowDigWhy (b) {
   const parts = []
   if (inWaterNow(b)) parts.push('我在水里')
-  if (b?.entity?.onGround === false) parts.push('我在空中')
+  if (fallingNow(b)) parts.push('我在空中')
   return parts.length ? `（${parts.join('、')}，挖方块慢 5 倍）` : ''
 }
 

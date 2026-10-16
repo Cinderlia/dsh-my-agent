@@ -31,13 +31,16 @@ import { taskHave, verdictLine, taskSettle ,
   taskNote as taskNoteImpl,
   taskDone as taskDoneImpl,
   taskCancel as taskCancelImpl,
-  taskForget as taskForgetImpl
+  taskForget as taskForgetImpl,
+  taskPlan as taskPlanImpl,
+  taskStep as taskStepImpl
 } from './task-report.mjs'
+import { taskExecOf } from './task-exec.mjs'
+import { actionSchedulerOf, resourceSpecOf } from './action-scheduler.mjs'
 import { startObserver as startObserverImpl, stopObserver as stopObserverImpl, invSignature, observeTick } from './observer.mjs'
 import { isAir, isLiquid, CONTAINER_RE, TOGGLE_RE, canPlaceInto } from './block-names.mjs'
-/* 路线图第 ④ 条第三刀：异步小工具（sleep/withTimeout/raceAbort/abortError）搬到
- * `src/async-util.mjs`。`withTimeout`/`raceAbort` 在下面照样导出 —— 4 个扩展和
- * selfcheck 都是 `import { withTimeout } from '../src/core.mjs'`，一行都不用改。 */
+/* 路线图第 ④ 条第三刀：异步小工具（sleep/withTimeout/raceAbort/abortError）搬到 `src/async-util.mjs`。
+ * `withTimeout`/`raceAbort` 在下面照样导出 —— 4 个扩展和 selfcheck 都是 `import { withTimeout } from '../src/core.mjs'`，一行都不用改。 */
 import { sleep, withTimeout, raceAbort, abortError } from './async-util.mjs'
 import { plainText, playerChatFrom, pushChat, emitPlayerChat, wireChatEvents, chatSay as chatSayImpl } from './chat.mjs'
 /* 路线图第 ④ 条第十七刀：朝向/相机层（`lookAnglesTo`/`aimAt`/`lookAt`）搬到
@@ -52,6 +55,7 @@ import {
 } from './movement.mjs'
 import { breakBlock as breakBlockImpl, dig as digImpl } from './mining.mjs'
 import { placeRef, placeBlock as placeBlockImpl } from './place.mjs'
+import { bridgeAcross } from './bridge.mjs'
 import { attack } from './attack.mjs'
 import { runSequence } from './sequence.mjs'
 /* 路线图第 ④ 条第十八刀：「服务端到底认没认这次破坏」的判决监听搬到
@@ -219,14 +223,14 @@ import { NON_FULL_BLOCK, isFullBlockItem, NO_SCAFFOLD, scaffoldingItemIds, pickP
 
 /* 路线图第 ④ 条第七刀：背包那一层（heldText/invSnap/invUsed/canHarvestNow/toolKinds/countOf/freeSlot）
  * 搬到 src/inventory.mjs —— 第一次搬"读 bot 实时状态"的东西，只读、不 await、不改状态。 */
-import { heldText, invSnap, invUsed, canHarvestNow, toolKinds, countOf, freeSlot,
+import { invSnap, invUsed, canHarvestNow, toolKinds, countOf, freeSlot,
          inventoryView, giveItem, clearInventory, tossItem, equipFor } from './inventory.mjs'
 import { TIMEOUTS, CALL_MS, CALL_BUDGET_MS, callBudget, callDeadline, callSecText, budgetSecText } from './budget.mjs'
 import { entityHealth, inWaterNow, slowDigWhy, dropsNear, dropHint, blockReachOf, stateNameOf } from './world-observer.mjs'
 import { grabDrops } from './pickup.mjs'
 import { digMsFor, patchDigTime, bestToolFor } from './dig-speed.mjs'
 import { collectBusy, cancelCollect, waitGrounded, withHeld } from './dig-guard.mjs'
-import { isUnderground, caveCell, heightmapOf, glyphMapText, mapImageOf } from './map-render.mjs'
+import { isUnderground, caveCell, heightmapOf, glyphMapText, mapImageOf, mapImageOfAsync } from './map-render.mjs'
 import { scanAround, entitiesNear } from './world-scan.mjs'
 import { connectionViewOf, statusOf } from './status.mjs'
 
@@ -306,7 +310,20 @@ export class McBot extends EventEmitter {
      * 路径由宿主（`index.js` 的 `asTool`）每次调用喂一次 `setTaskDir()`；
      * 拿不到记忆根（脚本直接 new McBot）就退化成"只在内存里记"，不写文件。 */
     this.tasks = new TaskRunner({ log: (m) => this.log(m) })
+    /* 统一动作调度器（用户 2026-10-14 设计「统一动作调度」的**阶段 P0：只记账**）。
+     * 懒建（见 `actionScheduler()`），因为它只维护"谁在占什么"的一张表，
+     * 不碰 `_moveGen` / `_ctrlLease` / `interruptMove` —— 抢占仍然只有那一条路。 */
+    this._actions = null
   }
+
+  /** 统一动作调度器（阶段 P0：只记账，不拦人）。懒建与实现在 `src/action-scheduler.mjs`。 */
+  actionScheduler () { return actionSchedulerOf(this) }
+
+  /** 调度器一眼视图（`mc_diag` 用）：谁在占什么、撞过几次车 */
+  actionSnapshot () { return this.actionScheduler().snapshot() }
+
+  /** 这个工具该登记哪些资源（`null` = 只读工具 / 不认识的工具 ⇒ 根本不进调度器） */
+  actionSpecOf (name, args = {}) { return resourceSpecOf(name, args) }
 
   /** 任务文件放哪（宿主每次工具调用喂一次；路径没变是空操作） */
   setTaskDir (dir) {
@@ -319,11 +336,6 @@ export class McBot extends EventEmitter {
     // 路线图第 ④ 条第七刀：函数体搬到 `src\inventory.mjs` 了，这里只留公开面的薄包装
     return countOf(this.bot, name)
   }
-
-  /* ───────────── 任务（可恢复的任务状态机） ─────────────
-   * 用户 2026-10-08 路线图第 ②③ 条。这些方法只是**记账**：
-   * 不碰移动编号、不碰控制位、不下发动作 —— 那些仍然归 `walkTo` / `dig` 自己管。
-   * ------------------------------------------------------------------------- */
 
     /* ── 任务收工报告（路线图第 ④ 条第二十四刀）：函数体搬到 `src\task-report.mjs` 了 ── */
 
@@ -357,6 +369,23 @@ export class McBot extends EventEmitter {
 
   taskForget (opts = {}) { return taskForgetImpl(this, opts) }
 
+  /** 步骤台账：写/看计划（2026-10-14 "任务驱动"第一步） */
+  taskPlan (opts = {}) { return taskPlanImpl(this, opts) }
+
+  /** 推进当前那一步（只记账，不下发动作） */
+  taskStep (opts = {}) { return taskStepImpl(this, opts) }
+
+  /* ───────────── 任务执行器（2026-10-14 "任务驱动"第二步） ─────────────
+   * 一轮只推进一个可验证的步骤。懒建、看现场、收手都在 `src/task-exec.mjs` 里
+   * （`taskExecOf` / `taskObserveOf` / `taskCancelStepOf`）—— 那儿不 import 游戏库，
+   * 干活由宿主每轮给 `call`（工具处理器表），"谁来推"因此可换。
+   * ------------------------------------------------------------------------- */
+
+  /** 跑一轮任务。`opts.call(tool, args, ctx)` 由宿主（`index.js` 的 `mc_task`）给。 */
+  taskRun (opts = {}) { return taskExecOf(this).run(opts) }
+
+  /** 取消任务（**先收手再改状态**） */
+  taskRunCancel (opts = {}) { return taskExecOf(this).cancel(opts.taskId ?? null, opts.reason ?? '取消') }
 
   /**
    * 在线 = **有身体** 且 **连接还活着**。
@@ -373,9 +402,14 @@ export class McBot extends EventEmitter {
     return { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) }
   }
 
-  /** 日志短标签：多会话共用一份日志时，至少能看出是哪只机器人（2026-10-06） */
+  /** 日志短标签：多会话共用一份日志时，至少能看出是哪只机器人（2026-10-06）
+   *  🔴 2026-10-15 审计（报告 B 第 8 条）：以前读的是 `this.cfg.auth.name`，但**凭据只走
+   *     `opts.auth`**（`src/connection.mjs` 把它存进 `self._connectOpts.auth`），全仓库没有任何
+   *     `cfg.auth` 的写入点 ⇒ 这个标签**恒为空**，"看不出是哪只机器人"那个初衷从没生效。
+   *     改读真正存凭据的地方（脱敏：只用 label/name，不带 token）。 */
   get logTag () {
-    const n = this.cfg?.auth?.name
+    const a = this._connectOpts?.auth
+    const n = a?.label ?? a?.name ?? this.cfg?.auth?.name
     return n ? ` ${String(n).slice(0, 12)}` : ''
   }
 
@@ -593,8 +627,6 @@ export class McBot extends EventEmitter {
     } catch {}
   }
 
-  /* ───────────── 聊天记录 ───────────── */
-
   /* ───────────── 聊天记录（已搬到 src\chat.mjs，第十六刀） ───────────── */
 
   /** 把 mineflayer 的聊天/系统消息接到本实例的 `chat` / `system` 事件上。见 `src\chat.mjs` 的 `wireChatEvents()`。 */
@@ -613,8 +645,6 @@ export class McBot extends EventEmitter {
   #pushChat (kind, who, text) { return pushChat(this, kind, who, text) }
 
   recentChat (n = 10) { return this.chat.slice(-n) }
-
-  /* ───────────── 世界读取 ───────────── */
 
   /* ───────────── 世界读取 ───────────── */
 
@@ -651,8 +681,9 @@ export class McBot extends EventEmitter {
   /** 字符地形图（无视觉也能读） */
   static glyphMap (names, step = 2, selfIndex = null) { return glyphMapText(names, step, selfIndex) }
 
-  /** 俯视地形 → RGBA 像素图（视觉模型看图像比看字符强）。 */
+  /** 俯视地形 → RGBA 像素图（视觉模型看图像比看字符强）；异步版把"网格→像素"交给 Worker 池（默认关）。 */
   mapImage (opts = {}) { return mapImageOf(this.requireBot(), opts) }
+  mapImageAsync (opts = {}) { return mapImageOfAsync(this.requireBot(), opts) }
   /* ───────────── 行动 ───────────── */
 
   /**
@@ -667,8 +698,8 @@ export class McBot extends EventEmitter {
   /** 挂上现成的寻路插件（实现在 `src\plugins.mjs` 的 `setupPathfinder`）。 */
   async setupPathfinder (opts = {}) { return await setupPathfinder(this, opts) }
 
-  /** 造一份 `Movements`（实现在 `src\plugins.mjs` 的 `movements`）。 */
-  #movements () { return movements(this) }
+  /** 造一份 `Movements`（实现在 `src\plugins.mjs` 的 `movements`；`terrain` 是地形分类结果，导航 P2）。 */
+  #movements (terrain = null) { return movements(this, { terrain }) }
 
   /** 把现成的生态插件都挂上（实现在 `src\plugins.mjs` 的 `setupPlugins`）。 */
   async setupPlugins (opts = {}) { return await setupPlugins(this, opts) }
@@ -688,7 +719,7 @@ export class McBot extends EventEmitter {
 
   #pathCtx () {
     return {
-      movements: () => this.#movements(),
+      movements: (terrain) => this.#movements(terrain),
       collectBusy: (b) => this.#collectBusy(b),
       cancelCollect: (b) => this.#cancelCollect(b),
       beginMove: () => this.#beginMove(),
@@ -768,8 +799,6 @@ export class McBot extends EventEmitter {
 
   /* ───────────── 放置 / 破坏（"搭高"就该用工具，不要用 /setblock） ───────────── */
 
-  /* ───────────── 放置 / 破坏（"搭高"就该用工具，不要用 /setblock） ───────────── */
-
   /** 找一个能对着放的相邻实体方块 —— 实现在 `src\place.mjs`（`placeRef`）。 */
   #placeRef (pos) { return placeRef(this, pos) }
 
@@ -829,9 +858,10 @@ export class McBot extends EventEmitter {
   async anvilTable (opts = {}) { return await anvilTable(this, opts, { t: (p, k, l) => this.#t(p, k, l) }) }
   /** 锻造台：模板 + 底座 + 附加 → 成品（实现在 `src\world-use.mjs` 的 `smithingTable`）。 */
   async smithingTable (opts = {}) { return await smithingTable(this, opts, { t: (p, k, l) => this.#t(p, k, l) }) }
-  /** 批量放置：从 (x1,y1,z1) 到 (x2,y2,z2) 的实心长方体（实现在 `src\build.mjs` 的 `build`）。
-   *  逐个调用 placeBlock（会自己走近/垫脚），count 上限保护；到点带着已放好的返回。 */
+  /** 批量放置：(x1,y1,z1)→(x2,y2,z2) 的实心长方体，逐个 `placeBlock`（`src\build.mjs`）。 */
   async build (opts = {}) { return await buildImpl(this, opts) }
+  /** 搭路（水平搭桥）：一格格铺，**每块等服务端确认了才走**（`src\bridge.mjs`；寻路库不会水平搭桥）。 */
+  async bridge (opts = {}) { return await bridgeAcross(this, opts, { t: (p, k, l) => this.#t(p, k, l) }) }
 
   /** 原地跳一下（爬台阶用）—— 实现在 `src\movement.mjs` 的 `jump`。 */
   async jump () { return await jumpImpl(this, { bumpGen: () => this.#beginMove() }) }
@@ -848,7 +878,15 @@ export class McBot extends EventEmitter {
     const b = this.requireBot()
     return await giveItem(b, opts, {
       t: (p, k, l) => this.#t(p, k, l),
-      makeItem: (type, n) => new (itemLoader()(b.registry))(type, n),
+      /* 🔴 2026-10-15 审计：`prismarine-item` 的 `Item` 构造函数**第一个参数是数字 id**
+       *    （`node_modules/prismarine-item/index.js:36` 是 `registry.items[type]`，按 id 查表）。
+       *    这里原来直接传 `type` **对象**（调用方给的是 `registry.itemsByName[itemName]`）⇒ 查不到
+       *    ⇒ `item.name` 退化成 `'unknown'` ⇒ 物品确实进了背包、但名字对不上，
+       *    紧接着 `pickPlaceItem(b, 'oak_planks')` 找不到它、报"背包里没有 oak_planks"
+       *    （实机症状：创造模式 `mc_build` 给个方块名却说背包里没有）。
+       *    所以这里统一取 `type.id`（同时兼容调用方直接给数字 id）。 */
+      makeItem: (type, n) => new (itemLoader()(b.registry))(
+        (type && typeof type === 'object') ? type.id : type, n),
     })
   }
 

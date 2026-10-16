@@ -14,7 +14,7 @@
  *     （迁移规矩第 17 条）；
  *   · 收尾类动作一律"能失败"，不抛（挖矿这条路上最怕的就是收尾把主流程带崩）。
  */
-import { sleep, abortError } from './async-util.mjs'
+import { sleep, abortError, waitUntil } from './async-util.mjs'
 import { heldText } from './inventory.mjs'
 
 /** mineflayer-collectblock 现在还有任务在跑吗（`targets` 是它自己的 Targets 实例） */
@@ -60,11 +60,21 @@ export async function cancelCollect (b, ctx = {}) {
       : (Number.isFinite(Number(budgetMs)) ? Math.max(0, Math.min(1500, Number(budgetMs))) : 1500)
     try {
       if (typeof b?.collectBlock?.cancelTask === 'function' && cap > 0) {
-        // cancelTask 会一直等到 collectBlock_finished；万一它自己也卡住，cap 毫秒后放行
-        await Promise.race([
-          Promise.resolve(b.collectBlock.cancelTask()).catch(() => {}),
-          sleep(cap),
-        ])
+        /* cancelTask 会一直等到 collectBlock_finished；万一它自己也卡住，cap 毫秒后放行。
+         * 🔴 2026-10-15 审计：`cancelTask()` 内部是 `yield once(bot, 'collectBlock_finished')`
+         *    （vendor CollectBlock.js:238-252）—— 超时放行时**它挂的那个监听器永远不摘**，
+         *    而 `pickup.mjs:50` 在掉落物循环里反复调它 ⇒ 累到 11 个就触发
+         *    `MaxListenersExceededWarning`（Node 默认阈值 10），并让之后每次 emit 都白跑一圈。
+         *    这里把"本次调用期间新挂上来的监听器"在超时后摘掉（自己摘，vendor 不会摘）。 */
+        const EV = 'collectBlock_finished'
+        const before = new Set((() => { try { return b.listeners(EV) } catch { return [] } })())
+        const finished = Promise.resolve(b.collectBlock.cancelTask()).then(() => true, () => true)
+        const ok = await Promise.race([finished, sleep(cap).then(() => false)])
+        if (!ok) {
+          let after = []
+          try { after = b.listeners(EV) } catch {}
+          for (const l of after) { if (!before.has(l)) { try { b.removeListener(EV, l) } catch {} } }
+        }
       }
     } catch {}
     try { stopPathing?.(b) } catch {}
@@ -82,7 +92,7 @@ export async function cancelCollect (b, ctx = {}) {
       try {
         log?.(cleared
           ? '⚠️ 采集任务没停下来（等不到 collectBlock_finished）—— 已清空它队列里剩下的目标，机器人可以继续走路'
-          : '⚠️ 采集任务停不下来、队列也清不掉 —— 只能 mc_connect {force:true} 重连一次')
+          : '⚠️ 采集任务停不下来、队列也清不掉 —— 建议先 mc_scan 复核；**不要**顺手 mc_connect {force:true}（那是真退出再进服，玩家会看到）')
       } catch {}
     }
   }
@@ -108,12 +118,9 @@ export async function waitGrounded (b, { maxMs = 1_200, signal = null } = {}) {
    * 不能因为读不到就把它拦下来。 */
   if (!ent || ent.onGround !== false) return true
   const cap = Math.max(0, Math.min(Number.isFinite(Number(maxMs)) ? Number(maxMs) : 1_200, 2_000))
-  const t0 = Date.now()
-  while (Date.now() - t0 < cap) {
-    if (signal?.aborted) throw abortError('落地')
-    await sleep(80)
-    if (ent.onGround !== false) return true
-  }
+  /* 2026-10-15 异步方案 ②：手写轮询收口到 `waitUntil`（查中止 / 算 deadline / 别睡穿预算 只有一份实现） */
+  const r = await waitUntil(() => ent.onGround !== false, { ms: cap, pollMs: 80, signal, label: '落地' })
+  if (r.reason === 'aborted') throw abortError('落地')
   return ent.onGround !== false
 }
 

@@ -392,7 +392,11 @@ export class MemoryStore {
       if (key) {
         const re = new RegExp(`^\\s*[-*]\\s+\\*\\*${escapeRe(key)}\\*\\*\\s*[—-]\\s*.*$`, 'm')
         if (re.test(content)) {
-          const next = content.replace(re, bullet)
+          /* 🟡 2026-10-15 审计（报告 E 第 3 条）：`String.replace(re, str)` 会把**替换串**里的
+           *   `$&` / `` $` `` / `$'` / `$1` 当特殊记号展开 —— 而 `bullet` 里含着用户给的 `body`，
+           *   于是用户写 "cost $& and $` end" 会把整行、甚至前文都插回去，把记忆文件写坏
+           *   （实测复现：`- **a** — cost - **a** — old line and  end`）。传函数就没这层解释。 */
+          const next = content.replace(re, () => bullet)
           if (Buffer.byteLength(next) > MAX_TEXT_BYTES) throw new Error(`文件超过 ${MAX_TEXT_BYTES / 1024}KB 上限`)
           writeFileSync(target.abs, next, 'utf8')
           this._textCache = { text: '', at: 0 }
@@ -523,9 +527,16 @@ export class MemoryStore {
     }
     const dir = dirname(target.abs)
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    /* 🟡 2026-10-15 审计（报告 E 第 7 条）：原来无条件 `created: true` —— 覆盖已有文件时也报"已创建"，
+     *   调用方（和模型）分不清"新建"和"覆盖"（覆盖是会丢东西的动作，得说清楚）。 */
+    const existed = existsSync(target.abs)
     writeFileSync(target.abs, body.endsWith('\n') ? body : body + '\n', 'utf8')
     this._textCache = { text: '', at: 0 }
-    return { path: target.rel, bytes: Buffer.byteLength(body), entries: countBullets(body), created: true }
+    return {
+      path: target.rel, bytes: Buffer.byteLength(body), entries: countBullets(body),
+      created: !existed, replaced: existed,
+      ...(existed ? { note: `这个文件本来就有，这次是**整体覆盖**（原来的内容没了）—— 想追加请用 action:"append"` } : {}),
+    }
   }
 
   /** 删：删文件；path 指向目录时整目录删 */

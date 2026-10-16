@@ -552,8 +552,11 @@ function aoCorners (world, bx, by, bz, axis, step, pos) {
       const s1 = solidAt(world, pos, ox + eUx * su, oy + eUy * su, oz + eUz * su)
       const s2 = solidAt(world, pos, ox + eVx * sv, oy + eVy * sv, oz + eVz * sv)
       const cn = solidAt(world, pos, ox + eUx * su + eVx * sv, oy + eUy * su + eVy * sv, oz + eUz * su + eVz * sv)
-      const occ = (s1 && s2) ? 0 : 3 - (s1 + s2 + cn)
-      out[i++] = 1 - 0.3 * (3 - occ) / 3
+      /* 审计 G11：这个数**越大越开阔**（两侧都实心时 = 0 = 最暗；周围全空 = 3 = 最亮），
+       * 所以叫 `openness` 才不误导 —— 原来叫 `occ`（occlusion 遮挡）语义正好是反的。
+       * 算式一个字没动。 */
+      const openness = (s1 && s2) ? 0 : 3 - (s1 + s2 + cn)
+      out[i++] = 1 - 0.3 * (3 - openness) / 3
     }
   }
   return out
@@ -581,12 +584,16 @@ export function sunOf (time) {
 
 function skyColor (dx, dy, dz, sky, pc) {
   const { sun, daylight, sunset } = sky
-  const dim = pc.dimension
-  if (dim === 'nether') {
+  /* 🔴 报告 H13（2026-10-13）：`pc.dimension` 是从 `bot.game.dimension` 来的**完整标识符**
+   *    （`minecraft:the_nether` / `minecraft:the_end`），而这里以前拿 `'nether'` / `'end'` 比
+   *    ⇒ 下界和末地的天空永远走不到这两支（一直是主世界的颜色）。本文件 `:1071` 的文档
+   *    写的就是 `'the_nether'` / `'the_end'`。这里统一剥掉 `minecraft:` 前缀，两种写法都认。 */
+  const dim = String(pc.dimension ?? '').replace(/^minecraft:/, '')
+  if (dim === 'nether' || dim === 'the_nether') {
     const haze = 0.55 + 0.45 * clamp01(dy + 0.4)
     return [118 * haze + 40, 26 * haze + 8, 20 * haze + 6]
   }
-  if (dim === 'end') {
+  if (dim === 'end' || dim === 'the_end') {
     const haze = 0.6 + 0.4 * clamp01(dy + 0.3)
     return [42 * haze + 12, 30 * haze + 10, 58 * haze + 16]
   }
@@ -1248,7 +1255,12 @@ export function renderView (opts) {
 
   /* ── 实体 ── */
   const ents = []
-  const partsById = new Map()
+  /* 🔴 审计 G9：这里原来叫 `partsById`、按 `ent.id ?? null` 存 —— 实体没有 id 时全挤在
+   *    同一个 `null` 键上（后一个覆盖前一个），而查的时候是 `partsById.get(e.id)`（`undefined`）
+   *    ⇒ `Map` 里 `null !== undefined`，**一个都查不到** ⇒ 准星判定 `bestId` 永远是 null
+   *    ⇒ `underCrosshair` 永远不置真、`crosshairEntity` 永远是 null。
+   *    改成按"在 `ents` 里的下标"存，跟 id 有没有、是不是 null 都无关。 */
+  const partsByIndex = new Map()
   if (drawEntities && Array.isArray(opts.entities) && opts.entities.length > 0) {
     const list = []
     for (const ent of opts.entities) {
@@ -1268,7 +1280,7 @@ export function renderView (opts) {
       const skin = opts.skins ? (opts.skins[ent.username ?? ''] ?? opts.skins[ent.id] ?? null) : null
       if (skin) stats.skinned++
       const parts = entityParts(ent, style, skin)
-      partsById.set(ent.id ?? null, parts)
+      partsByIndex.set(ents.length, parts)
       // ① 描边（外扩一点，深色，不写深度、不采样皮肤）
       for (const p of parts) {
         paintBox(pc, grownPart(p, 0.035), [22, 22, 26], { writeDepth: false, faceDark: true, plain: true })
@@ -1310,17 +1322,20 @@ export function renderView (opts) {
   // 准星真正对着的实体：沿视线方向做射线-部件盒测试（比"投影中心靠近画面中心"可靠）
   if (ents.length > 0) {
     const centerDist = center && center.unknown !== true ? center.dist : distance
-    let bestId = null
+    let bestIdx = null
     let bestDist = Math.min(centerDist, distance)
-    for (const e of ents) {
-      const parts = partsById.get(e.id)
+    for (let i = 0; i < ents.length; i++) {
+      const parts = partsByIndex.get(i)
       if (!parts) continue
       for (const p of parts) {
         const h = hitPart(ox, oy, oz, f[0], f[1], f[2], p, bestDist)
-        if (h !== null && h.dist <= bestDist) { bestDist = h.dist; bestId = e.id }
+        if (h !== null && h.dist <= bestDist) { bestDist = h.dist; bestIdx = i }
       }
     }
-    if (bestId !== null) for (const e of ents) e.underCrosshair = e.id === bestId && e.pixels > 0
+    if (bestIdx !== null) {
+      const e = ents[bestIdx]
+      e.underCrosshair = e.pixels > 0
+    }
   }
   stats.entities = ents
   stats.crosshairEntity = ents.find((e) => e.underCrosshair && e.pixels > 0) ?? null

@@ -64,20 +64,27 @@ export function lossless (value, seen = new WeakSet()) {
   if (t !== 'object') return undefined          // undefined / function / symbol
   if (seen.has(value)) return '[circular]'
   seen.add(value)
-  if (value instanceof Date) return value.toISOString()
-  if (Array.isArray(value)) {
-    return value.map((v) => {
+  /* 🟡 2026-10-15 审计（报告 E 第 4 条）：原来只 `add` 从不 `delete`，而 `seen` 是**整棵树共用**
+   *   的 —— 于是兄弟位置复用同一个对象（mineflayer 到处是这种：同一个 Vec3 挂给两个字段、
+   *   数组里同一个实例出现两次）会被误判成循环引用，输出假的 `'[circular]'`。
+   *   递归回来就把自己摘掉：只有"**祖先链**上出现过"才叫循环。
+   *   （`src/tool-def.mjs:174` 那处一直是对的，这里与它对齐。） */
+  try {
+    if (value instanceof Date) return value.toISOString()
+    if (Array.isArray(value)) {
+      return value.map((v) => {
+        const s = lossless(v, seen)
+        return s === undefined ? null : s
+      })
+    }
+    if (value instanceof Map) return lossless(Object.fromEntries([...value].map(([k, v]) => [String(k), v])), seen)
+    if (value instanceof Set) return lossless([...value], seen)
+    const out = {}
+    // 只取自有可枚举属性：类实例的 getter/原型方法/私有字段一并丢掉
+    for (const [k, v] of Object.entries(value)) {
       const s = lossless(v, seen)
-      return s === undefined ? null : s
-    })
-  }
-  if (value instanceof Map) return lossless(Object.fromEntries([...value].map(([k, v]) => [String(k), v])), seen)
-  if (value instanceof Set) return lossless([...value], seen)
-  const out = {}
-  // 只取自有可枚举属性：类实例的 getter/原型方法/私有字段一并丢掉
-  for (const [k, v] of Object.entries(value)) {
-    const s = lossless(v, seen)
-    if (s !== undefined) out[k] = s
-  }
-  return out
+      if (s !== undefined) out[k] = s
+    }
+    return out
+  } finally { seen.delete(value) }
 }

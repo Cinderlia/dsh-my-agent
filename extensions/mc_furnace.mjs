@@ -413,17 +413,17 @@ export async function apply (api) {
       + '· `takeOnly:true` = 只把熔炉里已经烧好的拿走（不新塞东西）；`dryRun:true` 只出计划。\n'
       + '🔴 熔炼会动世界里的熔炉，所以**受 mc_observe 门禁限制**（强制模式要先看）。',
     parameters: {
-      name: { type: 'string', description: '要烧的东西（英文 id 或简称），如 raw_iron / sand / beef / oak_log；也可以写产物名 iron_ingot / glass / charcoal' },
-      count: { type: 'number', description: '想要几个产物（默认 1；一次调用最多装 8 个进炉子，剩下的下次再叫一次）' },
-      fuel: { type: 'string', description: '指定燃料（可选），如 coal / stick；不给就按要烧的数量自己挑（优先煤炭/木炭）' },
+      name: { type: 'string', description: '要烧的东西（英文 id 或简称，如 raw_iron），也可以写产物名（如 iron_ingot）' },
+      count: { type: 'number', description: '想要几个产物（默认 1，一次最多装 8 个）' },
+      fuel: { type: 'string', description: '指定燃料（可选），如 coal / stick；不给就自己挑' },
       x: { type: 'number', description: '指定熔炉坐标 x（可选，和 y/z 一起给）' },
       y: { type: 'number', description: '指定熔炉坐标 y（可选）' },
       z: { type: 'number', description: '指定熔炉坐标 z（可选）' },
       radius: { type: 'number', description: '附近找熔炉的半径（默认 6，最大 12）' },
-      placeFurnace: { type: 'boolean', description: '附近没熔炉时把背包里的熔炉放到脚边再用（默认 true）' },
-      takeOnly: { type: 'boolean', description: '只把熔炉里已经烧好的成品拿走，不新塞东西（默认 false）' },
-      maxWaitSec: { type: 'number', description: '最多盯多少秒（**默认 0 = 不盯**，装好料就返回；最多 10。炉子自己在服务端烧，过一会儿再叫一次取成品）' },
-      list: { type: 'boolean', description: '只看熔炼表/看背包里能烧什么、有哪些燃料（不烧）' },
+      placeFurnace: { type: 'boolean', description: '附近没熔炉时自己放一个（默认 true）' },
+      takeOnly: { type: 'boolean', description: '只取已经烧好的，不新塞（默认 false）' },
+      maxWaitSec: { type: 'number', description: '最多盯多少秒（**默认 0 = 不盯**；最多 10）' },
+      list: { type: 'boolean', description: '只看熔炼表和燃料（不烧）' },
       dryRun: { type: 'boolean', description: '只出计划，不动手（默认 false）' },
     },
     output: {
@@ -460,8 +460,12 @@ export async function apply (api) {
 
       /* ③ 找熔炉（没有就放一个） */
       let fblock = findFurnaceBlock(bot, wantPos)
-      // 上次用过/自己放的那个熔炉还认 —— radius 给小了（比如 1）也能接着用
-      if (!fblock && bot.__wcLastFurnace) {
+      /* 🔴 报告 H18（2026-10-13）：给了坐标就**只认那个坐标**。以前"上次用过的熔炉"这条兜底
+       *    排在 H6 守卫（下面那段）**之前** ⇒ 给了坐标、那里又不是熔炉时，会偷偷拿记忆里
+       *    那个旧熔炉去烧/取（用户以为在 A 处烧，其实在 B 处）。所以先把 `askedPos` 算出来。 */
+      const askedPos = Number.isFinite(Number(args.x)) && Number.isFinite(Number(args.y)) && Number.isFinite(Number(args.z))
+      // 上次用过/自己放的那个熔炉还认 —— radius 给小了（比如 1）也能接着用（但给了坐标时不认）
+      if (!fblock && !askedPos && bot.__wcLastFurnace) {
         const last = bot.__wcLastFurnace
         const b2 = blockAtXYZ(bot, last.x, last.y, last.z)
         if (b2 && FURNACE_NAMES.includes(b2.name)) fblock = b2
@@ -469,12 +473,15 @@ export async function apply (api) {
       let placedNote = null
       /* 🔴 2026-10-08 审计 H6：**给了坐标却在那里找不到熔炉**时，以前会照走"没熔炉就放一个"这条路
        *    ⇒ 在脚边另造一个新熔炉，然后对着它烧/取。给了坐标就只认那个坐标。 */
-      const askedPos = Number.isFinite(Number(args.x)) && Number.isFinite(Number(args.y)) && Number.isFinite(Number(args.z))
       if (!fblock && askedPos) {
-        const near = listText(bot, { radius })
+        /* 🔴 报告 H17（2026-10-13）：这里原来写 `listText(bot, { radius })` —— 而 `listText(bot, name)`
+         *    第二个参数是**物品名**（`String({radius:6})` ⇒ `"[object Object]"`）⇒ 用户看到的是
+         *    `❌ "[object object]"不在熔炼表里`。这里要的是"附近有哪些熔炉"，自己扫一遍。 */
+        const nearF = (bot.findBlocks({ matching: (x) => FURNACE_NAMES.includes(x?.name), maxDistance: 16, count: 3 }) ?? [])
+          .map((p) => `${blockAtXYZ(bot, p.x, p.y, p.z)?.name ?? 'furnace'}(${p.x},${p.y},${p.z})`)
         const lines = [...head, `❌ (${args.x},${args.y},${args.z}) 那里**不是**熔炉（读到的是 ${blockAtXYZ(bot, args.x, args.y, args.z)?.name ?? '空气/没加载'}）。`,
-          '　→ 我**没有**另放新熔炉（免得你对着一个自己不知道的炉子烧/取）。']
-        lines.push('　' + String(near).split('\n').join('\n　'))
+          '　→ 我**没有**另放新熔炉（免得你对着一个自己不知道的炉子烧/取）。',
+          nearF.length ? `　附近 16 格内的熔炉：${nearF.join('、')}` : '　附近 16 格内也没找到别的熔炉 —— 要新放一个的话就别给坐标。']
         logLine(`mc_furnace：给的坐标 (${args.x},${args.y},${args.z}) 上没有熔炉，没另放`)
         return { text: lines.join('\n') }
       }

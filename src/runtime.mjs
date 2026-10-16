@@ -18,7 +18,7 @@
  * 模块自己只 import `async-util.mjs` 与 `budget.mjs`，
  * 不 import `core.mjs`、不 import 游戏库。
  */
-import { sleep, withTimeout, raceAbort, abortError } from './async-util.mjs'
+import { withTimeout, raceAbort, abortError, waitUntil } from './async-util.mjs'
 import { TIMEOUTS, CALL_MS } from './budget.mjs'
 
 /**
@@ -212,20 +212,26 @@ export function releaseControls (self) {
 export async function waitForChunks (self, timeoutMs = 20_000) {
     const b = self.bot
     if (!b?.entity) return false
-    const t0 = Date.now()
     // 🔴 等区块也要算进"这一轮 11 秒"里：没区块可读时别把整次调用占满
     // 🔴 不写 `|| CALL_BUDGET_MS`：`msLeft()` 没设截止时刻时本来就返回 `CALL_MS`，
     //    而"这一轮已经用完"时它返回 0 —— `0 || 10000` 会白送 10 秒（本文件自检抓过一次）。
     //    2026-10-08 审计⑦：也不能写 `Math.max(300, …)` —— 用完时外层 max 又白送 300ms。
     const leftMs = self.msLeft()
     const cap = leftMs <= 100 ? 0 : Math.max(0, Math.min(Number(timeoutMs) || 20_000, leftMs))
-    while (Date.now() - t0 < cap) {
-      if (self.abortSignal?.aborted) throw abortError('等待区块', self.abortSignal)
-      const p = b.entity.position.floored()
-      if (b.blockAt(p.offset(0, -1, 0)) || b.blockAt(p)) return true
-      await raceAbort(sleep(300), self.abortSignal, '等待区块')
+    const probe = () => {
+      try {
+        const p = b.entity.position.floored()
+        return Boolean(b.blockAt(p.offset(0, -1, 0)) || b.blockAt(p))
+      } catch { return false }
     }
-    return false
+    /* 🔴 2026-10-15 审计（报告 B 第 5 条）：`cap === 0`（这一轮的预算已经用完）时原来**一次探测都不做**
+     *    就 `return false`，调用方（`index.js` 的 mc_connect）把它当 `chunksReady:false` ⇒
+     *    明明区块早就加载好了，却谎报"区块没加载好"。预算用完了也至少看一眼。
+     * 2026-10-15 异步方案 ②：手写轮询收口到 `waitUntil` —— `ms <= 0` 时它自己就只"当场看一眼"，
+     *    上面那条特殊分支因此不再需要（行为反而更难写错）。 */
+    const r = await waitUntil(probe, { ms: cap, pollMs: 300, signal: self.abortSignal, label: '等待区块' })
+    if (r.reason === 'aborted') throw abortError('等待区块', self.abortSignal)
+    return r.ok
   }
 
 export function requireBot (self) {

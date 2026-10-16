@@ -56,8 +56,15 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     .map((x) => `${x.nm} ${x.d.toFixed(1)} 格`).join('、')
   const pick = list[0]
   // 半径内只剩掉落物（且不在手边）就别动手：打到一个 item 是白费一轮
-  const target = pick && !(rankOf(pick) === 3 && pick.d > 4.5) ? pick.e : null
+  /* 🔴 2026-10-15 审计：点名点到掉落物时，旧文案是"附近找不到 X（24 格内实际有：X）"——
+   *    同一句话里自相矛盾（找不到却列出来了）。这里单独说清"它是掉落物、而且够不着"。 */
+  const dropOutOfReach = Boolean(pick && rankOf(pick) === 3 && pick.d > 4.5)
+  const target = pick && !dropOutOfReach ? pick.e : null
   if (!target) {
+    if (needle && dropOutOfReach) {
+      throw new Error(`"${who}" 是**掉落物**，而且离我 ${pick.d.toFixed(1)} 格（超过 4.5 格）—— 我不打掉落物。`
+        + '要捡它就先 `mc_move` 走过去站上去（一两秒就自己飞进背包）。')
+    }
     if (needle) {
       throw new Error(`附近找不到 "${who}"（24 格内实际有：${near || '什么都没有'}）`
         + ' —— 名字要跟 `mc_observe` "程序检测到"里显示的一致（中文叫法也认）；'
@@ -83,11 +90,20 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     const t0 = Date.now()
     let note = null
     let pvpErr = null
+    /* 🔴 2026-10-15 审计：`killed: gone` 把"怪走出服务端实体追踪距离（destroy 包）/ 区块卸载"
+     *    当成"我打死了它" ⇒ 后面还会据此报掉落物。只有**消失前读到过血量下降**才算打死。 */
+    let sawDamage = false
+    let lastHp = hpBefore
     try {
       await b.pvp.attack(target)
       while (Date.now() - t0 < bd) {
         if (ctx.abortSignal?.aborted) break
         if (!b.entities?.[target.id] || target.isValid === false) break
+        const hp = entityHealth(b, target)
+        if (hp != null) {
+          if (lastHp != null && hp < lastHp) sawDamage = true
+          lastHp = hp
+        }
         await sleep(120)
       }
     } catch (e) {
@@ -99,12 +115,16 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
       try { Promise.resolve(b.pvp.stop()).catch(() => {}) } catch { /* 停不掉也不影响 */ }
     }
     const gone = !b.entities?.[target.id] || target.isValid === false
+    const killed = gone && sawDamage
     const inRange = Boolean(b.pvp?.wasInRange)
-    const hpAfter = gone ? 0 : entityHealth(b, target)
+    const hpAfter = gone ? (killed ? 0 : null) : entityHealth(b, target)
     const waitedMs = Date.now() - t0
+    if (gone && !killed && !pvpErr) {
+      note = `目标不见了，但**没读到过它掉血** —— 说不清是我打死的还是它走远/区块卸载了（别当成打死了）`
+    }
     /* 打死了 ⇒ 掉落物就掉在原地。用户 2026-10-08 原话："打完动物以后老是忘记走过去拾取" ——
      * 只**点一句**，不替它走过去（先捡哪个、走多远是决策，而且这一轮的预算基本已经花完了）。 */
-    const pickup = gone ? dropHint(b) : null
+    const pickup = killed ? dropHint(b) : null
     if (!gone && !pvpErr) {
       note = inRange
         ? `打了 ${(waitedMs / 1000).toFixed(1)} 秒还没打死（这一轮的时间到了）—— 再叫一次 mc_act{attack} 接着打`
@@ -112,7 +132,7 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
           + '先 mc_move 到它旁边，或者换个近一点的目标'
     }
     return {
-      attacked: label, distance: d, killed: gone, health: b.health, via: 'pvp', waitedMs,
+      attacked: label, distance: d, killed, gone, health: b.health, via: 'pvp', waitedMs,
       ...(hpBefore != null && hpAfter != null && hpBefore !== hpAfter ? { targetHealth: `${hpBefore} → ${hpAfter}` } : {}),
       ...(note ? { note } : {}),
       ...(pickup ? { pickup } : {}),
@@ -125,6 +145,14 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
   const leftMs2 = ctx.callLeft() - 400
   const bd = leftMs2 <= 100 ? 0 : Math.max(0, Math.min(callBudget(budget, 4_000), leftMs2))
   let swings = 0
+  let sawDamage2 = false
+  let lastHp2 = hpBefore
+  const sample = () => {
+    const hp = entityHealth(b, target)
+    if (hp == null) return
+    if (lastHp2 != null && hp < lastHp2) sawDamage2 = true
+    lastHp2 = hp
+  }
   while (Date.now() - t0 < bd) {
     if (ctx.abortSignal?.aborted) break
     if (!b.entities?.[target.id] || target.isValid === false) break
@@ -132,12 +160,21 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     await ctx.t(Promise.resolve(b.attack(target)), 'attack', `攻击 ${label}`)
     swings++
     await sleep(620)
+    sample()
   }
   // 没有 pvp 时至少挥一下（bd=0 说明这一轮已经用完了，那就别再拖）
   if (swings === 0 && b.entities?.[target.id] && target.isValid !== false && distOf(target) <= 4.5 && !ctx.abortSignal?.aborted) {
     try { await ctx.t(Promise.resolve(b.attack(target)), 'attack', `攻击 ${label}`); swings = 1 } catch {}
+    await sleep(200)
+    sample()
   }
   const gone = !b.entities?.[target.id] || target.isValid === false
-  const pickup = gone ? dropHint(b) : null
-  return { attacked: label, distance: d, swings, killed: gone, health: b.health, ...(pickup ? { pickup } : {}) }
+  /* 🔴 同 pvp 分支：`gone` ≠ `killed`（怪可能只是走远/区块卸载）。 */
+  const killed = gone && sawDamage2
+  const pickup = killed ? dropHint(b) : null
+  return {
+    attacked: label, distance: d, swings, killed, gone, health: b.health,
+    ...(gone && !killed ? { note: '目标不见了，但**没读到过它掉血** —— 说不清是我打死的还是它走远/区块卸载了（别当成打死了）' } : {}),
+    ...(pickup ? { pickup } : {}),
+  }
 }

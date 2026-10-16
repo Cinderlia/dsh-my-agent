@@ -15,7 +15,9 @@
  */
 
 import { Vec3 } from 'vec3'
-import { isAir, isLiquid, isPassable, SOFT_ROOF, glyphOf, colorOf, CAVE_LABEL, CAVE_GLYPH } from './block-names.mjs'
+import { isAir, isLiquid, isPassable, isSolidBlock, SOFT_ROOF, glyphOf, colorOf, CAVE_LABEL, CAVE_GLYPH, FLOOR_LABEL, FLOOR_GLYPH } from './block-names.mjs'
+import { rgbaOfNames } from './worker-tasks.mjs'
+import { runInWorker } from './worker-pool.mjs'
 
 /**
  * 我是不是"在地下"（头顶 40 格内有实心遮挡，且遮挡不是树叶/竹子/雪层这类"软顶"）。
@@ -85,7 +87,323 @@ export function caveCell (b, x, cy, z, slab) {
     if (isLiquid(blk.name)) return { key: /lava/.test(blk.name) ? 'cave_lava' : 'cave_water', name: blk.name }
     return { key: 'cave_drop', name: blk.name }
   }
-  return { key: 'cave_void', name: null }
+  /* 🔴 审计 G4：这里原来回 `cave_void`，和上面"`blockAt` 读到 null = 区块没加载"混成同一个 key
+   *    ⇒ `unloaded++` 把"大洞穴/深井探不到底"也算成"未加载"，`mc_observe` 据此提示
+   *    "未加载像素偏多"，模型会以为只是没加载、等等就好。深不可测单独一个 key。 */
+  return { key: 'cave_deep', name: null }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 脚下方块那一层（"地板层"视图）—— 2026-10-15 用户需求
+ *
+ * 与洞穴层视图（`caveCell`）的区别：洞穴图问"**我**站在这格行不行"（以我脚下那层为中心往
+ * 上下看），地板图问"**这一层本身**是什么、站上去会不会掉"。所以不能拿 `cy-1` 去调
+ * `caveCell` —— 那会把地板本身当成墙，整张图全是 `#`。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** 地板层视图的默认参数（`layer` 缺省 = 我脚底下那层 = `feetY - 1`） */
+export const FLOOR_DEFAULTS = { radius: 32, depth: 4 }
+
+/**
+ * 从 `fromY` 往下最多 `depth` 格，找第一块**能当地板**的实心方块，返回它的 y。
+ * 找不到（下面全是空气/液体，或区块没加载）**一律回 null** —— 未知就是未知，不猜。
+ */
+function surfaceBelow (b, x, fromY, z, depth) {
+  const D = Math.min(Math.max(Number(depth) || 0, 0), 8)
+  for (let y = fromY; y >= fromY - D; y--) {
+    const blk = b.blockAt(new Vec3(x, y, z))
+    if (!blk) return null                      // 未加载 → 未知（不能当成"到底了"）
+    if (!isSolidBlock(blk.name)) continue      // 空气/液体/能穿过去的小东西都不是地板
+    return y
+  }
+  return null
+}
+
+/**
+ * **地板层视图的一格**：`layerY` 这一层在 (x, z) 处是什么、站上去会怎样。
+ *
+ * 返回（字段名就是用户 2026-10-15 给的结构体）：
+ * ```
+ * { x, z, y, floor, surfaceY, kind, supported, hazard, loaded }
+ * ```
+ * · `y`         查询层（默认 = 我脚底下那层 = `feetY - 1`）
+ * · `floor`     这一层的方块名；`null` = 区块没加载
+ * · `surfaceY`  往脚下最多 `depth` 格能找到的地板高度；**找不到就是 null**（深不见底/未加载）
+ * · `kind`      `walkable`（能站）/ `blocked`（这一层实心、但身体那两格被占）/ `drop`（这一层是空的）
+ *               / `liquid`（水/岩浆）/ `unknown`（未加载）
+ * · `supported` 脚下（`y` 这一格）是不是实心、能不能托住我
+ * · `hazard`    `'lava'` / `'water'` / `null`
+ * · `loaded`    这格有没有已加载的区块数据
+ *
+ * 🔴 两条禁令（用户明确要求）：
+ *   ① **`blockAt()` 返回 null 绝不能当成空气** —— 那是"区块没加载"，必须如实标 `unknown`，
+ *      否则未加载区会被画成"能走"，模型会径直走过去；
+ *   ② **"脚下是实心方块"不等于"能站"** —— 还要看身体那两格（`y+1` / `y+2`）有没有被占。
+ */
+export function floorCell (b, x, layerY, z, { depth = 4 } = {}) {
+  const cell = {
+    x, z, y: layerY, floor: null, surfaceY: null,
+    kind: 'unknown', supported: false, hazard: null, loaded: false,
+  }
+  const blk = b.blockAt(new Vec3(x, layerY, z))
+  if (!blk) return cell                        // ① 未加载：如实说"不知道"
+  cell.floor = blk.name
+  cell.loaded = true
+  const nm = blk.name
+
+  if (isLiquid(nm)) {
+    cell.kind = 'liquid'
+    cell.hazard = /lava/.test(nm) ? 'lava' : 'water'
+    cell.surfaceY = surfaceBelow(b, x, layerY - 1, z, depth)
+    return cell
+  }
+
+  if (isSolidBlock(nm)) {
+    cell.supported = true
+    cell.surfaceY = layerY
+    // ② 实心 ≠ 能站：身体那两格也得空着（液体不算占位 —— 能游过去）
+    let free = true
+    for (let y = layerY + 1; y <= layerY + 2; y++) {
+      const body = b.blockAt(new Vec3(x, y, z))
+      if (!body) {                             // 身体那格读不到 ⇒ 整格退回"未知"，不硬猜
+        cell.kind = 'unknown'; cell.loaded = false; cell.supported = false; cell.surfaceY = null
+        return cell
+      }
+      if (!isPassable(body.name) && !isAir(body.name) && !isLiquid(body.name)) { free = false; break }
+    }
+    cell.kind = free ? 'walkable' : 'blocked'
+    return cell
+  }
+
+  // ③ 这一层是空的 ⇒ 会掉下去；`surfaceY` 告诉你掉到哪一层（null = 探不到底/未加载）
+  cell.kind = 'drop'
+  cell.surfaceY = surfaceBelow(b, x, layerY - 1, z, depth)
+  return cell
+}
+
+/** 格 → 合成名（就是 `FLOOR_GLYPH` 的键，字符图/图例/配色都用它） */
+export function floorKeyOf (cell) {
+  if (!cell || cell.kind === 'unknown') return 'floor_void'
+  if (cell.kind === 'liquid') return cell.hazard === 'lava' ? 'floor_lava' : 'floor_water'
+  if (cell.kind === 'walkable') return 'floor_walk'
+  if (cell.kind === 'blocked') return 'floor_wall'
+  return 'floor_drop'
+}
+
+/**
+ * **脚下方块那一层**的地图（2026-10-15 用户需求）：默认 `layer = feetY - 1`。
+ *
+ * 先统一算出一整片**结构化的格**（`cells`），字符图 / 像素图 / 导航摘要全从它派生 ——
+ * 不再各自重新读世界、各自算坐标（用户"第二刀"的明确要求）。
+ *
+ * 坐标（用户"第三刀"）：`names` 是 `(2R)×(2R)`；行 `i` ↔ 世界 z = `originZ + i*cellSize`，
+ * 列 `j` ↔ 世界 x = `originX + j*cellSize`。这里 `cellSize = 1`（一格就是 1 个方块）；
+ * 工具层按 `glyphStep` 抽稀时会把它改成**实际步长**，所以换算**必须**走 `gridToWorld()`。
+ */
+export function floorMapOf (b, { radius = 32, layer = null, depth = 4 } = {}) {
+  const R = Math.min(Math.max(Number(radius) || 32, 4), 96)
+  const cx = Math.floor(b.entity.position.x)
+  const cy = Math.floor(b.entity.position.y)
+  const cz = Math.floor(b.entity.position.z)
+  /* 🔴 `Number(null) === 0` 且 `Number.isFinite(0)` 为真 —— 只写 `Number.isFinite(Number(layer))`
+   *    会把"没传 layer"当成"要看 y=0 那一层"。必须先排掉 null / undefined / 空串。 */
+  const layerGiven = layer !== null && layer !== undefined && layer !== '' && Number.isFinite(Number(layer))
+  const layerY = layerGiven ? Math.floor(Number(layer)) : cy - 1
+  const D = Math.min(Math.max(Number(depth) || 4, 0), 8)
+
+  const cells = []
+  const names = []
+  const legend = new Map()
+  const counts = { walkable: 0, blocked: 0, drop: 0, liquid: 0, unknown: 0 }
+  let unloaded = 0
+  let truncated = false
+  let scannedRows = 0
+  const t0 = Date.now()
+  const budgetMs = 2_500
+
+  for (let dz = -R; dz < R; dz++) {
+    if (Date.now() - t0 > budgetMs) { truncated = true; break }
+    const row = []
+    const nrow = []
+    for (let dx = -R; dx < R; dx++) {
+      const cell = floorCell(b, cx + dx, layerY, cz + dz, { depth: D })
+      const key = floorKeyOf(cell)
+      row.push(cell)
+      nrow.push(key)
+      counts[cell.kind] = (counts[cell.kind] ?? 0) + 1
+      if (cell.kind === 'unknown') unloaded++
+      legend.set(key, (legend.get(key) ?? 0) + 1)
+    }
+    cells.push(row)
+    names.push(nrow)
+    scannedRows++
+  }
+  while (names.length < R * 2) {
+    names.push(new Array(R * 2).fill('floor_void'))
+    cells.push(new Array(R * 2).fill(null))
+  }
+
+  const map = {
+    mode: 'floor',
+    center: { x: cx, y: cy, z: cz },
+    layer: { y: layerY, depth: D },
+    radius: R,
+    cellSize: 1,
+    originX: cx - R,
+    originZ: cz - R,
+    bounds: {
+      minX: cx - R, maxX: cx + R - 1,
+      minZ: cz - R, maxZ: cz + Math.max(0, scannedRows) - 1,
+    },
+    names, cells, counts, unloaded, truncated, scannedRows,
+    complete: !truncated,
+    colors: names.map((row) => row.map(colorOf)),
+    legend: [...legend.entries()].sort((a, b2) => b2[1] - a[1])
+      .map(([key, count]) => ({ name: FLOOR_LABEL[key] ?? key, key, glyph: FLOOR_GLYPH[key] ?? '?', count })),
+    ...(truncated ? { note: `范围太大，只扫了前 ${scannedRows} 行（剩下的行是空的）—— 想看全就调小 radius` } : {}),
+  }
+  map.hazards = hazardCellsOf(map, { limit: 16 })
+  return map
+}
+
+/**
+ * 格坐标（行/列）↔ 真实世界坐标。`cellSize` 是**实际抽稀步长**（`glyphStep`），
+ * 所以**别自己乘** —— 一律用这两个函数换算，否则改了 `glyphStep` 坐标就全错。
+ */
+export function gridToWorld (row, col, map) {
+  const size = Number(map?.cellSize) || 1
+  return {
+    x: Number(map?.originX ?? 0) + Number(col) * size,
+    z: Number(map?.originZ ?? 0) + Number(row) * size,
+  }
+}
+
+export function worldToGrid (x, z, map) {
+  const size = Number(map?.cellSize) || 1
+  return {
+    row: Math.round((Number(z) - Number(map?.originZ ?? 0)) / size),
+    col: Math.round((Number(x) - Number(map?.originX ?? 0)) / size),
+  }
+}
+
+/** 危险/要留意的一格：岩浆 > 水 > 会掉下去 > 未加载（排序用） */
+const HAZARD_RANK = { lava: 0, water: 1, drop: 2, unloaded: 3 }
+const HAZARD_KIND = {
+  floor_lava: 'lava', floor_water: 'water', floor_drop: 'drop', floor_void: 'unloaded',
+  cave_lava: 'lava', cave_water: 'water', cave_drop: 'drop', cave_deep: 'drop', cave_void: 'unloaded',
+  lava: 'lava', water: 'water',
+}
+
+/**
+ * 从一张地图里挑出**要留意**的格（岩浆/水/深坑/未加载），按"危险程度 + 到中心的距离"排序。
+ * 坐标一律走 `gridToWorld()`，所以对抽稀过的字符图也准。
+ */
+export function hazardCellsOf (map, { limit = 16 } = {}) {
+  const out = []
+  const names = map?.names ?? []
+  const R = Number(map?.radius ?? 0)
+  for (let row = 0; row < names.length; row++) {
+    const line = names[row] ?? []
+    for (let col = 0; col < line.length; col++) {
+      const kind = HAZARD_KIND[line[col]]
+      if (!kind) continue
+      const w = gridToWorld(row, col, map)
+      out.push({ x: w.x, z: w.z, kind, d: Math.round(Math.max(Math.abs(col - R), Math.abs(row - R)) * 10) / 10 })
+    }
+  }
+  out.sort((a, b2) => (HAZARD_RANK[a.kind] ?? 9) - (HAZARD_RANK[b2.kind] ?? 9) || a.d - b2.d)
+  return out.slice(0, limit)
+}
+
+/* Minecraft 的方位：+x = 东，+z = 南（北 = -z）；0° = 北，顺时针 */
+const DIR_NAMES = ['北', '东北', '东', '东南', '南', '西南', '西', '西北']
+function dirName (dx, dz) {
+  if (!dx && !dz) return '脚下'
+  const ang = (Math.atan2(dx, -dz) * 180 / Math.PI + 360) % 360
+  return DIR_NAMES[Math.round(ang / 45) % 8]
+}
+
+/** `"x,y,z"` / `"x y z"` / `{x,y,z}` → 点（认不出来就 null） */
+export function parsePoint (t) {
+  if (t && typeof t === 'object') {
+    const x = Number(t.x); const z = Number(t.z)
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return null
+    const y = Number(t.y)
+    return { x: Math.round(x), y: Number.isFinite(y) ? Math.round(y) : null, z: Math.round(z) }
+  }
+  const m = String(t ?? '').match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)/)
+  if (!m) return null
+  return { x: Math.round(Number(m[1])), y: Math.round(Number(m[2])), z: Math.round(Number(m[3])) }
+}
+
+/**
+ * 目标 → 相对位置。`target` 可以是 `"x,y,z"` / `{x,y,z}` / 它们的数组。
+ * 🔴 只算**相对位置**（距离/方位/高差），**不代表路通、也不代表挖得到**。
+ */
+export function navTargetsOf (map, target) {
+  const list = Array.isArray(target) ? target : (target ? [target] : [])
+  const out = []
+  for (const raw of list) {
+    const p = parsePoint(raw)
+    if (!p) continue
+    const dx = p.x - Number(map?.center?.x ?? 0)
+    const dz = p.z - Number(map?.center?.z ?? 0)
+    out.push({
+      ...p, dx, dz, dir: dirName(dx, dz),
+      d: Math.round(Math.hypot(dx, dz) * 10) / 10,
+      dy: p.y == null ? null : p.y - Number(map?.layer?.y ?? map?.center?.y ?? 0),
+    })
+  }
+  return out
+}
+
+/**
+ * 把地图翻成**给模型读的补充摘要**（用户"第一刀"的 `purpose`）。
+ *
+ * `purpose`：`overview`（不加东西）/ `navigation`（目标相对位置 + 可站占比 + 建议）/
+ *            `hazards`（先列岩浆/水/深坑/未加载的坐标）。
+ *
+ * 🔴 职责边界（用户明确要求）：**目标坐标由 `mc_scan` 提供；地形与危险由地图提供；
+ *    真实路线可达性交给 pathfinder；能不能挖由动作工具动手前再验证。**
+ *    所以这段文案里**不许**出现"路是通的 / 能挖到"这类地图推不出来的结论。
+ */
+export function navSummaryOf (map, { purpose = 'overview', target = null } = {}) {
+  const lines = []
+  const nearbyTargets = navTargetsOf(map, target)
+  const cells = map?.radius ? (map.radius * 2) ** 2 : 0
+  const c = map?.counts ?? {}
+
+  if (purpose === 'navigation') {
+    lines.push(`🧭 覆盖 x ${map?.bounds?.minX}…${map?.bounds?.maxX} · z ${map?.bounds?.minZ}…${map?.bounds?.maxZ}（真实坐标）`
+      + ` ｜ 每格 ${map?.cellSize ?? 1} 方块 ｜ 扫描${map?.complete ? '完整' : `被截断（只扫了前 ${map?.scannedRows} 行）`}`)
+    if (map?.mode === 'floor') {
+      const pct = cells ? Math.round(((c.walkable ?? 0) / cells) * 100) : 0
+      lines.push(`可站立 ${c.walkable ?? 0} 格（${pct}%）｜ 墙 ${c.blocked ?? 0} ｜ 会掉下去 ${c.drop ?? 0} ｜ 液体 ${c.liquid ?? 0} ｜ 未加载 ${c.unknown ?? 0}`)
+    }
+    if (nearbyTargets.length) {
+      for (const t of nearbyTargets) {
+        lines.push(`🎯 目标 (${t.x}, ${t.y ?? '?'}, ${t.z}) ｜ 直线距离 ${t.d} 格 ｜ 方位 ${t.dir}`
+          + `${t.dy == null ? '' : ` ｜ 相对本层 dy=${t.dy >= 0 ? '+' : ''}${t.dy}`}`)
+      }
+      lines.push('（这只是**坐标和地形**：路通不通要 `mc_move`/pathfinder 真走一次；动手挖之前再 `mc_scan` 复核一眼目标还在不在。）')
+    } else {
+      lines.push('🎯 没给 target：想算相对方位就把 `mc_scan` 找到的坐标用 `target:"x,y,z"` 传进来。')
+    }
+  }
+
+  if (purpose === 'hazards') {
+    const hz = map?.hazards ?? hazardCellsOf(map, { limit: 16 })
+    const NAME = { lava: '岩浆', water: '水', drop: '深坑', unloaded: '未加载' }
+    if (!hz.length) {
+      lines.push('✅ 扫到的范围里没有岩浆 / 水 / 深坑 / 未加载。')
+    } else {
+      lines.push(`⚠️ 要留意的格（按危险程度排，最多 8 个）：`
+        + hz.slice(0, 8).map((h) => `${NAME[h.kind] ?? h.kind}(${h.x}, ${h.z}) 距 ${h.d}`).join(' ｜ '))
+      lines.push(`（共扫到 ${hz.length} 处；深坑 = 这一层空、往下 ${map?.layer?.depth ?? 4} 格内没地板。坐标是真实世界坐标。）`)
+    }
+  }
+
+  return { lines, nearbyTargets }
 }
 
 /**
@@ -95,6 +413,10 @@ export function caveCell (b, x, cy, z, slab) {
  * `'auto'` 时由 `isUnderground()` 决定 —— **在地下自动给洞穴层视图**（用户 2026-10-08 需求）。
  * 洞穴层视图里 `names` 是 `cave_*` 合成名（`glyphOf` 把它们画成 `#·↓v~≈*?`），
  * 用 `slab` 控制上下看几格（默认 2 = 上下各 2 格，共 5 层）。
+ *
+ * 2026-10-15：补上 `originX/originZ/cellSize/bounds/complete`，让"字符图第几行第几列"
+ * 能换算回真实坐标（`gridToWorld()`）；**默认层已改成地板层视图 `floorMapOf()`**，
+ * 这里是 `mode:"auto"/"surface"/"cave"` 的老行为，一字未改。
  */
 export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24, mode = 'auto', slab = 2 } = {}) {
   const R = Math.min(Math.max(radius, 4), 96)
@@ -115,28 +437,39 @@ export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24, mode = 
   const cave = mode === 'cave' || (mode !== 'surface' && isUnderground(b))
   if (cave) {
     const S = Math.min(Math.max(Number(slab) || 2, 1), 8)
+    /* 🔴 审计 G6：截断提示原来用 `names.filter(r => r.some(c => c !== 'cave_void')).length`
+     *    当"扫了几行" —— 那不是一回事（没扫的行被补成整行 cave_void，而扫过但全是洞的行
+     *    也全是 cave_void）⇒ 开阔洞穴会报"只扫了前 0 行"。老实数行数。 */
+    let scannedRows = 0
     for (let dz = -R; dz < R; dz++) {
       if (Date.now() - t0 > budgetMs) { truncated = true; break }
       const row = []
       for (let dx = -R; dx < R; dx++) {
         const cell = caveCell(b, cx + dx, cy, cz + dz, S)
+        /* 只有 `blockAt` 读到 null 才算"未加载"（`cave_deep` 是探不到底，不是没加载） */
         if (cell.key === 'cave_void') unloaded++
         legend.set(cell.key, (legend.get(cell.key) ?? 0) + 1)
         row.push(cell.key)
       }
       names.push(row)
+      scannedRows++
     }
     while (names.length < R * 2) names.push(new Array(R * 2).fill('cave_void'))
     return {
-      center: { x: cx, y: cy, z: cz }, radius: R, unloaded, names, truncated,
+      center: { x: cx, y: cy, z: cz }, radius: R, unloaded, names, truncated, scannedRows,
       colors: names.map((row) => row.map(colorOf)),
       mode: 'cave', layer: { y: cy, slab: S },
-      ...(truncated ? { note: `范围太大，只扫了前 ${names.filter((r) => r.some((c) => c !== 'cave_void')).length} 行（剩下的行是空的）—— 想看全就调小 radius` } : {}),
+      /* 2026-10-15：行/列 ↔ 世界坐标（`gridToWorld()` 用），以及"实际扫到哪" */
+      originX: cx - R, originZ: cz - R, cellSize: 1,
+      bounds: { minX: cx - R, maxX: cx + R - 1, minZ: cz - R, maxZ: cz + Math.max(0, scannedRows) - 1 },
+      complete: !truncated,
+      ...(truncated ? { note: `范围太大，只扫了前 ${scannedRows} 行（剩下的行是空的）—— 想看全就调小 radius` } : {}),
       legend: [...legend.entries()].sort((a, b2) => b2[1] - a[1])
         .map(([name, count]) => ({ name: CAVE_LABEL[name] ?? name, key: name, glyph: CAVE_GLYPH[name] ?? '?', count })),
     }
   }
 
+  let scannedRows = 0
   for (let dz = -R; dz < R; dz++) {
     if (Date.now() - t0 > budgetMs) { truncated = true; break }
     const row = []
@@ -152,11 +485,15 @@ export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24, mode = 
       row.push(nm)
     }
     names.push(row)
+    scannedRows++
   }
   while (names.length < R * 2) names.push(new Array(R * 2).fill(null))
   return {
-    center: { x: cx, y: cy, z: cz }, radius: R, unloaded, names, mode: 'surface', truncated,
+    center: { x: cx, y: cy, z: cz }, radius: R, unloaded, names, mode: 'surface', truncated, scannedRows,
     colors: names.map((row) => row.map(colorOf)),
+    originX: cx - R, originZ: cz - R, cellSize: 1,
+    bounds: { minX: cx - R, maxX: cx + R - 1, minZ: cz - R, maxZ: cz + Math.max(0, scannedRows) - 1 },
+    complete: !truncated,
     ...(truncated ? { note: '范围太大，只扫了一部分（剩下的行是空的）—— 想看全就调小 radius' } : {}),
     legend: [...legend.entries()].sort((a, b2) => b2[1] - a[1]).map(([name, count]) => ({ name, count })),
   }
@@ -183,52 +520,205 @@ export function glyphMapText (names, step = 2, selfIndex = null) {
  *
  * @returns {{width:number,height:number,rgba:Uint8Array,center:object,radius:number,unloaded:number,legend:Array}}
  */
-export function mapImageOf (b, { radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'auto', slab = 2 } = {}) {
-  const hm = heightmapOf(b, { radius, yTop, yBottom, mode, slab })
+export function mapImageOf (b, { radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'auto', slab = 2, layer = null, depth = 4 } = {}) {
+  /* 2026-10-15：`mode:'floor'`（脚下方块那一层）也出图 —— 两条路的返回形状一样
+   * （names/colors/center/radius/unloaded/legend），下面一行都不用改。 */
+  const hm = mode === 'floor'
+    ? floorMapOf(b, { radius, layer, depth })
+    : heightmapOf(b, { radius, yTop, yBottom, mode, slab })
   const h = hm.names.length
   const w = h > 0 ? hm.names[0].length : 0
   if (!w || !h) throw new Error('地形数据为空（区块可能还没加载）')
 
   const s = Math.min(Math.max(Number(scale) || 4, 1), 16)
-  const W = w * s
-  const H = h * s
-  const rgba = new Uint8Array(W * H * 4)
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const [r, g, b] = colorOf(hm.names[y][x])
-      for (let dy = 0; dy < s; dy++) {
-        const rowBase = (y * s + dy) * W
-        for (let dx = 0; dx < s; dx++) {
-          const o = (rowBase + x * s + dx) * 4
-          rgba[o] = r; rgba[o + 1] = g; rgba[o + 2] = b; rgba[o + 3] = 255
-        }
-      }
-    }
-  }
-
-  // 自己：中心格画白色外框（内芯保留原色，便于看清脚下是什么）
-  if (markSelf) {
-    const cx = Math.floor(w / 2) * s
-    const cy = Math.floor(h / 2) * s
-    const put = (px, py, c) => {
-      if (px < 0 || py < 0 || px >= W || py >= H) return
-      const o = (py * W + px) * 4
-      rgba[o] = c[0]; rgba[o + 1] = c[1]; rgba[o + 2] = c[2]; rgba[o + 3] = 255
-    }
-    const white = [255, 255, 255]
-    for (let d = 0; d < s; d++) {
-      put(cx + d, cy, white)
-      put(cx + d, cy + s - 1, white)
-      put(cx, cy + d, white)
-      put(cx + s - 1, cy + d, white)
-    }
-  }
+  const img = rgbaOfNames(pixelPayloadOf(hm, { scale: s, markSelf }))
 
   return {
-    width: W, height: H, rgba,
+    width: img.width, height: img.height, rgba: img.rgba,
     center: hm.center, radius: hm.radius, unloaded: hm.unloaded,
     legend: hm.legend.slice(0, 15),
     scale: s,
   }
+}
+
+/**
+ * `mapImageOf` 的**异步版**：把"字符网格 → 像素"这段纯计算交给 Worker 线程池
+ * （`DSH_MC_AGENT_WORKERS` 开着才会真搬；关着 / 活太小 / 起不了线程 ⇒ 原地算，结果一样）。
+ *
+ * 2026-10-15 实测：`radius:96, scale:16` ⇒ 943 万像素，纯循环 28.2ms、整条 36.1ms ——
+ * 这是**唯一**一个既超过 30ms 阈值、又不需要 bot 对象的候选，所以只搬这一段。
+ * 扫地形那部分（`blockAt` 百万次）在主线程跑，搬不动。
+ *
+ * @returns {Promise<object>} 形状与 `mapImageOf()` 一致，另带 `via`/`workerMs`
+ */
+export async function mapImageOfAsync (b, opts = {}) {
+  const { radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'auto', slab = 2, layer = null, depth = 4 } = opts
+  const hm = mode === 'floor'
+    ? floorMapOf(b, { radius, layer, depth })
+    : heightmapOf(b, { radius, yTop, yBottom, mode, slab })
+  const h = hm.names.length
+  const w = h > 0 ? hm.names[0].length : 0
+  if (!w || !h) throw new Error('地形数据为空（区块可能还没加载）')
+
+  const s = Math.min(Math.max(Number(scale) || 4, 1), 16)
+  const payload = pixelPayloadOf(hm, { scale: s, markSelf })
+  /* 粗略估一下：每格 s² 个像素，每个像素几纳秒 —— 只用来决定"值不值得搬" */
+  const estMs = (w * h * s * s * 4) / 4e6
+  const r = await runInWorker('rgbaOfNames', payload, { estMs, transfer: [payload.idx.buffer] })
+  const img = r.value
+  return {
+    width: img.width, height: img.height, rgba: img.rgba,
+    center: hm.center, radius: hm.radius, unloaded: hm.unloaded,
+    legend: hm.legend.slice(0, 15),
+    scale: s,
+    via: r.via, workerMs: r.ms,
+    ...(r.workerError ? { workerError: r.workerError } : {}),
+  }
+}
+
+/**
+ * 把 `heightmapOf`/`floorMapOf` 的字符网格压成"调色板 + 下标数组"。
+ *
+ * 为什么不直接把 `names`（二维字符串数组）丢给线程：结构化克隆 3.7 万个字符串很贵，
+ * 而方块名一般只有几种。压成 `Uint16Array` + 小 `palette` 之后，
+ * 下标数组还能**零拷贝转移**过去。
+ */
+export function pixelPayloadOf (hm, { scale = 4, markSelf = true } = {}) {
+  const names = hm.names
+  const h = names.length
+  const w = h > 0 ? names[0].length : 0
+  const palette = []
+  const seen = new Map()
+  const idx = new Uint16Array(w * h)
+  for (let y = 0; y < h; y++) {
+    const row = names[y]
+    for (let x = 0; x < w; x++) {
+      const nm = row[x]
+      const key = nm === null || nm === undefined ? '\u0000null' : String(nm)
+      let k = seen.get(key)
+      if (k === undefined) {
+        k = palette.length
+        if (k > 65535) k = 0            // 不会发生（方块名就那几百种），保险起见
+        else { seen.set(key, k); palette.push(key === '\u0000null' ? null : String(nm)) }
+      }
+      idx[y * w + x] = k
+    }
+  }
+  return { idx, palette, width: w, height: h, scale, markSelf }
+}
+
+
+/* ───────────── 竖列图（2026-10-15 用户需求：让 AI 知道脚底下有没有空的） ───────────── */
+
+/** 竖列图每格的字形（与地板图/地表图刻意不同：这里 `#` 就是"实心"，不掺"能不能站人"） */
+export const COLUMN_GLYPH = { solid: '#', air: '.', water: '~', lava: '≈', unloaded: '?' }
+export const COLUMN_LABEL = { solid: '实心', air: '空腔', water: '水', lava: '岩浆', unloaded: '未加载' }
+/** 一次最多往下看几格（再深就该用 mc_scan 或 mc_move 了） */
+export const COLUMN_MAX = 96
+
+/**
+ * 一格方块在"会不会托住你"这个意义上的分类。
+ *
+ * `isSolidBlock` = 不是空气、不是液体、也不是可穿过的（草/雪层/梯子/火把…）——
+ * 正好是"站上去不会掉"的判据。**故意不用 `isAir`**：雪层和草也是"空的"，
+ * 但它们托不住你，报成"空腔"才对。
+ */
+export function columnKindOf (name) {
+  if (name === null || name === undefined) return 'unloaded'
+  if (isLiquid(name)) return /lava/.test(String(name)) ? 'lava' : 'water'
+  return isSolidBlock(name) ? 'solid' : 'air'
+}
+
+/** `"12,-4"` / `"12,63,-4"` / `{x,z}` 都认（竖列只要 x/z） */
+export function parseXZ (t) {
+  if (t && typeof t === 'object') {
+    const x = Number(t.x); const z = Number(t.z)
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return null
+    return { x: Math.round(x), z: Math.round(z) }
+  }
+  const m = String(t ?? '').match(/(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)\s*(?:[, ]\s*(-?\d+(?:\.\d+)?))?/)
+  if (!m) return null
+  /* 给了三个数 ⇒ 最后一个当 z（"x,y,z"）；只给两个 ⇒ 当 "x,z" */
+  return m[3] === undefined
+    ? { x: Math.round(Number(m[1])), z: Math.round(Number(m[2])) }
+    : { x: Math.round(Number(m[1])), z: Math.round(Number(m[3])) }
+}
+
+/**
+ * 竖着看一格：从**脚底那一格**往下，每一层是什么、哪里有空的。
+ *
+ * 回答的就是"我往下挖会不会掉下去"：脚底往下连续几格实心、第一处空腔在哪、空腔多高、
+ * 空腔底下是什么。
+ *
+ * @returns {{x:number,z:number,feetY:number,from:number,to:number,layers:Array,runs:Array,
+ *            solidRun:number,firstGap:object|null,gaps:Array,unloaded:number,complete:boolean}}
+ */
+export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX } = {}) {
+  const feet = b?.entity?.position
+  const fx = Number.isFinite(Number(x)) ? Math.floor(Number(x)) : Math.floor(feet?.x ?? 0)
+  const fz = Number.isFinite(Number(z)) ? Math.floor(Number(z)) : Math.floor(feet?.z ?? 0)
+  const fy = Math.floor(feet?.y ?? 0)
+  /* 默认从**脚底那一格**（`fy - 1`，也就是托着你的那块）开始往下 —— 从 `fy` 开始的话
+   * 第一格永远是你自己站的空气，看着像"脚底下就是空的"。 */
+  const from = Number.isFinite(Number(yTop)) ? Math.floor(Number(yTop)) : fy - 1
+  const depth = Math.max(4, Math.min(Math.abs(Math.floor(Number(yBottom) ?? -24)) || 24, maxDepth))
+  const to = from - depth + 1
+
+  const layers = []
+  for (let y = from; y >= to; y--) {
+    const blk = b?.blockAt?.(new Vec3(fx, y, fz))
+    const name = blk ? blk.name : null
+    const kind = columnKindOf(name)
+    layers.push({ y, name, kind, glyph: COLUMN_GLYPH[kind] })
+  }
+
+  /* 把连续的同类压成"段"，省得 AI 一格一格读 */
+  const runs = []
+  for (const l of layers) {
+    const last = runs[runs.length - 1]
+    if (last && last.kind === l.kind) { last.to = l.y; last.n++; if (l.name && !last.names.includes(l.name)) last.names.push(l.name) }
+    else runs.push({ kind: l.kind, from: l.y, to: l.y, n: 1, names: l.name ? [l.name] : [] })
+  }
+
+  const unloaded = layers.filter((l) => l.kind === 'unloaded').length
+  /* 脚底往下连续实心几格（第一段就是实心才算；第一段是空/未加载 ⇒ 0） */
+  const solidRun = runs[0]?.kind === 'solid' ? runs[0].n : 0
+  /* 所有"托不住你"的段（空腔 / 水 / 岩浆） */
+  const gaps = runs.filter((r) => r.kind === 'air' || r.kind === 'water' || r.kind === 'lava')
+    .map((r) => ({ y: r.from, to: r.to, thickness: r.n, kind: r.kind, glyph: COLUMN_GLYPH[r.kind] }))
+  const firstGap = gaps.length ? { ...gaps[0], below: runs[runs.indexOf(runs.find((r) => r.from === gaps[0].y)) + 1]?.names?.[0] ?? null } : null
+
+  return {
+    x: fx, z: fz, feetY: fy, from, to, layers, runs,
+    solidRun,
+    firstGap,
+    gaps,
+    unloaded,
+    complete: unloaded === 0,
+    mode: 'column',
+  }
+}
+
+/** 竖列图 → 人话（AI 真正要读的就是这几行） */
+export function columnText (col) {
+  if (!col || !col.layers?.length) return '🕳 竖列图：这一列一格都没读到（区块没加载？）'
+  const where = (col.x === undefined) ? '' : `(${col.x}, ${col.z})`
+  const out = [`🕳 竖列 ${where}：脚底 y=${col.feetY}，从 y=${col.from} 往下扫到 y=${col.to}`]
+  for (const r of col.runs) {
+    const names = r.names.length ? `（${r.names.slice(0, 4).join('、')}${r.names.length > 4 ? '…' : ''}）` : ''
+    const span = r.from === r.to ? `y=${r.from}` : `y=${r.from}..${r.to}`
+    out.push(`  ${COLUMN_GLYPH[r.kind]} ${span} ${COLUMN_LABEL[r.kind]} ${r.n} 格${names}`)
+  }
+  if (col.solidRun === 0) {
+    out.push('  ⚠️ 脚底那一格就托不住你 —— 别往下挖，先挪一步。')
+  } else if (!col.firstGap) {
+    out.push(`  ✅ 往下 ${col.solidRun} 格全是实心，这一段没探到空腔 —— 可以放心往下挖。`)
+  } else {
+    const g = col.firstGap
+    const under = g.below ? `，再往下 y=${g.to - 1} 是 ${g.below}` : ''
+    out.push(`  ⚠️ 脚底往下 **${col.solidRun} 格是实心**，然后 y=${g.y}..${g.to} 是 **${g.thickness} 格${COLUMN_LABEL[g.kind]}**${under}`)
+    out.push(`     ⇒ 挖到 y=${g.y + 1} 再往下就会掉下去${col.gaps.length > 1 ? `（下面还有 ${col.gaps.length - 1} 处空腔）` : ''}。`)
+  }
+  if (col.unloaded) out.push(`  ? 有 ${col.unloaded} 格没加载，那几行是"不知道"，不是"实心"。`)
+  return out.join('\n')
 }

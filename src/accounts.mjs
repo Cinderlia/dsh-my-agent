@@ -18,7 +18,7 @@
  *    也**不降级**写明文。
  * ============================================================================
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash, randomBytes } from 'node:crypto'
 
@@ -99,6 +99,9 @@ export class AccountStore {
     this.credentials = credentials
     this.logger = logger
     this.data = { version: 1, defaultAccount: null, authServers: [], accounts: [] }
+    /** 账户库读失败（JSON 坏了/权限不对）—— 调用方看到它就必须**跳过一切写盘**，见 load() */
+    this.loadFailed = false
+    this.loadError = null
     this.load()
     /** 有凭据的 innerID 缓存（`list()` 是同步的，所以要缓存；启动/增删时刷新） */
     this._withCred = new Set()
@@ -123,13 +126,29 @@ export class AccountStore {
     } catch (e) {
       this.data = { version: 1, seeded: false, defaultAccount: null, authServers: [], accounts: [] }
       this.loadError = `账户库读取失败（已按空库运行）：${e.message}`
+      /* 🔴 2026-10-15 审计（报告 E 第 1 条）：这里把"读失败"降级成"按空库运行"，而 `index.js`
+       *    紧接着会调 `ensureDefaults()` + `save()` —— 于是**一次读失败就把用户的账户库覆盖成
+       *    "只剩一个默认离线号"**（账户永久丢失，而且没有任何提示）。这个标志位就是给调用方
+       *    用来**跳过一切写盘**的；`loadError` 仍然保留给人看。 */
+      this.loadFailed = true
     }
   }
 
   save () {
+    /* 🔴 2026-10-15 审计（报告 E 第 1 条）：读失败之后**绝不能写** —— 否则一次读失败就把
+     *    用户的账户库覆盖成"空库 + 一个默认离线号"。这是最后一道保险（调用方也该先看 loadFailed）。 */
+    if (this.loadFailed) {
+      throw new Error(`账户库之前读取失败（${this.loadError ?? '原因不明'}）—— 为免覆盖掉里面的账户，这次不写盘。`
+        + `请先修好 ${this.file}（比如从备份恢复）再重试。`)
+    }
     try {
       if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true })
-      writeFileSync(this.file, JSON.stringify(this.data, null, 2) + '\n', 'utf8')
+      /* 🟡 2026-10-15 审计（报告 E 第 1 条）：原来直接 `writeFileSync` —— 写到一半断电/被杀就留下
+       *    半个 JSON（下次启动就是"读失败"）。与 `src/wsconfig.mjs:112-116`、`src/task-runner.mjs:384-385`
+       *    统一：先写临时文件再 rename（同分区上 rename 是原子的）。 */
+      const tmp = `${this.file}.tmp`
+      writeFileSync(tmp, JSON.stringify(this.data, null, 2) + '\n', 'utf8')
+      renameSync(tmp, this.file)
     } catch (e) { throw new Error(`账户库写入失败：${e.message}`) }
   }
 
@@ -177,6 +196,10 @@ export class AccountStore {
       type: acc.type,                           // offline | yggdrasil
       server,
       hasCredential: this._withCred.has(acc.innerID),
+      /* 🟡 2026-10-15 审计（报告 E 第 2 条）：凭据索引刷失败时上面的 `hasCredential` 可能已经过时，
+       *    如实告诉调用方"这个值可不可信"，别让它把"读不出来"当成"没有密码"。 */
+      credIndexOk: !this.credIndexError,
+      ...(this.credIndexError ? { credIndexError: this.credIndexError } : {}),
       default: this.data.defaultAccount === acc.innerID,
     }
   }
@@ -327,17 +350,26 @@ export class AccountStore {
 
   /** 启动时建"哪些账户有凭据"的缓存（list() 是同步的，用它填充 hasCredential） */
   async refreshCredentialIndex () {
-    this._withCred = new Set()
     this.credIndexError = null
-    if (!this.credentialsReady) return
+    if (!this.credentialsReady) { this._withCred = new Set(); return }
+    /* 🔴 2026-10-15 审计（报告 E 第 2 条）：这里原来**先清空** `_withCred` 再去 `listRecords()`，
+     *    而它抛错时只记 `credIndexError`（**不 rethrow**）⇒ `index.js:698` 那个"必须 catch"的兜底
+     *    永远不触发；后果是**所有账户都显示"没有密码"**（`hasCredential` 全 false），UI/模型会
+     *    引导用户去重设密码 —— 明明是凭据服务/网络抖了一下。
+     *    改成：结果没拿到之前**不动旧集合**，失败就保留旧值并记下原因。 */
     try {
       const entries = await this.credentials.listRecords()
+      const next = new Set()
       for (const e of entries ?? []) {
         const key = String(e?.key ?? e ?? '')
         const [scope, id] = key.split('/')
-        if (scope === CRED_SCOPE && id) this._withCred.add(id)
+        if (scope === CRED_SCOPE && id) next.add(id)
       }
-    } catch (e) { this.credIndexError = String(e?.message ?? e) }
+      this._withCred = next
+    } catch (e) {
+      this.credIndexError = String(e?.message ?? e)
+      try { this.logger?.warn?.(`账户凭据索引刷新失败（沿用上一次的结果，共 ${this._withCred.size} 条）：${this.credIndexError}`) } catch { /* 日志失败无所谓 */ }
+    }
   }
 
   async setCredential (innerID, { password = null, accessToken = null, clientToken = null } = {}) {
