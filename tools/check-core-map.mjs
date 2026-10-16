@@ -58,7 +58,8 @@ const Vec3 = req('vec3')
 const { McBot, glyphOf } = await import(new URL('../src/core.mjs', import.meta.url))
 /* 2026-10-15：`mc_map` 默认改成"脚下方块那一层" —— 新函数直接从 map-render.mjs 取
  *（工具层就是这么 import 的，没经过 core.mjs 的薄包装）。 */
-const { floorMapOf, floorCell, floorKeyOf, gridToWorld, worldToGrid, hazardCellsOf, navSummaryOf } =
+const { floorMapOf, floorCell, floorKeyOf, gridToWorld, worldToGrid, hazardCellsOf, navSummaryOf,
+  columnOf, columnText, columnKindOf, parseXZ } =
   await import(new URL('../src/map-render.mjs', import.meta.url))
 
 const TMP_DIRS = []
@@ -375,6 +376,138 @@ try {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  section('⑩ 竖列图（2026-10-15 用户需求："加一个竖向的，单格就行，让ai知道下面有没有空的方块"）')
+
+  {
+    ok(columnKindOf('stone') === 'solid', '石头 ⇒ 实心')
+    ok(columnKindOf('air') === 'air', '空气 ⇒ 空腔')
+    ok(columnKindOf('water') === 'water' && columnKindOf('lava') === 'lava', '水 / 岩浆分开')
+    ok(columnKindOf('snow') === 'air' && columnKindOf('ladder') === 'air',
+      '🔴 雪层 / 梯子 ⇒ **空腔**（`isAir` 会说它们"空"，可它们托不住你）')
+    ok(columnKindOf(null) === 'unloaded', '读不到 ⇒ 未加载（**不是"空"**）')
+  }
+  {
+    ok(JSON.stringify(parseXZ('2,-3')) === '{"x":2,"z":-3}', 'parseXZ 认 "x,z"（两个数）')
+    ok(JSON.stringify(parseXZ('2,63,-3')) === '{"x":2,"z":-3}', 'parseXZ 认 "x,y,z"（取第 1、3 个数）')
+    ok(parseXZ({ x: 1, z: 2 })?.x === 1 && parseXZ({ x: 1, z: 2 })?.z === 2, 'parseXZ 认对象')
+    ok(parseXZ('乱写') === null && parseXZ(null) === null, '乱写 / 不给 ⇒ null')
+  }
+  {
+    /* 机器人站在 **(3, 64, -2)**（故意不是 0,0）：脚下 y=63 草、62 土、61/60 石（4 格实心），
+     * y=59..56 是 4 格空腔，再往下 y=55..40 全是石头。 */
+    const w = mkWorld({ fill: 'air' })
+    w.set(3, 63, -2, 'grass_block')
+    w.set(3, 62, -2, 'dirt')
+    w.set(3, 61, -2, 'stone')
+    w.set(3, 60, -2, 'stone')
+    for (let y = 59; y >= 56; y--) w.set(3, y, -2, 'air')
+    for (let y = 55; y >= 40; y--) w.set(3, y, -2, 'stone')
+    const b = mkBot({ pos: [3, 64, -2], world: w })
+    const col = columnOf(b, { yBottom: -20 })
+
+    ok(col.x === 3 && col.z === -2, '不给 x/z ⇒ 看机器人自己那一格（3, -2）')
+    ok(col.feetY === 64, 'feetY = 脚站的那一层')
+    /* 🔴 这条钉的是 `Number(null) === 0` 那个坑：写成 `Number.isFinite(Number(yTop))`
+     *    会让"没传"变成"传了 0"，于是永远从 y=0 开始扫。 */
+    ok(col.from === 63 && col.to === 44,
+      '🔴 默认从**脚底那一格**（feetY-1 = 63）往下扫到 44 —— 不是从脚站的那格、更不是从 y=0', `${col.from}..${col.to}`)
+    ok(col.solidRun === 4, '往下 4 格实心（63..60）', `solidRun=${col.solidRun}`)
+    ok(col.firstGap?.y === 59 && col.firstGap?.to === 56 && col.firstGap?.thickness === 4,
+      '第一处空腔 y=59..56、厚 4 格', JSON.stringify(col.firstGap))
+    ok(col.firstGap?.below === 'stone', '空腔下面是石头')
+    ok(col.gaps.length === 1, '这一段只探到一处空腔')
+    ok(col.unloaded === 0 && col.complete === true, '这一段没有未加载')
+
+    const t = columnText(col)
+    ok(/脚底 y=64/.test(t) && /从 y=63 往下扫到 y=44/.test(t), '抬头写清脚底与扫描范围')
+    ok(/# y=63\.\.60 实心 4 格/.test(t), '每段一行：`# y=a..b 实心 N 格`')
+    ok(/脚底往下 \*\*4 格是实心\*\*/.test(t) && /y=59\.\.56 是 \*\*4 格空腔\*\*/.test(t),
+      '🔴 摘要直接回答"几格实心、然后几格是空的"')
+    ok(/挖到 y=60 再往下就会掉下去/.test(t), '🔴 给出"挖到哪一格就得停"')
+
+    ok(columnOf(b, { x: -2, z: 5, yBottom: -20 }).x === -2, '给了 x/z 就用给的')
+    ok(columnOf(b, { x: 0, z: 0, yBottom: -20 }).x === 0, '🔴 传 x=0 是"真的看 0"，不是"没传"')
+  }
+  {
+    /* 脚底那一格就是空的 ⇒ 得明说"托不住"，别报成"放心挖" */
+    const w = mkWorld({ fill: 'stone' })
+    w.set(0, 63, 0, 'air')
+    const col = columnOf(mkBot({ pos: [0, 64, 0], world: w }), { yBottom: -8 })
+    ok(col.solidRun === 0 && col.firstGap?.y === 63, '脚底那格是空气 ⇒ solidRun = 0、第一处空腔就是它')
+    ok(/托不住你/.test(columnText(col)) && /别往下挖/.test(columnText(col)), '摘要说"托不住你，别往下挖"')
+  }
+  {
+    /* 全实心 + 深处未加载：不能拍胸脯说"放心挖" */
+    const w = mkWorld({ fill: 'stone' })
+    for (let y = 55; y >= 50; y--) w.set(0, y, 0, null)   // 未加载（不是空气）
+    const col = columnOf(mkBot({ pos: [0, 64, 0], world: w }), { yBottom: -20 })
+    ok(col.solidRun === 8 && col.unloaded === 6, '实心 8 格（63..56）、下面 6 格未加载',
+      `solidRun=${col.solidRun} unloaded=${col.unloaded}`)
+    ok(!col.firstGap, '未加载**不算空腔**（"不知道" ≠ "空的"）')
+    const t = columnText(col)
+    ok(/先停下再看一次/.test(t) && !/可以放心往下挖/.test(t),
+      '🔴 深处有未加载 ⇒ 不许说"可以放心往下挖"')
+  }
+  {
+    /* 未加载在**最上面**（脚底那格就没加载）：要说"没加载"，不能说成"托不住" */
+    const w = mkWorld({ fill: 'stone' })
+    w.set(0, 63, 0, null)
+    const t = columnText(columnOf(mkBot({ pos: [0, 64, 0], world: w }), { yBottom: -8 }))
+    ok(/没加载/.test(t) && !/托不住你/.test(t), '🔴 脚底未加载 ⇒ 说"没加载"，不能说"托不住你"（那是断言世界的样子）')
+  }
+  {
+    /* 🔴 2026-10-15 用户问「如果是水和岩浆呢」——
+     *    空腔 / 水 / 岩浆都"托不住你"，但后果差着量级：掉下去 vs 淹死/冲走 vs 烧死。
+     *    原来三种情况共用一句"再往下就会掉下去"，把"掉进岩浆"说成了"掉下去" —— 危险量级说反了。 */
+    const mk = (layers) => {
+      const w = mkWorld({ fill: null })   // 区外一律未加载，断言只看脚底这一段
+      for (const [y, n] of Object.entries(layers)) w.set(0, Number(y), 0, n)
+      return columnOf(mkBot({ pos: [0, 64, 0], world: w }), { yBottom: -8 })
+    }
+    const AIR = mk({ 63: 'grass_block', 62: 'dirt', 61: 'stone', 60: 'air', 59: 'air', 58: 'stone' })
+    const WAT = mk({ 63: 'grass_block', 62: 'dirt', 61: 'stone', 60: 'water', 59: 'water', 58: 'stone' })
+    const LAV = mk({ 63: 'grass_block', 62: 'dirt', 61: 'stone', 60: 'lava', 59: 'stone' })
+    const DEEP = mk({ 63: 'grass_block', 62: 'dirt', 61: 'air', 60: 'stone', 59: 'lava' })
+
+    ok(AIR.firstGap?.kind === 'air' && WAT.firstGap?.kind === 'water' && LAV.firstGap?.kind === 'lava',
+      'firstGap.kind 把空腔 / 水 / 岩浆分开')
+
+    const ta = columnText(AIR); const tw = columnText(WAT); const tl = columnText(LAV)
+    ok(/⚠️/.test(ta) && /挖到 y=61 再往下就会掉下去（落差 6 格）/.test(ta), '空腔 ⇒ ⚠️ + "掉下去"（带落差）')
+    ok(/🌊/.test(tw) && /挖到 y=61 就\*\*挖进水\*\*了/.test(tw) && /水会灌下来/.test(tw),
+      '🔴 水 ⇒ 🌊 + "挖进水、水会灌下来、可能被冲走或淹死"')
+    ok(/🔥/.test(tl) && /挖到 y=61 就\*\*挖穿到岩浆\*\*了/.test(tl) && /掉进去会死，别挖/.test(tl),
+      '🔴 岩浆 ⇒ 🔥 + "挖穿到岩浆、掉进去会死、别挖"')
+    ok(!/就会掉下去/.test(tw) && !/就会掉下去/.test(tl),
+      '🔴 水 / 岩浆**不许**共用"掉下去"那句（危险量级说反了）')
+
+    /* hazards 字段：给 AI 一份能直接判的（不用去啃文案） */
+    ok(WAT.hazards.water.length === 1 && WAT.hazards.water[0].y === 60 && WAT.hazards.water[0].to === 59
+      && WAT.hazards.water[0].thickness === 2 && WAT.hazards.lava.length === 0, 'hazards.water 记了 y/到哪/几格',
+      JSON.stringify(WAT.hazards))
+    ok(LAV.hazards.lava.length === 1 && LAV.hazards.lava[0].y === 60 && LAV.hazards.water.length === 0,
+      'hazards.lava 分开记')
+    ok(AIR.hazards.lava.length === 0 && AIR.hazards.water.length === 0, '普通空腔不算 hazard')
+
+    /* 第一处是普通空腔、更深处有岩浆 ⇒ 单独点名（只报第一处会漏掉真正致命的那个） */
+    const td = columnText(DEEP)
+    ok(/再往下还有 \*\*岩浆\*\*（y=59）/.test(td), '🔴 更深处有岩浆 ⇒ 单独提一行，别只报第一处空腔')
+    ok(DEEP.hazards.lava.length === 1 && DEEP.hazards.lava[0].y === 59, 'DEEP 的岩浆记在 hazards.lava')
+
+    /* 脚底那格本身就是液体：也要点名是什么，不能只说"托不住" */
+    const FOOTW = mk({ 63: 'water', 62: 'water', 61: 'stone' })
+    const FOOTL = mk({ 63: 'lava', 62: 'stone' })
+    const tfw = columnText(FOOTW); const tfl = columnText(FOOTL)
+    ok(FOOTW.solidRun === 0 && /🌊/.test(tfw) && /脚底那一格是 \*\*水\*\*/.test(tfw) && /水会灌下来/.test(tfw),
+      '🔴 脚底是水 ⇒ 点名"水"，不是笼统的"托不住"')
+    ok(FOOTL.solidRun === 0 && /🔥/.test(tfl) && /脚底那一格是 \*\*岩浆\*\*/.test(tfl) && /先挪一步，别在这上面挖/.test(tfl),
+      '🔴 脚底是岩浆 ⇒ 点名"岩浆"+ 最重的措辞')
+    const tfa = columnText(mk({ 63: 'air', 62: 'stone' }))
+    ok(/⚠️/.test(tfa) && /脚底那一格是 \*\*空的\*\*/.test(tfa) && /别往下挖，先挪一步/.test(tfa),
+      '脚底是空气 ⇒ 还是原来那句"别往下挖，先挪一步"')
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   section('⑤ 静态接线（core.mjs / index.js）')
 
   const core = readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8')
@@ -424,8 +557,20 @@ try {
   ok(!/hm\.legend\.slice\(0, 15\)\.join\(' '\)/.test(strip(idx)),
     '顺手修掉的老 bug：图例不再是 [object Object]（以前 legend 是对象却直接 join）')
   ok(/想强制看地表就 mode:"surface"/.test(idx), '文案告诉 AI 可以 mode:"surface" 强制看地表')
-  ok(/modeArg === 'auto' \|\| modeArg === 'surface' \|\| modeArg === 'cave' \? modeArg : 'floor'/.test(strip(idx)),
-    'index：mc_map 默认 floor，但 auto/surface/cave 老模式一个没丢（老参数兼容）')
+  ok(/modeArg === 'auto' \|\| modeArg === 'surface' \|\| modeArg === 'cave' \|\| modeArg === 'column' \? modeArg : 'floor'/.test(strip(idx)),
+    'index：mc_map 默认 floor，但 auto/surface/cave/column 老模式一个没丢（老参数兼容）')
+  /* ⑩ 竖列图的接线（2026-10-15） */
+  ok(/if \(mode === 'column'\) \{/.test(strip(idx)), 'index：mc_map 有 mode:"column" 分支')
+  ok(/columnOf\(sess\.bot\.requireBot\(\), \{ x: p\?\.x \?\? null, z: p\?\.z \?\? null, yBottom: args\.yBottom \}\)/.test(strip(idx)),
+    'index：column 分支直接调 map-render 的 columnOf（不经过 core 薄包装）')
+  ok(/parseXZ\(args\.target\)/.test(strip(idx)), 'index：column 用 target 定 x/z（复用老参数，不加新参数 —— token 预算只剩几十字符）')
+  ok(/text: columnText\(col\)/.test(strip(idx)), 'index：column 的 text 走 columnText()')
+  ok(/"column"（竖列/.test(idx), 'index：mc_map 描述里写了 column 模式')
+  ok(/export function columnOf \(b, \{ x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX \} = \{\}\) \{/.test(mapSrc),
+    'map-render：columnOf(b, {x,z,yTop,yBottom,maxDepth})')
+  ok(/export function columnText \(col\) \{/.test(mapSrc), 'map-render：columnText(col)')
+  ok(/const given = \(v\) => v !== null && v !== undefined && v !== '' && Number\.isFinite\(Number\(v\)\)/.test(mapSrc),
+    '🔴 map-render：columnOf 里判"传没传"必须用 `given()` 先挡 null —— `Number(null) === 0` 会让"没传"变成"传了 0"')
 } finally {
   for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 }

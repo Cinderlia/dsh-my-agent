@@ -42,7 +42,7 @@ import { EXPRESS_DIR, OUT_DIR, expressRootOf, outRootOf, parseExpressPath, safeE
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 /* 2026-10-15：`mc_map` 默认改成"脚下方块那一层"（地板层视图）—— 直接调 `src/map-render.mjs`
  * 的新函数，**不往 `core.mjs` 加薄包装**（那个文件已经贴着 `check-module-load` 的 1000 行上限）。 */
-import { floorMapOf, navSummaryOf, hazardCellsOf } from './src/map-render.mjs'
+import { floorMapOf, navSummaryOf, hazardCellsOf, columnOf, columnText, parseXZ } from './src/map-render.mjs'
 /* 2026-10-15：事件循环延迟 / CPU 占用监测（用户「异步与多线程优化」方案第 1 步）——
  * **用数据决定要不要上 Worker 线程**，`mc_diag` 的 `perf` 段直接给结论。 */
 import { perfWrap, perfSnapshot, perfText, perfReset } from './src/perf-monitor.mjs'
@@ -2519,23 +2519,23 @@ export function apply(ctx, rawConfig) {
     name: 'mc_map',
     description: '看周围地形。**默认给"脚下方块那一层"**（地板层图：这一层哪里是实心地面、哪里是坑/岩浆/未加载）：'
       + '· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载。'
-      + 'mode="floor"（默认）/ "auto"（地下自动切洞穴层：# 墙 · 能站 ↓ 低一格 v 会掉下去 * 矿石）'
-      + '/ "surface"（地表：@ 我 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田）/ "cave"；slab = 洞穴层上下各看几格（默认 2）。'
-      + 'format="image" 额外生成**俯视图像**（有视觉的模型能直接看，并落盘）。'
-      + `🔴 要让 **Master** 看到图：给 \`out:"\\.dsh-mc-agent/${EXPRESS_DIR}/<子目录>/map.png"\` 写进发布区，`
-      + '再用 `mc_kit_express` 取那一行，自己拼进回复。'
+      + 'mode="floor"（默认）/ "auto"（地下自动切洞穴层：# 墙 · 能站 ↓ 低一格 v 会掉 * 矿石）'
+      + '/ "surface"（地表：@ 我 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田）/ "cave"'
+      + '/ "column"（竖列：只看你脚下这一格，往下几格实心、哪里开始是空的）；slab = 洞穴层上下各看几格（默认 2）。'
+      + 'format="image" 出**俯视图像**（有视觉的模型能直接看，并落盘）。'
+      + '🔴 想让 Master 看到图：见 out 参数。'
       + '字符图省 token 且坐标精确；形状/外观问题用图像。',
     parameters: {
       radius: { type: 'number', description: '半径（默认 32，上限 96）' },
-      mode: { type: 'string', description: 'floor（默认，脚下方块那一层）/ auto（地下自动切洞穴层）/ surface / cave' },
+      mode: { type: 'string', description: 'floor（默认，脚下方块那一层）/ auto（地下自动切洞穴层）/ surface / cave / column（竖列）' },
       purpose: { type: 'string', description: 'overview（默认）/ navigation（加目标方位）/ hazards（先列危险格）' },
-      target: { type: 'string', description: '（可选）目标坐标 "x,y,z"（mc_scan 给的），只算距离方位' },
+      target: { type: 'string', description: '（可选）目标坐标 "x,y,z"（mc_scan 给的）；竖列图用它定 x/z' },
       layer: { type: 'number', description: 'floor 层的 y（默认 feetY-1）' },
       depth: { type: 'number', description: 'floor 层往下探几格找地面（默认 4，0–8）' },
       slab: { type: 'number', description: '洞穴层上下各看几格（默认 2，范围 1–8；5 = 上下各 5 格）' },
       glyphStep: { type: 'number', description: '字符图抽稀步长（默认 2；1 最细）' },
       yTop: { type: 'number', description: '地表搜索起始高度偏移（默认 +10，仅地表图用）' },
-      yBottom: { type: 'number', description: '向下搜索深度（默认 -24，仅地表图用）' },
+      yBottom: { type: 'number', description: '向下搜索深度（默认 -24；地表图与竖列图用）' },
       format: { type: 'string', description: 'chars（默认）/ image / both' },
       scale: { type: 'number', description: '图像每格放大倍数（默认 4，1–16）' },
       out: { type: 'string', description: `落盘路径（工作区相对；默认 .dsh-mc-agent/${OUT_DIR}/mc-map-<时间>.png 不对外）。`
@@ -2562,7 +2562,21 @@ export function apply(ctx, rawConfig) {
       /* 🔴 2026-10-15（用户需求）：**默认给"脚下方块那一层"**（地板层视图）。
        *    老行为一个都没丢：`mode:"auto"`（地下自动切洞穴层）/ `"surface"` / `"cave"` 原样保留 ——
        *    传了就用传的那个；不传、或传了不认识的值 ⇒ `floor`。 */
-      const mode = modeArg === 'auto' || modeArg === 'surface' || modeArg === 'cave' ? modeArg : 'floor'
+      const mode = modeArg === 'auto' || modeArg === 'surface' || modeArg === 'cave' || modeArg === 'column' ? modeArg : 'floor'
+      /* 🔴 2026-10-15（用户需求）：**竖列图** —— 只看一格，从脚底那一格往下，回答"我往下挖会不会掉下去"。
+       *    它跟俯视图是两件事（一个是"周围哪能走"，一个是"底下有没有空的"），所以拿到 x/z 就直接返回，
+       *    不参与 radius / legend / 导航摘要那一套。`target` 用 `parseXZ` 定 x/z（`"12,-4"` 或 `"12,63,-4"`），
+       *    不给就用机器人自己站的那一格；`yBottom`（默认 -24）就是往下看多深；`format` 忽略，恒出字符。 */
+      if (mode === 'column') {
+        const p = parseXZ(args.target)
+        const col = columnOf(sess.bot.requireBot(), { x: p?.x ?? null, z: p?.z ?? null, yBottom: args.yBottom })
+        return {
+          mode: 'column', x: col.x, z: col.z, feetY: col.feetY, from: col.from, to: col.to,
+          solidRun: col.solidRun, firstGap: col.firstGap, gaps: col.gaps, hazards: col.hazards,
+          unloaded: col.unloaded, complete: col.complete, runs: col.runs, layers: col.layers,
+          text: columnText(col),
+        }
+      }
       const slab = Math.min(Math.max(Number(args.slab ?? 2) || 2, 1), 8)
       /* `floor` 走新函数（直接 import `src/map-render.mjs`，不经过 `core.mjs` 的薄包装 —— 那文件贴着 1000 行上限）；
        * 其余三条仍走 `sess.bot.heightmap()`。 */

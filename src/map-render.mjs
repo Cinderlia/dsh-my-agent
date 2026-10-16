@@ -655,13 +655,17 @@ export function parseXZ (t) {
  */
 export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX } = {}) {
   const feet = b?.entity?.position
-  const fx = Number.isFinite(Number(x)) ? Math.floor(Number(x)) : Math.floor(feet?.x ?? 0)
-  const fz = Number.isFinite(Number(z)) ? Math.floor(Number(z)) : Math.floor(feet?.z ?? 0)
+  /* 🔴 2026-10-15（踩过的坑）：**`Number(null)` 是 `0`，而 `Number.isFinite(0)` 为真** ——
+   *    直接写 `Number.isFinite(Number(x))` 会让"没传"变成"传了 0"：不传 x/z 时永远看 (0,0)、
+   *    不传 yTop 时永远从 y=0 开始扫（`mc_map` 的 `layer` 栽过一模一样的跟头）。所以先判 `!= null`。 */
+  const given = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v))
+  const fx = given(x) ? Math.floor(Number(x)) : Math.floor(feet?.x ?? 0)
+  const fz = given(z) ? Math.floor(Number(z)) : Math.floor(feet?.z ?? 0)
   const fy = Math.floor(feet?.y ?? 0)
   /* 默认从**脚底那一格**（`fy - 1`，也就是托着你的那块）开始往下 —— 从 `fy` 开始的话
    * 第一格永远是你自己站的空气，看着像"脚底下就是空的"。 */
-  const from = Number.isFinite(Number(yTop)) ? Math.floor(Number(yTop)) : fy - 1
-  const depth = Math.max(4, Math.min(Math.abs(Math.floor(Number(yBottom) ?? -24)) || 24, maxDepth))
+  const from = given(yTop) ? Math.floor(Number(yTop)) : fy - 1
+  const depth = Math.max(4, Math.min(Math.abs(Math.floor(given(yBottom) ? Number(yBottom) : -24)) || 24, maxDepth))
   const to = from - depth + 1
 
   const layers = []
@@ -688,16 +692,37 @@ export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, m
     .map((r) => ({ y: r.from, to: r.to, thickness: r.n, kind: r.kind, glyph: COLUMN_GLYPH[r.kind] }))
   const firstGap = gaps.length ? { ...gaps[0], below: runs[runs.indexOf(runs.find((r) => r.from === gaps[0].y)) + 1]?.names?.[0] ?? null } : null
 
+  /* 水 / 岩浆单独拎出来：它们和"空腔"都托不住你，但后果差着量级（掉下去 vs 淹死 vs 烧死） */
+  const hazards = {
+    lava: gaps.filter((g) => g.kind === 'lava').map((g) => ({ y: g.y, to: g.to, thickness: g.thickness })),
+    water: gaps.filter((g) => g.kind === 'water').map((g) => ({ y: g.y, to: g.to, thickness: g.thickness })),
+  }
+
   return {
     x: fx, z: fz, feetY: fy, from, to, layers, runs,
     solidRun,
     firstGap,
     gaps,
+    hazards,
     unloaded,
     complete: unloaded === 0,
     mode: 'column',
   }
 }
+
+/* 托不住的三种东西，警告级别不一样：空腔是"掉下去"、水是"淹/冲"、岩浆是"会死" */
+const GAP_WARN = { air: '⚠️', water: '🌊', lava: '🔥' }
+
+/** 一段"托不住你"的东西，各说各的后果 */
+function gapAdvice (g, feetY) {
+  const at = `挖到 y=${g.y + 1} `
+  if (g.kind === 'lava') return `${at}就**挖穿到岩浆**了 —— **掉进去会死，别挖**。`
+  if (g.kind === 'water') return `${at}就**挖进水**了 —— 水会灌下来，你可能被冲走或淹死。`
+  const drop = feetY - (g.to - 1)
+  return `${at}再往下就会掉下去（落差 ${drop > 0 ? drop : g.thickness} 格）。`
+}
+
+const hazardSpan = (h) => (h.y === h.to ? `y=${h.y}` : `y=${h.y}..${h.to}`)
 
 /** 竖列图 → 人话（AI 真正要读的就是这几行） */
 export function columnText (col) {
@@ -709,16 +734,33 @@ export function columnText (col) {
     const span = r.from === r.to ? `y=${r.from}` : `y=${r.from}..${r.to}`
     out.push(`  ${COLUMN_GLYPH[r.kind]} ${span} ${COLUMN_LABEL[r.kind]} ${r.n} 格${names}`)
   }
-  if (col.solidRun === 0) {
-    out.push('  ⚠️ 脚底那一格就托不住你 —— 别往下挖，先挪一步。')
+  /* `unloaded` 与"空"是两回事：没加载 = **不知道**，不能说成"托不住你"（那是断言世界的样子） */
+  const top = col.runs?.[0]
+  if (top?.kind === 'unloaded') {
+    out.push('  ⚠️ 脚底那一格**没加载**（不是"空的"）—— 先等一下区块 / 挪一步再看，别凭这个下判断。')
+  } else if (col.solidRun === 0) {
+    /* 脚底那格本身就托不住：也要点名是空的 / 水 / 岩浆 —— "掉下去"和"掉进岩浆"不是一回事 */
+    const k = top?.kind ?? 'air'
+    const what = k === 'lava' ? '**岩浆**' : k === 'water' ? '**水**' : '**空的**'
+    const tail = k === 'lava' ? '**先挪一步，别在这上面挖**。' : k === 'water' ? '别往下挖，水会灌下来。' : '别往下挖，先挪一步。'
+    out.push(`  ${GAP_WARN[k] ?? '⚠️'} 脚底那一格是 ${what}，托不住你 —— ${tail}`)
   } else if (!col.firstGap) {
-    out.push(`  ✅ 往下 ${col.solidRun} 格全是实心，这一段没探到空腔 —— 可以放心往下挖。`)
+    out.push(col.unloaded
+      ? `  ✅ 往下 ${col.solidRun} 格是实心，这一段没探到空腔；但更深处有 ${col.unloaded} 格没加载 —— 挖到那里**先停下再看一次**。`
+      : `  ✅ 往下 ${col.solidRun} 格全是实心，这一段没探到空腔 —— 可以放心往下挖。`)
   } else {
     const g = col.firstGap
+    const span = g.y === g.to ? `y=${g.y}` : `y=${g.y}..${g.to}`
     const under = g.below ? `，再往下 y=${g.to - 1} 是 ${g.below}` : ''
-    out.push(`  ⚠️ 脚底往下 **${col.solidRun} 格是实心**，然后 y=${g.y}..${g.to} 是 **${g.thickness} 格${COLUMN_LABEL[g.kind]}**${under}`)
-    out.push(`     ⇒ 挖到 y=${g.y + 1} 再往下就会掉下去${col.gaps.length > 1 ? `（下面还有 ${col.gaps.length - 1} 处空腔）` : ''}。`)
+    out.push(`  ${GAP_WARN[g.kind] ?? '⚠️'} 脚底往下 **${col.solidRun} 格是实心**，然后 ${span} 是 **${g.thickness} 格${COLUMN_LABEL[g.kind]}**${under}`)
+    out.push(`     ⇒ ${gapAdvice(g, col.feetY)}${col.gaps.length > 1 ? `（下面还有 ${col.gaps.length - 1} 处托不住的）` : ''}`)
   }
+  /* 再往下的水 / 岩浆单独点名：上面那层就算只是普通空腔，底下有岩浆也够呛 */
+  const firstY = col.firstGap?.y
+  const deepLava = (col.hazards?.lava ?? []).filter((h) => h.y !== firstY)
+  const deepWater = (col.hazards?.water ?? []).filter((h) => h.y !== firstY)
+  if (deepLava.length) out.push(`  🔥 再往下还有 **岩浆**（${deepLava.map(hazardSpan).join('、')}）—— 上面那层挖开了也够呛。`)
+  if (deepWater.length) out.push(`  🌊 再往下还有 **水**（${deepWater.map(hazardSpan).join('、')}）。`)
   if (col.unloaded) out.push(`  ? 有 ${col.unloaded} 格没加载，那几行是"不知道"，不是"实心"。`)
   return out.join('\n')
 }
