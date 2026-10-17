@@ -45,6 +45,9 @@
     "locale",
     "README.md",
     "CHANGELOG.md",
+    "插件说明.md",
+    "开发说明.md",
+    "踩坑档案.md",
     "THIRD_PARTY_NOTICES.md"
   ],
   "dependencies": {
@@ -93,6 +96,6 @@
     "dev:link": "node tools/dev.mjs link",
     "dev:status": "node tools/dev.mjs status",
     "dev:stop": "node tools/dev.mjs stop",
-    "prepublishOnly": "npm run check"
+    "prepublishOnly": "npm run check:all"
   }
 }

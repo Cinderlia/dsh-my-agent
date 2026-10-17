@@ -50,7 +50,7 @@ import { terrainCacheStats } from './src/terrain.mjs'
 import { workerPoolStats } from './src/worker-pool.mjs'
 import { MemoryStore } from './src/memory.mjs'
 import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, personaTextKeyOf, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS, matchCommandList, isRegexEntry } from './src/config.mjs'
-import { COMMAND_GROUPS, catalogNames } from './src/commands.mjs'
+import { COMMAND_GROUPS, catalogNames, COMMANDS_THAT_MOVE_ME } from './src/commands.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { msaCacheDir, msaHasCache, msaJobOf, msaJobStart, msaJobClear, msaSupported } from './src/msa.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, legacyAgentsMdPath, migrateLegacyAgentsMd, readAgentsMd, writeAgentsMd, resetAgentsMd, syncRulesVersion } from './src/agentsmd.mjs'
@@ -3288,7 +3288,15 @@ export function apply(ctx, rawConfig) {
         throw new Error(`指令 /${name} 不在白名单里。当前白名单：${JSON.stringify(pluginConfig.get('commandWhitelist'))}`
           + '（要放行请在普通会话里用 mc_admin_config 改 commandWhitelist）')
       }
-      return { sent: sess.bot.command(raw, { allow: (n) => pluginConfig.commandAllowed(n) }) }
+      const sent = sess.bot.command(raw, { allow: (n) => pluginConfig.commandAllowed(n) })
+      /* 🔴 会挪人的指令（`tp`/`spreadplayers`/`execute`）发完就打断在飞的移动：
+       *    真正改变位置的是服务端，占着 `movement` 资源没用（发包只要几微秒），
+       *    但**正在跑的 mc_move 并不知道自己被挪走了** —— 它只会继续朝旧目标走，
+       *    最后报"走不到"，让模型以为是路不通。推一次移动代次，它就会如实说"被挪走了"。 */
+      if (COMMANDS_THAT_MOVE_ME.has(name)) {
+        try { await sess.bot.interruptMove(`服务器指令 /${name} 把我挪走了`) } catch { /* 没在动就算了 */ }
+      }
+      return { sent }
     },
   }))
 

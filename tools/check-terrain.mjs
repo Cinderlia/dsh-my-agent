@@ -249,6 +249,8 @@ section('④ profileFor：每一类一套权重，用户配置优先')
   ok(profileFor('hazard').cost.maxDropDown === 1, '危险地形：一格都不许往下跳')
   ok(profileFor('hazard').cost.liquidCost > profileFor('flat').cost.liquidCost, '危险地形：更不想下水')
   ok(profileFor('gap').cost.placeCost < profileFor('flat').cost.placeCost, '沟边：垫方块比平地便宜（这地方就是要垫/搭）')
+  ok(profileFor('gap').cost.placeCost >= profileFor('gap').cost.digCost,
+    '🔴 沟边垫方块不许比挖一格还便宜（2026-10-17 实机：垫柱子时放置被拒，人在半空掉了 21 格）')
   ok(profileFor('steps').cost.digCost < profileFor('flat').cost.digCost, '台阶：挖穿比绕远便宜')
   ok(profileFor('drops').cost.maxDropDown < profileFor('flat').cost.maxDropDown, '落差：允许往下跳的格数收窄')
   ok(profileFor('narrow').cost.digCost > profileFor('flat').cost.digCost, '窄道：挖更贵（挖了容易把自己埋了）')
@@ -430,7 +432,7 @@ section('⑦ 端到端：movements(self, { terrain }) 真的换了一套权重')
   ok(hazard.canDig === true, 'canDig 不受地形影响（还是配置说了算）')
 
   const gap = movements(self(), { terrain: { kind: 'gap' } })
-  ok(gap.placeCost === 4 && gap.placeCost < flat.placeCost, '沟边垫方块更便宜（这地方就是要垫）')
+  ok(gap.placeCost === 8 && gap.placeCost < flat.placeCost, '沟边垫方块比平地便宜、但不再是最便宜的那一档')
   ok(movements(self(), { terrain: { kind: 'steps' } }).digCost === 3, '台阶上挖便宜一点')
   ok(movements(self(), { terrain: { kind: 'drops' } }).maxDropDown === 2, '落差上允许往下跳的格数收窄')
 

@@ -838,12 +838,41 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
    * 返回 'steered'（已叫醒）/ 'throttled'（有人值守但刚叫过，听 AI 的）/ 'none'（**没人值守**，
    * 调用方只记档、不做别的 —— 反射层已经没有兜底动作了）。
    */
+  /* P0-B（2026-10-17 实机）：**掉落伤害必须和"被远程怪打"分开** —— 那天垫柱子时放方块被服务端
+   * 拒了（vendor `index.js:563` 的 `place_error`），人从 y=68 掉到 y=47、血 3/20。`hurtRecently`
+   * 只看"血掉了"，于是报了「挨了打但 22 格内看不到怪（多半是远程/隔墙）→ 叫醒 AI 定位」，
+   * 还 `stopWork` 打断了移动；AI 照 hint 又爬又掉第二次（y=33、血 1.9）。
+   * 判据：**最近 1.5 秒内 y 掉了 > 3 格**（记一小段 y 采样，取窗口内最高点减当前 y）。
+   * 为什么不用 `entity.fallDistance`：mineflayer 只在部分版本/时机更新它，读出来常常是 0；
+   * 自己的位置采样永远有、且是同一份事实来源。 */
+  const FALL_WINDOW_MS = 1500
+  const FALL_MIN_DROP = 3
+  /** 记一个高度采样（**每个 tick 一次，放在 `avoid()` 最开头** —— 不能等"挨了打"那一刻才记，
+   *  那时候只有一个点，净下落永远是 0）。 */
+  const noteFall = (s, e, t) => {
+    const y = Number(e?.position?.y)
+    if (!Number.isFinite(y)) return
+    const tr = (s.fallTrace = Array.isArray(s.fallTrace) ? s.fallTrace : [])
+    tr.push({ t, y })
+    while (tr.length > 0 && t - tr[0].t > FALL_WINDOW_MS) tr.shift()
+  }
+  /** 读窗口：窗口内最高点减当前 y。返回 `{ drop, from }` 或 null（不足 3 格）。**不写任何状态。** */
+  const fallDropOf = (s, e) => {
+    const y = Number(e?.position?.y)
+    if (!Number.isFinite(y)) return null
+    const tr = Array.isArray(s.fallTrace) ? s.fallTrace : []
+    let top = y
+    for (const q of tr) if (q.y > top) top = q.y
+    const drop = top - y
+    return drop >= FALL_MIN_DROP ? { drop: Number(drop.toFixed(1)), from: Math.floor(top) } : null
+  }
+
   const wakeForDanger = (s, sess, cfg, t, info) => {
     const agent = s.agent
     if (!agent || typeof agent.steer !== 'function') return 'none'
     const { threat = null, foes = [], health = 20, ranged = false, hurt = false, blind = false,
       drown = false, air = null, submerged = false, subSec = 0, gap = DANGER_WAKE_GAP_MS,
-      waterRecover = false } = info ?? {}
+      waterRecover = false, fell = null, fellFrom = null } = info ?? {}
     if (t - num(s.lastDangerWakeAt, 0) < gap) return 'throttled'
     s.wakeTimes = s.wakeTimes.filter((x) => t - x < 3_600_000)
     if (s.wakeTimes.length >= cfg.idleWakeMaxPerHour) { s.stats.denied++; return 'throttled' }
@@ -852,8 +881,11 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const held = String(b?.heldItem?.name ?? '空手')
     const L = []
     /* 自保第一步：**先停下手里的事**（用户 2026-10-14 任务驱动第三步："先停止采集，再由 AI
-     * 决定逃跑、战斗还是继续任务"）。只停手 —— 不跑、不还手。 */
-    const stopped = cfg.dangerStopWork !== false ? stopWork(s, sess) : null
+     * 决定逃跑、战斗还是继续任务"）。只停手 —— 不跑、不还手。
+     * 🔴 摔伤是例外（P0-B）：打断移动对"正在往下掉"毫无帮助，只会让 AI 失去上下文 ——
+     *    实机那天 `stopWork` 把 `mc_move` 掐成 `preempted`，AI 于是又重发、又掉 14 格。 */
+    const fallOnly = fell != null && !drown && !threat
+    const stopped = (fallOnly || cfg.dangerStopWork === false) ? null : stopWork(s, sess)
     const stopLine = stopped === null
       ? ''
       : `⏸ 我已经先把手里的活停下了（寻路 / 采集 / 控制位都松开了${stopped}）—— 现在你说了算。`
@@ -885,6 +917,20 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       L.push('· 出水之后往岸上走：`mc_move` 到最近的干燥方块；不知道岸在哪就先 `mc_scan {"radius":16}` 看一圈')
       L.push('· 水/岩浆是**流体，挖不掉** —— 别 `mc_dig` 水（白花一次调用）')
       L.push('· 血少（< 8）就先浮上来换气、再吃/躲；别在水下跟怪纠缠')
+      L.push('选一个**直接做**，不用问我。')
+    } else if (fallOnly) {
+      /* P0-B：摔伤。**别说成"被打"** —— 那会让 AI 去找一个不存在的敌人（实机就是这么掉的第二次）。 */
+      L.push(`【自保：我刚摔下来了｜血 ${Math.round(health)}/20】`)
+      L.push('')
+      L.push(`**这不是被打** —— 你是**从高处掉下来的**：${fellFrom == null ? '' : `从 y=${fellFrom} `}掉到 `
+        + `y=${me ? Math.round(me.y) : '?'}，**净下落 ${fell} 格**。`
+        + '掉落伤害和"被远程怪射"在插件里长得一模一样（血掉了、附近没怪），这次是按**垂直位移**判成摔伤的。')
+      L.push(`我：血 ${Math.round(health)}/20，手上 ${held}，在 ${me ? `${Math.round(me.x)} ${Math.round(me.y)} ${Math.round(me.z)}` : '?'}`)
+      L.push('')
+      L.push('· 先看脚下和四周：`mc_status`（脚下那格是什么、有没有水/岩浆/虚空，血多少）')
+      L.push('· 血少先吃/回血、躲开怪，**别急着继续往上爬**；要上去就走**斜台阶**（`mc_act {"mode":"break"}` 一格一格挖上去），'
+        + '别反复垫柱子 —— 垫柱子要往自己脚下放方块，被服务端一拒人就在半空了')
+      L.push('· 垫柱子失败最常见的原因是**目标格被占 / 离得太远 / 手上有别的**：放之前先 `mc_status` 看手上和脚下')
       L.push('选一个**直接做**，不用问我。')
     } else {
       L.push(hurt
@@ -933,7 +979,9 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
           kind: 'plugin:dsh-mc-agent', form: 'notice',
           summary: drown
             ? `MC 自保：快淹死了（${air == null ? '头在水下' : `氧气 ${air}/20`}）`
-            : `MC 自保：${blind ? '被远程打' : threat?.name ?? '有怪'}`,
+            : fallOnly
+              ? `MC 自保：摔伤（掉了 ${fell} 格，不是被打）`
+              : `MC 自保：${blind ? '被远程打' : threat?.name ?? '有怪'}`,
         },
       }))
       s.lastDangerWakeAt = t
@@ -943,8 +991,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       s.stats.dangerWakes++
       logLine(drown
         ? `mc_auto：在水里憋气（${air == null ? `头在水下 ${subSec || '?'} 秒` : `氧气 ${air}/20`}，血 ${Math.round(health)}/20）→ 已叫醒 AI 上浮`
-        : `mc_auto：${blind ? '挨了打但看不到怪' : `${threat?.name}${ranged ? '（远程）' : ''} 贴上来`}`
-          + ` → 已叫醒 AI 定策略（血 ${Math.round(health)}/20）`)
+        : fallOnly
+          ? `mc_auto：挨了打但看不到怪 → 判成**摔伤**（净下落 ${fell} 格，血 ${Math.round(health)}/20）→ 已叫醒 AI`
+          : `mc_auto：${blind ? '挨了打但看不到怪' : `${threat?.name}${ranged ? '（远程）' : ''} 贴上来`}`
+            + ` → 已叫醒 AI 定策略（血 ${Math.round(health)}/20）`)
       return 'steered'
     } catch (e) {
       s.stats.denied++
@@ -1055,6 +1105,9 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const e = b?.entity
     if (!e?.position) return
     const p = e.position
+    /* P0-B：高度采样放在**最开头**（早于任何 `return`）—— 掉下去和"挨了打"不是同一刻发生的，
+     * 等挨打那一刻才记，窗口里只有一个点，净下落永远是 0。 */
+    noteFall(s, e, t)
     const here = [blockNameAt(b, p), blockNameAt(b, p.offset(0, 1, 0)), blockNameAt(b, p.offset(0, -1, 0))]
     const bad = here.find((n) => n && DANGER.test(n))
     if (bad) {
@@ -1086,6 +1139,8 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     if (num(s.lastHealth, health) - health >= 0.5) s.lastHurtAt = t
     s.lastHealth = health
     const hurtRecently = t - num(s.lastHurtAt, 0) < 4000
+    /* P0-B：**这一 tick 只读一次窗口**（写窗口的是 `avoid()` 最开头的 `noteFall`）。 */
+    const fellRecently = fallDropOf(s, e)
     /* 憋气（溺水）：氧气掉到 0 之后开始掉血 —— 表现出来和"被远程怪隔墙射"一模一样
      * （掉血、22 格内看不到怪），所以**必须在水里先判一次**，否则 AI 会被派去找一个不存在的敌人，
      * 人还泡在水里继续沉（用户 2026-10-07："现在容易被淹死"）。
@@ -1159,6 +1214,20 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     // 挨了打却看不到怪（隔墙/超远射）：不自己动，把"上次看到它在哪"报给 AI 让它定位
     if (!threat) {
       if (!hurtRecently) return
+      /* P0-B：**先判摔伤，再判远程怪** —— 两者在插件里长得一模一样（血掉了 + 附近没怪），
+       * 只有垂直位移能分开。判反了的代价是让 AI 去找一个不存在的敌人（2026-10-17 实机）。 */
+      if (fellRecently != null) {
+        s.lastAlertAt = t
+        if (t - num(s.lastAlertLoggedAt, 0) > 30_000) {
+          s.lastAlertLoggedAt = t
+          logLine(`mc_auto：掉血 + 净下落 ${fellRecently.drop} 格 ⇒ 判成**摔伤**（不是远程怪）→ 叫醒 AI`)
+        }
+        s.stats.alerts++
+        wakeForDanger(s, sess, cfg, t, {
+          health, hurt: true, fell: fellRecently.drop, fellFrom: fellRecently.from,
+        })
+        return
+      }
       s.lastAlertAt = t
       if (t - num(s.lastAlertLoggedAt, 0) > 30_000) {
         s.lastAlertLoggedAt = t

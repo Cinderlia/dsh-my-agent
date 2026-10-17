@@ -216,9 +216,14 @@ export async function swimUp (self, { hold = 3_000 } = {}, ctx = {}) {
  *
  * 关于水流：`prismarine-physics` 的 `simulatePlayer` 里 `isInWaterApplyCurrent()` 会把
  * `getFlow()` 的方向**每 tick 加 0.014 到速度上**（`index.js:687-702`）⇒ 机器人**真的会被水推**。
- * 但 0.014/tick ≈ **0.28 格/秒**，只有游泳速度（≈2 格/秒）的 1/7 ⇒ 单纯逆流几乎推不动它，
- * 真正的"游不动"是**撞墙 / 顶到天花板 / 目标在脚下**。所以第一轮只做上面两件事，
- * 不给水流写专门的"往上游瞄准"补偿（收益小、还容易把自己对准到错误的方向）。
+ * 🔴 2026-10-17 复审更正：这里原先写"0.014/tick ≈ 0.28 格/秒，只有游泳速度的 1/7" —— **算错了**。
+ *    0.014 是**每 tick 的速度增量**（加速度），而水里每 tick 还有横向阻尼（速度乘 0.8），
+ *    稳态速度是 `a / (1 - 0.8) = 5a` ≈ 0.07 格/tick ≈ **1.4 格/秒**，和游泳速度（≈2 格/秒）**同一量级**。
+ *    ⇒ 结论要分两种水：**静水**（水源方块 `level=0`，`getFlow()` 为 0）根本不受力；
+ *      **流动水**（河/瀑布/排水道）里逆着强流是**游不动**的。
+ *    但仍然**不做**"往上游瞄准"补偿：流向得自己从方块 `level` 推，算错方向比不算更糟，
+ *    而窗口进度 + 纠偏已经能把"游不动"如实报出来。真要做，先实机量出静水/顺流/逆流的实际速度差。
+ *    真正的"游不动"多数是**撞墙 / 顶到天花板 / 目标在脚下**。
  */
 export const SWIM_WINDOW_MS = 600          // 观测窗口（用户建议 500–750ms）
 export const SWIM_STALL_WINDOWS = 2        // 连续两个窗口没靠近才算"卡住"（别过度调整）
@@ -312,13 +317,20 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
       if (wantJump !== lastJump) { b.setControlState('jump', wantJump); lastJump = wantJump }
       await raceAbort(sleep(250), self.abortSignal, '游泳')   // 可中断（用户点停止要立刻出来）
       jumpOverride = null
+      /* 🔴 窗口进度必须用**等完之后**的位置采样（2026-10-17 复审）。
+       *    原来这里直接拿循环开头那个 `me` 去算 —— `me` 只是 `b.entity.position` 的**引用**，
+       *    靠"物理 tick 原地改这个 Vec3"才碰巧是对的；一旦哪次传送把 `position` 换成新对象，
+       *    读到的就是 250ms 之前的旧坐标，`gained` 恒 0 ⇒ 明明在靠近也会被判"没进展"。
+       *    快照下来，判据就不再依赖"别人会不会原地改它"。 */
+      const sample = b.entity?.position?.clone?.() ?? b.entity?.position ?? me
+      const nowLeft = sample.distanceTo(goal)
       /* ── 窗口进度：连续 `SWIM_STALL_WINDOWS` 个窗口都没靠近 ⇒ 先纠偏，纠不动就如实收手 ──
        * 用户原话："连续两个窗口没有有效进展时，才启动纠偏；一直有进展就保持原有控制"；
        * "确认通道被堵住后，再调用现有水下恢复控制器" —— 这里 `break` 出去，
        * `walkTo` 看到 `stuck:true` 就会把这一趟交给 `recoverFromWater`（找出口那套）。 */
       if (Date.now() - winAt >= SWIM_WINDOW_MS) {
-        const gained = winLeft - me.distanceTo(goal)
-        winLeft = me.distanceTo(goal)
+        const gained = winLeft - nowLeft
+        winLeft = nowLeft
         winAt = Date.now()
         if (gained < SWIM_PROGRESS_EPS) {
           stallWins++
@@ -706,6 +718,25 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   const start = b.entity.position.clone()
   const at = (p) => ({ x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) })
   const startRemaining = Math.hypot(start.x - target.x, start.z - target.z)
+  /* P0-A（2026-10-17 实机）：`moved` 只有**水平**位移（`Math.hypot(dx, dz)`）—— 那天在要塞里垫
+   * 柱子时放方块被拒（vendor `mineflayer-pathfinder/index.js:563` 的 `place_error`：先
+   * `setControlState('jump', true)` 再往脚下 `placeBlock`，方块没放成人已经在半空），人从 y=68
+   * 掉到 y=47，工具却报 `moved: 4.24` + `hint: 不是走不通，再叫一次` ⇒ 模型又爬又掉第二次
+   * （y=33、血 1.9）。**垂直位移必须自己报出来**，否则"掉下去了"和"没走到"在模型眼里一模一样。 */
+  const fellOf = (p) => {
+    const d = Number(start.y) - Number(p?.y ?? start.y)
+    return Number.isFinite(d) && d >= 3 ? Number(d.toFixed(1)) : null
+  }
+  const fellInfo = (p) => {
+    const f = fellOf(p)
+    return f == null ? {} : { fell: f, fellFrom: Math.floor(start.y), fellTo: Math.floor(p.y) }
+  }
+  const fellNote = (p) => {
+    const f = fellOf(p)
+    return f == null ? '' : `🔴 **你掉下去了 ${f} 格**（从 y=${Math.floor(start.y)} 掉到 y=${Math.floor(p.y)}）—— `
+      + '多半是垫柱子/搭路时**放方块被服务端拒了**（那一刻人已经在半空）。先看清脚下站稳没有，'
+      + '**别对着同一个高度反复爬**。'
+  }
   /* 🔴 目标 y 可能是半空（地图/扫描给的是"地表高度"、树冠、别人站的 y）—— 直接朝那个 y 走，
    *    pathfinder 会一路垫方块往上爬（"搭路一直搭到空气上"）。收到底面再走。 */
   const ty = standableY(b, target.x, target.y, target.z)
@@ -881,10 +912,12 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           remaining: Number(left.toFixed(2)),
           moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
           via: 'pathfinder', stuck: true, reason: 'preempted',
-          ...roadInfo(), ...moveInfo(),
-          hint: `这次走路被**另一次移动**接管了（旁边有怪时是自保反射先跑，也可能是又发了一次 mc_move）：`
+          ...roadInfo(), ...moveInfo(), ...fellInfo(end),
+          hint: `${fellNote(end)}这次走路被**另一次移动**接管了（旁边有怪时是自保反射先跑，也可能是又发了一次 mc_move）：`
             + `我从 ${startRemaining.toFixed(1)} 格挪到了 ${left.toFixed(1)} 格，但走到目标的是那一份。`
-            + '等它结束，再叫一次 mc_move 往同一个目标走就行，**不是走不通**。',
+            + (fellOf(end) != null
+              ? '**先别急着再叫 mc_move** —— 你刚掉下来，先站稳、看清脚下和四周，再决定往哪走。'
+              : '等它结束，再叫一次 mc_move 往同一个目标走就行，**不是走不通**。'),
         }
       }
       /* 🔴 2026-10-08 审计③：走到这里 = "goto 无错 resolve 但我没到"，两种成因**必须分开说**：
@@ -902,10 +935,10 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           arrived: false, position: at(end), ms: Date.now() - t0,
           remaining: Number(left.toFixed(2)),
           moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
-          via: 'pathfinder', stuck: true, reason: 'goal_reached-but-far', ...moveInfo(),
+          via: 'pathfinder', stuck: true, reason: 'goal_reached-but-far', ...moveInfo(), ...fellInfo(end),
           // P1：把两个轴分开报 —— 否则"水平到了但高了两格"看起来和"还差 5 格"一模一样
           horiz: Number(horiz.toFixed(2)), vert: Number(vert.toFixed(2)),
-          hint: `寻路插件说到了，但**高度不对**：水平只差 ${horiz.toFixed(1)} 格，垂直差了 ${Math.abs(vert).toFixed(1)} 格`
+          hint: `${fellNote(end)}寻路插件说到了，但**高度不对**：水平只差 ${horiz.toFixed(1)} 格，垂直差了 ${Math.abs(vert).toFixed(1)} 格`
             + `（我${vert > 0 ? '站在目标上方' : '站在目标下方'}）—— 先 \`mc_move\` 走到目标**同一层**，或换个目标点。`,
         }
       }
@@ -916,9 +949,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
           via: 'pathfinder', stuck: true,
           reason: emptyNoPath ? 'NoPath' : 'goal-reached-elsewhere',
-          ...roadInfo(), ...moveInfo(),
+          ...roadInfo(), ...moveInfo(), ...fellInfo(end),
           hint: emptyNoPath
-            ? `寻路**没路可走**（被墙 / 水 / 悬崖挡住，或目标在实心方块里）：离目标还有 ${left.toFixed(1)} 格。`
+            ? `${fellNote(end)}寻路**没路可走**（被墙 / 水 / 悬崖挡住，或目标在实心方块里）：离目标还有 ${left.toFixed(1)} 格。`
               + '先 `mc_scan` 看挡路的是什么：是方块就 `mc_act{mode:"break"}` 挖开；'
               + '**是沟/缺口就 `mc_act{mode:"bridge"}`**（寻路插件不会水平搭桥，只会报没路）——'
               + '朝对岸那一格铺过去（x/y/z 给对岸**脚下一层**的坐标）。换个目标点再叫 mc_move 也一样走不通。'
@@ -930,8 +963,8 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         arrived: false, position: at(end), ms: Date.now() - t0,
         remaining: Number(left.toFixed(2)),
         moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
-        via: 'pathfinder', stuck: true, reason: 'goal_reached-but-far', ...moveInfo(),
-        hint: `寻路插件说到了，但离目标还有 ${left.toFixed(1)} 格（可能被占住或只到附近）—— 再走一次，或换个目标点。`,
+        via: 'pathfinder', stuck: true, reason: 'goal_reached-but-far', ...moveInfo(), ...fellInfo(end),
+        hint: `${fellNote(end)}寻路插件说到了，但离目标还有 ${left.toFixed(1)} 格（可能被占住或只到附近）—— 再走一次，或换个目标点。`,
       }
     }
     return {
@@ -944,7 +977,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       remaining: Number(left.toFixed(2)),
       via: 'pathfinder',
       ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(),
-      ...moveInfo({ arrived: true }), ...arrivedTerrain(),
+      ...moveInfo({ arrived: true }), ...arrivedTerrain(), ...fellInfo(end),
     }
   } catch (e) {
     if (e?.mcAborted) throw e
@@ -1008,8 +1041,8 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       via: 'pathfinder',
       stuck: true,
       reason: reasonOut,
-      ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(), ...moveInfo(),
-      hint: `${nm}（从 ${startRemaining.toFixed(1)} 格变成 ${remaining.toFixed(1)} 格，挪了 ${moved} 格）`
+      ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(), ...moveInfo(), ...fellInfo(end),
+      hint: `${fellNote(end)}${nm}（从 ${startRemaining.toFixed(1)} 格变成 ${remaining.toFixed(1)} 格，挪了 ${moved} 格）`
          // 地形那一句（导航 P2）：只在**真有用**的时候说 —— 沟要说"用 bridge"，
          // 危险地形要说"别走这边"，平地/未知不说（说了纯占地方）
          + (!preempted && terrain.kind === 'gap'
@@ -1018,7 +1051,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
              ? `—— 你脚边是**${terrain.text}**（${terrain.note}）：别从这边走，换个方向绕。`
              : '')
          + (preempted
-           ? '—— 这次走路被**另一次移动**打断了（旁边有怪时是自保反射先跑，也可能是又发了一次 mc_move）：等它结束，再叫一次 mc_move 往同一个目标走就行，**不是走不通**。'
+           ? (fellOf(end) != null
+            ? '—— 这次走路被**另一次移动**打断了（旁边有怪时是自保反射先跑），但更值得注意的是：**你刚掉下来了**。先站稳、看清脚下，再决定往哪走，别对着同一个高度反复爬。'
+            : '—— 这次走路被**另一次移动**打断了（旁边有怪时是自保反射先跑，也可能是又发了一次 mc_move）：等它结束，再叫一次 mc_move 往同一个目标走就行，**不是走不通**。')
            : exhausted
              ? (pathThrash
                ? `—— 这一轮**路径被重算了 ${pathResetsTotal} 次**`

@@ -521,6 +521,20 @@ section('⑨ 指令白名单页改成"列出全部指令 + 每条一个开关"')
   ok(idx.includes('commandExtra:') && idx.includes('covers: names.filter'), 'configView 下发自定义条目 + 它们罩着谁')
   ok(idx.includes('if (!isRegexEntry(entry) && entry !== ') , '目录里的精确名不重复列进"自定义条目"')
 
+  /* ③b 会挪人的指令 ⇒ 发完打断在飞的移动（2026-10-17 复审） */
+  {
+    const { COMMANDS_THAT_MOVE_ME } = await import('../src/commands.mjs')
+    ok(COMMANDS_THAT_MOVE_ME instanceof Set, '导出了 COMMANDS_THAT_MOVE_ME')
+    for (const n of ['tp', 'teleport', 'spreadplayers', 'execute']) {
+      ok(COMMANDS_THAT_MOVE_ME.has(n), `\`/${n}\` 被认成"会挪人"`)
+    }
+    ok(!COMMANDS_THAT_MOVE_ME.has('say') && !COMMANDS_THAT_MOVE_ME.has('time'),
+      '说话/改时间不算挪人（不然每次说话都打断移动）')
+    ok(idx.includes('COMMANDS_THAT_MOVE_ME'), 'index.js 引了这份名单')
+    ok(/if \(COMMANDS_THAT_MOVE_ME\.has\(name\)\)[\s\S]{0,160}?interruptMove\(/.test(idx),
+      '🔴 发完 /tp 就 interruptMove（否则在飞的 mc_move 会继续朝旧目标走）')
+  }
+
   /* ④ 客户端：文本框与「保存」都没了 */
   const pane = src.slice(src.indexOf('function WhitelistPane'), src.indexOf('function PromptPane'))
   ok(pane.length > 200, '切出了 WhitelistPane 那一段')

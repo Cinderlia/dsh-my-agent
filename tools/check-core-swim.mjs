@@ -525,11 +525,22 @@ section('⑧ 游泳：按目标高度决定上浮 + 连续没靠近就收手')
     ok(calls.lookAt >= 2, '还是每 250ms 重新对准', `lookAt=${calls.lookAt}`)
   }
 
-  // ④ 静态：判据必须是"离目标变近"，不是"总位移"
+  // ④ 静态：判据必须是"离目标变近"，不是"总位移"；且必须用**等完之后**的采样
   {
     const src = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
-    ok(/const gained = winLeft - me\.distanceTo\(goal\)/.test(src), '🔴 窗口判据是"离目标变近了没有"（不是总位移）')
+    ok(/const gained = winLeft - nowLeft/.test(src), '🔴 窗口判据是"离目标变近了没有"（不是总位移）')
     ok(!/const gained = .*start\.distanceTo/.test(src), '🔴 绝不用 `start.distanceTo` 当进展（被水推着横漂也是位移）')
+    /* 🔴 2026-10-17 复审：原来窗口用的是循环开头那个 `me`，而 `me` 只是 `b.entity.position`
+     *    的**引用** —— 靠"物理 tick 原地改这个 Vec3"才碰巧读得到新坐标。一旦位置被换成新对象
+     *    （传送就是），读到的是 250ms 之前的旧坐标，`gained` 恒 0 ⇒ 明明在靠近也判"没进展"。
+     *    这里钉两件事：① 采样必须在 `await sleep(250)` **之后**；② 采样必须 `clone()` 下来。 */
+    ok(/const sample = b\.entity\?\.position\?\.clone\?\.\(\)/.test(src),
+      '🔴 窗口进度用**快照**采样（不靠"别人会原地改这个对象"）')
+    ok(/const nowLeft = sample\.distanceTo\(goal\)/.test(src), '`nowLeft` 由快照算出')
+    const iSleep = src.indexOf("await raceAbort(sleep(250), self.abortSignal, '游泳')")
+    const iSample = src.indexOf('const sample = b.entity?.position?.clone?.()')
+    ok(iSleep > 0 && iSample > iSleep, '🔴 采样在"等 250ms"**之后**（等之前采的样是旧坐标）')
+    ok(!/winLeft - me\.distanceTo\(goal\)/.test(src), '旧的"拿循环开头那个 me 算进度"写法已消失')
     ok(/if \(fixups < SWIM_FIXUPS\)/.test(src) && /jumpOverride = !wantJump/.test(src), '纠偏 = 把上浮/下沉反过来试一轮')
     ok(/stuckWhy = 'swim-stuck'/.test(src), '纠偏用尽 ⇒ 记 swim-stuck 收手')
   }

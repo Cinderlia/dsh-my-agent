@@ -142,3 +142,18 @@ export function inCatalog (name) {
   for (const g of COMMAND_GROUPS) for (const it of g.items) if (it.name === n) return true
   return false
 }
+
+/**
+ * 这些指令会**把机器人挪走**（或者可能挪走）。
+ *
+ * 🔴 为什么要单独列：`mc_command` 只是"把指令发给服务端"，发包那一瞬是微秒级的 ——
+ *    用调度器占住 `movement` 一点意义都没有（真正改变位置的是**服务端之后做的事**）。
+ *    真正的问题是：正在跑的 `mc_move` 不知道自己已经被挪走了，会继续朝旧目标走，
+ *    于是报"走不到"或者走到一个完全无关的地方。
+ *    ⇒ 发完这类指令就**主动打断在飞的移动**（推移动代次 + 松控制位），让它老实说"被挪走了"。
+ *
+ * `execute` 也在里面：`/execute ... run tp` 一样会挪人。
+ */
+export const COMMANDS_THAT_MOVE_ME = new Set([
+  'tp', 'teleport', 'spreadplayers', 'execute',
+])

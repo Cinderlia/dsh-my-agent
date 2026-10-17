@@ -122,7 +122,7 @@ const mkWorld = ({
     // 打怪走的是 core.mjs 的 attack（内部用 mineflayer-pvp）
     attack: (args) => { calls.attacks.push(args); return Promise.resolve({ attacked: args?.who ?? '?' }) },
   }
-  return { raw, mc, calls, walks, entities, fire }
+  return { raw, mc, calls, walks, entities, fire, setHealth: (v) => { health = v } }
 }
 
 const mkAgent = (id = 'a1', status = 'idle') => ({ id, status, steers: [], steer (m) { this.steers.push(m) } })
@@ -482,6 +482,57 @@ section('3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不抢控�
   ok('并叫醒说明"看不到怪"', /看不到怪/.test(steered(blind)), steered(blind))
   ok('看不到怪时告诉它用 mc_observe 定位（"程序检测到"那段隔墙也能给坐标/血量）',
     /mc_observe/.test(steered(blind)) && /distance/.test(steered(blind)), steered(blind))
+
+  // ⑪-b 掉下去了（摔伤）→ **不许说成"被远程怪打"**（2026-10-17 实机：垫柱子时放置被拒，
+  //      人从 y=68 掉到 y=47、血 3/20，反射层报"挨了打但 22 格内看不到怪 → 叫醒 AI 定位"，
+  //      还 stopWork 打断了移动；AI 照 hint 又爬又掉第二次，掉到 y=33、血 1.9）
+  {
+    const fall = setup({ world: { health: 20, mobs: [], pos: [10.5, 64, 20.5] }, patch: { lookAround: false } })
+    fall.tick(fall.at(1000))
+    await flush()
+    ok('没掉血时什么都不说', fall.agent.steers.length === 0, steered(fall))
+    fall.w.setHealth(3)
+    fall.w.raw.entity.position = mkP(10.5, 43, 20.5)      // 净下落 21 格
+    fall.w.fire('entityHurt', fall.w.raw.entity)
+    fall.setT(fall.now() + 100)
+    fall.tick(fall.at(0))
+    await flush()
+    const fm = steered(fall)
+    ok('🔴 判成摔伤，不说"被远程怪打"', /摔下来了/.test(fm) && /这不是被打/.test(fm), fm.slice(0, 90))
+    ok('报出净下落几格 + 从哪掉到哪', /净下落 21 格/.test(fm) && /y=64/.test(fm) && /y=43/.test(fm), fm.slice(0, 140))
+    ok('文案里不许出现"看不到怪"（那是"被打"的说法，会把 AI 带偏）', !/看不到怪/.test(fm), fm.slice(0, 90))
+    ok('🔴 摔伤不打断正在做的事（打断对"往下掉"没用，只会让 AI 失去上下文）',
+      fall.w.calls.interrupts.length === 0, JSON.stringify(fall.w.calls.interrupts))
+    ok('摔伤也不自己跑', !walked(fall))
+    ok('摔伤时劝"别反复垫柱子"（垫柱子要往自己脚下放方块，被拒就半空了）',
+      /垫柱子/.test(fm) && /斜台阶/.test(fm), fm.slice(0, 200))
+  }
+  {
+    // 只掉 2 格（下台阶）⇒ 还得按"被远程打"报：摔伤判据不能太宽，否则真挨打时被当成摔伤
+    const small = setup({ world: { health: 20, mobs: [], pos: [10.5, 64, 20.5] }, patch: { lookAround: false } })
+    small.tick(small.at(1000))
+    await flush()
+    small.w.setHealth(3)
+    small.w.raw.entity.position = mkP(10.5, 62, 20.5)
+    small.w.fire('entityHurt', small.w.raw.entity)
+    small.setT(small.now() + 100)
+    small.tick(small.at(0))
+    await flush()
+    ok('只掉 2 格 ⇒ 仍然按"挨了打看不到怪"报（判据不能太宽）', /看不到怪/.test(steered(small)), steered(small).slice(0, 90))
+  }
+  {
+    // 掉得够多但**还在往下掉的过程中**也要能判出来：窗口 1.5 秒内的最高点减当前 y
+    const src = readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8')
+    ok(/const FALL_WINDOW_MS = 1500/.test(src) && /const FALL_MIN_DROP = 3/.test(src),
+      '摔伤判据 = 1.5 秒内净下落 ≥ 3 格')
+    ok(/const fallDropOf = \(s, e\) => \{/.test(src), '摔伤由统一的一处算（不散在几处）')
+    ok(/noteFall\(s, e, t\)/.test(src), '🔴 高度采样在 avoid() 最开头（等挨打那一刻才记，窗口里就一个点，净下落永远是 0）')
+    ok(/const fallOnly = fell != null && !drown && !threat/.test(src),
+      '🔴 摔伤只在"不是溺水、也没有看得见的怪"时成立')
+    ok(/const stopped = \(fallOnly \|\| cfg\.dangerStopWork === false\) \? null : stopWork\(s, sess\)/.test(src),
+      '🔴 摔伤不 stopWork（实机那天就是被它掐成 preempted 才又掉第二次）')
+  }
+
 
   // ⑫ AI 正在动手 + 怪在 4 格外 + 没挨打 → 不打扰（等它这一轮跑完）
   const busy = setup({ world: { health: 20, mobs: [MOB('zombie', [16.5, 64, 20.5])] }, patch: { lookAround: false } })

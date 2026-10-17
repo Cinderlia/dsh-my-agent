@@ -67,8 +67,12 @@ export const TERRAIN_PROFILES = {
   // 落差：把"允许往下跳"收窄到 2 格；垫方块放宽（垫一格比摔下去便宜），挖更贵（挖了脚下可能塌）
   drops: { maxDropDown: 2, liquidCost: 6, digCost: 5, placeCost: 8, allowParkour: false },
   // 沟/缺口：更不想下水（掉进去常常出不来，`walkSwim` 只保证"游到附近"）；
-  // 垫方块**明显放宽** —— 这地方本来就是要垫过去（或者改用 `mc_act {mode:"bridge"}` 搭路）
-  gap: { maxDropDown: 2, liquidCost: 8, digCost: 5, placeCost: 4, allowParkour: false },
+  // 垫方块比平地（12）便宜一点，但**不能是全表最便宜的** —— 2026-10-17 实机（要塞里）：
+  // 地形判成 gap、`placeCost = 4` 让寻路器一路往脚下垫柱子（`pillared: 11`），其中一次放置
+  // 被服务端拒（vendor `index.js:563` 的 `place_error`），**那一刻人已经在半空** ⇒ 从 y=68
+  // 掉到 y=47。垫方块的代价里必须算上"垫失败 = 摔下去"，所以抬到 8（= `drops`）：仍比平地
+  // 便宜，但比挖一格（5）贵 —— 沟边更倾向绕路 / 挖台阶，真要过去就用 `mc_act {mode:"bridge"}`。
+  gap: { maxDropDown: 2, liquidCost: 8, digCost: 5, placeCost: 8, allowParkour: false },
   // 危险地形（岩浆/火/仙人掌/细雪）：一格都别往下跳、水一滴都别碰、挖穿更贵（挖开可能放出岩浆）
   hazard: { maxDropDown: 1, liquidCost: 20, digCost: 8, placeCost: 8, allowParkour: false },
   // 窄道：挖更贵（挖了容易把自己埋了 / 掉下去），垫方块稍微放宽（贴墙走不动时垫一格）

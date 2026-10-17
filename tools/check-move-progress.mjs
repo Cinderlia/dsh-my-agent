@@ -524,6 +524,76 @@ section('⑨ noTower（逃跑时关掉"原地垫高"）')
   ok(/noTower: true/.test(atk), '🔴 战斗撤退（ctx.moveTo）明确关掉垫脚')
 }
 
+/* ═══════════════ ⑨ 掉下去了必须看得见（P0-A） ═══════════════ */
+section('⑨ 掉下去了必须看得见：`fell` 字段 + hint 先说掉下去')
+
+/** 真时钟的 ctx（采样器 600ms 才判一次，测试在 30ms 内就把 goto 结掉 ⇒ 不会误触卡住） */
+function realCtx (self) {
+  return {
+    movements: () => ({}),
+    collectBusy: () => false,
+    cancelCollect: async () => {},
+    beginMove: () => ++self._moveGen,
+    stopPathing: (bb) => { bb.pathfinder.setGoal(null) },
+    releaseControls: () => {},
+    watchOpts: { arrive: 1.6, ty: 64 },
+  }
+}
+
+{
+  /* 实机 2026-10-17 20:49：垫柱子时放方块被拒，人从 y=68 掉到 y=47（21 格），
+   * 工具却报 `moved: 4.24` + "不是走不通，再叫一次" ⇒ AI 又爬又掉第二次。 */
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  const p = walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, realCtx(self))
+  setTimeout(() => {
+    bot.entity.position = new Vec3(2, 43, 0)
+    bot.settleGoto((q) => { const e = new Error('Timeout'); e.name = 'Timeout'; q.reject(e) })
+  }, 30)
+  const r = await p
+  ok(r.fell === 21, '结果里带 fell（净下落 21 格）', JSON.stringify({ fell: r.fell, moved: r.moved }))
+  ok(r.fellFrom === 64 && r.fellTo === 43, '带 fellFrom / fellTo（说清从哪掉到哪）', `${r.fellFrom}→${r.fellTo}`)
+  ok(/你掉下去了 21 格/.test(r.hint ?? ''), '🔴 hint 明说掉下去了', String(r.hint).slice(0, 70))
+  ok(/别对着同一个高度反复爬/.test(r.hint ?? ''), 'hint 劝别对着同一个高度反复爬')
+  ok(r.moved < 3, '🔴 moved 只有水平位移（旧版就是这样把掉 21 格报成挪了 4.24）', String(r.moved))
+}
+{
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  const p = walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, realCtx(self))
+  setTimeout(() => {
+    bot.entity.position = new Vec3(2, 63, 0)   // 下台阶，只差 1 格
+    bot.settleGoto((q) => { const e = new Error('Timeout'); e.name = 'Timeout'; q.reject(e) })
+  }, 30)
+  const r = await p
+  ok(r.fell === undefined, '下台阶（1 格）不算"掉下去"', String(r.fell))
+  ok(!/掉下去了/.test(r.hint ?? ''), '没掉下去时 hint 不提掉落')
+}
+{
+  /* 被抢占 + 掉下去：那天 `stopWork` 把移动掐成 preempted，hint 却说"不是走不通，再叫一次" ⇒ 又掉 14 格 */
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  const p = walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, realCtx(self))
+  setTimeout(() => {
+    bot.entity.position = new Vec3(1, 47, 0)
+    self._moveGen++                        // 模拟"自保反射又发了一次移动"
+    bot.settleGoto((q) => q.resolve())
+  }, 30)
+  const r = await p
+  ok(r.reason === 'preempted', '被抢占 ⇒ reason = preempted', String(r.reason))
+  ok(r.fell === 17, '被抢占时也报 fell', String(r.fell))
+  ok(/你掉下去了 17 格/.test(r.hint ?? ''), '🔴 被抢占 + 掉下去 ⇒ hint 先说掉下去')
+  ok(!/不是走不通/.test(r.hint ?? ''), '🔴 不许再说"不是走不通，再叫一次"（那天就是这么掉第二次的）')
+}
+{
+  const src = read('../src/movement.mjs')
+  ok(/const fellOf = \(p\) => \{/.test(src), 'fell 由统一的一处算（不散在五个 return 里）')
+  ok(/const fellInfo = \(p\) => \{/.test(src) && (src.match(/\.\.\.fellInfo\(end\)/g) ?? []).length >= 5,
+    '每个出口都带 fellInfo（arrived / preempted / 站错层 / 没路 / 时间到 / 异常）')
+  ok(/const fellNote = \(p\) => \{/.test(src), 'hint 用同一份措辞（掉多少格 + 别反复爬）')
+  ok(/d >= 3 \? Number\(d\.toFixed\(1\)\) : null/.test(src), '阈值 3 格：下台阶不算掉下去')
+}
+
 console.log(`\n${'─'.repeat(50)}`)
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)
