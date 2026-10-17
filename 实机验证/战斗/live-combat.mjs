@@ -6,8 +6,9 @@
  *
  * 四组：
  *   ① 正常单挑   —— 一只僵尸：应当**进攻**，`combat` 是机器可读的，`killed` 必须有掉血证据
- *   ② 低血量     —— 血 4：应当**主动撤退**（一下都不该还手），并且**真的挪窝了**
- *   ③ 被三只围   —— 三只僵尸贴身：应当**拉开距离 / 撤退**，而不是继续往前顶
+ *   ② 低血量     —— 血 4：**不许自己撤**（用户 2026-10-17："自动战斗的优先级不应该比 AI 高"），
+ *                    继续打，但结果里必须带"该撤了"的建议
+ *   ③ 被三只围   —— 三只僵尸贴身：同样只给建议、手不停（撤退要 AI 自己叫 mc_move）
  *   ④ 外部中止   —— 攻击中途 abort：应当**立刻收手**、`combat:'aborted'`、不被内部循环重启
  *
  * 🔴 实机的坑（踩坑档案 97/98/113）：`bot.chat()` 只有**以 `/` 开头**才当指令发；
@@ -210,8 +211,8 @@ await spawnZombie(5, 0)
     '🔴 战斗结果不许把 outcome 占成自己的词汇（那是跨工具的统一结局）', String(r.outcome))
 }
 
-/* ── ② 低血量 ⇒ 撤退 ── */
-section('② 低血量（血 4）⇒ 应当主动撤退，一下都不还手')
+/* ── ② 低血量 ⇒ 只建议、不自行撤退 ── */
+section('② 低血量（血 4）⇒ 不许自己撤，但必须把"该撤了"的建议带出来')
 await killZombies()
 await teleport(SITE.x + 0.5, SITE.y, SITE.z + 0.5)
 await setHealth(4)
@@ -224,15 +225,16 @@ await setHealth(4)
   const before = bot.entity.position.clone()
   const r = await mc.attack({ who: 'zombie', budget: 6000 })
   const moved = bot.entity.position.distanceTo(before)
-  log(`  · 结果：${JSON.stringify({ combat: r.combat, strategy: r.strategy, retreated: r.retreated, moved: Number(moved.toFixed(1)) })}`)
-  ok(r.combat === 'retreated' && r.retreated === true, '🔴 血 4 ⇒ 主动撤退（不再往前顶）', String(r.combat))
-  ok(r.strategy === 'retreat', '策略是 retreat', String(r.strategy))
-  ok(moved > 1, '🔴 撤退是**真动作**（真的挪窝了），不是只改个字段', `${moved.toFixed(1)} 格`)
-  ok(r.retreatWhy != null, '结果里说清了**为什么**撤', String(r.retreatWhy))
+  log(`  · 结果：${JSON.stringify({ combat: r.combat, strategy: r.strategy, reason: r.reason, advice: r.advice, moved: Number(moved.toFixed(1)) })}`)
+  ok(r.combat !== 'retreated' && r.retreated !== true, '🔴 血 4 也不许自己撤（AI 叫的打就是命令）', String(r.combat))
+  ok(r.strategy === 'engage' && r.reason === 'hold-line', '🔴 这一轮真的在打（state=engage / reason=hold-line）', `${r.strategy}/${r.reason}`)
+  ok(Array.isArray(r.advice) && r.advice.some((a) => a.action === 'retreat' && a.reason === 'low-health'),
+    '🔴 建议里必须带"该撤了"（low-health），决定权交回 AI', JSON.stringify(r.advice))
+  ok(/撤/.test(String(r.adviceText ?? '')), '建议有一句人话（AI 不用猜结构）', String(r.adviceText ?? '').slice(0, 60))
 }
 
-/* ── ③ 被三只围 ⇒ 拉开距离 ── */
-section('③ 被三只僵尸围住 ⇒ 应当拉开距离 / 撤退')
+/* ── ③ 被三只围 ⇒ 只建议、手不停 ── */
+section('③ 被三只僵尸围住 ⇒ 只给"拉开距离"的建议，不许自己掉头')
 await killZombies()
 await teleport(SITE.x + 0.5, SITE.y, SITE.z + 0.5)
 await setHealth(20)
@@ -247,8 +249,10 @@ await spawnZombie(0, -2)
   const moved = bot.entity.position.distanceTo(before)
   log(`  · 结果：${JSON.stringify({ combat: r.combat, strategy: r.strategy, moved: Number(moved.toFixed(1)) })}`)
   ok(zombies().length >= 3, '确实造出了"被围"的局面（不是自欺欺人）', `${zombies().length} 只`)
-  ok(['retreat', 'defend'].includes(r.strategy), '🔴 被围 ⇒ 策略是拉开距离/防御，不是闷头进攻', String(r.strategy))
-  ok(moved > 1, '🔴 被围时真的动了（不是原地站着）', `${moved.toFixed(1)} 格`)
+  ok(r.strategy === 'engage' && r.combat !== 'retreated', '🔴 被围也不自己撤（策略层没有否决权）', `${r.strategy}/${r.combat}`)
+  ok(Array.isArray(r.advice) && r.advice.some((a) => a.action === 'defend' && a.reason === 'surrounded'),
+    '🔴 建议里说"被围了，建议拉开距离"', JSON.stringify(r.advice))
+  ok(moved > 0, '这一轮真的贴近去打（被围不是站着不动）', `${moved.toFixed(1)} 格`)
 }
 
 /* ── ④ 外部中止 ── */

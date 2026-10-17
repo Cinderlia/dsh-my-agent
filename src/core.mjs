@@ -910,8 +910,8 @@ export class McBot extends EventEmitter {
   /** 攻击实体。给 `who` 就按名字找，否则打最近的那个 —— 实现在 `src\attack.mjs`
    *  （为什么不能 `await pvp.attack()` 完就 stop、名字怎么匹配、掉落物怎么提示，都写在那个文件头上）
    *
-   *  `moveTo` / `equipTo` 是**能力回调**：战斗策略层要"走位/撤退/换武器"时通过这里做，
-   *  而不是自己去碰 bot —— 这样它就不可能悄悄长成第二套移动控制器。两个都是现成实现的转发。 */
+   *  `moveTo` / `equipTo` 是**能力回调**：战斗策略层要"走位/换武器"时通过这里做（撤退不做了，见
+   *  attack.mjs 的 `hold-line`），而不是自己去碰 bot —— 它就不可能悄悄长成第二套移动控制器。 */
   async attack (opts = {}) {
     return await attack(this.requireBot(), opts, {
       t: (p, k, l) => this.#t(p, k, l),

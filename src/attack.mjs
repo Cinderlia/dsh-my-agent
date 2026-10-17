@@ -7,9 +7,9 @@
  *   · `ctx.callLeft()`  —— 这一轮还剩多少毫秒（决定"等多久"和"挥几下"）
  *   · `ctx.abortSignal` —— 玩家新命令抢占（`mc_stop` / 新一轮工具调用）
  *   · `ctx.hasPvp`      —— 插件实例状态（`this.mcPlugins.pvp`），不是 bot 的
- *   · `ctx.moveTo`      —— 走位/撤退用（现成的 `walkTo`，**不是**第二套移动控制器）
+ *   · `ctx.moveTo`      —— 走位用（现成的 `walkTo`，**不是**第二套移动控制器）；撤退不在这里做
  *   · `ctx.equipTo`     —— 换武器用（现成的 `equip`）
- *   后两个**可以没有**：缺了就退化（想撤却没得撤时如实说"没给我移动能力"），不报错。
+ *   后两个**可以没有**：缺了就退化（想走位却没得走时如实说"没给我移动能力"），不报错。
  *
  * 这里踩过的坑（`踩坑档案.md` 第 12 / 26 / 27 条）：
  *   ① `bot.pvp.attack(target)` **立刻** resolve（上游 `mineflayer-pvp\lib\PVP.js:60-76`
@@ -30,7 +30,7 @@
  * 本文件只负责**执行一个阶段 → 重新观察 → 再问一次**。
  *
  * 🔴 三条不能破的规矩（用户原话）：
- *   · **不新建第二套移动控制** —— 走位/撤退一律 `ctx.moveTo`（现成 `walkTo`，
+ *   · **不新建第二套移动控制** —— 走位一律 `ctx.moveTo`（现成 `walkTo`，
  *     带它自己的进度监控与脱困阶梯）。本文件里**没有一处** `setControlState`。
  *   · **不新建第二个任务状态机** —— 只报告结果，要不要继续追击/换目标/恢复原任务，
  *     由 `mc_task` 那一层决定。这里**没有** `tasks.*` 调用。
@@ -52,7 +52,7 @@ import { dropHint, entityHealth } from './world-observer.mjs'
 import { durabilityOf, EQUIP_SLOTS } from './inventory.mjs'
 import {
   assessCombat, chooseStrategy, combatOutcomeOf, combatOutcomeText, combatPlanText,
-  retreatPointOf, approachPointOf, isShield, RETREAT_DISTANCE, COMBAT_PHASE_MS,
+  approachPointOf, isShield, COMBAT_PHASE_MS,
 } from './combat-strategy.mjs'
 
 /**
@@ -299,8 +299,9 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
   const hurt = []
   let sawDamageAny = false
   let last = null
-  let retreated = false
-  let retreatWhy = null
+  /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高"）：策略层想撤 / 想拉开距离时，
+   *    这里只记**建议**，不执行 —— 见下面 `chooseStrategy` 的解构。 */
+  const advice = []
   let unreachable = false
   let aborted = false
   let timedOut = false
@@ -399,7 +400,30 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
       sawDamage: sawDamageAny,
       wasInRange: mem.lastInRange,
     })
-    const step = chooseStrategy(snap, mem)
+    const wanted = chooseStrategy(snap, mem)
+    /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高" ⇒ 回的是"一律不停"）：
+     *
+     *   `mc_act{attack}` 是 **AI 自己叫的**，那就是命令 —— 内建策略层**没有否决权**。
+     *   被围、有远程在射我、血少了，策略想说"退"都只记成**建议**，手不停：
+     *   真要撤是 AI 自己叫 `mc_move`（它才知道撤离方向对不对、后面还要不要回来）。
+     *
+     *   以前这里是把 `defend` / `retreat` **直接执行**：往反方向退 8 格然后 break，
+     *   于是 AI 说"打这只骷髅"，战斗层自己掉头走了 —— 命令被策略改掉了。
+     *   现在只留 `attack.mjs` 里的**机械动作**（换武器、走位靠近），决策权还给 AI。 */
+    const advisory = wanted.action === 'retreat' || wanted.action === 'defend'
+    const step = advisory
+      ? {
+          ...wanted,
+          action: 'engage',
+          /* 这一轮**实际执行**的是进攻 ⇒ state 也得跟着改，否则结果里 `strategy:"defend"`
+           * 和 `actions:["engage"]` 自相矛盾（AI 会以为我们真的退了）。 */
+          state: 'engage',
+          reason: 'hold-line',
+          why: `策略层建议${wanted.action === 'defend' ? '拉开距离' : '撤退'}（${wanted.why}），但这一轮是你叫的打 —— 我不改道`,
+          advice: wanted.action,
+        }
+      : wanted
+    if (advisory) advice.push({ action: wanted.action, reason: wanted.reason, why: wanted.why })
     lastStep = step
     lastSnap = snap
     actions.push(step.action)
@@ -409,34 +433,6 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
 
     /* ── 够不着，试够了 ── */
     if (step.action === 'stop') { unreachable = true; break }
-
-    /* ── 撤退 / 拉开距离 ── */
-    if (step.action === 'retreat' || step.action === 'defend') {
-      if (!canMove) {
-        /* 想撤却没给我移动能力：**如实说**，然后照打（比"假装撤了"诚实）。 */
-        moveErr = '想撤但这次调用没给我移动能力（ctx.moveTo 不在）'
-        lastStep = { ...step, action: 'engage', why: `${step.why}；但撤不了（没给移动能力），只能接着打` }
-        actions.push('engage')
-      } else {
-        const mp = b.entity?.position
-        const tp = target.position
-        const pt = mp && tp ? retreatPointOf({ x: mp.x, y: mp.y, z: mp.z }, { x: tp.x, z: tp.z }, RETREAT_DISTANCE) : null
-        if (!pt) { moveErr = '算不出往哪撤（我和目标位置重合）' }
-        else {
-          /* 🔴 `noTower: true`：逃跑时**不许**寻路器原地垫方块往上爬
-           *    （用户实机：撤退一路垫到 y=57，越逃越远）。见 `src\movement.mjs` 的同名注释。 */
-          try { await ctx.moveTo(pt, { reason: `战斗撤退：${step.why}`, noTower: true }) } catch (e) { moveErr = String(e?.message ?? e) }
-        }
-        retreated = true
-        retreatWhy = step.why
-        /* 🔴 只有 defend（被围 / 被远程射）计入退次数，`retreat`（血快没了）**不计** ——
-         *    保命没有上限，但"退了还退"必须有：`chooseStrategy` 用 `mem.retreats`
-         *    在退够 `RETREAT_TRIES` 次之后改成边打边找机会（用户实机 2026-10-17：
-         *    AI 反复调用、每轮都判"还有远程"，于是一路退到没地方退）。 */
-        if (step.action === 'defend') mem.retreats = (Number(mem.retreats) || 0) + 1
-        break
-      }
-    }
 
     /* ── 换武器 ── */
     if (step.action === 'equip') {
@@ -481,15 +477,16 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     killed,
     gone: gone && !killed,
     sawDamage: sawDamageAny || (last?._sawDamage === true),
-    retreated, unreachable, aborted, timedOut,
+    /* 🔴 不再有 `retreated`：策略层没有否决权，这一轮不会"自己撤"（用户 2026-10-17）。 */
+    unreachable, aborted, timedOut,
   })
-  /* 撤退/够不着时没有"进攻结果"可继承 ⇒ 自己拼一份，字段名与旧的一致 */
+  /* 够不着/超时时没有"进攻结果"可继承 ⇒ 自己拼一份，字段名与旧的一致 */
   const base = last ?? {
     attacked: label, distance: d, killed: false, gone: false, health: b.health,
   }
   const { _sawDamage, _inRange, _gone, _killed, ...clean } = base
-  /* 撤退/够不着时，旧 `note` 那句"再叫一次接着打"是误导 ⇒ 换成策略层的话 */
-  const strategyNote = (retreated || unreachable || aborted || timedOut) && !last?.note
+  /* 够不着/超时/被中止时，旧 `note` 那句"再叫一次接着打"是误导 ⇒ 换成策略层的话 */
+  const strategyNote = (unreachable || aborted || timedOut) && !last?.note
     ? `${combatPlanText(lastStep)}${moveErr ? `（${moveErr}）` : ''}`
     : null
 
@@ -499,11 +496,20 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     combatText: combatOutcomeText(combat),
     strategy: lastStep?.state ?? null,
     /* 机器可读的"为什么"（`low-health` / `unreachable` / `surrounded` / `gone-no-damage`…）。
-     * 和 `note`/`retreatWhy` 那种给人看的中文分开：一个给下游判分支，一个给 AI 读。 */
+     * 和 `note`/`adviceText` 那种给人看的中文分开：一个给下游判分支，一个给 AI 读。 */
     reason: lastStep?.reason ?? null,
     actions,
     ...(strategyNote ? { note: strategyNote } : {}),
-    ...(retreated ? { retreated: true, retreatWhy: retreatWhy ?? null } : {}),
+    /* 策略层的建议（没有执行）：AI 要撤 / 要拉开距离，自己叫 `mc_move`。
+     * 单独给一个字段，别混进 `note`（那样会和"这一轮的攻击结果"抢同一句话）。 */
+    ...(advice.length
+      ? {
+          advice,
+          adviceText: `策略层建议（我没自己动，因为这一轮是你叫的打）：${advice
+            .map((a) => `${a.action === 'defend' ? '拉开距离' : '撤退'} —— ${a.why}`)
+            .join('；')}。真要撤就自己叫 \`mc_move\`。`,
+        }
+      : {}),
     ...(unreachable ? { unreachable: true } : {}),
     ...(moveErr ? { strategyError: moveErr } : {}),
     ...(lastSnap?.weaponWarn ? { weaponWarn: lastSnap.weaponWarn } : {}),

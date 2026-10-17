@@ -520,8 +520,11 @@ section('⑨ noTower（逃跑时关掉"原地垫高"）')
   ok(/if \(noTower\) mv\.allow1by1towers = false/.test(src), '🔴 关的是 allow1by1towers 这一个开关')
   ok(!/mv\.scafoldingBlocks = \[\]/.test(src), '🔴 绝不清空 scafoldingBlocks（那会把 1×1 柱子的 move 一起剪掉，掉坑里出不来）')
   ok(/noTower = false \} = \{\}, ctx = \{\}\)/.test(src), 'walkTo 也接 noTower（上层能一路传到 walkPathfinder）')
+  /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高"）：战斗层**不再自己撤退**，
+   *    所以"撤退要关掉垫脚"这条已经没有对象了 —— 反过来要守住"不许再出现撤退执行"。 */
   const atk = read('../src/attack.mjs')
-  ok(/noTower: true/.test(atk), '🔴 战斗撤退（ctx.moveTo）明确关掉垫脚')
+  ok(!/战斗撤退/.test(atk) && !/retreatPointOf/.test(atk),
+    '🔴 战斗策略层没有"自己撤退"的移动调用（撤退要 AI 自己叫 mc_move）')
 }
 
 /* ═══════════════ ⑨ 掉下去了必须看得见（P0-A） ═══════════════ */

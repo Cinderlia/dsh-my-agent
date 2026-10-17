@@ -794,9 +794,14 @@ section('⑦ 战斗策略层 —— 威胁排序 / 换武器 / 状态机 / 结�
     ok(capped.action === 'engage' && capped.reason === 'retreat-exhausted',
       '🔴 状态机：退够次数还是被围 ⇒ 不再退，改成边打边找机会（否则会一路退到没地方退）',
       JSON.stringify(capped))
+    /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高"，口径选"一律不停"）：
+     *    `attack.mjs` 里**不许**再有"自己撤退"的执行路径 —— 策略层的撤/退一律降级成建议。 */
     const atkSrc = readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8')
-    ok(/if \(step\.action === 'defend'\) mem\.retreats = /.test(atkSrc),
-      '🔴 attack.mjs：执行 defend 时给策略层记一次退次数（否则 RETREAT_TRIES 形同虚设）')
+    ok(!/retreatPointOf/.test(atkSrc) && !/战斗撤退/.test(atkSrc),
+      '🔴 attack.mjs：没有任何"自己往反方向撤"的执行路径（策略层没有否决权）')
+    ok(/const advisory = wanted\.action === 'retreat' \|\| wanted\.action === 'defend'/.test(atkSrc)
+      && /if \(advisory\) advice\.push\(/.test(atkSrc),
+      '🔴 attack.mjs：策略层的撤退/拉开距离被降级成 advice（不再执行）')
     const stratSrc = readFileSync(new URL('../src/combat-strategy.mjs', import.meta.url), 'utf8')
     ok(/if \(retreats >= RETREAT_TRIES\)/.test(stratSrc),
       '🔴 策略层：退次数上限真的被用在分支里')
@@ -879,33 +884,33 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
   }
   const zombieAt = (id, z) => ent({ id, name: 'zombie', type: 'hostile', kind: 'Hostile mobs', pos: { x: 0, y: 64, z } })
 
-  {   /* 低血量 ⇒ 主动撤退，且走的是现成的移动实现 */
+  {   /* 血 4 + AI 明确叫打 ⇒ 不停手，只把"该撤"当建议带出去 */
     const f = mkFightBot([zombieAt('z1', 2)])
     f.bot.health = 4
     const { ctx, calls } = mkCtx()
     const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
-    ok(r.combat === 'retreated' && r.retreated === true, '🔴 血 4 ⇒ 主动撤退（不再一直往前顶）', JSON.stringify({ combat: r.combat }))
-    ok(calls.move.length === 1, '撤退走的是 ctx.moveTo（现成的 walkTo），不是自己按键', String(calls.move.length))
-    ok(r.killed === false && !r.pickup, '撤退时不谎报击杀、也不报掉落物')
-    ok(f.calls.attack.length === 0, '🔴 撤退时一下都没打（血 4 还往上顶才是 bug）', String(f.calls.attack.length))
-    ok(r.strategy === 'retreat' && r.actions.includes('retreat'), '结果里写明策略与动作序列', JSON.stringify({ s: r.strategy, a: r.actions }))
-    /* 用户方案第五节点名要 `reason`（机器可读的"为什么"），和给人看的 `note` 分开 */
-    ok(r.reason === 'low-health', '🔴 结果里带机器可读的 reason（为什么这么做）', String(r.reason))
+    ok(r.combat !== 'retreated' && r.retreated !== true, '🔴 血 4 也不许自己撤（AI 叫的打就是命令）', JSON.stringify({ combat: r.combat }))
+    ok(calls.move.length === 0, '🔴 血 4 也不再往反方向走（要撤是 AI 自己叫 mc_move）', String(calls.move.length))
+    ok(r.strategy === 'engage' && r.reason === 'hold-line', '🔴 结果里写明"这一轮我没改道"', JSON.stringify({ s: r.strategy, r: r.reason }))
+    ok(Array.isArray(r.advice) && r.advice.some((a) => a.action === 'retreat' && a.reason === 'low-health'),
+      '🔴 建议里带"该撤了"（reason=low-health），决定权交回 AI', JSON.stringify(r.advice))
+    ok(/撤|血/.test(String(r.adviceText ?? '')), '建议还有一句给人看的话（AI 不用去猜 advice 结构）', String(r.adviceText ?? '').slice(0, 60))
   }
-  {   /* 想撤却没给移动能力 ⇒ 如实说，不假装撤了 */
+  {   /* 没给移动能力 ⇒ 本来就不撤，"撤不了"这句话也不该出现 */
     const f = mkFightBot([zombieAt('z1', 2)])
     f.bot.health = 4
     const { ctx } = mkCtx({ noMove: true })
     const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
-    ok(/没给我移动能力/.test(String(r.strategyError)), '🔴 想撤却没移动能力 ⇒ 如实说（不假装撤了）', String(r.strategyError))
-    ok(r.retreated !== true, '撤不了就不许报 retreated（说谎比失败更坏）')
+    ok(r.retreated !== true && !/没给我移动能力/.test(String(r.strategyError)), '没给移动能力也不会"假装撤"（本来就不撤了）', String(r.strategyError))
+    ok(Array.isArray(r.advice) && r.advice.length > 0, '没移动能力 ⇒ 建议照样带出去', JSON.stringify(r.advice))
   }
-  {   /* 被围 ⇒ 拉开距离 */
+  {   /* 被围 ⇒ 只给建议，手不停 */
     const f = mkFightBot([zombieAt('z1', 3), zombieAt('z2', 4), zombieAt('z3', 5)])
     const { ctx, calls } = mkCtx()
     const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
-    ok(r.strategy === 'defend' && calls.move.length === 1, '🔴 三只怪围着 ⇒ 先拉开距离', JSON.stringify({ s: r.strategy, moves: calls.move.length }))
-    ok(r.combat === 'retreated', '被围拉开距离 ⇒ 结局是 retreated')
+    ok(r.strategy === 'engage' && calls.move.length === 0, '🔴 三只怪围着也不自己拉开（只建议）', JSON.stringify({ s: r.strategy, moves: calls.move.length }))
+    ok(r.combat !== 'retreated', '被围不再产生 retreated 结局')
+    ok(r.advice?.some((a) => a.action === 'defend' && a.reason === 'surrounded'), '建议里说"被围了，建议拉开距离"', JSON.stringify(r.advice))
   }
   {   /* 换武器：空手 + 背包有剑 */
     const f = mkFightBot([zombieAt('z1', 2)])
@@ -945,7 +950,7 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     const { ctx } = mkCtx()
     const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
     ok(r.shield === true, '🔴 盾挂在**副手**（45 格）⇒ 认得出有盾（以前只查背包 9..44 格）', JSON.stringify({ shield: r.shield, s: r.strategy }))
-    ok(r.strategy === 'defend' && /有盾/.test(String(r.why ?? r.note ?? '')), '策略里也说清「有盾，边挡边退」', String(r.why ?? r.note ?? '').slice(0, 40))
+    ok(/有盾/.test(String(r.adviceText ?? '')), '建议里也说清「有盾，边挡边退」', String(r.adviceText ?? '').slice(0, 40))
   }
   {   /* 没盾就别硬说有（反向） */
     const f = mkFightBot([zombieAt('z1', 3), zombieAt('z2', 4), zombieAt('z3', 5)])

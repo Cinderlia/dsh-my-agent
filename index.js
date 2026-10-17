@@ -2987,7 +2987,7 @@ export function apply(ctx, rawConfig) {
       + '· break  破坏 (x,y,z)：**先自动换对的工具**；换不上就拒绝\n'
       + '· use    使用方块或实体(who)：开门、按钮、拉杆、喂动物；都不给=用手上的东西\n'
       + '· useitem 用手上的东西：扔眼睛/雪球、拉弓、喝药水\n'
-      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。会看血/被围决定进退，结果看 outcome。约 10 秒\n'
+      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。会看血/被围给建议（**不替你撤退**，要撤自己叫 mc_move），结果看 outcome。约 10 秒\n'
       + '· equip  装备(name)：护甲自动穿到对应格（盾→副手），其余拿到手上；to 指定格子\n'
       + '· enchant 附魔台：自动开窗放料；option:0-2 真附魔，不给只报选项\n'
       + '· anvil   铁砧：action:combine(默认) / rename；item + name\n'
