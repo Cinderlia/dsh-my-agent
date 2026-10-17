@@ -49,7 +49,7 @@ import { sleep } from './async-util.mjs'
 import { callBudget } from './budget.mjs'
 import { HOSTILE_RE, RANGED_RE, JUNK_RE, NAME_ALIAS, entityNameOf, nameFieldsOf } from './entity-names.mjs'
 import { dropHint, entityHealth } from './world-observer.mjs'
-import { durabilityOf } from './inventory.mjs'
+import { durabilityOf, EQUIP_SLOTS } from './inventory.mjs'
 import {
   assessCombat, chooseStrategy, combatOutcomeOf, combatOutcomeText, combatPlanText,
   retreatPointOf, approachPointOf, isShield, RETREAT_DISTANCE, COMBAT_PHASE_MS,
@@ -136,8 +136,23 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
         + '要捡它就先 `mc_move` 走过去站上去（一两秒就自己飞进背包）。')
     }
     if (needle) {
+      /* 🔴 2026-10-17（用户实机：苦力怕贴到 3 格，它报「附近找不到 creeper」，只列出 `item 2.5 格`，
+       *    然后换着法子瞎试了十几个调用）：原句只说"找不到"，模型无法区分
+       *    ① **名字写错了**（那好办，改个名）② **客户端根本没跟踪到那只怪**
+       *    （重生 / 换维度 / 区块卸载之后 `bot.entities` 会被清空或过期 —— 这时改一百次名字都没用）。
+       *    所以把"客户端共跟踪几个实体 + 我自己在哪"一并报出来：数字少得离谱本身就是证据。 */
+      const seen = Object.keys(b.entities ?? {}).length
+      const me = b.entity?.position
+      const meText = me && Number.isFinite(me.x)
+        ? `(${me.x.toFixed(1)}, ${me.y.toFixed(1)}, ${me.z.toFixed(1)})`
+        : '（坐标读不到）'
       throw new Error(`附近找不到 "${who}"（24 格内实际有：${near || '什么都没有'}）`
-        + ' —— 名字要跟 `mc_observe` "程序检测到"里显示的一致（中文叫法也认）；'
+        + ` —— 客户端现在共跟踪 ${seen} 个实体，我自己在 ${meText}。`
+        + (seen < 8
+          ? '**这么少基本说明客户端没跟上服务端**（刚重生 / 换了维度 / 区块还没加载）—— '
+            + '先 `mc_observe` 看一眼身边到底有什么，别反复换名字试。'
+          : '')
+        + '名字要跟 `mc_observe` "程序检测到"里显示的一致（中文叫法也认）；'
         + '要打远处那只就先 `mc_move` 过去，怪跑远了同样找不到。')
     }
     throw new Error(`4.5 格内没有能打的实体${near ? `（24 格内最近的是 ${near}）` : ''}`
@@ -320,6 +335,21 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     let bagItems = []
     try { bagItems = b.inventory?.items?.() ?? [] } catch { bagItems = [] }
     const items = bagItems.map((i) => i?.name).filter(Boolean)
+    /* 🔴 2026-10-17（用户实机：副手一直挂着 `shield 103/336`，它却报「没有盾牌，只能拉开距离」）：
+     *    `b.inventory.items()` 只覆盖**背包 9..44 格**（主背包 + 快捷栏）—— 副手是 **45 格**、
+     *    盔甲是 **5..8 格**，都不在里面 ⇒ 盾挂在副手 = 对这里完全不可见。
+     *    槽位表直接用 `src/inventory.mjs` 的 `EQUIP_SLOTS`（`mc_inventory` / 耐久功能一直在用，
+     *    别再手写一份槽号）。读不到就当没穿，绝不因此抛错。 */
+    const equipped = []
+    try {
+      const slots = b.inventory?.slots
+      if (Array.isArray(slots)) {
+        for (const [slotIdx] of EQUIP_SLOTS) {
+          const it = slots[slotIdx]
+          if (it?.name) equipped.push(it.name)
+        }
+      }
+    } catch { /* 读不到装备栏就当没穿 */ }
     /* 武器耐久：同一个名字可能有好几把，取**最好的一把**（换上一把快坏的没意义） */
     const pctOfItem = (it) => {
       try { const d = durabilityOf(it); return d && Number.isFinite(d.pct) ? d.pct : null } catch { return null }
@@ -350,7 +380,7 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
       held, items,
       heldPct: pctOfItem(heldItem),
       pctOf: (n) => (bagPct.has(n) ? bagPct.get(n) : null),
-      hasShield: items.some((n) => isShield(n)) || isShield(held),
+      hasShield: items.some((n) => isShield(n)) || equipped.some((n) => isShield(n)) || isShield(held),
       hurt, now, hasPvp,
       autoEat: b.autoEat?.enabled !== false,
       targetGone: !stillThere,
@@ -381,7 +411,9 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
         const pt = mp && tp ? retreatPointOf({ x: mp.x, y: mp.y, z: mp.z }, { x: tp.x, z: tp.z }, RETREAT_DISTANCE) : null
         if (!pt) { moveErr = '算不出往哪撤（我和目标位置重合）' }
         else {
-          try { await ctx.moveTo(pt, { reason: `战斗撤退：${step.why}` }) } catch (e) { moveErr = String(e?.message ?? e) }
+          /* 🔴 `noTower: true`：逃跑时**不许**寻路器原地垫方块往上爬
+           *    （用户实机：撤退一路垫到 y=57，越逃越远）。见 `src\movement.mjs` 的同名注释。 */
+          try { await ctx.moveTo(pt, { reason: `战斗撤退：${step.why}`, noTower: true }) } catch (e) { moveErr = String(e?.message ?? e) }
         }
         retreated = true
         retreatWhy = step.why
@@ -458,6 +490,9 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     ...(unreachable ? { unreachable: true } : {}),
     ...(moveErr ? { strategyError: moveErr } : {}),
     ...(lastSnap?.weaponWarn ? { weaponWarn: lastSnap.weaponWarn } : {}),
+    /* 有没有盾（含**副手 45 格**与盔甲槽 5..8）。如实给出来：AI 需要它判断"能不能进依赖盾牌的策略"，
+     * 而这正是 2026-10-17 用户实机逮到的那个 bug 的现场（副手有盾却被判成没盾）。 */
+    ...(typeof lastSnap?.hasShield === 'boolean' ? { shield: lastSnap.hasShield } : {}),
     ...foesNear(target),
   }
 }

@@ -49,6 +49,12 @@ export function stepOk (step, r) {
     case 'place':
       return r.placed !== false && r.placed != null
     case 'break':
+      /* 🔴 2026-10-17（用户实机：`mc_sequence` 里某一格已经是空气，整串中止，报的还是
+       *    「这一轮时间不够」而 `elapsedMs` 只有 300ms）：`breakBlock` 对空气格返回
+       *    `broken: null`（"那里本来就是空气"），而这里以前判 `broken != null` ⇒ **算失败**。
+       *    可这一步的**目标已经达成**（那格已经不是实心的），不该算失败、更不该中止整串。
+       *    只有 `broken === false` 才是真的没挖成（够不着 / 挖不动 / 被复原）。 */
+      if (r.broken === null) return true
       return r.broken !== false && r.broken != null
     case 'attack':
       return r.killed !== false && r.attacked !== false
@@ -131,12 +137,19 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
        * 🔴 报告 H3：其余 op 以前走 `r?.ok !== false`（动作模块根本不回 `ok`）⇒ 恒真。
        *    现在交给 `stepOk()` 按各 op 的真实成功字段判（见上面那个函数的注释）。 */
       const ok = stepOk(step, r)
+      /* 🔴 2026-10-17（用户实机：序列里某格是空气 ⇒ 整串中止，报的却是「这一轮时间不够」，
+       *    他花很久才想明白是撞到空气）：非 move 步骤失败时，note 以前是**硬编码**的
+       *    「本轮时间不够」，跟真实原因毫无关系 —— 动作模块明明已经把原因写在 `note` /
+       *    `reason` / `error` 里了（够不着 / 挖不动 / 被复原 / 缺料 / 那里本来就是空气）。
+       *    把真实原因原样带出来，模型才可能一次就改对。 */
+      const why = String(r?.note ?? r?.reason ?? r?.error ?? '').trim()
       results.push({
         i, op: step.op, ok, ...r,
         ...(ok ? {} : {
           note: step.op === 'move'
             ? '这一步**没走到**（看 arrived / remaining）—— 再叫一次 mc_sequence，从这一步往后发就行'
-            : '这一步**没做完**（本轮时间不够）—— 再叫一次 mc_sequence，从这一步往后发就行',
+            : `这一步**没做完**${why ? `：${why}` : '（动作没给原因）'}`
+              + ' —— 先按上面这句的原因处理，再叫一次 mc_sequence，从这一步往后发就行',
         }),
       })
       if (!ok) { next = i; break }
@@ -183,7 +196,13 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
               + '**这不等于那些方块没动过**：先 `mc_dig` / `mc_scan` 复核一下到底做完没有，'
               + '确认真没干再单独叫一次 mc_sequence（**别塞在 mc_task 里** —— 外层时间早被前面的步骤吃掉了）。'
             : next === 0
-              ? '这一轮的时间已经用完了（前面什么都没做）—— 直接再叫一次 mc_sequence，steps 原样发就行。'
+              /* 🔴 2026-10-17：这一步以前**一律**说"时间用完了"。可第 1 步就失败、而且只花了几百
+               *    毫秒时，原因显然不是时间（用户就是被这句带偏、花很久才想明白）。用"用掉的时间
+               *    远不到预算"当判据分开说 —— 真原因就在 `results[0].note` 里。 */
+              ? (results.length > 0 && (Date.now() - t0) < bd * 0.6
+                ? `第 1 步就没做成（**不是时间不够** —— 只用了 ${Date.now() - t0}ms / 预算 ${bd}ms，`
+                  + '真原因见 results[0] 的 note）—— 先按那句话处理，再叫一次 mc_sequence。'
+                : '这一轮的时间已经用完了（前面什么都没做）—— 直接再叫一次 mc_sequence，steps 原样发就行。')
               : `做到第 ${next + 1} 步时这一轮的时间到了 —— 再叫一次 mc_sequence，`
                 + `steps 从第 ${next + 1} 步往后发就行（前面已经做完了）。`,
     }),

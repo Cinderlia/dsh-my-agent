@@ -566,6 +566,12 @@ section('⑤ 静态接线')
   ok(!/withTimeout\(b\.pvp\.attack/.test(atkNo) && !/raceAbort\(\s*withTimeout\(b\.pvp\.attack/.test(atkNo),
     'attack.mjs：不再把 pvp.attack 当同步动作 await（旧写法的病根）')
   ok(!/附近找不到 "?\$\{who\}?"?\)/.test(atkNo), 'attack.mjs：不再只有干巴巴一句"附近找不到"')
+  /* 🔴 2026-10-17：盾牌判定漏了副手（45 格）与盔甲槽（5..8 格）—— `inventory.items()` 只回 9..44。 */
+  has(atkNo, "import { durabilityOf, EQUIP_SLOTS } from './inventory.mjs'", 'attack.mjs：槽位表复用 inventory.mjs 的 EQUIP_SLOTS（不手写槽号）')
+  has(atkNo, 'equipped.some((n) => isShield(n))', 'attack.mjs：hasShield 把**身上穿/副手拿**的也算进去')
+  has(atkNo, 'const slots = b.inventory?.slots', 'attack.mjs：从 inventory.slots 按绝对槽号读装备栏')
+  ok(!/hasShield: items\.some\(\(n\) => isShield\(n\)\) \|\| isShield\(held\),/.test(atkNo),
+    'attack.mjs：旧写法（只看背包 + 手上）已消失')
   /* 接线：第二十一刀把整个 attack() 搬走 ⇒ core 里只剩薄包装，且必须真的 import 了 */
   has(coreNo, "import { attack } from './attack.mjs'", 'core：确实 import 了 attack')
   ok(/async attack \(opts = \{\}\) \{[\s\S]{0,420}return await attack\(this\.requireBot\(\), opts, \{/.test(coreNo),
@@ -855,6 +861,38 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     let err = null
     try { await attack(f.bot, { who: 'zombie', budget: 300 }, ctx) } catch (e) { err = e }
     ok(/附近找不到/.test(String(err?.message)), '目标本来就不在 ⇒ 如实报找不到（不是"打死了"）', String(err?.message ?? '').slice(0, 50))
+    /* 🔴 2026-10-17 用户实机：苦力怕贴到 3 格却报"找不到"，只列出 `item 2.5 格`，AI 分不清
+     *    "名字写错"还是"客户端根本没跟踪到那只怪"，于是换着法子瞎试了十几个调用。
+     *    现在必须把"客户端共跟踪几个实体 + 我自己在哪"一并说出来。 */
+    const m = String(err?.message ?? '')
+    ok(/客户端现在共跟踪 \d+ 个实体/.test(m), '🔴 找不到时说出"客户端共跟踪几个实体"', m.slice(0, 80))
+    ok(/我自己在 \(/.test(m), '🔴 同时说出我自己的坐标（用来判断是不是客户端没跟上）', m.slice(0, 80))
+    ok(/没跟上服务端/.test(m), '实体数少得离谱时直说"客户端没跟上服务端"，别让它反复换名字试')
+  }
+  {   /* 🔴 2026-10-17 用户实机：副手一直挂着 shield 103/336，它却报「没有盾牌，只能拉开距离」。
+   *    根因是 `hasShield` 只查 `bot.inventory.items()`（背包 9..44 格），副手是 45 格 ⇒ 看不见。 */
+    const slots = []
+    slots[45] = { name: 'shield', count: 1 }          // 副手
+    const f = mkFightBot([zombieAt('z1', 3), zombieAt('z2', 4), zombieAt('z3', 5)])
+    f.bot.inventory = { items: () => [], slots }
+    const { ctx } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(r.shield === true, '🔴 盾挂在**副手**（45 格）⇒ 认得出有盾（以前只查背包 9..44 格）', JSON.stringify({ shield: r.shield, s: r.strategy }))
+    ok(r.strategy === 'defend' && /有盾/.test(String(r.why ?? r.note ?? '')), '策略里也说清「有盾，边挡边退」', String(r.why ?? r.note ?? '').slice(0, 40))
+  }
+  {   /* 没盾就别硬说有（反向） */
+    const f = mkFightBot([zombieAt('z1', 3), zombieAt('z2', 4), zombieAt('z3', 5)])
+    f.bot.inventory = { items: () => [], slots: [] }
+    const { ctx } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(r.shield === false, '🔴 背包和副手都没有盾 ⇒ 如实说没有盾', String(r.shield))
+  }
+  {   /* 背包里的盾照样认（旧行为不许被弄丢） */
+    const f = mkFightBot([zombieAt('z1', 3), zombieAt('z2', 4), zombieAt('z3', 5)])
+    f.bot.inventory = { items: () => [{ name: 'shield' }], slots: [] }
+    const { ctx } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(r.shield === true, '盾在背包里也认（旧行为没丢）', String(r.shield))
   }
   {   /* 附近还有怪 ⇒ 顺带报一句（既有能力，别被重构弄丢） */
     const f = mkFightBot([zombieAt('z1', 2), zombieAt('z2', 9)])

@@ -205,6 +205,46 @@ export async function swimUp (self, { hold = 3_000 } = {}, ctx = {}) {
  *
  * 上岸就交还给 pathfinder（返回 `outOfWater: true`），别自己在地面上走 —— 地面上它比手写按键靠谱。
  */
+/* ─────────── 游泳的"按什么决定方向"（2026-10-17，用户方案：分水域控制 + 有效进度检测）───────────
+ * 用户实机点出的两件事：
+ *   ① 水面游和水下游用的是**同一套**控制（一直按住 jump）⇒ 目标在水下时它永远下不去，
+ *      在低矮水道里会被顶在天花板上；
+ *   ② 循环里没有"这一段时间到底有没有**靠近**目标"的判据 —— `moved` 报的是**总位移**，
+ *      被水推着横着漂很远也算"游了很多"，可离目标一步没近。
+ * 这里补两件轻量的东西：**按目标高度决定要不要上浮** + **按窗口看"有没有靠近"**。
+ * ⚠️ 不新建第二套控制器：移动仍然是 `forward` + `jump` 两个控制位，代次/中断/释放一律走原有机制。
+ *
+ * 关于水流：`prismarine-physics` 的 `simulatePlayer` 里 `isInWaterApplyCurrent()` 会把
+ * `getFlow()` 的方向**每 tick 加 0.014 到速度上**（`index.js:687-702`）⇒ 机器人**真的会被水推**。
+ * 但 0.014/tick ≈ **0.28 格/秒**，只有游泳速度（≈2 格/秒）的 1/7 ⇒ 单纯逆流几乎推不动它，
+ * 真正的"游不动"是**撞墙 / 顶到天花板 / 目标在脚下**。所以第一轮只做上面两件事，
+ * 不给水流写专门的"往上游瞄准"补偿（收益小、还容易把自己对准到错误的方向）。
+ */
+export const SWIM_WINDOW_MS = 600          // 观测窗口（用户建议 500–750ms）
+export const SWIM_STALL_WINDOWS = 2        // 连续两个窗口没靠近才算"卡住"（别过度调整）
+export const SWIM_PROGRESS_EPS = 0.2       // 一个窗口至少靠近这么多格才算有进展
+export const SWIM_FIXUPS = 2               // 纠偏最多试两次，再不行就交给水下自救
+export const SWIM_MIN_AIR = 6              // 气低于这个数，不管目标在哪都先上浮
+export const SWIM_VERT_EPS = 0.6           // 目标比脚高/低这么多，才算"要去上一层/下一层"
+
+/**
+ * 这一轮该不该按住 jump（= 上浮）。
+ *
+ * 水里按 jump **不是跳**，是往上浮（`prismarine-physics` 里 `isInWater` 时 `vel.y += 0.04`）。
+ * 所以它该由"目标在哪个高度"决定，而不是一直按着：
+ *   · 快没气了 ⇒ 先上去（命比目标重要）；
+ *   · 目标在**下面**（比脚低 `SWIM_VERT_EPS` 以上）⇒ **松开**，让它自己沉下去；
+ *   · 目标在**同一层或上面** ⇒ 按着 —— 水里不按 jump 会以 ≈2 格/秒往下沉
+ *     （`waterGravity 0.02` / `1-waterInertia 0.2`），横渡时非沉不可。
+ * @returns {boolean}
+ */
+export function swimJumpWanted (b, goal, me, air) {
+  if (Number.isFinite(air) && air < SWIM_MIN_AIR) return true
+  if (!me) return true
+  if (goal.y < me.y - SWIM_VERT_EPS) return false
+  return true
+}
+
 export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs } = {}, ctx = {}) {
   const b = self.bot
   const goal = new Vec3(Number(target.x), Number(target.y), Number(target.z))
@@ -234,6 +274,19 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
   const left0 = self.msLeft()
   const bd = left0 <= 100 ? 0 : Math.max(0, Math.min(callBudget(budget), left0))
   let moved = 0
+  /* 窗口进度（用户方案第 4 条）：每个 `SWIM_WINDOW_MS` 看一次"离目标近了没有"。
+   * ⚠️ 判据必须是**离目标变近**，不是"总位移" —— 被水推着横着漂很远也是位移。 */
+  let winLeft = start.distanceTo(goal)
+  let winAt = t0
+  let stallWins = 0
+  let fixups = 0
+  let jumpOverride = null       // 纠偏时强行指定一轮"按/不按 jump"
+  /* 🔴 只在"该不该按"**变了**的时候才写控制位：机器人默认就是没按 jump，
+   *    每一轮都写一遍 `jump: false` 除了白发包，还会让"被抢占时不松别人的控制位"这条判据失灵
+   *    （收尾那一轮写的 false 会被当成"抢了新移动者的控制位"）。 */
+  let lastJump = false
+  let stuckWhy = null
+  const airOf = () => (Number.isFinite(b.oxygenLevel) ? b.oxygenLevel : null)
   const preemptResult = (end) => ({
     arrived: false, position: at(end), ms: Date.now() - t0,
     remaining: r2(end.distanceTo(goal)), moved: r2(start.distanceTo(end)),
@@ -253,8 +306,38 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
       // 每 250ms 重新对准：水流、撞岸、浮起来都会把朝向推偏（只对准一次会游歪）
       try { await b.lookAt(goal.offset(0, 1.0, 0), true) } catch { /* 假 bot 没有 lookAt */ }
       b.setControlState('forward', true)
-      b.setControlState('jump', true)      // 浮在水面游（不是跳）
+      /* 🔴 上浮由"目标在哪个高度"决定（见 `swimJumpWanted`）：目标在水下就松开 jump 让它沉下去。
+       *    `jumpOverride` 只在纠偏的那一轮生效，之后立刻回到按高度决定。 */
+      const wantJump = jumpOverride === null ? swimJumpWanted(b, goal, me, airOf()) : jumpOverride
+      if (wantJump !== lastJump) { b.setControlState('jump', wantJump); lastJump = wantJump }
       await raceAbort(sleep(250), self.abortSignal, '游泳')   // 可中断（用户点停止要立刻出来）
+      jumpOverride = null
+      /* ── 窗口进度：连续 `SWIM_STALL_WINDOWS` 个窗口都没靠近 ⇒ 先纠偏，纠不动就如实收手 ──
+       * 用户原话："连续两个窗口没有有效进展时，才启动纠偏；一直有进展就保持原有控制"；
+       * "确认通道被堵住后，再调用现有水下恢复控制器" —— 这里 `break` 出去，
+       * `walkTo` 看到 `stuck:true` 就会把这一趟交给 `recoverFromWater`（找出口那套）。 */
+      if (Date.now() - winAt >= SWIM_WINDOW_MS) {
+        const gained = winLeft - me.distanceTo(goal)
+        winLeft = me.distanceTo(goal)
+        winAt = Date.now()
+        if (gained < SWIM_PROGRESS_EPS) {
+          stallWins++
+          if (stallWins >= SWIM_STALL_WINDOWS) {
+            if (fixups < SWIM_FIXUPS) {
+              /* 纠偏：把上浮/下沉**反过来**试一轮 —— "以为该浮着"却纹丝不动时，
+               * 十有八九是顶在天花板上，或者目标其实在脚下。 */
+              fixups++
+              stallWins = 0
+              jumpOverride = !wantJump
+            } else {
+              stuckWhy = 'swim-stuck'
+              break
+            }
+          }
+        } else {
+          stallWins = 0
+        }
+      }
       // 已经上岸：剩下的路交给 pathfinder（地面上它更靠谱）
       if (!inWaterNow(b) && b.entity?.onGround) break
     }
@@ -266,6 +349,7 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
   moved = r2(start.distanceTo(end))
   const left = r2(end.distanceTo(goal))
   const outOfWater = !inWaterNow(b)
+  const reason = outOfWater ? 'swim-shore' : (stuckWhy ?? 'swim-budget')
   return {
     arrived: false,
     position: at(end),
@@ -273,12 +357,15 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
     remaining: left,
     moved,
     via: 'swim',
-    stuck: !outOfWater,
-    reason: outOfWater ? 'swim-shore' : 'swim-budget',
+    stuck: stuckWhy != null || !outOfWater,
+    reason,
     outOfWater,
+    ...(fixups ? { fixups } : {}),
     hint: outOfWater
       ? `已经上岸了（游了 ${moved} 格，离目标 ${left} 格）—— 再叫一次 mc_move 到同一个目标，它会自己走完。`
-      : `还在水里：游了 ${moved} 格（离目标 ${left} 格）—— 再叫一次 mc_move 往同一个目标游，会接着游。`,
+      : reason === 'swim-stuck'
+        ? `还在水里，**这一段确实游不过去了**：连续 ${SWIM_STALL_WINDOWS} 个窗口离目标都没靠近，把上浮/下沉反过来试了 ${fixups} 次也没用（多半是撞墙、顶在天花板上，或者那边根本不通）。**别再往这个方向硬游** —— 换个方向/换个出口，或者先上岸绕过去。`
+        : `还在水里：游了 ${moved} 格（离目标 ${left} 格）—— 再叫一次 mc_move 往同一个目标游，会接着游。`,
   }
 }
 
@@ -287,7 +374,7 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
  * 这是唯一的移动实现：不再保留手写的按键、盲跳、挖方块或垫脚兜底。
  * ⚠️ 唯一的例外：**在水里**先交给 `#walkSwim`（A* 不把水当节点，见它的注释）。
  */
-export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs } = {}, ctx = {}) {
+export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = false } = {}, ctx = {}) {
   const b = self.requireBot()
   // 🔴 在水里：A* 不把水当节点（见 #walkSwim 的注释），实机表现是"4 秒挪 1 格"。
   //    先直接游；上了岸、还有时间，再把剩下的路交给 pathfinder 走完。
@@ -318,7 +405,7 @@ export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.mo
     if (swim.arrived || !swim.outOfWater || !canWalk) return swim
     const left = self.msLeft()
     if (left < 500) return swim
-    const rest = await ctx.walkPathfinder(target, { arrive, budget: Math.max(0, Math.min(callBudget(budget), left)), budgetAsked: callBudget(budget) })
+    const rest = await ctx.walkPathfinder(target, { arrive, noTower, budget: Math.max(0, Math.min(callBudget(budget), left)), budgetAsked: callBudget(budget) })
     return { ...rest, swam: true, swimMoved: swim.moved, swimMs: swim.ms }
   }
   if (!self.pfReady || typeof b.pathfinder?.goto !== 'function') {
@@ -351,6 +438,7 @@ export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.mo
   }
   return await ctx.walkPathfinder(target, {
     arrive,
+    noTower,
     // 🔴 单次调用 ≤11 秒：预算收进 CALL_BUDGET_MS，且不超过本轮剩余时间。
     //    走不到不是失败，是"这一轮用完了"—— 再叫一次接着走。
     //    `msLeft()` 没设截止时刻时返回 CALL_MS（11000），用完时返回 0（别再 `||` 补 10 秒）。
@@ -611,7 +699,7 @@ export async function escapeMove (b, goal, step, ctx = {}) {
  * 返回值保持 `arrived / moved / remaining / stuck / hint` 结构；
  * 上层 `mc_move` 和自主层直接使用；额外带 `via:"pathfinder"` 便于排查。
  */
-export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null } = {}, ctx = {}) {
+export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null, noTower = false } = {}, ctx = {}) {
   const b = self.bot
   const { goals, Movements } = self._pf
   const t0 = Date.now()
@@ -629,6 +717,14 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   const terrain = classifyTerrainCached(b)
   const mv = ctx.movements(terrain)
   if (!mv) throw new Error('pathfinder 的 Movements 造不出来（插件没挂上？）')
+  /* 🔴 2026-10-17（用户实机：逃跑时寻路器把方块垫在自己脚下往上爬，一路升到 y=57，越跑越远）：
+   *    vendor 的 `allow1by1towers` 默认是 **true**，而**全仓没有任何一处设置过它**
+   *    （只出现在两处注释里）⇒ 一直吃的是默认值。赶路时偶尔垫一块无伤大雅，
+   *    **逃跑时它是纯亏**：垫脚要停下来、要耗方块、还让你离地面更远。
+   *    `noTower: true` 把这条腿关掉 —— 挖穿 / 绕路 / 跳 1 格 / 下蹲过缝**全都还在**，
+   *    只是不再"原地把自己顶高"。（⚠️ 别改成清空 `scafoldingBlocks`：那会把 1×1 柱子的
+   *    整条 move 也剪掉，掉坑里就真出不来了 —— 见 `src\plugins.mjs` 的注释。） */
+  if (noTower) mv.allow1by1towers = false
   if (terrain.kind !== 'flat' && terrain.kind !== 'unknown') {
     self.log(`🧭 脚边是${terrain.text}（${terrain.note}）—— 按这一类调寻路权重`)
   }

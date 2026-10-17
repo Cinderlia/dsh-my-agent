@@ -491,6 +491,39 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(/check-move-progress\.mjs/.test(all), 'check-all.mjs 的 ORDER 里登记了这一套')
 }
 
+/* ═══════════ ⑨ noTower：逃跑时不许寻路器原地垫方块往上爬 ═══════════
+ * 用户 2026-10-17 实机：撤退时 pathfinder 把方块垫在自己脚下，一路升到 y=57，越逃越远。
+ * vendor 的 `allow1by1towers` 默认 true，而全仓**没有任何一处**设置过它（只出现在注释里）。 */
+section('⑨ noTower（逃跑时关掉"原地垫高"）')
+{
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  const mv = {}
+  const ctx = { ...mkCtx(self, clock), movements: () => mv }
+  await walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 20000, noTower: true }, ctx)
+  clock.stopPump()
+  ok(mv.allow1by1towers === false, '🔴 noTower ⇒ allow1by1towers = false（逃跑时不再原地垫高）', String(mv.allow1by1towers))
+}
+{
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  const mv = {}
+  const ctx = { ...mkCtx(self, clock), movements: () => mv }
+  await walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, ctx)
+  clock.stopPump()
+  ok(!Object.hasOwn(mv, 'allow1by1towers'), '不传 noTower ⇒ 不碰这个开关（赶路时照旧吃 vendor 默认）')
+}
+{
+  const src = read('../src/movement.mjs')
+  ok(/if \(noTower\) mv\.allow1by1towers = false/.test(src), '🔴 关的是 allow1by1towers 这一个开关')
+  ok(!/mv\.scafoldingBlocks = \[\]/.test(src), '🔴 绝不清空 scafoldingBlocks（那会把 1×1 柱子的 move 一起剪掉，掉坑里出不来）')
+  ok(/noTower = false \} = \{\}, ctx = \{\}\)/.test(src), 'walkTo 也接 noTower（上层能一路传到 walkPathfinder）')
+  const atk = read('../src/attack.mjs')
+  ok(/noTower: true/.test(atk), '🔴 战斗撤退（ctx.moveTo）明确关掉垫脚')
+}
+
 console.log(`\n${'─'.repeat(50)}`)
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

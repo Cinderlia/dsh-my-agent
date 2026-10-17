@@ -5221,10 +5221,11 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_diag',
-    description: '诊断：当前会话的机器人内部状态（物理/控制位/收包/事件队列/合成窗口与合成格）——排查"走不动/收不到消息/合成说缺料"用。'
-      + '同时报**提示词注入状态**（`promptInjection`：三段提示词各自会不会注入、为什么不会），'
-      + '以及**性能监测**（`perf`：每个动作的墙钟 / CPU / 期间事件循环延迟 —— 判断"要不要把某个动作搬进 Worker 线程"就看它）。',
+    /* 🔴 2026-10-17（用户实机：`mc_diag` 一次输出几万字符，AI 只想知道其中一节）：
+     *    加 `only` 分节。同时把描述压短腾出 token 预算（`check-token-budget` 只剩几十字符余量）。 */
+    description: '诊断：机器人内部状态（物理/控制位/收包/事件/合成窗口）+ 提示词注入 + 性能监测（`perf`）。**输出很大**，用 `only` 只取需要的节。',
     parameters: {
+      only: { type: 'string', description: '只取这几节（逗号分隔）：state/perf/crafting/scheduler/watching/prompt/terrain/workers/connection' },
       resetPerf: { type: 'boolean', description: '顺手清空性能样本（换场景重测用）' },
     },
     output: text(),
@@ -5250,7 +5251,7 @@ export function apply(ctx, rawConfig) {
           hint: '连接已经结束了（bot.entity 只是 mineflayer 的残留）——要回到游戏里请重新 mc_connect',
         }
       }
-      return {
+      const full = {
         online: true, version: b.version, physicsEnabled: b.physicsEnabled,
         controlState: { forward: b.controlState?.forward, jump: b.controlState?.jump, sneak: b.controlState?.sneak },
         velocity: b.entity.velocity, onGround: b.entity.onGround,
@@ -5277,6 +5278,38 @@ export function apply(ctx, rawConfig) {
         /* 2026-10-15：性能监测 —— `verdict` 里就是"哪个动作该搬 Worker"的中文结论 */
         perf,
       }
+      /* 🔴 2026-10-17：`only` 分节。整份输出动辄几万字符，AI 往往只想知道其中一节
+       *    （"我到底在不在水里"/"合成窗口开没开"），全量灌进去纯属烧上下文。
+       *    规则：
+       *      · 不传 ⇒ 原样全给（向后兼容，老调用行为一个字都没变）；
+       *      · 传了 ⇒ 只给点名的节 + **永远**带上 `online`/`version`/`position`/`mode`
+       *        （少了这四个，任何结论都没法落地 —— 比如"我是不是还在线"）；
+       *      · 认不出的名字不静默丢掉，放进 `unknownSections` 让 AI 自己改。 */
+      const ONLY_GROUPS = {
+        state: ['physicsEnabled', 'controlState', 'velocity', 'onGround', 'inWater', 'submerged', 'pendingEvents', 'stats'],
+        perf: ['perf'],
+        crafting: ['crafting'],
+        scheduler: ['scheduler'],
+        watching: ['watching'],
+        prompt: ['promptInjection'],
+        terrain: ['terrainCache'],
+        workers: ['workers'],
+        connection: ['connection'],
+      }
+      const asked = String(args?.only ?? '').split(/[,，\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean)
+      if (!asked.length) return full
+      const keep = new Set(['online', 'version', 'position', 'mode'])
+      const unknown = []
+      for (const name of asked) {
+        const keys = ONLY_GROUPS[name]
+        if (keys) { for (const k of keys) keep.add(k); continue }
+        if (Object.hasOwn(full, name)) { keep.add(name); continue }
+        unknown.push(name)
+      }
+      const picked = {}
+      for (const k of Object.keys(full)) if (keep.has(k)) picked[k] = full[k]
+      if (unknown.length) picked.unknownSections = unknown
+      return picked
     },
   }))
 }

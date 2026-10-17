@@ -382,8 +382,8 @@ section('⑧ 静态接线：core / index 都在')
   ok(/if \(inWaterNow\(b\)\) \{\r?\n    const swim = await walkSwim\(self, target, \{ arrive, budget \}, ctx\)/.test(movSrc), 'walkTo 在水里先走 walkSwim（判据同 inWaterNow）')
   ok(/return \{ \.\.\.rest, swam: true, swimMoved: swim\.moved, swimMs: swim\.ms \}/.test(movSrc), '上岸后交回 pathfinder（并标注 swam/swimMoved）')
   ok(/via: 'swim'/.test(movSrc), 'walkSwim 返回 via:swim')
-  ok(/b\.setControlState\('forward', true\)\r?\n      b\.setControlState\('jump', true\)/.test(movSrc), 'walkSwim 按住 forward + jump（jump = 浮在水面）')
-  ok(/reason: outOfWater \? 'swim-shore' : 'swim-budget'/.test(movSrc), '如实区分"上岸了"与"这一轮用完了"')
+  ok(/b\.setControlState\('forward', true\)/.test(movSrc) && /const wantJump = jumpOverride === null \? swimJumpWanted\(/.test(movSrc), 'walkSwim 按 forward，并按目标高度决定要不要上浮（不再死按 jump）')
+  ok(/const reason = outOfWater \? 'swim-shore' : \(stuckWhy \?\? 'swim-budget'\)/.test(movSrc), '如实区分"上岸了" / "这一轮用完了" / "这段游不过去"')
   ok(/from '\.\/movement\.mjs'/.test(core), 'core 确实从 movement.mjs 导入（搬走 + 忘接 = 假绿）')
   /* 路线图第 ④ 条第四十刀：`dig()` 已搬进 `src\mining.mjs`。 */
   const mineSrc = strip(readFileSync(new URL('../src/mining.mjs', import.meta.url), 'utf8'))
@@ -422,6 +422,117 @@ section('⑧ 静态接线：core / index 都在')
   ok(/drown: true, air, submerged, subSec/.test(auto), '叫醒时带上 drown/air/submerged/subSec')
   ok(/这不是被打/.test(auto) && /多半不是被打/.test(auto), '文案写清"不是被打"（读不到氧气时是"多半"）')
   ok(/水\/岩浆是\*\*流体，挖不掉\*\*/.test(auto), '文案里点明水挖不掉')
+}
+
+/* ═══════════ ⑧ 分水域控制 + 有效进度检测（用户 2026-10-17 方案） ═══════════
+ * 用户实机点出两件事：
+ *   ① 水面游和水下游用同一套控制（一直按住 jump）⇒ 目标在水下时永远下不去；
+ *   ② 循环里没有"这一段时间到底有没有**靠近**目标"的判据 —— `moved` 报的是总位移。
+ * 这里钉住三件事：按目标高度决定上浮 / 连续没靠近就收手 / 别把"总位移"当进展。 */
+section('⑧ 游泳：按目标高度决定上浮 + 连续没靠近就收手')
+{
+  const M = await import(new URL('../src/movement.mjs', import.meta.url))
+  const { walkSwim, swimJumpWanted, SWIM_WINDOW_MS, SWIM_STALL_WINDOWS, SWIM_FIXUPS } = M
+
+  /* 用户建议的窗口是 500–750ms —— 钉住这个范围，别哪天被改成 5 秒或 50ms */
+  ok(SWIM_WINDOW_MS >= 500 && SWIM_WINDOW_MS <= 750, `观测窗口 ${SWIM_WINDOW_MS}ms 落在用户建议的 500–750ms 内`)
+  ok(SWIM_STALL_WINDOWS >= 2, '连续 ≥2 个窗口没进展才算卡住（别一个窗口就下结论）')
+  ok(SWIM_FIXUPS >= 1, '纠偏至少试一次再放弃')
+
+  const me = { y: 60 }
+  ok(swimJumpWanted({}, { y: 62 }, me, 20) === true, '目标在上面 ⇒ 上浮')
+  ok(swimJumpWanted({}, { y: 60 }, me, 20) === true, '同一层 ⇒ 还是按着（水里不按每秒沉约 2 格）')
+  ok(swimJumpWanted({}, { y: 55 }, me, 20) === false, '🔴 目标在下面 ⇒ 松开 jump 让它沉下去')
+  ok(swimJumpWanted({}, { y: 55 }, me, 4) === true, '🔴 快没气了 ⇒ 不管目标在哪都先上去')
+  ok(swimJumpWanted({}, { y: 60 }, null, 20) === true, '读不到自己的位置 ⇒ 保守上浮（别乱沉）')
+
+  /** 自带的假 bot：`forward` 按住时按 2 格/秒朝 aim 走（y 不变）；`frozen` = 一格都不动。 */
+  const mkSwimBot = ({ frozen = false, pos = [0, 60, 0] } = {}) => {
+    const calls = { control: [], lookAt: 0 }
+    const bot = {
+      entity: { position: new Vec3(pos[0], pos[1], pos[2]), isInWater: true, onGround: false, yaw: 0, pitch: 0, eyeHeight: 1.62 },
+      game: { gameMode: 'survival' },
+      registry: { itemsByName: {}, blocksByName: {}, items: {} },
+      inventory: { items: () => [] },
+      heldItem: null,
+      blockAt: () => null,
+      findBlocks: () => [],
+      setControlState: (k, v) => calls.control.push([k, v, Date.now()]),
+      lookAt: async (p) => { calls.lookAt++; bot.__aim = { x: p.x, y: p.y, z: p.z } },
+      on: () => bot, removeListener: () => {},
+      __aim: null,
+    }
+    let timer = null
+    if (!frozen) {
+      timer = setInterval(() => {
+        const last = calls.control.filter(([k]) => k === 'forward').slice(-1)[0]
+        if (!last || last[1] !== true || !bot.__aim) return
+        const p = bot.entity.position
+        const dx = bot.__aim.x - p.x, dz = bot.__aim.z - p.z
+        const d = Math.hypot(dx, dz)
+        if (d < 0.05) return
+        const step = Math.min(0.2, d)
+        bot.entity.position = new Vec3(p.x + (dx / d) * step, p.y, p.z + (dz / d) * step)
+      }, 100)
+    }
+    return { bot, calls, stop: () => { if (timer) clearInterval(timer) } }
+  }
+  const mkCtx = (mc) => ({ beginMove: () => ++mc._moveGen, releaseControls: () => {} })
+
+  // ① 目标在水下 4 格 ⇒ 一开始绝不按 jump（不然永远沉不下去）
+  {
+    const { bot, calls, stop } = mkSwimBot({ pos: [0, 60, 0] })
+    const mc = mkMc(bot)
+    const t0 = Date.now()
+    const r = await walkSwim(mc, { x: 0, y: 56, z: 3 }, { arrive: 1.6, budget: 6000 }, mkCtx(mc))
+    stop()
+    /* 注意：卡住之后的**纠偏**会故意反着试一轮（"以为该沉"时按一次上浮），
+     * 所以这里钉的是**第一个决定** —— 一上来就该是"不上浮"，而不是死按。
+     * 另外现在只在"该不该按"变了的时候才写控制位（默认就是没按），
+     * 所以"一次都不写"也算对 —— 只要**没有先按下去**。 */
+    const ups = calls.control.filter(([k, v]) => k === 'jump' && v === true)
+    const firstUpAt = ups.length ? ups[0][2] - t0 : null
+    ok(firstUpAt === null || firstUpAt >= 1000,
+      '🔴 目标在水下 ⇒ 前 1 秒一次都没上浮（只有卡住之后的纠偏才反着试一轮）',
+      `第一次上浮在 ${firstUpAt}ms`)
+    ok(r.via === 'swim' && r.arrived === false, '没游到就如实报没游到', JSON.stringify({ via: r.via, arrived: r.arrived }))
+  }
+
+  // ② 一格都不动 ⇒ 连续两个窗口没靠近就该收手，别把整轮预算耗光
+  {
+    const { bot, calls, stop } = mkSwimBot({ frozen: true })
+    const mc = mkMc(bot)
+    const t0 = Date.now()
+    const r = await walkSwim(mc, { x: 0, y: 60, z: 8 }, { arrive: 1.6, budget: 8000 }, mkCtx(mc))
+    const ms = Date.now() - t0
+    stop()
+    ok(r.reason === 'swim-stuck', '🔴 连续没靠近 ⇒ reason = swim-stuck（不是含糊的 swim-budget）', String(r.reason))
+    ok(r.stuck === true, 'stuck:true（上层据此交给水下自救）')
+    ok(r.fixups >= 1, '先纠偏过（把上浮/下沉反过来试）', String(r.fixups))
+    ok(ms < 7000, '不用等满 8 秒预算就收手', `${ms}ms`)
+    ok(/别再往这个方向硬游/.test(r.hint ?? ''), 'hint 明确劝"别再往这个方向硬游"', String(r.hint).slice(0, 60))
+    ok(calls.control.length > 0, '确实按过控制位（不是空转）')
+  }
+
+  // ③ 一直在靠近 ⇒ 不许误报卡住（"别过度调整"）
+  {
+    const { bot, calls, stop } = mkSwimBot({ pos: [0, 60, 0] })
+    const mc = mkMc(bot)
+    const r = await walkSwim(mc, { x: 0, y: 60, z: 4 }, { arrive: 1.6, budget: 6000 }, mkCtx(mc))
+    stop()
+    ok(r.arrived === true, '有进展就一路游到（不纠偏、不收手）', JSON.stringify({ arrived: r.arrived, ms: r.ms }))
+    ok(r.fixups === undefined, '没有纠偏记录（说明一次都没误判）', String(r.fixups))
+    ok(calls.lookAt >= 2, '还是每 250ms 重新对准', `lookAt=${calls.lookAt}`)
+  }
+
+  // ④ 静态：判据必须是"离目标变近"，不是"总位移"
+  {
+    const src = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+    ok(/const gained = winLeft - me\.distanceTo\(goal\)/.test(src), '🔴 窗口判据是"离目标变近了没有"（不是总位移）')
+    ok(!/const gained = .*start\.distanceTo/.test(src), '🔴 绝不用 `start.distanceTo` 当进展（被水推着横漂也是位移）')
+    ok(/if \(fixups < SWIM_FIXUPS\)/.test(src) && /jumpOverride = !wantJump/.test(src), '纠偏 = 把上浮/下沉反过来试一轮')
+    ok(/stuckWhy = 'swim-stuck'/.test(src), '纠偏用尽 ⇒ 记 swim-stuck 收手')
+  }
 }
 
 /* ─────────── 收尾 ─────────── */

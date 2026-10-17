@@ -725,6 +725,34 @@ section('⑩ interruptMove() —— 自保反射抢 AI 那一步的移动（"动
         '序列里"没走到的 move"不再记成成功（审计⑧）', JSON.stringify({ ok: r.results[0]?.ok, note: r.results[0]?.note }))
       ok(r.succeeded === 0 && r.failed === 1, 'succeeded 不把没走到的 move 算进去', JSON.stringify({ succeeded: r.succeeded, failed: r.failed }))
     }
+    /* 🔴 2026-10-17 用户实机：`mc_sequence` 里某一格**已经是空气** ⇒ 整串中止，
+     *    而报的原因是「这一轮时间不够」、`elapsedMs` 只有 300ms。两个毛病一起钉住：
+     *    ① 空气格的目标（"那格不是实心的"）**已经达成**，不该算失败、更不该中止整串；
+     *    ② 失败步骤的 note 必须带**真实原因**，不许硬编码"时间不够"。 */
+    {
+      const fake = mkBot({ hang: false })
+      const mc = mkMc(fake)
+      mc.breakBlock = async () => ({
+        broken: null, at: { x: 0, y: 64, z: 0 },
+        note: '那里本来就是空气（**我这边**读到的）—— 要么已经挖掉了，要么客户端的区块缓存旧了',
+      })
+      mc.walkTo = async () => ({ arrived: true })
+      const r = await mc.runSequence(
+        [{ op: 'break', x: 0, y: 64, z: 0 }, { op: 'move', x: 5, y: 64, z: 0 }],
+        { budgetMs: 3_000 })
+      ok(r.results[0]?.ok === true, '🔴 空气格不算失败（目标"那格不是实心的"已经达成）', JSON.stringify({ ok: r.results[0]?.ok }))
+      ok(r.results.length === 2 && r.stoppedAt == null, '🔴 空气格**不中止**后面的步骤（以前整串断在这）', JSON.stringify({ n: r.results.length, at: r.stoppedAt }))
+    }
+    {
+      const fake = mkBot({ hang: false })
+      const mc = mkMc(fake)
+      mc.placeBlock = async () => ({ placed: false, note: '那一格被占了（现在里面是 stone）' })
+      const r = await mc.runSequence([{ op: 'place', x: 1, y: 64, z: 0 }], { budgetMs: 3_000 })
+      const note = String(r.results[0]?.note ?? '')
+      ok(/那一格被占了/.test(note), '🔴 失败步骤的 note 带出**真实原因**', note.slice(0, 60))
+      ok(!/时间不够/.test(note), '🔴 不再谎报"本轮时间不够"（那是硬编码的旧文案）', note.slice(0, 60))
+      ok(/不是时间不够/.test(String(r.hint ?? '')), '🔴 第 1 步秒失败 ⇒ hint 明说"不是时间不够"', String(r.hint ?? '').slice(0, 60))
+    }
     // ⑦ waitForChunks：时间用完 ⇒ 立刻返回，不白等 300ms
     {
       const fake = mkBot({ hang: false })

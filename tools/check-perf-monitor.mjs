@@ -275,6 +275,14 @@ section('④ 静态接线')
     '🔴 唯一的工具入口 asTool.execute 包了 perfWrap（这样"每个工具"都被量到）')
   ok(/const perf = perfSnapshot\(\)/.test(idx) && /perf,/.test(idx), 'mc_diag 的返回里带 perf')
   ok(/resetPerf/.test(idx), 'mc_diag 支持 resetPerf（换场景重测）')
+  /* 🔴 2026-10-17 用户实机：`mc_diag` 一次输出几万字符，AI 只想知道其中一节 ⇒ 加 `only` 分节。 */
+  ok(/only: \{ type: 'string'/.test(idx), '🔴 mc_diag 支持 only（只取需要的几节）')
+  ok(/const ONLY_GROUPS = \{/.test(idx) && /state: \['physicsEnabled'/.test(idx),
+    '🔴 only 有分组表（state/perf/crafting/scheduler/watching/prompt/terrain/workers/connection）')
+  ok(/if \(!asked\.length\) return full/.test(idx), '🔴 不传 only ⇒ 原样全给（老调用行为一个字都没变）')
+  ok(/picked\.unknownSections = unknown/.test(idx), '🔴 认不出的节名放进 unknownSections（不静默丢）')
+  ok(/const keep = new Set\(\['online', 'version', 'position', 'mode'\]\)/.test(idx),
+    '🔴 点名分节时仍**永远**带 online/version/position/mode（不然任何结论都没法落地）')
   ok(!/require\(|import .*mineflayer|prismarine/.test(self), '🔴 perf-monitor 不 import 任何游戏库（纯 Node，好测）')
   ok(!/from '\.\/core\.mjs'/.test(self), '🔴 perf-monitor 不反向 import core.mjs（会循环导入）')
   ok(/if \(!perfEnabled\(\)\) return fn\(\)/.test(self), '🔴 关掉时零成本：直接 return fn()，连 hrtime 都不取')
