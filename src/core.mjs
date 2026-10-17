@@ -92,13 +92,12 @@ const requireFromMineflayer = (() => {
  *   yggdrasil/src/utils.js:35   `if (body?.error !== undefined) throw new Error(body.error)`
  *                               → 皮肤站令牌失效时抛 `ForbiddenOperationException`
  *   ⇒ 这个 rejection **没有任何人接**（回调没人调、返回的 promise 没人 await）
- *   ⇒ 宿主的 `installFailLoud` 把"未处理的 Promise 拒绝"当致命错误 → `dsh: fatal load failure` → **exit(1)**
+ *   ⇒ 宿主的 `installFailLoud` 把它当致命错误 → `dsh: fatal load failure` → **exit(1)**
  *
  * 所以这里把 `yggdrasil.server(...)` 返回的对象包一层：
  *   · 调用方传了回调 → 我们替新版库把回调调起来（成功/失败都调）⇒ 恢复老式调用的语义、不产生悬空拒绝；
  *   · 没传回调 → 至少 `.catch()` 掉，别把它变成 unhandledRejection。
  * 同时把这类认证失败记下来（`takeAuthJoinError()`），好让上层给出"去 MC设置重新登录"的明确指引。
- *
  * ⚠️ 只动这一个方法；resolver 锚在 **mineflayer 自己的依赖树**上（保证和 minecraft-protocol 用的是同一份）。
  * ─────────────────────────────────────────────────────────────────────────────────────────── */
 let lastAuthJoinError = null
@@ -156,17 +155,16 @@ export function friendlyAuthError (e) {
  * 交给 minecraft-protocol 的**凭据开关**（纯函数，自检直接测）。
  *
  * 🔴 2026-09-17 真机致命事故的另一半：`haveCredentials` 的语义是"**有真凭据**能拿给认证服看"
- *   （minecraft-protocol `microsoftAuth.js:33` / `mojangAuth.js:24` 都是这么设的），
- *   而我们以前**无条件设 true** ⇒ 离线账户也会被拖去 `sessionserver.mojang.com` 做 session join，
- *   假 token 必然被拒（`ForbiddenOperationException`）→ 那条 rejection 没人接 →
- *   宿主的 fail-loud 直接 `exit(1)`，整个 Harness 死。
- *   离线账户必须走 encrypt.js 的"无凭据"分支（不发 session join）。
- * @param {'offline'|'yggdrasil'} mode 账户类型
+ *   （minecraft-protocol `microsoftAuth.js:33` / `mojangAuth.js:24` 都这么设），而我们以前
+ *   **无条件设 true** ⇒ 离线账户也会被拖去做 session join，假 token 必被拒
+ *   （`ForbiddenOperationException`）→ 那条 rejection 没人接 → 宿主 fail-loud `exit(1)`，整个 Harness 死。
+ *   离线账户必须走 encrypt.js 的"无凭据"分支；2026-10-15 加微软正版（跟皮肤站一样是**真凭据**）。
+ * @param {'offline'|'yggdrasil'|'microsoft'} mode 账户类型
  * @returns {{haveCredentials:boolean, useAccessToken:boolean}}
  */
 export function sessionFlags (mode) {
-  const ygg = mode === 'yggdrasil'
-  return { haveCredentials: ygg, useAccessToken: ygg }
+  const real = mode === 'yggdrasil' || mode === 'microsoft'
+  return { haveCredentials: real, useAccessToken: real }
 }
 
 let _itemLoader = null
@@ -477,13 +475,11 @@ export class McBot extends EventEmitter {
   /**
    * 移动的"当前归属者"编号。
    *
-   * 🔴 为什么需要（2026-10-06 实机，用户原话「刚刚遇到怪了，但是他动了一下不动了，
-   *    应该是 move 的时候冲突了」）：
-   *   自主层被怪贴上时会自己逃（`mc_auto` 的 avoid），而 AI 那一轮可能正在 `mc_move`
-   *   或 `mc_dig`。两份移动同时占着**同一个** `bot.pathfinder`，而 `#walkPathfinder`
-   *   的 `finally` 原来是**无条件**停 pathfinder + 松控制位的 —— 先结束的那一份会把
-   *   另一份一起停掉：动一下就僵住，之后谁都不动。
-   *   现在每次移动开始时领一个号，收尾时只有"号还是最新的"才允许动 pathfinder / 控制位。
+   * 🔴 为什么需要（2026-10-06 实机，用户原话「刚刚遇到怪了，但是他动了一下不动了，应该是 move
+   *    的时候冲突了」）：自主层被怪贴上时会自己逃（`mc_auto` 的 avoid），而 AI 那一轮可能正在
+   *    `mc_move`/`mc_dig`。两份移动同时占着**同一个** `bot.pathfinder`，而 `#walkPathfinder` 的
+   *    `finally` 原来是无条件停 pathfinder + 松控制位的 —— 先结束的那份会把另一份一起停掉。
+   *    现在每次移动开始时领一个号，收尾时只有"号还是最新的"才允许动 pathfinder / 控制位。
    */
   _moveGen = 0
 
@@ -912,13 +908,18 @@ export class McBot extends EventEmitter {
   }
 
   /** 攻击实体。给 `who` 就按名字找，否则打最近的那个 —— 实现在 `src\attack.mjs`
-   *  （为什么不能 `await pvp.attack()` 完就 stop、名字怎么匹配、掉落物怎么提示，都写在那个文件头上） */
+   *  （为什么不能 `await pvp.attack()` 完就 stop、名字怎么匹配、掉落物怎么提示，都写在那个文件头上）
+   *
+   *  `moveTo` / `equipTo` 是**能力回调**：战斗策略层要"走位/撤退/换武器"时通过这里做，
+   *  而不是自己去碰 bot —— 这样它就不可能悄悄长成第二套移动控制器。两个都是现成实现的转发。 */
   async attack (opts = {}) {
     return await attack(this.requireBot(), opts, {
       t: (p, k, l) => this.#t(p, k, l),
       callLeft: () => this.callLeft(),
       abortSignal: this.abortSignal,
       hasPvp: Boolean(this.mcPlugins?.pvp),
+      moveTo: async (pos, o = {}) => await this.walkTo(pos, o),
+      equipTo: async (name) => await this.equip({ name }),
     })
   }
 
@@ -936,8 +937,7 @@ export class McBot extends EventEmitter {
    * 步骤 op：wait / move / look / toward / place / break / dig / use / useitem /
    *          attack / equip / give / toss / say / jump / swim
    *
-   * 实现在 `src\sequence.mjs`（预算 / 中断 / 从第几步续跑 / 为什么 `move` 的 ok 要看 `arrived`，
-   * 都写在那两个函数的注释里）。
+   * 实现在 `src\sequence.mjs`（预算 / 中断 / 从第几步续跑 / 为什么 `move` 的 ok 要看 `arrived`，都写在注释里）。
    */
   async runSequence (steps, opts = {}) { return await runSequence(this, steps, opts) }
 

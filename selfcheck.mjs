@@ -348,14 +348,15 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   console.log(`  ${!/serveExpressFile/.test(idx) && !/knownWorkspaces/.test(idx) ? '✅' : '❌'} 🔴 旧的"目录名 + 进程内见过的工作区集合"那套已删干净`)
   console.log(`  ${/realpathSync\(target\)/.test(idx) && /拒绝越界（符号链接）/.test(idx) ? '✅' : '❌'} 🔴 防穿透：段级校验 + realpath 复查（符号链接也跳不出去）`)
   // 「随版本更新」（用户 2026-09-17）：在"备好记忆目录"那两个时机执行，版本变了才替换
-  console.log(`  ${/syncRulesVersion\(root, PLUGIN_VERSION, \{ follow: workspaceConfigValues\(root\)\.rulesFollowVersion !== false \}\)/.test(idx) ? '✅' : '❌'} 🔴 「随版本更新」挂在"备好记忆目录"时机上（follow 来自**本工作区** config.json，默认开）`)
+  // 🔴 用户 2026-10-15「对升级只动默认的，会话的不动」：同步目标从 `root`（会话根）挪到 `memoryBaseFor(cwd)`（基根）
+  console.log(`  ${/syncRulesVersion\(syncDir, PLUGIN_VERSION, \{\s*follow: workspaceConfigValues\(root\)\.rulesFollowVersion !== false,\s*backup: true\s*\}\)/.test(idx) && /const syncDir = memoryBaseFor\(cwd\)/.test(idx) ? '✅' : '❌'} 🔴 「随版本更新」只动**基根那份**（=「默认提示词」），会话那份不碰（follow 来自**本工作区** config.json，默认开；覆盖前留 .bak-<旧版本>）`)
   console.log(`  ${/migrateWorkspaceConfig\(root, \{ seed: pluginConfig\.legacyPromptSwitches\(\) \}\)/.test(idx) ? '✅' : '❌'} 🔴 建档/迁移（旧 .rules-version 并入 config.json）**先于**版本同步（否则旧值这轮看不到）`)
-  console.log(`  ${/行事准则已替换为新版本默认内容/.test(idx) ? '✅' : '❌'} 真替换时会写一行日志（便于排查"我的准则怎么变了"）`)
+  console.log(`  ${/默认提示词\*\*（基根那份）已替换为新版本默认内容/.test(idx) ? '✅' : '❌'} 真替换时会写一行日志（便于排查"我的默认提示词怎么变了"）`)
   console.log(`  ${!/read_image \{file_path/.test(codeOnly) && !/present \{files/.test(codeOnly) ? '✅' : '❌'} 🔴 旧的"用 read_image / present 发图"提示已清干净（注释里的历史说明不算）`)
   const vp = readFileSync(new URL('./src/version-prompt.mjs', import.meta.url), 'utf8')
   console.log(`  ${/\.dsh-mc-agent\/\.express\//.test(vp) && /mc_kit_express/.test(vp) && /!\[图片名\]\(url\)/.test(vp) && /\[文件名\]\(url\)/.test(vp) ? '✅' : '❌'} 版本提示里写清交付流程（先放发布区 → mc_kit_express 拿路径 → 自己拼 ![]/[]）`)
   const cli = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
-  console.log(`  ${/data-wc-verprompt/.test(cli) && /看内置默认/.test(cli) && /target: 'version'/.test(cli) && /setVpText\(/.test(cli) ? '✅' : '❌'} 「提示词」页**可编辑**版本提示（读文件 / 保存 / 恢复默认 / 看内置默认 —— 用户有权知道它说了什么，也有权改）`)
+  console.log(`  ${!/data-wc-verprompt/.test(cli) && !/setVpText\(/.test(cli) && !/'vp:save'/.test(cli) ? '✅' : '❌'} 「提示词」页**不再**放版本提示的编辑入口（用户 2026-10-15：文件仍在、仍注入，但不在设置页里改）`)
   // 🔴 2026-10-08 事故：失败清单用**被包装过的** console.log 打印 ⇒ 每打印一条就把这条又记回 __scFails，
   //    而 `for (const s of __scFails)` 边遍历边长 ⇒ 死循环：输出涨到 2.7 GB、堆 OOM（exit 134）。
   const self = readFileSync(new URL('./selfcheck.mjs', import.meta.url), 'utf8')
@@ -802,8 +803,14 @@ console.log('\n--- 强制停止：UI 路径的真实顺序（停LLM → 退游�
   console.log(`  ${accNew.ok && accDel.ok ? '✅' : '❌'} 账户增/删（DELETE 带 body）`)
   const cfgApi = await callApi('GET', '/api/mc/config')
   console.log(`  ${Array.isArray(cfgApi.commandWhitelist) ? '✅' : '❌'} 设置接口 GET /config（白名单 ${cfgApi.commandWhitelist?.length} 条）`)
-  // 🔴 2026-09-17 隔离实例实测：`/api/mc/presets` 只在 handleSettingsApi 里判过、**没进分派名单** →
-  //    真机上一律 404，前端只能靠兜底名单。这条断言直接打真路由，防止再漏。
+  /* 「指令白名单」页那一排开关的数据源（2026-10-15 用户：「把命令都列出来并配上开关」）：
+   *   目录由服务端下发，`on` 也由服务端算（客户端一行 import 都没有，抄不了匹配逻辑）。 */
+  const catRows = (cfgApi.commandCatalog ?? []).flatMap((g) => g.items ?? [])
+  console.log(`  ${Array.isArray(cfgApi.commandCatalog) && catRows.length >= 50
+    && catRows.every((it) => it.name && it.desc && typeof it.on === 'boolean')
+    ? '✅' : '❌'} 🔴 指令目录随配置下发（${(cfgApi.commandCatalog ?? []).length} 组 / ${catRows.length} 条，每条带 name/desc/on）`)
+  console.log(`  ${Array.isArray(cfgApi.commandExtra) ? '✅' : '❌'} 自定义条目单独下发（${(cfgApi.commandExtra ?? []).length} 条）`)
+  console.log(`  ${!/password|accessToken|clientToken/i.test(JSON.stringify([accApi, srvApi, accNew, cfgApi])) ? '✅' : '❌'} 🔴 设置接口响应里逐字查过：没有凭据字段`)
   const presetRoute = await (async () => {
     const rq = new EventEmitter()
     rq.method = 'GET'; rq.url = '/api/mc/presets'; rq.headers = { host: '127.0.0.1:39999' }
@@ -2651,18 +2658,18 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
   console.log(`  ${/MC设置/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则教它把用户引导到「MC设置」`)
   // 🔴 2026-09-18 第五版（用户给的全文）：上一版的「建筑须知」之上，新增「较长思考」整节。
   {
-    const secs = ['宗旨', '称呼', '记忆', '边界信息', '登录游戏', '看门狗', '聊天', '建筑须知', '较长思考', '硬规矩']
+    const secs = ['宗旨', '称呼', '说话方式', '记忆', '进服', '感知', '任务', '生存', '工具速查', '干活习惯', '矿道', '主线与阶段', '看门狗与聊天', '多人服', '建筑', '较长思考', '硬规矩']
     const missing = secs.filter((s) => !DEFAULT_AGENTS_MD.includes(`## ${s}`))
-    console.log(`  ${missing.length === 0 ? '✅' : '❌'} 🔴 第五版的十个分节都在（缺：${missing.join('、') || '无'}）`)
+    console.log(`  ${missing.length === 0 ? '✅' : '❌'} 🔴 重写版的十七个分节都在（缺：${missing.join('、') || '无'}）`)
     const house = ['环境', 'NBT', '楼梯', '复盘', '功能性']
     const lack = house.filter((k) => !DEFAULT_AGENTS_MD.includes(k))
     console.log(`  ${lack.length === 0 ? '✅' : '❌'} 🔴「建筑须知」讲到了关键点（环境协调 / 方块属性与 NBT / 多部分方块 / 细节 / 复盘；缺：${lack.join('、') || '无'}）`)
-    const houseNew = ['先将建筑大体结构完成', '每阶段完成要给用户响应', '建造完成后，需要复盘']
+    const houseNew = ['先大体', '每阶段给用户回一句', '建完复盘']
     const lack2 = houseNew.filter((k) => !DEFAULT_AGENTS_MD.includes(k))
-    console.log(`  ${lack2.length === 0 ? '✅' : '❌'} 🔴「建筑须知」补的三条也在（先大体结构 / 每阶段回话 / 完工复盘；缺：${lack2.join('、') || '无'}）`)
-    console.log(`  ${/第一时间回复/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 「聊天」有"第一时间回复用户"（第四版加的）`)
+    console.log(`  ${lack2.length === 0 ? '✅' : '❌'} 🔴「建筑」补的三条也在（先大体 / 每阶段回话 / 完工复盘；缺：${lack2.join('、') || '无'}）`)
+    console.log(`  ${/先说一句再动手|第一时间回一句/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 「看门狗与聊天」有"先说一句再动手"（第四版加的）`)
     // 第五版新加的整节：长时间思考要偶尔冒个泡（否则用户以为你卡住了，事件提示词也没时机注入）
-    const think = ['较长思考', '简短地给用户汇报', '提示词有时机注入']
+    const think = ['较长思考', '简短报一句', '提示词有时机注入']
     const lack3 = think.filter((k) => !DEFAULT_AGENTS_MD.includes(k))
     console.log(`  ${lack3.length === 0 ? '✅' : '❌'} 🔴 新增「较长思考」讲到关键点（长思考要偶尔汇报 / 这样事件提示词才有注入时机；缺：${lack3.join('、') || '无'}）`)
   }
@@ -2888,7 +2895,7 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
     console.log(`  ${p1.includes('a.example:25566') && p1.includes('acc-1') && !/local network/.test(p1) ? '✅' : '❌'} 提示词含地址 + 账户 \`名字 (id: …)\`；手动连接不追加局域网说明`)
     console.log(`  ${/local network/.test(p2) ? '✅' : '❌'} 🔴 局域网触发才追加"该地址可能是临时的"`)
     const { DEFAULT_AGENTS_MD } = await import('./src/agentsmd.mjs')
-    console.log(`  ${!/within 11 seconds|Keep every tool call short|SAME tool again/.test(p1) && /## 不用替我省 token/.test(DEFAULT_AGENTS_MD) && /单次调用别超过 11 秒/.test(DEFAULT_AGENTS_MD) && /这一轮的 11 秒用完了/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 🔴 "单次调用 ≤11 秒：一次一小步、到点再叫一次同一个工具"写在 **RULES.md（行事准则）**的「不用替我省 token」里，**不再注入连接提示词**（用户 2026-10-08：先要求 ≤5 秒 → 抬到 11 秒 → 规则挪进文件让它自己读）`)
+    console.log(`  ${!/within 11 seconds|Keep every tool call short|SAME tool again/.test(p1) && /## 感知/.test(DEFAULT_AGENTS_MD) && /单次调用别超过 11 秒/.test(DEFAULT_AGENTS_MD) && /这一轮的 11 秒用完了/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 🔴 "单次调用 ≤11 秒：一次一小步、到点再叫一次同一个工具"写在 **RULES.md（行事准则）**的「感知」里，**不再注入连接提示词**（用户 2026-10-08：先要求 ≤5 秒 → 抬到 11 秒 → 规则挪进文件让它自己读）`)
 
     const isrc = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
     console.log(`  ${/path === '\/api\/mc\/servers'/.test(isrc) && /path === '\/api\/mc\/lan'/.test(isrc) && /path === '\/api\/mc\/connect'/.test(isrc) ? '✅' : '❌'} 三个新端点在 index.js（servers / lan / connect）`)
@@ -2939,7 +2946,11 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
   console.log(`  ${vers.length >= 20 && vers.includes(caps?.game?.latest) && vers.includes(caps?.game?.oldest) ? '✅' : '❌'} mc_capabilities 报出支持的 MC 版本（${vers.length} 个，端点 ${caps?.game?.oldest} → ${caps?.game?.latest} 均在清单内）`)
   console.log(`  ${vers.includes('26.2') === (caps?.game?.latest === '26.2') ? '✅' : '❌'} 清单与上界自洽（本机装的那份${vers.includes('26.2') ? '**含** 26.2（打过补丁的树）' : '不含 26.2（官方版）'}）`)
   console.log(`  ${caps?.game?.oldest && caps?.game?.latest ? '✅' : '❌'} 给出范围 ${caps?.game?.oldest} → ${caps?.game?.latest}（mineflayer ${caps?.game?.mineflayer}）`)
-  console.log(`  ${/microsoft/i.test(JSON.stringify(caps?.auth?.notSupported)) ? '✅' : '❌'} 明说微软登录暂不支持`)
+  // 正版（微软）登录 2026-10-15 做完：`notSupported` 里**不该**再有 microsoft（除非这台机器上
+  // 真没装 prismarine-auth）；同时三种模式都要报出来。
+  const authModes = String(caps?.auth?.modes ?? '')
+  console.log(`  ${authModes.includes('offline') && authModes.includes('yggdrasil') && authModes.includes('microsoft') ? '✅' : '❌'} 报出三种账户模式（离线 / 皮肤站 / 微软正版）`)
+  console.log(`  ${!/microsoft/i.test(JSON.stringify(caps?.auth?.notSupported)) ? '✅' : '❌'} 微软正版登录已支持（不再列在"不支持"里）`)
   console.log(`  ${caps?.tools?.count >= 26 && Array.isArray(caps?.tools?.names) ? '✅' : '❌'} 报了工具总数 ${caps?.tools?.count} + 清单`)
   console.log(`  ${caps?.limits?.sequence?.steps === 64 && caps?.config?.file ? '✅' : '❌'} 报了上限与配置文件路径`)
 }
@@ -3598,11 +3609,15 @@ console.log('\n--- 局域网探测（mc_lan）---')
     console.log(`  ${dt1 < 16000 ? '✅' : '❌'} seconds 再大也被夹到 15 秒上限（实测 ${dt1}ms）`)
   }
 
-  // ⑥ 工具面：注册了、参数只剩广播那两个（扫段的参数必须消失）
+  // ⑥ 工具面：注册了、参数只剩 seconds（扫段的参数必须消失）
   const lanDef = tools.get('mc_lan')
   console.log(`  ${lanDef ? '✅' : '❌'} 注册了 mc_lan 工具`)
   const lanParams = Object.keys(lanDef?.parameters?.properties ?? lanDef?.parameters ?? {})   // defineTool 归一成 JSON Schema，真参数在 .properties
-  console.log(`  ${lanParams.length === 2 && ['mode', 'seconds'].every((k) => lanParams.includes(k)) ? '✅' : '❌'} 参数只剩广播（${lanParams.join(', ')}）`)
+  /* 🔴 2026-10-17 审计：这里原来钉的是 `['mode','seconds']`。可 `mode` **从来没被读过**
+   *    （`execute` 里写死 `broadcast`）—— 声明一个按了没反应的旋钮，比没有更坏：
+   *    模型会以为能切模式。参数已删，这里改成"只剩 seconds"。返回里的 `mode:'broadcast'`
+   *    仍然保留（那是**报告**，不是旋钮）。 */
+  console.log(`  ${lanParams.length === 1 && lanParams[0] === 'seconds' ? '✅' : '❌'} 参数只剩 seconds（${lanParams.join(', ') || '空'}）`)
   const scanParams = ['subnet', 'ports', 'timeoutMs', 'pingTimeoutMs', 'includeSelf'].filter((k) => lanParams.includes(k))
   console.log(`  ${scanParams.length === 0 ? '✅' : '❌'} 扫段参数已从工具面移除（${scanParams.length ? '还在：' + scanParams.join(', ') : '没有 subnet/ports/timeoutMs/pingTimeoutMs/includeSelf'}）`)
   const lanDefault = await tools.get('mc_lan').execute({ seconds: 1 }, A)
@@ -3756,7 +3771,7 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['RULES.md/AGENTS.md 缺失标记来自服务端（rulesExists / wsExists）', /rulesExists/.test(code) && /m\.workspaceExists === true/.test(code)],
     ['弹窗关闭按钮 = 叉图标（data-wc-xbtn + IconCloseOutlineRegular；与标题同色、hover 红、无边框）', /data-wc-xbtn/.test(code) && /IconCloseOutlineRegular/.test(code) && !/'data-wc-tiny': '', title: '关闭/.test(code)],
     ['Switch 不拿节点 label 当 title（防 [object Object]）', /typeof props\.label === 'string' \? props\.label : undefined/.test(code)],
-    ['版本提示来自顶层 versionPrompt（无工作区也显示），且可编辑（保存/恢复默认走 target:"version"）', /versionPrompt, hasWorkspace,/.test(code) && /setVersionPrompt\(m\.versionPrompt/.test(code) && /看内置默认/.test(code) && /setVpText\(/.test(code) && /target: 'version'/.test(code)],
+    ['版本提示不再有界面编辑入口（用户 2026-10-15 要求去掉；文件仍在、仍注入，顶部状态行仍显示它）', !/data-wc-verprompt/.test(code) && !/setVpText\(/.test(code) && /data-wc-injectstatus/.test(code)],
     // 🔴 「已保存」气泡：3s 自动消失、切标签页消失、关闭时清掉，且定时器清场（别在关窗后到点报错）
     ['已保存提示 3s 自动消失 + 定时器清场', /setTimeout\(\(\) => setSaved\(''\), 3000\)/.test(code) && /clearTimeout\(t\)/.test(code) && /setSaved\(''\); setTab\(t\.id\)/.test(code)],
     // ── 「连接到MC」（2026-10-04）──
@@ -3820,19 +3835,20 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['调用 /api/mc/authservers', src.includes('/api/mc/authservers')],
     ['调用 /api/mc/config', src.includes('/api/mc/config')],
     ['普通停止按钮已移除（没有 }, \'停止\') 这种按钮）', !/\}\s*,\s*'停止'\s*\)/.test(src) && !/stop\(false\)/.test(src)],
-    ['微软账户那项标"未实现"', /未实现/.test(code)],
+    ['微软账户那项不再标"未实现"', /'new-microsoft'/.test(code) && !/k: 'microsoft'[\s\S]{0,60}off: true/.test(code)],
+    ['类型项仍支持置灰（off），只是当前没有项在用', /未实现/.test(code)],
     ['拖卡片能读 dataTransfer', /dataTransfer/.test(src)],
     // ── 账户页 UI（用户 2026-09-16 重做）：横条 + 类型气泡 + 独立新建/编辑界面 ──
     ['账户列表是横条 + 类型气泡', /data-wc-acct/.test(code) && /function TypeChip/.test(code)],
     ['列表里不再展示细节（innerID / UUID / 服务器）', !/innerID：/.test(code) && !/UUID：/.test(code) && !/服务器：/.test(code)],
-    ['离线 = 编辑，其余 = 刷新', /disabled: rowBusy,\s*onClick: \(\) => props\.onEdit/.test(code) && /'刷新'/.test(code)],
+    ['行里一律给「编辑」，「刷新」挪到页头一下刷全部', /onClick: \(\) => props\.onEdit\(acc\)/.test(code) && /'刷新'/.test(code) && /props\.onRefreshAll\?\.\(\)/.test(code)],
     ['「添加」在右上角（panehead + spacer）', /data-wc-panehead/.test(code) && /data-wc-spacer/.test(code) && /＋ 添加/.test(code)],
     ['三种账户各有独立界面', /function TypePicker/.test(code) && /function OfflineForm/.test(code) && /function YggdrasilForm/.test(code)],
     ['第三方新建：服务器 → 名字 → 账号 → 密码', (() => {
       const a = code.indexOf("label: '认证服务器'")
       const b = code.indexOf("label: '服务器名字（留空就用域名）'")
       const c = code.indexOf("label: '账号（邮箱）'")
-      const d = code.indexOf("label: '密码'")
+      const d = code.indexOf("'密码（留空 = 不改）'")
       return a > 0 && a < b && b < c && c < d
     })()],
     // 🔴 用户 2026-09-16 纠正：第三方表单问的必须是**认证服务器的名字**（缓存标签要看得懂），
@@ -3844,6 +3860,17 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
       return /服务器名字/.test(seg) && !/游戏内名字/.test(seg)
     })()],
     ['服务器名字会随账户一起提交（serverName）', /serverName/.test(code)],
+    // 🔴 用户 2026-10-15 报的 bug：「我用的是第三方皮肤站账号，点编辑进去还是离线账号」——
+    //    给第三方账户也发「编辑」之后，路由**必须**分出 edit-yggdrasil 这一档，
+    //    否则会被送进没有服务器/密码的离线表单，一保存就把账户写成了离线。
+    ['第三方账户点「编辑」走自己的表单（不再掉进离线表单）', (() => {
+      const a = code.indexOf('onEdit: (acc) => {')
+      const seg = a >= 0 ? code.slice(a, a + 400) : ''
+      return /acc\.type === 'yggdrasil' \? 'edit-yggdrasil'/.test(seg)
+    })()],
+    ['第三方表单同时服务「新建」与「编辑」', /view === 'new-yggdrasil' \|\| view === 'edit-yggdrasil'/.test(code) && /const \{ servers = \[\], busyKey, mode = 'new', account \} = props/.test(code)],
+    ['编辑第三方账户时密码留空 = 不改密码', /!editing && !hasPass/.test(code) && /if \(p\) payload\.password = p/.test(code)],
+    ['编辑第三方账户不拿账号前缀覆盖显示名', /\.\.\.\(editing \? \{\} : \{ name: fallback \}\)/.test(code)],
     ['改过名字才带 serverName（没改就别无谓地改名请求）', /nm !== pickedSrv\.name \? \{ serverName: nm \}/.test(code)],
     ['第三方新建有**看得见的**拽托接受区', /data-wc-drop/.test(code) && /把 authlib-injector 卡片拖到这里/.test(code)],
     ['拖卡片后自动选中并填进输入框', /onAddCard\(card\)[\s\S]{0,160}setUrl\(srv\.url\)/.test(code)],
@@ -3888,7 +3915,7 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['清除走 DELETE /api/mc/express', /apiDelete\(withSid\('\/api\/mc\/express'\)\)/.test(code)],
     // 「随版本更新」（提示词页）：开关 + 版本提示行 + 一拨就存 + 失败回滚
     ['「提示词」页有「随版本更新」开关', /label: '随版本更新'/.test(code) && /onToggle: \(next\) => onFollowVersion\(next\)/.test(code)],
-    ['开关说明写清"会覆盖你的修改"', /用新版本的默认提示词替换当前内容（会覆盖你的修改）/.test(code)],
+    ['开关说明写清"只动默认那块、会话不动"', /替换「默认提示词」那一块（会覆盖你的修改）；「会话提示词」不动/.test(code)],
     ['页面显示"当前内容对应哪个版本"', /当前内容对应：\$\{rulesVersion \? `v\$\{rulesVersion\}` : '未知（还没同步过）'\}/.test(code)],
     ['开关一拨就存（乐观更新 + 失败回滚）', /run\('cfg:follow', \(\) => apiPatch\(withSid\('\/api\/mc\/config'\), \{ rulesFollowVersion: next === true \}\)/.test(code) && /if \(!ok\) setFollowVersion\(prev\)/.test(code)],
     ['页面上能看见发布区目录与大小', /data-wc-hint/.test(code) && /share\.files\} 个文件/.test(code) && /fmtBytes/.test(code)],

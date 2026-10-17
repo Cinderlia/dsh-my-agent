@@ -1,0 +1,56 @@
+插件已挂载：注册了 29 个工具
+
+══════ 前置：真连本地服 ══════
+(node:28948) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Mineflayer detected that you are using a deprecated event (physicTick)! Please use this event (physicsTick) instead.
+  · mc_connect ⇒ {"connected":true,"account":{"innerID":"acc-56da5125","id":null,"login":null,"name":"DeepSeek","uuid":"f4cf1fc0-6293-3d4
+  ✓ 连上了（mc_status 看得到自己） — 🟢 active ｜ 我在 (16, 5, 6) ｜ 朝 yaw 3.1 / pitch 0 ｜ 血 20/20 ｜ 食 20 ｜ 手 cobblestonex4 ｜ survi
+  ✓ mc_diag 里能看到调度器快照 — mode=observe-only active=0
+  · 我在 (16,5,6)
+
+══════ ① 长动作在飞时 mc_stop ⇒ 调度器清空 + 在飞动作被 abort ══════
+  ✓ 在飞的 mc_move 登记在调度器里（有 actionId） — {"actionId":"a1","name":"mc_move","owner":"session-sched01","priority":60,"priorityText":"用户","resources":["movement"],"parent":nu
+  ✓ 它占着 movement 资源 — ["movement"]
+  ✓ 🔴 mc_stop 之后调度器**真的清空了**（不是"表里还挂着"） — active=[]
+  ✓ 在飞的 mc_move 真的收场了（没被挂住） — {"done":true,"t":""}
+  ✓ 🔴 mc_stop 之后确实退出了游戏（旁证：它真的停了） — ⚪ standby ｜ 不在游戏里
+📨 有 2 条事件没看（mc_events）
+🐕 看门狗没守
+Mineflayer detected that you are using a deprecated event (physicTick)! Please use this event (physicsTick) instead.
+  ✓ 重连成功（继续测后面的场景）
+
+══════ ④ 任务里的子动作复用父的 actionId（父记录 frames 涨到 2，不新建顶层记录） ══════
+  · mc_dig 建台账 ⇒ 附近找不到 sand
+  ✓ 挖 4 个以上真的开了任务台账 — taskId=t-20261016-210353-01 · · t-20261016-210353-01 · dig · dig sand · 0/8个 · 等条件 · 上次卡在：no-target（附近找不到 sand）
+  · plan ⇒ 📋 t-20261016-210353-01 · dig sand（步骤表已重写） | 现在：第 1/2 步 走到东北边 · 已完成 0 |   · 走到东北边 |   · 再走回来
+  ✓ 步骤表写进去了 — 📋 t-20261016-210353-01 · dig sand（步骤表已重写）
+现在：第 1/2 步 走到东北边 · 已完成 0
+  · 走到东北边
+  · 再走回来
+  · resume ⇒ 📋 t-20261016-210353-01 · dig · dig sand · running | ▶️ 从「waiting」拉回「进行中」—— 可以接着做了 | 步骤：第 1/2 步 走到东北边 · 已完成 0（当前这步试过 0/3 次） | 现场复核
+  ✓ 🔴 resume 真的把任务从 waiting 拉回「进行中」（以前只给建议、不动状态 ⇒ 死胡同） — 📋 t-20261016-210353-01 · dig · dig sand · running
+▶️ 从「waiting」拉回「进行中」—— 可以接着做了
+  ✓ 工具输出里说清了"从哪个状态拉回来的"
+  ✓ 🔴 子动作复用父的 actionId（`frames` 涨到 2，不是另起一条） — mc_task#a3 frames=2 parent=null
+  ✓ 同一时刻只有一条顶层记录（子动作没另起记录） — ["mc_task#a3(2)"]
+  ✓ 静态：子动作的 actionId 取自父记录
+  ✓ 静态：子动作只让父记录 `frames++`，不新建记录
+  · run ⇒ {"done":true,"t":"⏳ 这一轮先到这（推进 0 步）\n▶ 第 1/2 步「走到东北边」→ mc_move\n❓ 走到东北边 结果未知（时间到或被抢占 —— 服务器可能已经做了）\n先 mc_observe / mc_inventory 复核现场，再 mc_tas
+
+══════ ③ 长任务在飞时断线 ⇒ 任务换代、那一步不记账 ══════
+  ✓ 断线前确实有动作在飞（不然测不到"在飞那一步"） — ["mc_task#a4(1)"]
+  · 断线后 get ⇒ t-20261016-210353-01 · dig · dig sand · 0/8个 · 暂停 · 第 1/1 步 走很远 · 已完成 0 · 上次卡在：timeout（被抢占 / 超时） |   ▶ 走很远 | 上次现场：{"at":1792155833996,"position":{"x":
+  · 「走很远」这一步：running(试0次) → running(试0次)（直读 tasks.json）
+  ✓ 🔴 断线后任务不再是"继续跑" — t-20261016-210353-01 · dig · dig sand · 0/8个 · 暂停 · 第 1/1 步 走很远 · 已完成 0 · 上次卡在：timeout（被抢占 / 超时）
+  ▶
+  ✓ 🔴 断线后任务**不**停在 running（否则在飞那一步会被记成已完成） — t-20261016-210353-01 · dig · dig sand · 0/8个 · 暂停 · 第 1/1 步 走很远 · 已完成 0 · 上次卡在：timeout（被抢占 / 超时）
+  ▶
+  ✓ 🔴 断线时在飞的那一步**没有**被记成已完成 — step=running(试0次)
+  · 台账 epoch：3 → 5（直读 tasks.json）
+  ✓ 🔴 断线**让任务换代了**（epoch 涨了）—— 在飞那一步回来会被判过期 — epoch 3 → 5
+  ✓ 任务执行器收场了（没被挂住） — {"done":true,"t":""}
+  ✓ 断线后调度器也是空的 — active=[]
+
+──────────────────────────────────────────────────
+live-sched：pass=23 fail=0

@@ -14,6 +14,7 @@
  */
 
 import { offlineUuid, dashUuid } from './accounts.mjs'
+import { msaSession } from './msa.mjs'
 
 /**
  * 规范化认证端点基址：去首尾空白、去掉结尾多余的斜杠。
@@ -61,7 +62,14 @@ export async function makeSession (self, auth) {
       availableProfiles: [{ id: bare, name }],
     }
   }
-  if (auth.mode !== 'yggdrasil') throw new Error(`不支持的登录方式：${auth.mode}（只有 offline / yggdrasil）`)
+  /* 正版（Microsoft）：令牌缓存是 `prismarine-auth` 自己管的（`<stateDir>/msa/<innerID>/`），
+   * 所以这里**没有密码、也没有我们自己的 token 字段** —— 只把邮箱和缓存目录传下去。
+   * ⚠️ `msaSession` 绝不停下来等用户（缓存没了就直接报"需要重新登录"），
+   *    否则 `mc_connect` 会卡在一个永远不会来的浏览器操作上。 */
+  if (auth.mode === 'microsoft') {
+    return await msaSession({ email: auth.msaEmail, cacheDir: auth.msaCacheDir })
+  }
+  if (auth.mode !== 'yggdrasil') throw new Error(`不支持的登录方式：${auth.mode}（只有 offline / yggdrasil / microsoft）`)
 
   const base = normalizeBaseUrl(auth.authUrl)
   if (!base) throw new Error('认证端点为空（authUrl）——这是插件内部 bug，请报告')

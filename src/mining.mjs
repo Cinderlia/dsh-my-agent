@@ -22,11 +22,12 @@ const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 
 import { sleep, DESYNC_HINT } from './async-util.mjs'
 import { isAir, isLiquid } from './block-names.mjs'
-import { heldText, canHarvestNow, toolKinds, countOf } from './inventory.mjs'
+import { heldText, canHarvestNow, toolKinds, countOf, durWarnText } from './inventory.mjs'
 import { digMsFor } from './dig-speed.mjs'
 import { blockReachOf, slowDigWhy, stateNameOf, dropHint } from './world-observer.mjs'
 import { classifyRestore } from './server-break.mjs'
 import { callBudget, callSecText } from './budget.mjs'
+import { dangerNow, dangerText, healthOf } from './danger.mjs'
 
 /* 「挖到刚好够合成就不挖了」—— 收工时补一句（用户 2026-10-13 报的毛病）。
  *
@@ -197,12 +198,16 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
   /* 真挖掉了 ⇒ 掉落物就在脚边。用户 2026-10-08 原话："挖完方块…老是忘记走过去拾取"。
    * 只**点一句**（`mc_act{break}` 这条路从来不自己捡），让模型知道这活还没完。 */
   const pickup = localGone ? dropHint(b) : null
+  /* 这一下把工具磨掉多少 —— 只在快坏时给（理由见 `dig` 收工段那段注释：
+   * 全好时不说，坏的时候必须说，否则"镐子中途爆了"和"挖得好好的"长得一模一样）。 */
+  const toolWear = durWarnText(b)
   return {
     broken: localGone ? name : false,
     confirmed,
     at: { x: pos.x, y: pos.y, z: pos.z },
     now,
     held,
+    ...(toolWear ? { toolWear } : {}),
     ...(t.changed ? { tool: `${t.heldBefore} → ${t.held}` } : {}),
     ...(digMs != null ? { digMs } : {}),
     ...(pickup ? { pickup } : {}),
@@ -330,7 +335,13 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
    *    方块其实早挖掉了）。收尾包括：`#cancelCollect` 等 `collectBlock_finished`、
    *    兜底原地挖、拼返回文本、DSH 层序列化 —— 这些以前都排在预算之外，
    *    两个目标就是 2×1.5 秒，整轮直接冲出工具超时，模型只拿到一个没有信息的硬错误。 */
-  const deadline = Date.now() + Math.max(0, self.callLeft() - 900)
+  const callLeftMs = self.callLeft()
+  const deadline = Date.now() + Math.max(0, callLeftMs - 900)
+  /* 🔴 2026-10-17（实机：「mc_sequence 会假失败：秒回报 stoppedAt:0 / 本轮时间不够，但方块其实已经挖掉了」）：
+   *    `callLeft()` 太小 ⇒ `leftOf()` 一上来就 < 900 ⇒ **一个都不挖**。
+   *    这是"没做"，不是"没做成" —— 两件事必须分开说（踩坑档案第 107 条），
+   *    否则模型会把已经挖掉的再挖一遍、或者以为"这矿挖不动"。 */
+  const noBudget = callLeftMs <= 900
   const leftOf = () => deadline - Date.now()
   /* 🔴 2026-10-08 实机（用户「挖矿还是会」）：**`dig()` 不再把方块交给 mineflayer-collectblock**。
    *    collectBlock 走过去用的是 `goals.GoalLookAtBlock`（vendor CollectBlock.js:30）—— 只要**看得见**
@@ -345,6 +356,12 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
    *    掉落物由 `#grabDrops` 捡（原来靠 collectBlock 顺手捡）。 */
   let okCount = 0   // 这一轮挖到几个（下面那条兜底路径也要用，所以放在块外）
   let budgetCut = false   // 是不是"时间用完了"提前收工的（那条路自己会说"还有 N 个没挖"）
+  /* 🔴 2026-10-17（用户报"工具排队执行、延迟很大"）：一次调用是**原子**的。
+   *    实机那次：12 个 break 挖竖井 → 骷髅跟下来一路射 → AI 要等 10 秒过完才知道
+   *    （日志里 `mc_auto：zombie 贴上来 → 已叫醒 AI` 比这条调用结束早 5 秒）。
+   *    挖矿是最容易招怪的场景（挖穿到洞穴、没插火把），所以每个目标之前查一次。 */
+  let danger = null
+  const hp0 = healthOf(b)
   {
     /* 🔴 2026-10-08 审计④：`interruptMove()` 以前是**死代码**（定义了没人调），而文档说 mc_dig 靠它抢占。
      *    走路/采集会按着 forward、占着 pathfinder ⇒ 先把还在跑的移动真停掉，再领号。 */
@@ -354,11 +371,23 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
     const reachMax = b.game?.gameMode === 'creative' ? 5.0 : 4.5
     for (const target of targets) {
       seen++
+      /* 挨打了 / 有怪贴脸 ⇒ **立刻**把控制权还回去（这个目标没挖）。放在预算检查**之前**：
+       * 还剩 8 秒也不该继续挖 —— 怪已经站到脸上了。 */
+      danger = dangerNow(b, { hp0 })
+      if (danger) {
+        out.push(`⚠️ ${dangerText(danger)} —— 先别挖了（挖到 ${okCount}/${targets.length}），`
+          + '`mc_act {mode:"attack"}` 打掉它，或者 `mc_move` 躲开；安全了再叫一次 mc_dig')
+        break
+      }
       // 🔴 单次调用 ≤11 秒：到点就带着已经挖到的结果返回，剩下的下次再叫
       const left = leftOf()
       if (left < 900) {
-        out.push(`—— 这一轮的 ${callSecText()}用完了（挖到 ${okCount}/${targets.length}），`
-          + `还有 ${targets.length - seen + 1} 个没挖：再叫一次 mc_dig 接着挖`)
+        out.push(noBudget && okCount === 0
+          ? `—— 这次调用**自己没分到时间**（外层只剩 ${callLeftMs}ms），**一个都没挖**。`
+            + '**这不等于那些方块还在**：先 `mc_scan` / `mc_map` 复核一下到底挖掉没有，'
+            + '确认真没挖再单独叫一次 mc_dig（**别塞在 mc_task 里** —— 外层时间早被前面的步骤吃掉了）。'
+          : `—— 这一轮的 ${callSecText()}用完了（挖到 ${okCount}/${targets.length}），`
+            + `还有 ${targets.length - seen + 1} 个没挖：再叫一次 mc_dig 接着挖`)
         budgetCut = true
         break
       }
@@ -502,6 +531,12 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
       const h = veinHint(b, targets[0]?.name ?? name)
       if (h) out.push(h)
     }
+    /* 工具快坏了就点一句。**只在有警告时**加 —— 这个动作每轮都在跑，
+     * 全好时也念"都还好"就是稳定噪声。而缺了它的后果很实：`mc_dig {count:16}`
+     * 一次能打掉几十点耐久，镐子在执行**中间**爆掉时，AI 拿到的结果
+     * 和"挖得好好的"一模一样，只能靠自己 `mc_inventory` 去查（通常不会查）。 */
+    const wear = durWarnText(b)
+    if (wear) out.push(`⚠️ 工具：${wear}`)
     ctx.taskSettle(task, out, okCount, targets.length)
     ctx.verdictLine(out, okCount, targets.length)
     return ctx.withHeld(out, b, held0)

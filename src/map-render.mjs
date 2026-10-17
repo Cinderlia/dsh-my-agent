@@ -698,12 +698,22 @@ export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, m
     water: gaps.filter((g) => g.kind === 'water').map((g) => ({ y: g.y, to: g.to, thickness: g.thickness })),
   }
 
+  /* 你自己站的这一格（`fy`）**不在往下扫的范围里**（扫的是 `fy-1` 往下），
+   * 但它决定"你现在处在什么环境里" —— 尤其是泡在水里 / 岩浆里的时候。
+   * 🔴 2026-10-17 实机（用户报）：机器人在水坑里（脚那一格是水、人一直在游、游不动），
+   *    报告却说「往下 24 格全是实心 —— **可以放心往下挖**」。话没说错，但**一个字没提"你正泡在水里"**；
+   *    AI 的思考记录里紧接着就写「simplest: **dig down**! The column says all solid, no caves」——
+   *    照着挖下去，水就灌进坑里了。所以这一格必须单独报出来。 */
+  const hereName = b?.blockAt?.(new Vec3(fx, fy, fz))?.name ?? null
+  const here = { y: fy, name: hereName, kind: columnKindOf(hereName) }
+
   return {
     x: fx, z: fz, feetY: fy, from, to, layers, runs,
     solidRun,
     firstGap,
     gaps,
     hazards,
+    here,
     unloaded,
     complete: unloaded === 0,
     mode: 'column',
@@ -729,6 +739,15 @@ export function columnText (col) {
   if (!col || !col.layers?.length) return '🕳 竖列图：这一列一格都没读到（区块没加载？）'
   const where = (col.x === undefined) ? '' : `(${col.x}, ${col.z})`
   const out = [`🕳 竖列 ${where}：脚底 y=${col.feetY}，从 y=${col.from} 往下扫到 y=${col.to}`]
+  /* 先说你**自己**那一格是什么 —— 它不在下面那串 runs 里（扫的是脚底往下），
+   * 但"泡在水里/岩浆里"和"站在空气里"完全是两回事，不说清就会得出"可以放心往下挖"。 */
+  const hk = col.here?.kind
+  if (hk === 'lava' || hk === 'water') {
+    out.push(hk === 'lava'
+      ? `  🔥 你现在**这一格（y=${col.here.y}）就是岩浆** —— 先出来，别在这挖。`
+      : `  🌊 你现在**这一格（y=${col.here.y}）是水**（人正泡在水里）—— 往下挖水会灌进坑，`
+        + '可能把你冲下去或淹死；要挖就先想清楚水往哪流，或者先离开水面。')
+  }
   for (const r of col.runs) {
     const names = r.names.length ? `（${r.names.slice(0, 4).join('、')}${r.names.length > 4 ? '…' : ''}）` : ''
     const span = r.from === r.to ? `y=${r.from}` : `y=${r.from}..${r.to}`
@@ -742,12 +761,23 @@ export function columnText (col) {
     /* 脚底那格本身就托不住：也要点名是空的 / 水 / 岩浆 —— "掉下去"和"掉进岩浆"不是一回事 */
     const k = top?.kind ?? 'air'
     const what = k === 'lava' ? '**岩浆**' : k === 'water' ? '**水**' : '**空的**'
-    const tail = k === 'lava' ? '**先挪一步，别在这上面挖**。' : k === 'water' ? '别往下挖，水会灌下来。' : '别往下挖，先挪一步。'
+    /* 已经在泡水的时候，"水会灌下来"是句废话 —— 该说的是"你先出去"。 */
+    const tail = k === 'lava' ? '**先挪一步，别在这上面挖**。'
+      : k === 'water' ? (col.here?.kind === 'water' ? '**你自己就在水里** —— 先游出去，别在这往下挖。' : '别往下挖，水会灌下来。')
+        : '别往下挖，先挪一步。'
     out.push(`  ${GAP_WARN[k] ?? '⚠️'} 脚底那一格是 ${what}，托不住你 —— ${tail}`)
   } else if (!col.firstGap) {
+    /* 🔴 判"可以放心往下挖"之前先看你自己站在哪 —— 泡在水里 / 岩浆里时这句话会把人坑死。 */
+    const inLava = col.here?.kind === 'lava'
+    const inWater = col.here?.kind === 'water'
     out.push(col.unloaded
       ? `  ✅ 往下 ${col.solidRun} 格是实心，这一段没探到空腔；但更深处有 ${col.unloaded} 格没加载 —— 挖到那里**先停下再看一次**。`
-      : `  ✅ 往下 ${col.solidRun} 格全是实心，这一段没探到空腔 —— 可以放心往下挖。`)
+      : inLava
+        ? `  ✅ 往下 ${col.solidRun} 格是实心 —— 但**你人就在岩浆里**，先出来再说。`
+        : inWater
+          ? `  ✅ 往下 ${col.solidRun} 格是实心（**不会掉下去**）—— 但**你人泡在水里**，挖开之后水会灌进坑；`
+            + '先把水堵上/排掉，或者换个地方挖。'
+          : `  ✅ 往下 ${col.solidRun} 格全是实心，这一段没探到空腔 —— 可以放心往下挖。`)
   } else {
     const g = col.firstGap
     const span = g.y === g.to ? `y=${g.y}` : `y=${g.y}..${g.to}`

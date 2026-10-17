@@ -65,11 +65,16 @@ const CTRL = ['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint']
  *   - `lookHang` `lookAt` 是否永不 resolve
  *   - `itemHang` `activateItem` 是否永不 resolve（测 `#t()` 闸门用：`useItem` 走的就是它）
  */
-const mkBot = ({ hang = false, blocks = {}, lookHang = false, itemHang = false } = {}) => {
+const mkBot = ({ hang = false, blocks = {}, lookHang = false, itemHang = false, health = 20, mobs = [] } = {}) => {
   const calls = { control: [], stop: 0, setGoal: 0, goto: 0, setMovements: 0, place: [], seq: [] }
   const handlers = new Map()
   const bot = {
     entity: { position: new Vec3(0, 64, 0), yaw: 0, pitch: 0 },
+    /* 危险信号（`src/danger.mjs`）只认这三样：`health` / `entity.position` / `entities` */
+    health,
+    entities: Object.fromEntries(mobs.map((m, i) => [i + 1, {
+      name: m.name, kind: m.kind, position: new Vec3(m.at[0], m.at[1], m.at[2]),
+    }])),
     _client: {},
     game: { gameMode: 'survival' },
     registry: { itemsByName: {}, blocksByName: {}, items: {} },
@@ -267,7 +272,12 @@ section('⑤ runSequence() —— 到点停下并给出 stoppedAt / remaining / 
     mc0.setCallDeadline(0)
     const r0 = await mc0.runSequence([{ op: 'jump' }, { op: 'jump' }])
     ok(r0.stoppedAt === 0 && r0.succeeded === 0, '时间已经用完 ⇒ stoppedAt=0、succeeded=0（不假装做了第 1 步）', JSON.stringify({ stoppedAt: r0.stoppedAt, succeeded: r0.succeeded }))
-    ok(/什么都没做|原样发/.test(r0.hint ?? ''), 'hint 说清"前面什么都没做、原样再发一次"', String(r0.hint).slice(0, 90))
+    /* 🔴 2026-10-17（实机：「mc_sequence 会假失败：秒回报 stoppedAt:0 / 本轮时间不够，但方块其实已经挖掉了」）：
+     *    "我一步都没做"和"这活没干成"是两件事 —— 旧文案写成"时间用完了，原样再发一次"，
+     *    模型会以为刚才那串失败了、然后把已经做完的事重做一遍。现在必须明说"没分到时间"+ "先复核"。 */
+    ok(r0.noBudget === true && r0.budgetMs === 0, '没分到时间 ⇒ 明说 noBudget:true + budgetMs:0', JSON.stringify({ noBudget: r0.noBudget, budgetMs: r0.budgetMs }))
+    ok(/没分到时间/.test(r0.hint ?? '') && /一步都没做/.test(r0.hint ?? ''), 'hint 说清"这次调用自己没分到时间、一步都没做"', String(r0.hint).slice(0, 90))
+    ok(/复核/.test(r0.hint ?? '') && !/原样发/.test(r0.hint ?? ''), 'hint 让模型**先复核**，而不是"原样再发一次"（那是"没做成"的指令）', String(r0.hint).slice(0, 110))
     ok(f0.calls.control.length === 0, '一点时间都没有 ⇒ 一个控制位都没碰', JSON.stringify(f0.calls.control))
   }
 
@@ -286,6 +296,62 @@ section('⑤ runSequence() —— 到点停下并给出 stoppedAt / remaining / 
   const mc2 = mkMc(fake2)
   const r2 = await mc2.runSequence([{ op: 'wait', sec: 0 }, { op: 'wait', sec: 0 }])
   ok(r2.stoppedAt === undefined && r2.remaining === undefined, '没到点就不给 stoppedAt（别让模型白重发）', JSON.stringify({ stoppedAt: r2.stoppedAt }))
+}
+
+/* ─────────── ⑤b 危险信号：挨打就带进度退出（`src/danger.mjs`） ─────────── */
+section('⑤b 长循环挨打就退出 —— interrupted:"danger" + stoppedAt（用户 2026-10-17「延迟很大」）')
+{
+  /* ① 怪贴脸 ⇒ **第 0 步之前**就退出（一步都不做），且能直接判（不用啃自然语言） */
+  const fake = mkBot({ mobs: [{ name: 'zombie', at: [2, 64, 0] }] })
+  const mc = mkMc(fake)
+  const r = await mc.runSequence([{ op: 'wait', sec: 0 }, { op: 'wait', sec: 0 }])
+  ok(r.interrupted === 'danger', '有怪贴脸 ⇒ interrupted:"danger"（机器可读）', JSON.stringify(r.interrupted))
+  ok(r.stoppedAt === 0 && r.succeeded === 0, '第 0 步之前就退出（stoppedAt=0、succeeded=0）', JSON.stringify({ stoppedAt: r.stoppedAt, succeeded: r.succeeded }))
+  ok(r.danger?.kind === 'hostile' && r.danger?.name === 'zombie', 'danger 里带怪的名字', JSON.stringify(r.danger))
+  ok(/zombie/.test(r.hint ?? '') && /attack/.test(r.hint ?? ''), 'hint 说清"先打掉它"', String(r.hint).slice(0, 90))
+  ok(!/时间/.test(r.hint ?? ''), 'hint **不说**"时间不够"（两件事不能混）', String(r.hint).slice(0, 90))
+}
+{
+  /* ② 掉血 ⇒ 做完第 0 步、第 1 步之前退出（**进度不丢**） */
+  const fake = mkBot()
+  const mc = mkMc(fake)
+  const orig = fake.bot.setControlState
+  let dropped = false
+  fake.bot.setControlState = (k, v) => {
+    if (!dropped && k === 'jump' && v === true) { dropped = true; fake.bot.health = 16 }
+    return orig(k, v)
+  }
+  const r = await mc.runSequence([{ op: 'jump' }, { op: 'jump' }, { op: 'jump' }])
+  ok(r.interrupted === 'danger' && r.danger?.kind === 'hurt', '掉血 ⇒ kind=hurt', JSON.stringify(r.danger))
+  ok(r.danger?.hp0 === 20 && r.danger?.health === 16, '把 20 → 16 如实带上', JSON.stringify(r.danger))
+  ok(r.stoppedAt === 1 && r.succeeded === 1, '第 0 步做完了才退（进度不丢）', JSON.stringify({ stoppedAt: r.stoppedAt, succeeded: r.succeeded }))
+  ok(/从第 2 步往后发/.test(r.hint ?? ''), 'hint 说清从第几步接着发', String(r.hint).slice(0, 110))
+}
+{
+  /* ③ 8 格外的怪**不算** —— 不能把"挖 12 格"砍成 12 次调用（那正是要修的病） */
+  const fake = mkBot({ mobs: [{ name: 'zombie', at: [8, 64, 0] }] })
+  const mc = mkMc(fake)
+  const r = await mc.runSequence([{ op: 'wait', sec: 0 }, { op: 'wait', sec: 0 }])
+  ok(r.interrupted === undefined && r.stoppedAt === undefined, '8 格外的僵尸 ⇒ 不打断', JSON.stringify({ interrupted: r.interrupted, stoppedAt: r.stoppedAt }))
+}
+{
+  /* ④ 危险检查排在**预算检查之前**：时间还剩很多，但怪在脸上 ⇒ 照样退 */
+  const fake = mkBot({ mobs: [{ name: 'skeleton', at: [1, 64, 0] }] })
+  const mc = mkMc(fake)
+  mc.setCallDeadline(11_000)
+  const r = await mc.runSequence([{ op: 'wait', sec: 0 }, { op: 'wait', sec: 0 }])
+  ok(r.interrupted === 'danger', '预算充足也照样为危险退出', JSON.stringify({ interrupted: r.interrupted }))
+}
+{
+  /* ⑤ mc_build 一样：挨打就带进度退出 */
+  const box = { x1: 0, y1: 64, z1: 0, x2: 0, y2: 64, z2: 0, name: 'stone' }
+  const fake = mkBot({ mobs: [{ name: 'zombie', at: [2, 64, 0] }] })
+  const mc = mkMc(fake)
+  mc.placeBlock = async (o) => { fake.calls.place.push(o); return { placed: true } }
+  const r = await mc.build(box)
+  ok(r.interrupted === 'danger', 'mc_build 挨打也带 interrupted:"danger"', JSON.stringify(r.interrupted))
+  ok(r.placed === 0, '一块都没放（第 0 格之前就退了）', String(r.placed))
+  ok(fake.calls.place.length === 0, '真的一个 placeBlock 都没发', String(fake.calls.place.length))
 }
 
 /* ─────────── ⑥ build()：到点带进度返回 + 已经放对的格子跳过 ─────────── */
@@ -311,8 +377,29 @@ section('⑥ build() —— 到点返回 remaining；再叫一次时跳过已放
   const r2 = await mc2.build(box)
   ok(fake2.calls.place.length === 0, '时间用完 → 一个 placeBlock 都不调', String(fake2.calls.place.length))
   ok(r2.placed === 0 && r2.remaining === 4, '返回 remaining = 4', JSON.stringify({ placed: r2.placed, remaining: r2.remaining }))
-  ok(/再叫一次 mc_build/.test(r2.hint ?? ''), 'hint 告诉模型"再叫一次 mc_build"', String(r2.hint).slice(0, 80))
-  ok(/放对的会跳过/.test(r2.hint ?? ''), 'hint 说明"同一个范围重发就行，放对的会跳过"', String(r2.hint).slice(0, 90))
+  /* 🔴 2026-10-17：`setCallDeadline(0)` = **这次调用自己没分到时间** —— 与"有时间但用完了"
+   *    是两件事（实机 AI 报「mc_sequence 会假失败：秒回报 stoppedAt:0 / 本轮时间不够，
+   *    但方块其实已经挖掉了」）。这条指令不能是"原样再发一次"（模型会把做完的重做一遍），
+   *    必须是"先复核"。 */
+  ok(r2.noBudget === true, '没分到时间 ⇒ 明说 noBudget:true', JSON.stringify({ noBudget: r2.noBudget, callLeftMs: r2.callLeftMs }))
+  ok(/没分到时间/.test(r2.hint ?? '') && /一块都没放/.test(r2.hint ?? ''), 'hint 说清"自己没分到时间、一块都没放"', String(r2.hint).slice(0, 80))
+  ok(/复核/.test(r2.hint ?? '') && !/放对的会跳过/.test(r2.hint ?? ''), 'hint 让模型**先复核**（不是"原样重发"）', String(r2.hint).slice(0, 110))
+}
+
+/* ─────────── ⑥b build()：**有时间但用完了** ⇒ 另一套话（两件事不许混） ─────────── */
+section('⑥b build() —— "时间用完了"与"没分到时间"必须是两套话')
+{
+  const box6 = { x1: 0, y1: 64, z1: 0, x2: 0, y2: 64, z2: 9, name: 'stone' }  // 10 格（放得完才怪）
+  const fake = mkBot()
+  const mc = mkMc(fake)
+  mc.placeBlock = async (o) => { fake.calls.place.push(o); await new Promise((r) => setTimeout(r, 120)); return { placed: true } }
+  mc.setCallDeadline(1_000)
+  const r = await mc.build(box6)
+  ok(r.placed > 0 && r.placed < 10, '做了一部分才到点（带进度返回）', JSON.stringify({ placed: r.placed, remaining: r.remaining }))
+  ok(r.remaining === 10 - r.placed, 'remaining = 总格数 − 已放', JSON.stringify({ placed: r.placed, remaining: r.remaining }))
+  ok(r.noBudget === undefined, '这不是"没分到时间"（两件事不许混）', JSON.stringify({ noBudget: r.noBudget }))
+  ok(/再叫一次 mc_build/.test(r.hint ?? ''), 'hint 告诉模型"再叫一次 mc_build"', String(r.hint).slice(0, 80))
+  ok(/放对的会跳过/.test(r.hint ?? ''), 'hint 说明"同一个范围重发就行，放对的会跳过"', String(r.hint).slice(0, 90))
 }
 
 /* ─────────── ⑦ index.js：注册时的 timeoutMs 都 ≤ 12 秒 ─────────── */
@@ -414,12 +501,21 @@ section('⑨ core.mjs —— 长动作排 deadline 要算上"本轮已用掉的�
     .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
   const buildSrc = readFileSync(new URL('../src/build.mjs', import.meta.url), 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
-  const n = [...(minSrc + buildSrc).matchAll(/Date\.now\(\) \+ (?:Math\.max\(0, )?self\.callLeft\(\)/g)].length
+  const n = [...(minSrc + buildSrc).matchAll(/Date\.now\(\) \+ (?:Math\.max\(0, )?(?:self\.callLeft\(\)|callLeftMs)/g)].length
   ok(n >= 2, `dig() / build() 都用 self.callLeft() 排 deadline（${n} 处）`, String(n))
+  /* 🔴 2026-10-17：`self.callLeft()` 现在**先取出来存成 `callLeftMs`** —— 同一个数要用两遍
+   *    （排 deadline + 判断"这次调用到底有没有分到时间"）。断言钉住这个来源，
+   *    免得以后有人把 `callLeftMs` 换成别的来源、`noBudget` 就悄悄失效了。 */
+  ok(/const callLeftMs = self\.callLeft\(\)/.test(minSrc) && /const callLeftMs = self\.callLeft\(\)/.test(buildSrc),
+    '两个文件都把 self.callLeft() 先取出来（同一个数用两遍）')
+  ok(/const noBudget = callLeftMs <= 900/.test(minSrc) && /const noBudget = callLeftMs < 300/.test(buildSrc),
+    '两个文件都算了 noBudget（"这次有没有分到时间"）')
+  ok(/noBudget \? \{ noBudget: true, budgetMs: bd \}/.test(readFileSync(new URL('../src/sequence.mjs', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '')),
+    'sequence 也把 noBudget 单独回出去（三个长循环口径一致）')
   // 🔴 dig() 还要**留收尾时间**：`#cancelCollect` 等 collectBlock_finished 最多 1.5 秒、
   //    兜底原地挖、拼文本、DSH 序列化都排在预算之外 ⇒ 两个目标就冲出工具超时（2026-10-08 实机反馈：
   //    `Error: tool call timed out after 6000ms`，而方块其实早挖掉了）。
-  ok(/const deadline = Date\.now\(\) \+ Math\.max\(0, self\.callLeft\(\) - 900\)/.test(minSrc),
+  ok(/const deadline = Date\.now\(\) \+ Math\.max\(0, callLeftMs - 900\)/.test(minSrc),
     'dig() 的 deadline 留了 900ms 收尾（别再让它冲出工具超时）')
   /* 🔴 2026-10-08：`dig()` 不再把方块交给 collectBlock（"挖完又复原 + 之后几分钟走不了路"的根因），
    *    所以那条 `budgetMs: leftOf() - 200` 也没了。现在还要"限住取消动作"的地方只剩 `#grabDrops`

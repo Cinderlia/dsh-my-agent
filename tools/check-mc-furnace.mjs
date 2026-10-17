@@ -998,6 +998,31 @@ console.log('— ⑨ 该补料就补料、取货要等背包、背包满不许�
     const r = await run({ name: 'raw_iron', count: 2 }, { mc })
     ok(mc.placeCalls.length === 1, '没给坐标 ⇒ 照旧自己放熔炉', JSON.stringify(mc.placeCalls))
   }
+  /* 🔴 2026-10-16（用户 m11195 采纳的 F2）：熔炉的整个设计就是"装好料就走、过会儿回来取"，
+   *    空位是这条流程的**硬前置** —— 而 `free === 1` 时以前**什么都不说**，AI 高高兴兴再叫一次，
+   *    下一炉就卡在"烧好了但取不出来"（H5 那条才报，已经白跑一趟）。 */
+  {
+    const w = mkWorld({ '2,1,0': 'furnace' })
+    const fake = mkBot({ raw_iron: 2, coal: 1 }, { world: w, emptySlots: 1 })
+    const win = mkWin({ cook: true, outId: idOf('iron_ingot') })
+    fake.bot.openFurnace = async () => win
+    const mc = mkMc(fake)
+    const r = await run({ name: 'raw_iron', count: 2 }, { mc })
+    ok(/还有 1 个空位/.test(r.text), '报出还剩几个空位', r.text.replace(/\n/g, ' | '))
+    ok(/只剩 1 个空位/.test(r.text) && /下一炉取出来可能放不下/.test(r.text), '🔴 空位 ≤2 时预警"下一炉可能放不下"', r.text.replace(/\n/g, ' | '))
+    ok(/mc_chest/.test(r.text) && /toss/.test(r.text), '并给出腾位置的两条办法', r.text.replace(/\n/g, ' | '))
+  }
+  /* F2 反面：空位充足 ⇒ 一个字的预警都不许有（每轮都跑的动作不能刷噪声） */
+  {
+    const w = mkWorld({ '2,1,0': 'furnace' })
+    const fake = mkBot({ raw_iron: 2, coal: 1 }, { world: w, emptySlots: 36 })
+    const win = mkWin({ cook: true, outId: idOf('iron_ingot') })
+    fake.bot.openFurnace = async () => win
+    const mc = mkMc(fake)
+    const r = await run({ name: 'raw_iron', count: 2 }, { mc })
+    ok(!/下一炉取出来可能放不下/.test(r.text), '🔴 空位充足 ⇒ 不预警', r.text.replace(/\n/g, ' | '))
+    ok(/还有 36 个空位/.test(r.text), '但空位数照报（AI 拿它判断还够放几轮）', r.text.replace(/\n/g, ' | '))
+  }
 }
 
 console.log('')

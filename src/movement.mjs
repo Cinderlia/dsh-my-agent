@@ -23,6 +23,10 @@ import { heldText, invSnap, invUsed } from './inventory.mjs'
 import { isAir, isLiquid, isPassable } from './block-names.mjs'
 import { classifyTerrainCached } from './terrain.mjs'
 import { recoverFromWater } from './water-recovery.mjs'
+/* 🔴 2026-10-16 审计（P1，四类耗时）：`goto` 这一段的墙钟**几乎全是"等寻路"** ——
+ *    把它上报给性能监测，`mc_move` 才不会在 `perf` 里显示成"慢得可疑、要不要搬 Worker"。
+ *    没人包 `perfWrap` 时它是空操作（零成本）。 */
+import { perfWait } from './perf-monitor.mjs'
 
 /**
  * 给水下恢复控制器用的执行器 —— **就是这一层已有的 `walkTo` / `swimUp`**，不另起一套按键。
@@ -306,9 +310,9 @@ export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.mo
         stuck: !out,
         outOfWater: out,
         waterRecover: rec,
-        hint: rec?.ok
+        hint: rec?.escaped === true
           ? `我**自己从水里出来了一趟**（${rec.note}）—— 原来的目标还要不要接着走，你看一眼再定。`
-          : `还在水里，而且没找到出口（${rec?.reason ?? 'unknown'}）：${rec?.note ?? ''}`,
+          : `还在水里${rec?.ok ? '（能喘口气了，但没出去）' : ''}，没找到出口（${rec?.reason ?? 'unknown'}）：${rec?.note ?? ''}`,
       }
     }
     if (swim.arrived || !swim.outOfWater || !canWalk) return swim
@@ -691,13 +695,23 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   let pathThrash = 0
   let watch = null
   /** 脱困次数（P0-1）与路径失效次数（P1）：>0 才报 —— 模型据此知道"这次走得磕磕绊绊"。
-   *  外加地形分类（P2）：只有不是平地时才报（平地是默认，报了纯占地方）。 */
-  const moveInfo = () => ({
-    ...(terrain.kind === 'flat' || terrain.kind === 'unknown' ? {} : { terrain: terrain.kind }),
+   *  外加地形分类（P2）：只有不是平地时才报（平地是默认，报了纯占地方）。
+   *  `opts.arrived` —— **到达时**把出发时那份改名成 `terrainAtStart`。到了新位置还叫 `terrain`
+   *  会被读成"我现在脚边是这个"：从沟边跨到平地上，它仍写着 `gap`，属**主动误导**。 */
+  const moveInfo = (opts = {}) => ({
+    ...(terrain.kind === 'flat' || terrain.kind === 'unknown' ? {}
+      : { [opts.arrived ? 'terrainAtStart' : 'terrain']: terrain.kind }),
     ...(repathCount ? { repathCount } : {}),
     ...(pathThrash ? { pathThrash } : {}),
     ...(pathResetsTotal >= 2 ? { pathResets: pathResetsTotal, pathResetReasons: { ...resetReasons } } : {}),
   })
+  /** 到达时**重算落点地形**：`classifyTerrainCached` 的缓存键含脚下坐标，走到新位置会自动重算，
+   *  不用手动清缓存。平地/未知照旧不报（默认值）。 */
+  const arrivedTerrain = () => {
+    const now = classifyTerrainCached(b)
+    if (now.kind === 'flat' || now.kind === 'unknown') return {}
+    return { arrivedTerrain: now.kind, ...(now.note ? { arrivedNote: now.note } : {}) }
+  }
   try {
     for (let attempt = 0; ; attempt++) {
       if (attempt > 0) {
@@ -714,6 +728,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         await escapeMove(b, goal, step, ctx)
       }
       pathResets = 0                               // 本轮重新数（脱困动作自己也会 reset 一次）
+      const pfT0 = Date.now()
       const work = b.pathfinder.goto(goal)
       work.catch(() => {})                         // race 可能先结束：别让它变成"未处理拒绝"（会炸宿主）
       // `ctx.watchOpts` 是给离线测试注入假时钟用的（不然一套断言要真等 2.4 秒 × 4 轮）
@@ -734,6 +749,10 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         if (e?.mcPathThrash) pathThrash++          // P1：这次是被"路径反复失效"逼进阶梯的
         if (e?.mcStuck) continue                   // 卡住 ⇒ 下一轮走脱困阶梯
         throw e
+      } finally {
+        /* 这一轮 `goto` 的墙钟（含脱困动作之前的等待）—— 见文件头 import 处的说明。
+         * `continue` / `throw` 之前都会走到这里。 */
+        perfWait('path', Date.now() - pfT0)
       }
     }
     const end = b.entity.position
@@ -828,7 +847,8 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
        * 测试脚本只能打 `-`，看着像"谎报到达"）。 */
       remaining: Number(left.toFixed(2)),
       via: 'pathfinder',
-      ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(), ...moveInfo(),
+      ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(),
+      ...moveInfo({ arrived: true }), ...arrivedTerrain(),
     }
   } catch (e) {
     if (e?.mcAborted) throw e

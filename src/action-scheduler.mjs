@@ -128,7 +128,10 @@ const ACT_MODE_RES = {
   break: ['interaction'],
   use: ['interaction'],
   useitem: ['interaction'],
-  attack: ['combat', 'movement'],
+  /* 🔴 战斗现在会**中途换武器**（策略层决定换，走 `ctx.equipTo`）⇒ 它确实占着背包，
+   *    不登记 `inventory` 的话，enforce 模式下"战斗换剑"和"mc_craft 拿材料"会同时动背包。
+   *    不登记 `interaction`：v1 的战斗层不进食、不使用方块（见 combat-strategy.mjs 的说明）。 */
+  attack: ['combat', 'movement', 'inventory'],
   equip: ['inventory'],
   toss: ['inventory'],
   enchant: ['inventory', 'interaction'],
@@ -367,7 +370,15 @@ export class ActionScheduler {
     let preemptedBy = []
     let waitedMs = 0
 
-    if (conflicts.length && this.mode === 'enforce') {
+    /* 🔴 2026-10-16 审计（P0-1）：`PRIORITY.emergency`（100）是"不马上做就会死"那一档
+     *   （水下自救、脚下岩浆）。观察模式（默认）以前把它也一并放过 ⇒ 两处失真：
+     *     ① 调度器表在撒谎 —— 表里写"`mc_move` 占着 movement"，真正驱动 bot 的是水下自救；
+     *     ② 两者同时驱动 bot，只靠 `_moveGen`（后进者赢）仲裁，谁都不告诉谁。
+     *   现在的规矩：**紧急级永远真抢**，不受 `mode` 限制 —— 拿命去"观察"没有意义。
+     *   而且抢完**不排队**（把 `waitBudget` 当 0）：急救等不起"它自己收尾"，
+     *   叫停之后我立刻做，被叫停的那个由它自己的 abort 收场。 */
+    const emergency = prio >= PRIORITY.emergency
+    if (conflicts.length && (this.mode === 'enforce' || emergency)) {
       this.conflicts++
       const blockers = conflicts.map((c) => ({ c, rec: this.active.get(c.actionId) })).filter((b) => b.rec)
 
@@ -380,8 +391,12 @@ export class ActionScheduler {
         if (can) preemptedBy = this.#preempt(blockers, nm, prio)
       }
 
-      /* ④ 排队等它真的放（`preemptedBy` 非空时就是在等被我叫停的那些人收尾） */
-      if (waitBudget > 0) {
+      if (emergency) {
+        /* ④ 急救不排队：叫停归叫停，我自己马上做（`_moveGen` 保证后进者赢）。 */
+        const who = conflicts.map((c) => `${c.actionId} ${c.name}`).join(' / ')
+        this.log(`紧急：${nm}（${priorityText(prio)}）不等 ${who} 收尾就动手${preemptedBy.length ? `（已叫停 ${preemptedBy.join(' / ')}）` : ''}｜模式 ${this.mode}`)
+      } else if (waitBudget > 0) {
+        /* ④ 排队等它真的放（`preemptedBy` 非空时就是在等被我叫停的那些人收尾） */
         const t0 = this.now()
         const got = await this.#awaitFree(res, selfId, waitBudget, signal)
         waitedMs = Math.max(0, this.now() - t0)
@@ -622,11 +637,25 @@ export class ActionScheduler {
    *
    * @returns {number} 清掉了几条
    */
-  releaseAll (why = '') {
-    const n = this.active.size
+  releaseAll (why = '', { abort = true } = {}) {
+    const recs = [...this.active.values()]
+    const n = recs.length
     if (n) {
       this.active.clear()
-      this.log(`清空 ${n} 条动作记录${why ? `（${why}）` : ''}`)
+      /* 🔴 2026-10-16 审计（P0-1）：以前这里**只清表、不 abort** —— 于是"断线了/用户叫停了"
+       *    在调度器看来已经收工，实际那些 `execute` 还在飞：它们各自的 `withTimeout` / `msLeft()`
+       *    要等到点才收场，这中间**还在驱动 bot**（走路、按键）。清表只是让**别人**能占资源，
+       *    并没有让**它**停下来 —— 这是"表说没事了、手还在动"。
+       *    现在把在飞动作的 controller 一并 abort：它们的 `execute` 收到 signal，
+       *    宿主挂的 `interruptMove`（`index.js` 的 `setAbortSignal`）当场把移动停掉。 */
+      let aborted = 0
+      if (abort) {
+        for (const r of recs) {
+          if (!r.controller) continue
+          try { r.controller.abort(); aborted++ } catch { /* 忽略 */ }
+        }
+      }
+      this.log(`清空 ${n} 条动作记录${why ? `（${why}）` : ''}${aborted ? `，并叫停其中 ${aborted} 条` : ''}`)
     }
     /* 🔴 断线时**必须**叫醒排队的人：它们等的那条记录已经没了，再等下去就是干等到超时。
      * 叫醒之后它们会看到"资源空了" ⇒ 接着往下跑 ⇒ 自己撞上"连接没了"的错，如实报出去。 */

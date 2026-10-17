@@ -19,7 +19,7 @@
  * 流程（用户定的）：局部搜索 → 路线执行 → 复核进度；路线失败就把那个目标拉黑，重新搜。
  */
 
-import { WATER_ARRIVE, feetOfBot, inWaterAt, waterExitSearch, waterSummaryOf } from './water-navigation.mjs'
+import { WATER_ARRIVE, WATER_RADIUS, feetOfBot, inWaterAt, waterExitSearch, waterSummaryOf } from './water-navigation.mjs'
 
 /* ─────────── 常量 ─────────── */
 
@@ -35,6 +35,17 @@ export const WATER_RECOVER_MS = 12_000
 export const WATER_STUCK_MS = 2_500
 /** 朝出口挪近了这么多格就算"有进展"（不一定非要踩到那一格） */
 export const WATER_PROGRESS_EPS = 1.2
+/**
+ * 每失败一轮，搜索半径长多少格。
+ *
+ * 🔴 2026-10-16 审计：原来每一轮都用**同一个起点 + 同一套默认半径**重搜 ——
+ *    轮内靠 `avoid` 去重，可"搜索范围"一寸没动。于是"扩大范围"只写在
+ *    `all-tried` 的提示文案里，**代码里没有这个分支**。提示说了做不到的事，
+ *    比不说更坏。这里把它补上：第 1 轮用默认半径，之后每轮 +4 格。
+ */
+export const WATER_ROUND_RADIUS_STEP = 4
+/** 一条路线最多走多久（免得一轮吃光整个恢复预算，下一轮没得花） */
+export const WATER_ROUTE_MS = 4_000
 
 /** 触发原因 → 人话 */
 export const WATER_TRIGGER_TEXT = {
@@ -112,7 +123,13 @@ export async function executeRoute (self, res, ctx = {}) {
       await ctx.swimUp(self, { hold: ctx.swimMs ?? 3_000 })
     } else {
       if (!ctx.walkTo) return { moved: 0, used, from, to: from, error: '调用方没给 walkTo' }
-      await ctx.walkTo(self, { x: t.x, y: t.y, z: t.z }, { arrive: ctx.arrive ?? WATER_ARRIVE })
+      /* 🔴 审计：原来这里**不传 budget** ⇒ 一条 `walkTo` 会一直走到它自己的默认预算
+       *    （`self.cfg.moveBudgetMs`）—— 一轮就能把整个恢复预算吃光，后面的轮次
+       *    连"再找一条路"的机会都没有。给每条路线一个明确的上限。 */
+      await ctx.walkTo(self, { x: t.x, y: t.y, z: t.z }, {
+        arrive: ctx.arrive ?? WATER_ARRIVE,
+        ...(Number.isFinite(Number(ctx.routeBudgetMs)) ? { budget: Number(ctx.routeBudgetMs) } : {}),
+      })
     }
   } catch (e) {
     return { moved: 0, used, from, to: feetOfBot(b), error: String(e?.message ?? e) }
@@ -126,10 +143,15 @@ export async function executeRoute (self, res, ctx = {}) {
  * 从水里把自己救出来。**可以被取消**（`ctx.signal`），**有预算**（`ctx.budgetMs`）。
  *
  * @returns {{
- *   ok, reason, rounds, target, kind, moved, tried, log, note, state
+ *   ok, escaped, reason, rounds, target, kind, moved, tried, log, note, state
  * }}
- *   `reason`：`'escaped'`（真上岸了）/ `'improved'`（挪近了但没到）/ `'no-exit-found'`
- *   / `'budget-out'` / `'rounds-out'`（试完所有路线都不行）/ `'aborted'` / `'no-executor'` / `'not-in-water'`
+ *   `reason`：`'escaped'`（**真的出水了**，`escaped === true`）/ `'breathed'`（踩到了空气口袋、
+ *   **但人还在水里** —— 只是能喘口气，不算脱险）/ `'improved'`（挪近了 / 气在回，还没脱险）
+ *   / `'no-exit-found'` / `'budget-out'` / `'rounds-out'`（试完所有路线都不行）/ `'air-out'`
+ *   （氧气到危险线、直接上浮也换不到气）/ `'aborted'` / `'no-executor'` / `'not-in-water'`
+ *
+ *   ⚠️ `ok:true` **不等于脱险** —— 它只说明"这一轮有进展"。要看 `escaped`（或 `reason === 'escaped'`）
+ *   才知道是不是真上岸了。调用方别拿 `ok` 当"可以恢复原任务了"。
  */
 export async function recoverFromWater (self, opts = {}, ctx = {}) {
   const now = ctx.now ?? Date.now
@@ -140,27 +162,57 @@ export async function recoverFromWater (self, opts = {}, ctx = {}) {
   const maxRounds = Number.isFinite(Number(opts.rounds)) ? Number(opts.rounds) : WATER_RECOVER_ROUNDS
   const tried = new Set()
   const log = []
+  /* 搜索参数的基准（`opts.search` 里没给 radius 就用 `water-navigation.mjs` 的默认） */
+  const baseSearch = opts.search ?? {}
+  const radius0 = Number.isFinite(Number(baseSearch.radius)) ? Number(baseSearch.radius) : WATER_RADIUS
 
   const state0 = waterStateOf(b)
   if (!state0.inWater) {
-    return { ok: true, reason: 'not-in-water', rounds: 0, target: null, kind: null, moved: 0, tried: [], log, note: '我本来就没在水里', state: state0 }
+    return { ok: true, escaped: false, reason: 'not-in-water', rounds: 0, target: null, kind: null, moved: 0, tried: [], log, note: '我本来就没在水里', state: state0 }
   }
   if (!ctx.walkTo && !ctx.swimUp) {
-    return { ok: false, reason: 'no-executor', rounds: 0, target: null, kind: null, moved: 0, tried: [], log, note: '没人给我"怎么走"的接口 —— 这条得由宿主接上 walkTo / swimUp', state: state0 }
+    return { ok: false, escaped: false, reason: 'no-executor', rounds: 0, target: null, kind: null, moved: 0, tried: [], log, note: '没人给我"怎么走"的接口 —— 这条得由宿主接上 walkTo / swimUp', state: state0 }
+  }
+
+  /* 🔴 审计：`WATER_AIR_CRITICAL` / `WATER_AIR_LOW` / `waterTriggerOf` 是**导出给测试看的**
+   *    死代码 —— 生产里一个调用点都没有，恢复控制器**完全不看氧气**决定继续还是放弃。
+   *    结果：气都快没了还在"一格一格规划最优出口"。气到危险线时，唯一还讲得通的
+   *    动作是**直接上浮换气**（最快、最省），而不是继续找路。 */
+  if (state0.air != null && state0.air <= WATER_AIR_CRITICAL && ctx.swimUp) {
+    const f = state0.feet
+    log.push(`氧气只剩 ${state0.air}（危险线 ${WATER_AIR_CRITICAL}）—— 不按计划找路了，先直接上浮`)
+    if (f) {
+      await executeRoute(self, {
+        target: { x: f.x, y: f.y + 1, z: f.z },
+        path: [{ x: f.x, y: f.y + 1, z: f.z }],
+      }, { ...ctx, routeBudgetMs: WATER_ROUTE_MS })
+    }
+    const after = waterStateOf(b)
+    if (!after.inWater || (after.air != null && after.air > state0.air)) {
+      /* 🔴 审计（与下面那条同一个毛病）：**换了气 ≠ 出水**。`reason` 必须跟着 `escaped` 走 ——
+       * 原来这里写死 `reason:'escaped'`，于是"上浮换了气、人还在水里"会返回
+       * `{ escaped:false, reason:'escaped' }`，调用方读 `reason` 就以为脱险了。 */
+      return { ok: true, escaped: !after.inWater, reason: after.inWater ? 'breathed' : 'escaped', rounds: 1, target: null, kind: 'surface', moved: 0, tried: [], log, note: `上浮之后换到气了（氧气 ${state0.air} → ${after.air ?? '?'}）${after.inWater ? '，**但我还在水里**' : ''}`, state: after }
+    }
+    return { ok: false, escaped: false, reason: 'air-out', rounds: 1, target: null, kind: null, moved: 0, tried: [], log, note: `氧气只剩 ${state0.air}，直接上浮也换不到气 —— 别指望我自己解决了，赶紧给个明确方向（岸在哪）`, state: after }
   }
 
   let lastRes = null
   let movedTotal = 0
   for (let round = 1; round <= maxRounds; round++) {
     if (ctx.signal?.aborted) {
-      return { ok: false, reason: 'aborted', rounds: round - 1, target: null, kind: null, moved: movedTotal, tried: [...tried], log, note: '被取消了', state: waterStateOf(b) }
+      return { ok: false, escaped: false, reason: 'aborted', rounds: round - 1, target: null, kind: null, moved: movedTotal, tried: [...tried], log, note: '被取消了', state: waterStateOf(b) }
     }
     if (now() - t0 >= budgetMs) {
-      return { ok: false, reason: 'budget-out', rounds: round - 1, target: null, kind: null, moved: movedTotal, tried: [...tried], log, note: `这一轮的 ${Math.round(budgetMs / 1000)} 秒用完了 —— 过一会儿再叫我一次`, state: waterStateOf(b) }
+      return { ok: false, escaped: false, reason: 'budget-out', rounds: round - 1, target: null, kind: null, moved: movedTotal, tried: [...tried], log, note: `这一轮的 ${Math.round(budgetMs / 1000)} 秒用完了 —— 过一会儿再叫我一次`, state: waterStateOf(b) }
     }
 
-    /* 找出口（把上一轮试过没用的目标排除掉，然后重新搜） */
-    const res = waterExitSearch(b, { ...(opts.search ?? {}), avoid: tried.size ? tried : null })
+    /* 找出口（把上一轮试过没用的目标排除掉，然后重新搜）。
+     * 🔴 每失败一轮**把范围放大**（见 `WATER_ROUND_RADIUS_STEP` 的注释）——
+     *    否则"换个方向再叫我一次"其实是在同一片地方再问一遍同样的问题。 */
+    const roundRadius = radius0 + (round - 1) * WATER_ROUND_RADIUS_STEP
+    if (round > 1) log.push(`第 ${round} 轮：把搜索范围放大到 ${roundRadius} 格`)
+    const res = waterExitSearch(b, { ...baseSearch, radius: roundRadius, avoid: tried.size ? tried : null })
     lastRes = res
     if (!res.found) {
       /* 兜底：头顶一路是水的话，上浮仍然是有效的（而且最省）—— 别因为"没找到干燥落脚点"
@@ -169,22 +221,27 @@ export async function recoverFromWater (self, opts = {}, ctx = {}) {
       const canUp = st.feet && (ctx.swimUp != null)
       if (canUp && res.reason !== 'budget-out') {
         log.push(`第 ${round} 轮：没找到出口（${res.reason}）⇒ 先试着直接上浮换气`)
-        await executeRoute(self, { target: { x: st.feet.x, y: st.feet.y + 1, z: st.feet.z }, path: [{ x: st.feet.x, y: st.feet.y + 1, z: st.feet.z }] }, ctx)
+        await executeRoute(self, { target: { x: st.feet.x, y: st.feet.y + 1, z: st.feet.z }, path: [{ x: st.feet.x, y: st.feet.y + 1, z: st.feet.z }] }, { ...ctx, routeBudgetMs: WATER_ROUTE_MS })
         const after = waterStateOf(b)
         if (!after.inWater || (after.air != null && st.air != null && after.air > st.air)) {
-          return { ok: true, reason: 'escaped', rounds: round, target: null, kind: 'surface', moved: movedTotal, tried: [...tried], log, note: '上浮之后能换气了（或者已经出水）', state: after }
+          /* 🔴 审计：这里原来写死 `reason:'escaped'`，于是"上浮之后换了气、人还在水里"会返回
+           *    `{ escaped:false, reason:'escaped' }` —— 调用方读 `reason` 就以为脱险了。
+           *    `reason` 必须跟着 `escaped` 走：还在水里就老实说 `breathed`。 */
+          return { ok: true, escaped: !after.inWater, reason: after.inWater ? 'breathed' : 'escaped', rounds: round, target: null, kind: 'surface', moved: movedTotal, tried: [...tried], log, note: after.inWater ? `上浮之后能换气了（氧气 ${st.air} → ${after.air ?? '?'}），**但我还在水里**` : '上浮之后出水了', state: after }
         }
       }
-      return { ok: false, reason: res.reason, rounds: round, target: null, kind: null, moved: movedTotal, tried: [...tried], log, note: res.note, state: waterStateOf(b) }
+      return { ok: false, escaped: false, reason: res.reason, rounds: round, target: null, kind: null, moved: movedTotal, tried: [...tried], log, note: res.note, unknownCells: res.unknownCells ?? 0, partial: res.partial === true, state: waterStateOf(b) }
     }
     if (tried.has(keyOf(res.target))) {
-      return { ok: false, reason: 'rounds-out', rounds: round, target: res.target, kind: res.kind, moved: movedTotal, tried: [...tried], log, note: '能找的出口都试过了，都没走通 —— 换个方向再叫我一次', state: waterStateOf(b) }
+      return { ok: false, escaped: false, reason: 'rounds-out', rounds: round, target: res.target, kind: res.kind, moved: movedTotal, tried: [...tried], log, note: '能找的出口都试过了，都没走通 —— 换个方向再叫我一次', state: waterStateOf(b) }
     }
 
     const before = feetOfBot(b)
     const beforeAir = waterStateOf(b).air
     log.push(`第 ${round} 轮：${waterSummaryOf(res)}`)
-    const run = await executeRoute(self, res, ctx)
+    /* 每条路线分到的预算：别让第一条把整个恢复预算吃光（后面还有几条要试） */
+    const left = Math.max(0, budgetMs - (now() - t0))
+    const run = await executeRoute(self, res, { ...ctx, routeBudgetMs: Math.max(500, Math.min(WATER_ROUTE_MS, left)) })
     movedTotal += Number.isFinite(run.moved) ? run.moved : 0
 
     /* **复核**（用户明确要求）：不能仅凭移动函数返回成功就恢复原任务 ——
@@ -201,10 +258,17 @@ export async function recoverFromWater (self, opts = {}, ctx = {}) {
     const gained = st.air != null && beforeAir != null && st.air > beforeAir
     const outOfWater = !st.inWater
     if (outOfWater || gained || atTarget || improved) {
-      const escaped = outOfWater || atTarget
+      /* 🔴 审计（用户点名的"到了但还在水里"）：原来 `escaped = outOfWater || atTarget`
+       *    ⇒ **踩到一个 `breath`（空气口袋）格子、人还泡在水里，也报 `reason:'escaped'`**。
+       *    搜索层把 dry/breath/passage 分得很清，复核层又把它抹平了 —— 只有 note 文案不同。
+       *    改成：只有**真的出水**才算 `escaped`；踩到空气口袋单独一个 `reason:'breathed'`，
+       *    并且多给一个显式的 `escaped` 布尔，别让调用方去猜 `reason` 的字面意思。 */
+      const escaped = outOfWater
+      const reason = escaped ? 'escaped' : (atTarget ? 'breathed' : 'improved')
       return {
         ok: true,
-        reason: escaped ? 'escaped' : 'improved',
+        escaped,
+        reason,
         rounds: round,
         target: res.target,
         kind: res.kind,
@@ -212,8 +276,10 @@ export async function recoverFromWater (self, opts = {}, ctx = {}) {
         tried: [...tried],
         log,
         note: escaped
-          ? `到了${res.kind === 'dry' ? '岸上' : '那个能换气的地方'}`
-          : '挪近了 / 气在回 —— 还没脱险，接着来',
+          ? '真的出水了'
+          : (atTarget
+              ? `到了那个能换气的地方（${res.kind === 'breath' ? '空气口袋' : res.kind}），**但我还在水里** —— 这不算脱险，只是能喘口气`
+              : '挪近了 / 气在回 —— 还没脱险，接着来'),
         state: st,
       }
     }
@@ -226,6 +292,7 @@ export async function recoverFromWater (self, opts = {}, ctx = {}) {
 
   return {
     ok: false,
+    escaped: false,
     reason: 'rounds-out',
     rounds: maxRounds,
     target: lastRes?.target ?? null,
@@ -245,12 +312,17 @@ export async function recoverFromWater (self, opts = {}, ctx = {}) {
 export function waterReportText (res, trigger = null) {
   if (!res) return '水下恢复：没有结果'
   const why = trigger ? `（因为${WATER_TRIGGER_TEXT[trigger.why] ?? trigger.why}${trigger.detail ? `：${trigger.detail}` : ''}）` : ''
-  const head = res.ok ? '🌊 我自己从水里出来了一趟' : '🌊 我在水里没出来'
+  /* 🔴 审计：原来这里看的是 `res.ok` —— 而 `ok:true` 包含"只挪近了一点"和"踩到空气口袋、
+   *    人还在水里"。那两种情况下说"我自己从水里出来了一趟"是**假话**，而这句话是要
+   *    通过 `agent.steer` 送进 AI 上下文的。只有 `escaped === true` 才配这句话。 */
+  const head = res.escaped === true
+    ? '🌊 我自己从水里出来了'
+    : (res.ok ? '🌊 我在水里，能喘口气了，但**还没出去**' : '🌊 我在水里没出来')
   const lines = [`${head}${why} —— ${res.note}`]
   if (res.kind) lines.push(`目标类型：${res.kind}`)
   if (res.tried?.length) lines.push(`试过但没走通的：${res.tried.join(' / ')}`)
   for (const l of res.log ?? []) lines.push(`· ${l}`)
-  lines.push(res.ok
+  lines.push(res.escaped === true
     ? '我**没有**替你决定接下来去哪 —— 原来的任务要不要继续，你看一眼再定。'
     : '要救我：给个明确的目标（岸在哪 / 往哪个方向），或者用 mc_scan 看一眼四周再决定。')
   return lines.join('\n')

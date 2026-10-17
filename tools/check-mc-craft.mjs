@@ -111,6 +111,11 @@ function mkBot (inv = {}, opts = {}) {
   const world = opts.world ?? mkWorld()
   const calls = []
   const pos = opts.pos ?? { x: 0.5, y: 1, z: 0.5 }
+  /* 🔴 `dropsNear()` 用的是 `position.distanceTo(...)`（真 bot 是 vec3）—— 假 bot 的 pos 是普通
+   *    对象，不补这一下，"脚边有几个掉落物"那段永远走 catch 分支、测不到。 */
+  if (typeof pos.distanceTo !== 'function') {
+    pos.distanceTo = (o) => Math.hypot(pos.x - (o?.x ?? 0), pos.y - (o?.y ?? 0), pos.z - (o?.z ?? 0))
+  }
   /* 记录"关窗口 / 合成"的先后顺序，用来断言"动手前先把残留窗口关掉" */
   const trace = opts.trace ?? []
   const bot = {
@@ -127,7 +132,11 @@ function mkBot (inv = {}, opts = {}) {
     inventory: {
       count: (id, metadata = null) => (id == null ? 0 : (counts.get(id) ?? 0)),
       items: () => [...counts.entries()].filter(([, c]) => c > 0).map(([id, c]) => ({ type: id, name: nm(id), count: c })),
+      /* 🔴 实机 2026-10-17：「合成的时候背包满了，造出来的东西会掉地上，机器人不知道」——
+       *    空位数是那段对账的输入之一。 */
+      emptySlotCount: () => (opts.emptySlots ?? 36),
     },
+    entities: opts.entities ?? {},
     recipesAll (id, metadata, table) {
       if (opts.recipesAllThrows) throw new Error('假 recipesAll 故障')
       if (opts.recipes) return opts.recipes(id, metadata, table)
@@ -183,6 +192,21 @@ function mkBot (inv = {}, opts = {}) {
       }
       // 模拟"一次 craft 只做出一批"（实机：要 8 块木板只出了 4 块 ⇒ 下一步就撞 `原料对不上`）
       if (opts.craftOneBatch) count = Math.min(count, 1)
+      /* 🔴 实机 2026-10-17：「合成的时候背包满了，造出来的东西会掉地上，机器人不知道」——
+       *    背包满时服务端把产物 `spawn_entity` 掉在脚边，而 `bot.craft()` 照常 resolve。
+       *    这里模拟：料照扣、产物**不进背包**、地上多一个掉落物实体。 */
+      if (opts.craftToGround) {
+        for (let i = 0; i < count; i++) {
+          for (const d of rec.delta) if (d.count < 0) counts.set(d.id, (counts.get(d.id) ?? 0) + d.count)
+        }
+        craftDone += count
+        bot.entities['drop-1'] = {
+          name: 'item', displayName: 'Item', type: 'object',
+          position: { x: 1.5, y: 1, z: 0.5 }, count,
+        }
+        calls.push({ out: nm(rec.result.id), count, table: table ? 'table' : null, toGround: true })
+        return
+      }
       // 模拟"补做也补不动了"（第 N 批之后再怎么 craft 都没产出）
       if (opts.craftStopAfter != null && craftDone >= opts.craftStopAfter) count = 0
       for (let i = 0; i < count; i++) {
@@ -859,6 +883,49 @@ console.log('— ⑧ 合成窗口失步（实机 2026-10-07：10 根橡木没了
     ok(/完成/.test(r2.text) || /合成格里还剩/.test(r2.text), '清完照旧能合成', r2.text.split('\n').slice(0, 3).join(' ').slice(0, 200))
     await p1.catch(() => {})
   }
+}
+
+/* ─────────── ⑫ 背包满了：产物掉地上，必须点名（用户 2026-10-17 实机反馈） ─────────── */
+console.log('— ⑫ 背包满了 ⇒ 产物掉地上，必须点名 —')
+{
+  /* 用户原话：「合成的时候背包满了，造出来的东西会掉地上，机器人不知道」。
+   * 实机现场：第二把钻石镐就是这么掉在地上的（AI 看到的是「✅ 合成完成」）。 */
+  const f = mkBot({ oak_log: 3 }, { craftToGround: true, emptySlots: 0 })
+  const mc = mkMc(f)
+  const r = await run({ name: 'oak_planks', count: 4 }, { mc })
+  ok(!f.counts.get(idOf('oak_planks')), '产物没进背包（模拟的就是这个）', String(f.counts.get(idOf('oak_planks'))))
+  ok(/产物没进背包/.test(r.text), '报的是"产物没进背包"，**不是**"合成中断/白做了"', r.text.split('\n').slice(0, 3).join(' '))
+  ok(!/❌ 合成中断/.test(r.text), '不报成"合成中断"（料已经变成产物了，只是没进背包）', r.text)
+  ok(/背包一个空位都没有/.test(r.text), '点名根因是"背包一个空位都没有"', r.text)
+  ok(/脚边就有/.test(r.text) && /掉落物/.test(r.text), '扫到脚边的掉落物并报个数与距离', r.text)
+  ok(/mc_move/.test(r.text) && /几分钟就消失/.test(r.text), '给出可执行的下一步（走过去捡 + 说明会消失）', r.text)
+  ok(/先腾空位|mc_chest/.test(r.text), '告诉它下次合成前先腾空位', r.text)
+  ok(r.value?.dropped === true && r.value?.onGround === 1, '返回里带机器可读的 dropped / onGround', JSON.stringify({ dropped: r.value?.dropped, onGround: r.value?.onGround }))
+}
+{
+  // 空位还剩 1 个、这次没丢东西 ⇒ 也要预警（下次就来不及了）
+  const f = mkBot({ oak_log: 3 }, { emptySlots: 1 })
+  const mc = mkMc(f)
+  const r = await run({ name: 'oak_planks', count: 4 }, { mc })
+  ok(f.counts.get(idOf('oak_planks')) === 4, '空位够 ⇒ 照常合出来', String(f.counts.get(idOf('oak_planks'))))
+  ok(/只剩 1 个空位/.test(r.text) && /mc_chest/.test(r.text), '空位只剩 1 ⇒ 预警并给出对策', r.text)
+  ok(r.value?.lost == null, '没丢东西 ⇒ **不**带 lost（别虚报）', JSON.stringify({ lost: r.value?.lost }))
+}
+{
+  // 空位充足、也没丢东西 ⇒ 一个字都不许多说（噪音）
+  const f = mkBot({ oak_log: 3 }, { emptySlots: 20 })
+  const mc = mkMc(f)
+  const r = await run({ name: 'oak_planks', count: 4 }, { mc })
+  ok(!/空位/.test(r.text) && !/掉在脚边|产物没进背包/.test(r.text), '空位充足 ⇒ 不提空位、不提掉地上（不加噪音）', r.text.split('\n').slice(0, 4).join(' '))
+}
+{
+  // 扫不到脚边（假 bot 没有 distanceTo）⇒ 也得把"料被扣走了、产物没进背包"说出来
+  const f = mkBot({ oak_log: 3 }, { craftToGround: true, emptySlots: 0 })
+  delete f.bot.entity.position.distanceTo
+  const mc = mkMc(f)
+  const r = await run({ name: 'oak_planks', count: 4 }, { mc })
+  ok(/产物没进背包/.test(r.text), '扫不了脚边也照样把"产物没进背包"说出来', r.text.split('\n').slice(0, 3).join(' '))
+  ok(/脚边没扫到/.test(r.text) && /合成格里/.test(r.text), '扫不到就如实说扫不到（不编坐标），并提"可能卡在合成格里"', r.text)
 }
 
 console.log('')

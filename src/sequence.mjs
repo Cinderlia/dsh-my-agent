@@ -24,6 +24,7 @@
 
 import { CALL_BUDGET_MS, callBudget } from './budget.mjs'
 import { sleep, raceAbort } from './async-util.mjs'
+import { dangerNow, dangerText, healthOf } from './danger.mjs'
 
 /**
  * 这一步**到底成没成**（报告 H3，2026-10-13）。
@@ -94,14 +95,30 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
   //    2026-10-08 审计⑦：`msLeft()` 已经用完时，`Math.max(300, …)` 会白送 300ms。
   const leftMs = self.msLeft()
   const bd = leftMs <= 100 ? 0 : Math.max(0, Math.min(callBudget(budgetMs), leftMs))
+  /* 🔴 2026-10-17（实机：AI 报「mc_sequence 会假失败：秒回报 stoppedAt:0 / elapsedMs:0 / 本轮时间不够，
+   *    但方块其实已经挖掉了……我后来靠 mc_dig 复核才发现」）：
+   *    `bd === 0` 时这个循环**一步都不会做**（`Date.now() - t0 > 0` 在 1 毫秒后就成立）。
+   *    而这**不是"没做成"，是"没做"** —— 两件事必须分开说（踩坑档案第 107 条）：
+   *    模型看到 `stoppedAt:0` 只会得出"这活没干成、再发一遍"，于是把已经做完的事重做一遍，
+   *    或者在 `mc_task` 里反复撞同一堵墙。所以 `bd <= 0` 要单独标出来、单独给一句话。 */
+  const noBudget = bd <= 0
   const results = []
   let next = null
   let aborted = false
+  let danger = null
+  /* 🔴 2026-10-17（用户报"工具排队执行、延迟很大"）：一次调用是**原子**的 ——
+   *    实机 12 个 break 挖竖井，骷髅跟下来一路射，AI 要等这 10 秒过完才知道。
+   *    循环开始时记一次血，之后每步之间问一次 `dangerNow()`（判据保守，见 `src/danger.mjs`）。 */
+  const hp0 = healthOf(self.bot)
   for (let i = 0; i < steps.length; i++) {
     /* 🔴 2026-10-08 第四份审计报告 ⑪：这两支以前会为**根本没执行**的那步 push 一条 `ok:false`
      *    ⇒ 汇总里 `succeeded + failed + remaining > requested`（模型据此以为"那步做失败了"）。
      *    现在只记 `next`（那步没做，重发时从它开始），不写 results。 */
     if (self.abortSignal?.aborted) { aborted = true; next = i; break }
+    /* 挨打了 / 有怪贴脸 ⇒ **立刻**把控制权还回去（这一步没做，重发时从它开始）。
+     * 放在预算检查**之前**：预算还有 8 秒也不该继续挖 —— 怪已经站到你脸上了。 */
+    danger = dangerNow(self.bot, { hp0 })
+    if (danger) { next = i; break }
     if (Date.now() - t0 > bd) { next = i; break }
     const step = steps[i] ?? {}
     try {
@@ -136,6 +153,7 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
     }
   }
   const okCount = results.filter((r) => r.ok).length
+  const dText = dangerText(danger)
   return {
     requested: steps.length, succeeded: okCount, failed: results.length - okCount,
     /* 🔴 报告⑪：`remaining` 从"第一步还没做完的"算起（**含那一步本身**）⇒ 它和 `failed` 会
@@ -143,14 +161,31 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
     attempted: results.length,
     elapsedMs: Date.now() - t0, results,
     ...(aborted ? { aborted: true } : {}),
+    /* 这次调用**自己没分到时间** ⇒ 明说（`bd` 也一并给出来，别让模型猜）。
+     * 与"时间用完了"是两件事：那一种是"做了一部分、时间到了"，这一种是"一步都没做"。 */
+    ...(noBudget ? { noBudget: true, budgetMs: bd } : {}),
+    /* 挨打退出：`interrupted:'danger'` 是个**能直接判**的字段（不用去啃 hint 的自然语言）。
+     * `results` 里保留已经做完的那几步 —— 前功没有尽弃，AI 从 `stoppedAt` 接着发就行。 */
+    ...(danger ? { interrupted: 'danger', danger: { ...danger, text: dText } } : {}),
     ...(next == null ? {} : {
       stoppedAt: next, remaining: steps.length - next,
-      hint: aborted
-        ? `被中断了（第 ${next + 1} 步还没做）—— 要接着做就再叫一次 mc_sequence，steps 从第 ${next + 1} 步往后发。`
-        : next === 0
-          ? '这一轮的时间已经用完了（前面什么都没做）—— 直接再叫一次 mc_sequence，steps 原样发就行。'
-          : `做到第 ${next + 1} 步时这一轮的时间到了 —— 再叫一次 mc_sequence，`
-            + `steps 从第 ${next + 1} 步往后发就行（前面已经做完了）。`,
+      hint: danger
+        ? `⚠️ 第 ${next + 1} 步**没做** —— 先处理眼前这个（${dText}）：`
+          + '`mc_act {mode:"attack"}` 打掉它，或者 `mc_move` 躲开、`mc_act {mode:"equip"}` 换上装备。'
+          + `安全了再叫一次 mc_sequence，steps 从第 ${next + 1} 步往后发。`
+        : aborted
+          ? `被中断了（第 ${next + 1} 步还没做）—— 要接着做就再叫一次 mc_sequence，steps 从第 ${next + 1} 步往后发。`
+          : noBudget
+            /* 🔴 别写成"时间用完了，原样再发一次" —— 模型会以为"刚才那串没干成"，
+             *    而它**根本不知道**上一串干到哪了（这一串一步没做，上一串可能已经干完了）。
+             *    正确的指令是**先复核**。 */
+            ? `⚠️ 这次调用**自己没分到时间**（外层只剩 ${leftMs}ms）—— **一步都没做**。`
+              + '**这不等于那些方块没动过**：先 `mc_dig` / `mc_scan` 复核一下到底做完没有，'
+              + '确认真没干再单独叫一次 mc_sequence（**别塞在 mc_task 里** —— 外层时间早被前面的步骤吃掉了）。'
+            : next === 0
+              ? '这一轮的时间已经用完了（前面什么都没做）—— 直接再叫一次 mc_sequence，steps 原样发就行。'
+              : `做到第 ${next + 1} 步时这一轮的时间到了 —— 再叫一次 mc_sequence，`
+                + `steps 从第 ${next + 1} 步往后发就行（前面已经做完了）。`,
     }),
   }
 }

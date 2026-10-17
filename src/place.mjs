@@ -63,6 +63,45 @@ export function placeRef (self, pos) {
   return null
 }
 
+/**
+ * 「跳起来再放」—— **原地搭高**的标准做法。
+ *
+ * 🔴 为什么必须先跳（用户 2026-10-17 报的「一直尝试放方块」）：
+ *    想在自己脚下垫一块时，落点 `underFeet.position + (0,1,0)` 恰好是
+ *    **机器人自己站着的那一格**。服务端不会把方块放进玩家身体里 ⇒ 必拒。
+ *    站着放 = 每一轮都失败，而且上游抛的是英文
+ *    （`mineflayer/lib/plugins/place_block.js:42` 的 `Server refused to place … the block is still air`），
+ *    模型看不懂"报的坐标是我自己站的地方"，只会一遍遍重试同一个点位
+ *    （用户的 AI 后来自己总结成「服务端不让在脚底下放」，只好改去挖台阶）。
+ *    脚离地之后那一格就空了，才放得进去。
+ *
+ * 用"等真的离地"而不是死等固定毫秒：跳跃的滞空窗口只有几百毫秒，
+ * 而 `bot.placeBlock` 内部还要先 `await bot.lookAt(...)` 再发包（`generic_place.js:37`）。
+ */
+export async function placeWhileJumping (b, refBlock, face, { tries = 3 } = {}) {
+  let lastErr = null
+  try { b.setControlState('jump', true) } catch {}
+  try {
+    for (let i = 0; i < tries; i++) {
+      // 等脚真的离开整格（`position.y` 的小数部分不再是 0）
+      const t0 = Date.now()
+      while (Date.now() - t0 < 700) {
+        const y = b.entity?.position?.y
+        if (typeof y === 'number' && y - Math.floor(y) > 0.05) break
+        await sleep(20)
+      }
+      try {
+        await b.placeBlock(refBlock, new Vec3(face.x, face.y, face.z))
+        return true
+      } catch (e) { lastErr = e }
+      await sleep(120)   // 落地了再跳一次
+    }
+    throw lastErr ?? new Error('跳起来也没放上')
+  } finally {
+    try { b.setControlState('jump', false) } catch {}
+  }
+}
+
 /** 把背包里的方块放到某个坐标（先走近、必要时往上搭） */
 export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {}) {
   const b = self.requireBot()
@@ -153,29 +192,60 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
   }
   let ref = placeRef(self, pos)
   if (!ref) {
-    // 悬空：先在自己脚下垫一块，站上去，再放目标（等于"搭高"）
+    /* 悬空：先在自己**脚下**垫一块、站上去，目标格就挨着这一块了（"原地搭高"）。
+     * 🔴 2026-10-17 用户实机报「一直尝试放方块」：这一步原来**站着就放** ——
+     *    落点 = `underFeet.position + (0,1,0)` = **机器人自己站着的那一格**。
+     *    服务端不把方块放进玩家身体里 ⇒ 必拒；而那次调用**不在**下面的 try/catch 里
+     *    ⇒ 英文原文 `Server refused to place cobblestone at (305,20,-653): the block is still air`
+     *    直接冒泡给模型。模型看不懂"报的坐标是我自己站的地方"，只会一遍遍重试同一个点位
+     *    （用户的 AI 后来自己总结成「服务端不让在脚底下放」，只好改去挖台阶）。 */
     const below = b.entity.position.floored().offset(0, -1, 0)
     const underFeet = b.blockAt(below)
+    let padError = null
     if (underFeet && !isAir(underFeet.name)) {
       await ctx.t(b.equip(item, 'hand'), 'equip', '手持垫脚方块')
       await ctx.t(b.lookAt(below.offset(0.5, 0.5, 0.5), true), 'lookAt', '看向脚下')
-      await ctx.t(b.placeBlock(underFeet, { x: 0, y: 1, z: 0 }), 'place', '垫脚')
+      try {
+        await ctx.t(placeWhileJumping(b, underFeet, { x: 0, y: 1, z: 0 }), 'place', '垫脚')
+      } catch (e) { padError = e }
       await sleep(250)
     }
     ref = placeRef(self, pos)
-    if (!ref) throw new Error('目标位置悬空且脚下没有可依附方块（先走到有方块的地方，或先放一个垫脚方块）')
+    if (!ref) {
+      const why = padError
+        ? `在原地垫高一块也被拒了（${String(padError?.message ?? padError).slice(0, 120)}）`
+        : (underFeet && !isAir(underFeet.name) ? '垫高之后那一格还是挨不着它' : '脚下也没有可垫的方块')
+      throw new Error(`(${pos.x},${pos.y},${pos.z}) 悬空：它六面都没有可依附的方块，${why}。`
+        + '**别再对着同一个点位试了** —— 要么先 `mc_act{mode:"place"}` 把它**下面那一格**填上，'
+        + '要么 `mc_move` 走到紧挨着它的位置（上下左右差一格）再放。')
+    }
   }
   await ctx.t(b.equip(item, 'hand'), 'equip', '手持方块')
   await ctx.t(b.lookAt(ref.ref.position.offset(0.5, 0.5, 0.5), true), 'lookAt', '看向放置面')
+  /* 🔴 2026-10-17（用户实机：「`mc_act {mode:"place"}` 放不了自己脚下，经典 pillar-jump 做不成，
+   *    这是我在竖井里爬不上去、反复淹死的直接原因」）：
+   *    目标格正是**自己身体占着的那一格**（脚下 / 齐腰）时，站着放必被服务端拒 ——
+   *    服务端不会把方块放进玩家碰撞箱。寻路器的自动垫脚能做，是因为它**先跳起来**；
+   *    而水/岩浆这种可替换方块能过 `canPlaceInto` 那一关，所以以前是"预检放行、服务端拒"，
+   *    报出来的还是英文原文，模型只会对着同一个点位重试。
+   *    ⇒ 这种点位改走"跳起来再放"（脚离地那一瞬，那一格就空了）。 */
+  const feetNow = (() => { try { return b.entity.position.floored() } catch { return null } })()
+  const isOwnCell = Boolean(feetNow)
+    && pos.x === feetNow.x && pos.z === feetNow.z
+    && (pos.y === feetNow.y || pos.y === feetNow.y + 1)
   try {
-    await ctx.t(b.placeBlock(ref.ref, new Vec3(ref.face.x, ref.face.y, ref.face.z)), 'place', '放置方块')
+    if (isOwnCell) await ctx.t(placeWhileJumping(b, ref.ref, ref.face), 'place', '跳起来放到自己脚下')
+    else await ctx.t(b.placeBlock(ref.ref, new Vec3(ref.face.x, ref.face.y, ref.face.z)), 'place', '放置方块')
   } catch (e) {
     /* 🔴 报告⑤：上游 `place_block.js:42` 抛的是英文 `Server refused to place …`，
      *    以前原样冒泡给模型。翻译成它能用的话。 */
     const m = String(e?.message ?? '')
     if (/Server refused to place/i.test(m)) {
-      throw new Error('服务端拒了这次放置（太远 / 目标格被占 / 手上有别的 / 失步）——'
-        + '先用 `mc_move` 靠近或换个点位，**别当成放成功了**。')
+      throw new Error(`服务端拒了在 (${pos.x},${pos.y},${pos.z}) 的这次放置（太远 / 目标格被占 / 手上有别的 / 失步）——`
+        + (isOwnCell
+          ? '**那一格是我自己身体占着的**（脚下/齐腰），已经试过"跳起来放"也没成 —— '
+            + '先 `mc_move` 挪开一格、或者把**下面那一格**填上再站上去。别对着同一个点位反复试。'
+          : '先用 `mc_move` 靠近或**换一个点位**，别对着同一个点位反复试，**也别当成放成功了**。'))
     }
     throw e
   }
@@ -191,9 +261,12 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
     at: { x: pos.x, y: pos.y, z: pos.z },
     now,
     held: heldText(b),
+    /* 这一块是"跳起来放到自己脚下"放成的 ⇒ 报出来，模型才知道自己刚垫高了一格。 */
+    ...(isOwnCell ? { pillar: true } : {}),
     ...(ok ? {} : {
       note: `方块**没有出现**（现在那里是 ${now ?? '未加载'}）——服务端可能拒了这次放置`
-        + '（领地保护 / 权限 / 反作弊 / 失步）。不要当成放成功了。',
+        + '（领地保护 / 权限 / 反作弊 / 失步）。不要当成放成功了。'
+        + (isOwnCell ? '（这一格是我自己站的地方，已经跳过再放 —— 还是没成，说明不是"占着"的问题）' : ''),
     }),
   }
 }

@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url'
 
 /** 本套件要静态扫的两个源文件（**按脚本自身定位**，别用 cwd 拼 `..`） */
 const HERE = dirname(fileURLToPath(import.meta.url))
-const SRC = { index: join(HERE, '..', 'index.js'), client: join(HERE, '..', 'client.js') }
+const SRC = { index: join(HERE, '..', 'index.js'), client: join(HERE, '..', 'client.js'), agentsmd: join(HERE, '..', 'src', 'agentsmd.mjs'), config: join(HERE, '..', 'src', 'config.mjs'), commands: join(HERE, '..', 'src', 'commands.mjs') }
 
 let pass = 0
 let fail = 0
@@ -257,32 +257,157 @@ const stripComments = (s) => s.replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//
   ok(src.includes('const vpsync = syncVersionPrompt(root, PLUGIN_VERSION'), '建档时按版本同步它')
   ok(src.includes('已写入默认版本提示：'), '建档日志有它（好排查）')
   ok(src.includes("const isVersion = String(body.target ?? 'rules') === 'version'"), '接口按 target 区分两份文件')
-  ok(src.includes('writeVersionPrompt(promptDir, body.text, PLUGIN_VERSION)'), 'PUT 能改 版本提示.md')
-  ok(src.includes('resetVersionPrompt(promptDir, PLUGIN_VERSION)'), 'DELETE 能恢复它')
+  /* 🔴 2026-10-15：「提示词」页分成上下两块之后，PUT/DELETE 的目标目录由 `scope` 决定 ——
+   *    `session`（默认）= 本会话那份、`default` = **基根**那份（新会话的种子）。
+   *    版本提示只有会话那一份，所以 `scope:'default'` 对它**不生效**（`&& !isVersion`）。 */
+  ok(src.includes('const dir = (scope === \'default\' && !isVersion) ? baseDir : sessionDir'),
+    '写入目标按 scope 选目录（版本提示不走 default）')
+  ok(src.includes('writeVersionPrompt(dir, body.text, PLUGIN_VERSION)'), 'PUT 能改 版本提示.md')
+  ok(src.includes('resetVersionPrompt(dir, PLUGIN_VERSION)'), 'DELETE 能恢复它')
   ok(src.includes('const vpPath = root ? versionPromptPath(root) : null'), 'promptInjectionStatus 里报了它的路径')
   ok(src.includes('defaultText: versionPromptText(PLUGIN_VERSION)'), '接口回了内置默认（前端"看内置默认"用）')
 }
 
-/* ─────────────── ⑦ 静态接线：设置页可编辑 ─────────────── */
-section('⑦ 设置页：版本提示从"只读展示"改成"可编辑"')
+/* ─────────────── ⑦ 静态接线：版本提示不再有界面入口 ─────────────── */
+section('⑦ 设置页：版本提示不再有编辑入口（用户 2026-10-15「这两个去掉」）')
 {
   const src = stripComments(rd(SRC.client) ?? '')
-  ok(src.includes('vpText, onVpText, onVpSave, onVpReset'), 'PromptPane 收了这四个 props')
-  /* 🔴 2026-10-15 审计（client.js 报告第 1 条）：四个写接口以前写死 `'/api/mc/agents-md'`
+  ok(!src.includes('vpText, onVpText, onVpSave, onVpReset'), 'PromptPane 不再收版本提示那四个 props')
+  ok(!src.includes('setVpText('), 'load() 不再灌版本提示的输入框')
+  ok(!src.includes('data-wc-verprompt'), '「版本提示」那一块整个不在了（连它的 CSS 一起）')
+  ok(!src.includes("run('vp:save'") && !src.includes("run('vp:reset'"),
+    '两个写动作也删干净了（不留死代码）')
+  ok(!src.includes('看内置默认'),
+    '「默认提示词」那块也不再给"看内置默认"的折叠（用户 2026-10-15「这个去掉」）')
+  ok(String(rd(join(HERE, '..', 'index.js')) ?? '').includes('builtinText: DEFAULT_AGENTS_MD'),
+    '（接口仍然回着 builtinText —— 只是界面上不再展示）')
+  /* 🔴 2026-10-15 审计（client.js 报告第 1 条）：写接口以前写死 `'/api/mc/agents-md'`
      且只把 `sessionId` 塞进 body —— 服务端 `gateOf()` 是
      `settingsGate(query.sessionId ?? b?.sessionId, query.cwd ?? b?.cwd)`，**它认 `cwd`**。
      会话还没落盘时（新对话页）定位不到工作区，用户看到"提示词看得到、存不进去"。
      现在统一走 `withSid(...)`（它把 `sessionId` + `cwd` 都拼进 query）。 */
-  ok(src.includes("run('vp:save', () => apiPut(withSid('/api/mc/agents-md'), { text: vpText, sessionId, target: 'version' })"), '保存走 target:"version"')
-  ok(src.includes("run('vp:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId, target: 'version' })"), '恢复默认走 target:"version"')
-  ok(src.includes("run('md:save', () => apiPut(withSid('/api/mc/agents-md'), { text: mdText, sessionId })"), 'RULES.md 保存也走 withSid（带上 cwd）')
-  ok(src.includes("run('md:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId })"), 'RULES.md 恢复默认也走 withSid')
+  ok(src.includes("run('md:save', () => apiPut(withSid('/api/mc/agents-md'), { text: mdText, sessionId })"), 'RULES.md 保存走 withSid（带上 cwd）')
+  ok(src.includes("run('md:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId, from: 'default' })"),
+    'RULES.md 恢复默认也走 withSid（且现在是"从默认重新播种"）')
   ok(!src.includes("apiPut('/api/mc/agents-md'") && !src.includes("apiDelete('/api/mc/agents-md'"),
-    '🔴 四个写接口不再有裸路径（裸路径 = 不带 cwd ⇒ 新会话页存不进去）')
-  ok(src.includes('setVpText(String(m.versionPrompt?.text ?? \'\'))'), 'load() 把文件内容灌进输入框')
-  ok(src.includes('看内置默认（「恢复默认」用的就是这一份）'), '给了"看内置默认"的折叠')
-  ok(src.includes('注入只投一行指针，正文由会话自己去读'), '界面把"只投指针"写清了')
-  ok(src.includes("mark(seg['version-prompt'])"), '"本会话注入"那行也显示 版本提示.md 的状态')
+    '🔴 写接口不再有裸路径（裸路径 = 不带 cwd ⇒ 新会话页存不进去）')
+  ok(src.includes("mark(seg['version-prompt'])"), '"本会话注入"那行仍显示 版本提示.md 的状态（文件还在注入）')
+}
+
+/* ─────────────── ⑦b 「提示词」页分成上下两块（2026-10-15，用户点名）───────────────
+ * 用户原话：「把mc设置里的提示词优化一下，分为会话提示词和默认提示词。」
+ *   · 上 = **默认提示词** = **基根**那份（`<memoryDir>/RULES.md`）。新会话的记忆根是
+ *     `seedSessionRoot()` 从基根**拷** RULES.md 播种的 ⇒ 改它只影响**以后**的会话。
+ *   · 下 = **会话提示词** = 本会话那份（`memoryRootFor()`）。
+ * 两块都可编辑；「会话提示词 → 恢复为默认」= 用**基根那份**重新播种（不是出厂值）。 */
+section('⑦b 提示词页分两块：默认提示词（基根）+ 会话提示词')
+{
+  const idx = stripComments(rd(SRC.index) ?? '')
+  const src = stripComments(rd(SRC.client) ?? '')
+  // —— 服务端：GET 要同时回两块 ——
+  ok(idx.includes('const baseDir = memoryBaseFor(cwd)'), 'GET 里取到**基根**目录（默认提示词那一块）')
+  ok(idx.includes('const baseCur = readAgentsMd(baseDir)'), '读了基根那份 RULES.md')
+  ok(idx.includes('sharedWithSession: baseDir === promptDir'),
+    '🔴 没开 memoryPerSession 时如实标记"两块是同一份文件"')
+  ok(idx.includes('builtinText: DEFAULT_AGENTS_MD'), '回了出厂那份（前端"看内置默认"用）')
+  ok(idx.includes('text: baseCur.text,') && idx.includes('exists: existsSync(baseCur.path),'),
+    '回参里有 default 那一块（含基根那份的正文与"在不在"）')
+  // —— 服务端：写入按 scope 选目录 ——
+  ok(idx.includes('const sessionDir = memoryRootFor(gate.cwd, agentIdOf(safeAgentById(sessionId)))'),
+    '写分支把会话目录单独取出来')
+  ok(idx.includes("const scope = String(body.scope ?? 'session') === 'default' ? 'default' : 'session'"),
+    '收 scope（默认 session）')
+  ok(idx.includes('const dir = (scope === \'default\' && !isVersion) ? baseDir : sessionDir'),
+    'scope=default 写基根')
+  ok(idx.includes("if (String(body.from ?? '') === 'default')"), 'DELETE 支持 from=default（重新播种）')
+  ok(idx.includes('copyFileSync(src, dst)'), '重新播种就是**拷基根那份**过去')
+  ok(idx.includes('if (src === dst)'), '🔴 两块同一文件时不拷自己（会 EBUSY/EPERM）')
+  ok(idx.includes('默认提示词那份文件还不存在'), '基根那份不在时给一句能懂的话')
+  // —— 客户端：两块各自的状态与动作 ——
+  ok(src.includes('const [dfText, setDfText] = React.useState(\'\')'), 'dfText 进了 state')
+  ok(src.includes('const [dfInfo, setDfInfo] = React.useState(null)'), 'dfInfo 进了 state')
+  ok(src.includes("setDfText(String(m.default?.text ?? ''))"), 'load() 把默认那份灌进输入框')
+  ok(src.includes("setDfInfo(m.default ?? null)"), 'load() 记下默认那块的元信息')
+  ok(src.includes("run('df:save', () => apiPut(withSid('/api/mc/agents-md'), { text: dfText, sessionId, scope: 'default' })"),
+    '默认那块的保存走 scope:"default"')
+  ok(src.includes("run('df:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId, scope: 'default' })"),
+    '默认那块的恢复走 scope:"default"')
+  ok(src.includes('dfText, dfInfo, dfReady, onDfText, onDfSave, onDfReset'), 'PromptPane 收了这六个 props')
+  /* 🔴 服务端还没重载时（宿主没重启），GET 回的仍是旧形状 ⇒ 读不到内容。
+     这时**必须挡住保存**：旧服务端不认 `scope:'default'`，会把它写进**本会话**那份 ——
+     看着像"改默认"，其实是把当前会话覆盖了。 */
+  ok(src.includes('const [dfReady, setDfReady] = React.useState(true)'), 'dfReady 进了 state（服务端有没有回 default 那块）')
+  ok(src.includes('setDfReady(m.default != null)'), 'load() 按"回没回 default"判定')
+  ok(src.includes('disabled: busy || !dfReady'), '🔴 服务端没重载时输入框是禁用的')
+  ok(src.includes('hasWorkspace && dfReady'), '🔴 服务端没重载时保存/恢复按钮不出现')
+  ok(src.includes('if (!dfReady) {') && src.includes('现在保存会写进当前会话那份，先别存。'),
+    '🔴 动作层也硬拒（按钮藏了不算，回调也可能被别处叫到）')
+  ok(src.includes("'data-wc-defprompt': ''") && src.includes("'data-wc-sessionprompt': ''"),
+    '两个块各有一个可定位的容器')
+  ok(src.includes('以后新建的会话用的就是这一份'), '默认那块写清"只影响以后新建的会话"')
+  ok(src.includes('本会话正在用的那份'), '会话那块写清"就是本会话"')
+  ok(src.includes("onClick: () => setConfirmDfReset(true)"), '默认那块的恢复要二次确认')
+  ok(src.includes("title: '用上面「默认提示词」那一份重新播种本会话'"),
+    '会话那块的「恢复为默认」= 用上面那块（不是出厂值）')
+  ok(src.includes("'⚠️ 「记忆按会话分」没开"), '两块同一文件时界面上有警示')
+  ok(!src.includes('看内置默认'), '默认那块不再给"看内置默认"的折叠（用户 2026-10-15 去掉）')
+  ok(!src.includes("title: '恢复默认提示词'"), '旧的单个「恢复默认」按钮已经不在')
+}
+
+/* ─────────────── ⑦c 「随版本更新」只动默认提示词（用户 2026-10-15） ─────────────── */
+section('⑦c 「随版本更新」只动默认提示词（基根），会话那份不碰')
+{
+  const idx = stripComments(rd(SRC.index) ?? '')
+  const src = stripComments(rd(SRC.client) ?? '')
+  const md = stripComments(rd(SRC.agentsmd) ?? '')
+  // —— 服务端：同步目标是**基根**，不是会话根 ——
+  ok(idx.includes('const syncDir = memoryBaseFor(cwd)'), '🔴 同步目标是**基根**（=「默认提示词」那份）')
+  ok(/syncRulesVersion\(syncDir, PLUGIN_VERSION, \{\s*follow: workspaceConfigValues\(root\)\.rulesFollowVersion !== false,\s*backup: true\s*\}\)/.test(idx),
+    '🔴 同步的是 syncDir（基根）且开了备份')
+  ok(!/syncRulesVersion\(root, PLUGIN_VERSION, \{ follow: workspaceConfigValues\(root\)\.rulesFollowVersion !== false \}\)/.test(idx),
+    '🔴 旧的"同步会话根"那条已经不在')
+  ok(/syncRulesVersion\(root, PLUGIN_VERSION, \{ follow: false \}\)/.test(idx),
+    '会话根只**记版本**（follow:false = 内容一个字不动），页面上"当前内容对应：v…"才不会僵住')
+  ok(idx.includes('默认提示词**（基根那份）已替换为新版本默认内容'), '替换时日志点名"默认提示词"，并说明本会话没动')
+  // —— 模块：备份 ——
+  ok(md.includes('{ follow = true, backup = false } = {}'), 'syncRulesVersion 收了 backup 选项')
+  ok(md.includes('`${p}.bak-${from ?? \'unknown\'}`'), '备份名带旧版本号')
+  ok(md.includes('copyFileSync(p, cand)'), '覆盖前先拷一份')
+  ok(md.includes("...(backupPath ? { backup: backupPath } : {})"), '回参里带上备份路径')
+  // —— 客户端：开关的说明跟着改 ——
+  ok(src.includes('用新版本默认内容替换「默认提示词」那一块') && src.includes('「会话提示词」不动'),
+    '🔴 开关说明写清"只动默认那块"')
+  ok(!src.includes('用新版本的默认提示词替换当前内容'), '旧的"替换当前内容"说法已经不在')
+}
+
+/* ─────────────── ⑦d 第三方账户的「编辑」（用户 2026-10-15 报的 bug） ─────────────── */
+section('⑦d 第三方账户点「编辑」走自己的表单，不是离线表单')
+{
+  const idx = stripComments(rd(SRC.index) ?? '')
+  const src = stripComments(rd(SRC.client) ?? '')
+  /* 🔴 用户原话：「我用的是第三方皮肤站账号，点编辑进去还是离线账号」——
+     路由只分了 microsoft / 其它，第三方被归进 edit-offline（那个表单没有服务器和密码，
+     一保存就把账户写成了离线）。 */
+  ok(/acc\.type === 'microsoft' \? 'edit-microsoft' : acc\.type === 'yggdrasil' \? 'edit-yggdrasil' : 'edit-offline'/.test(src),
+    '🔴 路由按三种类型分档（第三方有自己那一档）')
+  ok(src.includes("view === 'new-yggdrasil' || view === 'edit-yggdrasil'"), '第三方表单同时接新建与编辑')
+  ok(src.includes("const { servers = [], busyKey, mode = 'new', account } = props"), '表单收了 mode / account')
+  ok(src.includes("editing ? '编辑第三方账户' : '新建第三方账户'"), '标题跟着换')
+  ok(src.includes("editing ? '保存中…' : '创建中…'"), '按钮文案跟着换')
+  ok(src.includes("'密码（留空 = 不改）'"), '🔴 编辑时密码留空 = 不改（标签上写出来）')
+  ok(src.includes('if (!editing && !hasPass) missing.push(\'密码\')'), '🔴 编辑时密码不是必填项')
+  ok(src.includes('if (p) payload.password = p'), '🔴 没填密码就不发 password 字段')
+  ok(src.includes('...(editing ? {} : { name: fallback })'), '编辑时不拿账号前缀覆盖显示名')
+  ok(src.includes('props.onPatch(account.innerID, payload, key)'), '编辑走 PATCH')
+  /* 服务端：PATCH 必须像 POST 一样认 serverUrl / password —— 否则 update() 会把它们静默忽略 */
+  const a = idx.indexOf("req.method === 'PATCH'")
+  const seg = a >= 0 ? idx.slice(a, a + 1400) : ''
+  ok(/cur\.type === 'yggdrasil'/.test(seg), '🔴 PATCH 里对第三方账户单独处理')
+  ok(/normalizeServerUrl\(String\(body\.serverUrl\)\)/.test(seg), '🔴 PATCH 认 serverUrl（resolve-or-create）')
+  ok(/patch\.serverId = serverId/.test(seg), '🔴 PATCH 把解析出来的 serverId 交给 update')
+  ok(/if \(body\.password\) await accounts\.setCredential\(innerID/.test(seg), '🔴 PATCH 认 password（留空就不覆盖）')
+  ok(/await accounts\.refreshCredentialIndex\(\)/.test(seg), '写完刷一次凭据索引')
+  ok(idx.includes('delete patch.password'), 'password 不直接丢给 update（它不认这个字段）')
 }
 
 /* ─────────────── ⑧ 静态接线：client.js 审计 10 条（2026-10-15） ─────────────── */
@@ -292,15 +417,15 @@ section('⑧ client.js 审计修复的静态接线')
   const idx = rd(SRC.index) ?? ''
 
   /* 🔴 第 2 条：config 读失败被 `.catch` 吞掉 ⇒ `Promise.all` 恒 resolve ⇒ `setLoaded(true)`
-     恒执行，而 `wlText` 还是初始 `''` ⇒ 点「保存」会发 `commandWhitelist: []`，
-     **把服务端真实白名单清空**。凭证是 `cfgOk`。 */
+     恒执行，而白名单那份 state 还是初始空值 ⇒ 拨任何一个开关都会拿"只有这一条"的名单
+     **把服务端真实白名单覆盖掉**。凭证是 `cfgOk`。 */
   ok(src.includes('const [cfgOk, setCfgOk] = React.useState(false)'), '🔴 有 cfgOk 凭证（默认 false）')
   ok(src.includes('setCfgOk(true)'), 'config 读成功才翻 true')
   ok(src.includes('setCfgOk(false)'), 'load() 开头与失败分支都翻回 false')
   ok(src.includes('const cfgBad = cfgOk === false'), 'UI 按 cfgBad 提示')
   ok(/if \(!cfgOk\) \{[\s\S]{0,220}?return Promise\.resolve\(false\)/.test(src),
-    '🔴 保存白名单 / base 在没读到配置时**硬拒**（不是只把按钮变灰）')
-  ok(src.includes('cfgOk, onWlText') && src.includes('hasWorkspace, cfgOk'),
+    '🔴 改白名单 / 存 base 在没读到配置时**硬拒**（不是只把按钮变灰）')
+  ok(src.includes('onToggleCmd: toggleCmd') && src.includes('hasWorkspace, cfgOk'),
     'cfgOk 传给了 WhitelistPane 与 SharePane')
 
   /* 🟡 第 3 条：hero 注入按钮 dispose 竞态 */
@@ -346,7 +471,85 @@ section('⑧ client.js 审计修复的静态接线')
     '🟢 服务端 /api/mc/presets 带上了支持版本范围')
 }
 
-/* ─────────────── 收尾 ─────────────── */
+/* ─────────── ⑨ 「指令白名单」页：目录 + 开关（用户 2026-10-15） ─────────── */
+section('⑨ 指令白名单页改成"列出全部指令 + 每条一个开关"')
+{
+  const { COMMAND_GROUPS, catalogNames, inCatalog } = await import('../src/commands.mjs')
+  const { matchCommandList, isRegexEntry, PluginConfig } = await import('../src/config.mjs')
+  const src = stripComments(rd(SRC.client) ?? '')
+  const idx = stripComments(rd(SRC.index) ?? '')
+  const cfgSrc = stripComments(rd(SRC.config) ?? '')
+  const cmdSrc = stripComments(rd(SRC.commands) ?? '')
+
+  /* ① 目录本身 */
+  const names = catalogNames()
+  ok(Array.isArray(COMMAND_GROUPS) && COMMAND_GROUPS.length >= 5, `目录有 ${COMMAND_GROUPS.length} 个分组`)
+  ok(names.length >= 50, `目录里 ${names.length} 条指令`)
+  ok(new Set(names).size === names.length, '目录里没有重名')
+  ok(COMMAND_GROUPS.every((g) => g.group && Array.isArray(g.items) && g.items.length), '每个分组都有名字和条目')
+  ok(COMMAND_GROUPS.every((g) => g.items.every((it) => it.name && it.desc)), '每条都有名字和中文说明')
+  ok(COMMAND_GROUPS.some((g) => g.items.some((it) => it.danger === true)), '危险指令有 danger 标记')
+  ok(inCatalog('tp') && inCatalog('/tp') && inCatalog('TP') && !inCatalog('nope') && !inCatalog(''),
+    'inCatalog 认前导斜杠与大小写、空串回 false')
+  ok(cmdSrc.includes('export function catalogNames') && cmdSrc.includes('export function inCatalog'), '两个助手都导出了')
+  ok(!/^import /m.test(cmdSrc), 'commands.mjs 是叶子（一行 import 都没有）')
+
+  /* ② 匹配逻辑**只有一份** */
+  ok(cfgSrc.includes('export function matchCommandList'), 'matchCommandList 导出了（两个调用方共用）')
+  ok((cfgSrc.match(/function matchCommandList/g) ?? []).length === 1, '全文件只定义一次')
+  ok(/commandAllowed \(command\) \{[\s\S]{0,200}?return matchCommandList\(this\.get\('commandWhitelist'\), command\)/.test(cfgSrc),
+    'commandAllowed 改成委托（不再自带一份匹配）')
+  ok(cfgSrc.includes('commandInList (command)'), '新增 commandInList')
+  ok(/commandInList \(command\) \{[\s\S]{0,120}?return matchCommandList\(this\.get\('commandWhitelist'\), command\)/.test(cfgSrc),
+    'commandInList 只看名单')
+  const cfg = new PluginConfig(mk('wc-wl-cfg-'))
+  cfg.set('commandWhitelist', ['tp', '/^gi/'])
+  cfg.set('allowAllCommands', true)
+  ok(cfg.commandAllowed('give') === true && cfg.commandInList('give') === true, '名单命中的两条都认')
+  ok(cfg.commandAllowed('op') === true && cfg.commandInList('op') === false,
+    '🔴 打开「允许所有指令」后 commandAllowed 全放行，但 commandInList **不跟着全亮**')
+  ok(cfg.commandAllowed('/tp x y z') === true && cfg.commandInList('tp') === true, '输入可以带 `/` 与参数')
+  ok(matchCommandList(['*'], 'anything') === true && matchCommandList([], 'tp') === false, '`*` 与空名单')
+  ok(matchCommandList(['/tp'], 'tp') === true, '`/tp` 这种带前导斜杠的精确名仍然认（审计第 6 条）')
+  ok(isRegexEntry('/^gi/') === true && isRegexEntry('/tp') === false && isRegexEntry('*') === false && isRegexEntry('tp') === false,
+    'isRegexEntry 与匹配逻辑同款规矩（`/tp` 不是正则）')
+
+  /* ③ 服务端下发 */
+  ok(idx.includes("from './src/commands.mjs'") && idx.includes('COMMAND_GROUPS'), 'index.js 引了目录')
+  ok(idx.includes('commandCatalog: COMMAND_GROUPS.map'), 'configView 下发 commandCatalog')
+  ok(idx.includes('on: pluginConfig.commandInList(it.name)'), '🔴 每条的 on 由服务端算（客户端不判）')
+  ok(idx.includes('commandExtra:') && idx.includes('covers: names.filter'), 'configView 下发自定义条目 + 它们罩着谁')
+  ok(idx.includes('if (!isRegexEntry(entry) && entry !== ') , '目录里的精确名不重复列进"自定义条目"')
+
+  /* ④ 客户端：文本框与「保存」都没了 */
+  const pane = src.slice(src.indexOf('function WhitelistPane'), src.indexOf('function PromptPane'))
+  ok(pane.length > 200, '切出了 WhitelistPane 那一段')
+  ok(!pane.includes("'data-wc-textarea'"), '🔴 白名单那个自由文本框删掉了')
+  ok(!pane.includes('wlText') && !pane.includes('onWlText'), '不再用 wlText')
+  ok(!pane.includes("'保存'") && !pane.includes('wl:save'), '🔴 「保存」按钮删掉了')
+  ok(pane.includes('catalog.map') && pane.includes('h(Switch'), '改成按目录渲染一排开关')
+  ok(pane.includes('data-wc-cmdgroup') && pane.includes('data-wc-cmdextra'), '有分组标题与自定义条目区')
+  ok(pane.includes('onToggleCmd') && pane.includes('onDropEntry'), '拨开关与删条目都接上了')
+  ok(pane.includes('disabled: rowOff') && pane.includes('const rowOff = busy || cfgBad || locked'),
+    'allowAll / cfgBad / busy 时开关置灰')
+  ok(src.includes('const [wlList, setWlList] = React.useState([])') &&
+    src.includes('const [cmdCatalog, setCmdCatalog] = React.useState([])') &&
+    src.includes('const [cmdExtra, setCmdExtra] = React.useState([])'), 'state 换成名单 + 目录 + 自定义条目')
+  ok(src.includes('setWlList(Array.isArray(c.commandWhitelist) ? c.commandWhitelist : [])') &&
+    src.includes('setCmdCatalog(Array.isArray(c.commandCatalog) ? c.commandCatalog : [])'),
+    'load() 从服务端读这三份')
+  ok(src.includes('const applyWhitelist = React.useCallback') &&
+    src.includes("apiPatch(withSid('/api/mc/config'), { commandWhitelist: next })"),
+    '改一条 = PATCH 一次（不再等「保存」）')
+  ok(src.includes('if (Array.isArray(r?.commandCatalog)) setCmdCatalog(r.commandCatalog)'),
+    '🔴 服务端回来的新目录直接覆盖本地（拨了没生效的开关会自己弹回去）')
+  ok(src.includes('wl:cmd:') && src.includes("'wl:drop'"), '每次拨动有独立的忙碌键')
+  ok(/const isRe = \(t\) => t\.length > 1 && t\.startsWith\('\/'\) && t\.lastIndexOf\('\/'\) > 0/.test(src),
+    '关掉时只删同名精确条目（正则与 `*` 留着）')
+  ok(!src.includes('whitelistToText') && !src.includes('textToWhitelist'), '两个文本转换助手已随文本框一起删掉')
+}
+
+
 for (const d of TMP) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 console.log(`\n${fail === 0 ? '✅ 全部通过' : '❌ 有失败'}：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

@@ -1,0 +1,54 @@
+[15:02:22] 连 127.0.0.1:25565（wccombat）…
+[15:02:24] 连上了：(5.5,68.0,-6.5) 维度=overworld 模式=survival 血=20
+[15:02:24] 
+══════ 前置：OP、场地与规则 ══════
+[15:02:25]   ✓ bot 有 OP（/fill 真的生效了） — (700,102,700)=stone
+[15:02:25] 场地好了（半径 %d 的石台 + 清空 + 夜里 + easy） 12
+[15:02:25] 
+══════ ① 正常单挑（一只僵尸，血满，背包里有剑） ══════
+[15:02:31]   · 手上：wooden_sword；包里：wooden_sword, diamond_sword
+[15:02:32]   · 召出来了：zombie @ 706,100,701（血 读不到）
+[15:02:36]   · 结果全量：{"attacked":"zombie","distance":5,"killed":true,"gone":true,"health":20,"via":"pvp","waitedMs":1623,"targetHealth":"20 → 0","pickup":"地上还有 2 个掉落物没捡（最近 5.4 格）—— 先 `mc_move` 走过去站上去，一两秒就飞进背包（掉落物几分钟就消失）","combat":"killed","combatText":"✅ 打死了","strategy":"engage","reason":"engage","actions":["equip","engage","engage"]}
+[15:02:36]   · 结果：{"combat":"killed","killed":true,"gone":true,"strategy":"engage","attacked":"zombie","actions":["equip","engage","engage"]}
+[15:02:36]   ✓ 战斗结局是机器可读的（combat） — killed
+[15:02:36]   ✓ 🔴 有剑的单挑 ⇒ 真的打起来了（killed/damaged/timeout 都算正常） — {"killed":true,"combat":"killed","hp":"20 → 0"}
+[15:02:36]   ✓ 🔴 报 killed 就得有证据（掉血或目标消失），不许空口说打死了 — {"killed":true,"gone":true,"hp":"20 → 0"}
+[15:02:36]   ✓ 🔴 报 damaged 也得有证据（`targetHealth` 写着掉了多少） — {"combat":"killed","hp":"20 → 0"}
+[15:02:36]   ✓ 🔴 不许自相矛盾：reason 说 killed，killed 就必须是 true — {"reason":"engage","killed":true}
+[15:02:36]   ✓ 🔴 手上木剑 + 包里有钻石剑 ⇒ 先换上再打（武器选择真的接进来了） — ["equip","engage","engage"]
+[15:02:36]   ✓ 🔴 换装真的落到了手上（不是只在结果里记了一笔） — diamond_sword
+[15:02:36]   ✓ 结果里能看到动作序列 — ["equip","engage","engage"]
+[15:02:36]   ✓ 结果里写了用的哪条策略 — engage
+[15:02:36]   ✓ 结果里写了机器可读的 reason（为什么这么做） — engage
+[15:02:36]   ✓ 🔴 战斗结果不许把 outcome 占成自己的词汇（那是跨工具的统一结局） — undefined
+[15:02:36] 
+══════ ② 低血量（血 4）⇒ 应当主动撤退，一下都不还手 ══════
+[15:02:37]   ✓ 前置：确实是低血量开的局（不是误判） — 4
+[15:02:37]   · 召出来了：zombie @ 706,100,701（血 读不到）
+[15:02:39]   · 结果：{"combat":"retreated","strategy":"retreat","retreated":true,"moved":6.9}
+[15:02:39]   ✓ 🔴 血 4 ⇒ 主动撤退（不再往前顶） — retreated
+[15:02:39]   ✓ 策略是 retreat — retreat
+[15:02:39]   ✓ 🔴 撤退是**真动作**（真的挪窝了），不是只改个字段 — 6.9 格
+[15:02:39]   ✓ 结果里说清了**为什么**撤 — 血只剩 4.833333492279053
+[15:02:39] 
+══════ ③ 被三只僵尸围住 ⇒ 应当拉开距离 / 撤退 ══════
+[15:02:41]   · 召出来了：zombie @ 703,100,701（血 读不到）
+[15:02:41]   · 召出来了：zombie @ 703,100,701（血 读不到）
+[15:02:42]   · 召出来了：zombie @ 703,100,701（血 读不到）
+[15:02:42]   · 场上僵尸 3 只
+[15:02:43]   · 结果：{"combat":"retreated","strategy":"defend","moved":7}
+[15:02:43]   ✓ 确实造出了"被围"的局面（不是自欺欺人） — 3 只
+[15:02:43]   ✓ 🔴 被围 ⇒ 策略是拉开距离/防御，不是闷头进攻 — defend
+[15:02:43]   ✓ 🔴 被围时真的动了（不是原地站着） — 7.0 格
+[15:02:43] 
+══════ ④ 攻击中途被中止 ⇒ 立刻收手 ══════
+[15:02:45]   · 召出来了：zombie @ 709,100,701（血 读不到）
+[15:02:46]   · 结果：{"combat":"aborted","killed":false,"strategy":"engage"}
+[15:02:46]   ✓ 🔴 中止 ⇒ combat 是 aborted — aborted
+[15:02:46]   ✓ 被中止时不许谎报击杀
+[15:02:46] 
+══════ 收尾：拆景 ══════
+[15:02:48]   ✓ 收尾指令已发（场地已拆、规则已还原）
+[15:02:48] 
+──────────────────────────────────────────────────
+[15:02:48] live-combat：pass=23 fail=0

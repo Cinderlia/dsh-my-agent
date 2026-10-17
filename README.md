@@ -36,7 +36,7 @@ pnpm add mineflayer-pathfinder mineflayer-collectblock mineflayer-tool mineflaye
 ## 跑自检
 
 ```bash
-node tools\check-all.mjs            # 42 项：41 个套件 + selfcheck（几分钟）
+node tools\check-all.mjs            # 43 项：42 个套件 + selfcheck（几分钟）
 node tools\check-all.mjs --fast     # 跳过 selfcheck（快）
 node tools\check-all.mjs --only check-core-dig   # 只跑一个
 ```
@@ -46,45 +46,47 @@ node tools\check-all.mjs --only check-core-dig   # 只跑一个
 
 | 套件 | 期望 | 盯的是什么 |
 | --- | --- | --- |
-| `check-mc-craft` | 184/0 | 合成链条、合成格不吞料 |
-| `check-mc-furnace` | 267/267 | 熔炼、燃料挑选、产物名反查 |
+| `check-mc-craft` | 198/0 | 合成链条、合成格不吞料 |
+| `check-mc-furnace` | 272/272 | 熔炼、燃料挑选、产物名反查、背包空位预警 |
 | `check-mc-chest` | 126/126 | 存取箱子、全搬 |
-| `check-mc-auto` | 244/0 | 自主层：反射/空闲决策/威胁判据；危险名单与搭路共用一份（含灵魂火）；叫醒简报带"脚下一层"摘要 |
-| `check-call-budget` | 143/0 | 单次调用 ≤11 秒、抢占推号 |
+| `check-mc-auto` | 247/0 | 自主层：反射/空闲决策/威胁判据；危险名单与搭路共用一份（含灵魂火）；叫醒简报带"脚下一层"摘要；**水下自救进调度器**（紧急级）且走完照样报结果 |
+| `check-call-budget` | 168/0 | 单次调用 ≤11 秒、抢占推号 |
 | `check-token-budget` | 37/0 | `mc_*` 描述总体积 ≤ 18000 字符 |
-| `check-core-place` | 77/0 | 放置判据、依附面、垫脚 |
+| `check-core-place` | 104/0 | 放置判据、依附面、垫脚 |
 | `check-core-dig` | 42/0 | 挖掘出口、复原包判决 |
 | `check-core-digtime` | 27/0 | 挖矿速度修正（含附魔效率） |
 | `check-core-swim` | 99/0 | 水里游/上浮/憋气 |
-| `check-core-map` | 162/0 | 地形图字形与配色、地板层图、**竖列图**（几格实心 / 哪里开始空 / 空腔·水·岩浆分开说）、坐标换算、危险格、导航摘要 |
-| `check-core-inventory` | 70/0 | 背包视图、动作与装备/工具耐久（"快坏了"看得见） |
+| `check-core-map` | 171/0 | 地形图字形与配色、地板层图、**竖列图**（几格实心 / 哪里开始空 / 空腔·水·岩浆分开说 / **你自己那一格是什么**）、坐标换算、危险格、导航摘要 |
+| `check-core-inventory` | 74/0 | 背包视图、动作与装备/工具耐久（"快坏了"看得见；**只报快坏的**那一版给每轮都跑的动作用） |
 | `check-core-equip` | 78/0 | 换工具/穿护甲 |
 | `check-core-useitem` | 39/0 | 用物品 |
-| `check-core-entities` | 53/0 | 实体名单与挑选 |
-| `check-core-attack` | 86/0 | 攻击判据（"打死了"要有掉血证据） |
-| `check-core-evidence` | 45/0 | "报成功要有证据" |
+| `check-core-entities` | 55/0 | 实体名单与挑选（**含防漏**：远程怪除羊驼外必须都是敌人、渲染层认得的怪也必须都是敌人） |
+| `check-core-attack` | 204/0 | 攻击判据（"打死了"要有掉血证据，**含真服形状的血量读法**）+ 打完顺带报附近还有谁 + **战斗策略层**（威胁评分/撤退/换武器/走位/中止，含端到端）+ "同一个问题只许一处判据"的不变量 |
+| `check-core-evidence` | 49/0 | "报成功要有证据"（含 `mc_build` 缺料时必须说清"别原样重发"） |
+| `check-danger` | 47/0 | 长循环"挨打就带进度退出"的判据（掉血最硬 / 3 格内的怪才算 / **8 格外有只僵尸不算**）+ 三个循环（sequence·build·mining）真接上了、且**排在预算检查之前** |
 | `check-session-memory` | 13/0 | 每会话独立记忆 |
-| `check-rules-file` | 107/0 | RULES.md 注入 + `client.js` 审计修复的静态接线 |
+| `check-rules-file` | 207/0 | RULES.md 注入 + 内置默认准则（进服那段 / 工具名） + 「提示词」页分两块（默认 / 会话） + 「随版本更新」只动默认那块 + 版本提示不再有界面入口 + 「指令白名单」页改成目录开关 + `client.js` 审计修复的静态接线 |
 | `check-mc-observe-host` | 96/0（`--gate-on` 110/0） | 第一人称感知 |
 | `check-mc-view-render` | 112/0 | 渲染内核 |
 | `check-mc-skin` | 78/0 | 皮肤 |
 | `check-async-util` | 59/0 | "等一件事"只有一份实现：`waitUntil` 判据顺序（已中止一次条件都不跑 / 当场成立一次都不等 / 到点不睡穿 / 条件抛错照样往外抛）+ `waitForEvent` 摘干净监听器 + 六处接线 |
 | `check-worker-pool` | 61/0 | Worker 池：**默认关**（一行线程都不开）/ 小活不搬 / 大活真搬且结果逐字节一致 / **搬了主线程真的不堵**（心跳实测）/ 超时·中止·未知任务都如实退回原地 / 统计形状 |
-| `check-task-epoch` | 86/0 | 任务代次：只有重排步骤/取消/收工才换代、两个 await 后各对一次、过期的结果不写账 |
+| `check-msa` | 75/0 | 微软正版登录：`authTitle` 是 **clientId 不是应用名**（写成 `"Minecraft"` 会 `invalid_client`）/ 设备码缓存按账户分 / 两种命名都认 / 登录任务表**只给状态不给令牌** / 账户库的 `microsoft` 类型 / 编辑第三方账户那一串（update + setCredential）/ 接线 |
+| `check-task-epoch` | 138/0 | 任务代次：**只有状态转变才换代**（重排步骤/取消/收工/**暂停**/**等条件**/**恢复**）、两个 await 后各对一次、过期的结果不写账、静态钉住"记账类方法一处都不许换代" |
 | `check-mc-pathfinder` | 26/0 | 寻路接入 |
 | `check-watch-chat` | 21/21 | 看门狗聊天唤醒 |
-| `check-audit-session` | 46/0 | 会话审计 |
+| `check-audit-session` | 48/0 | 会话审计 |
 | `check-logging` | 55/0 | 日志轮转/级别/去重 |
 | `check-mc-deps` | 8/0 | vendor 依赖可加载 |
-| `check-action-scheduler` | 144/0 | 动作调度器：资源登记/父子复用 `actionId`/撞车记账/**排队 + 抢占**/中断释放/ALS 死锁防线 |
-| `check-perf-monitor` | 48/0 | 性能监测：`cpuRatio` 判据、同步调用记账、短样本不给占比、开关零成本 |
-| `check-move-progress` | 104/0 | 移动进度监控：只认"既没挪动也没靠近"、正常等待豁免有上限、脱困阶梯 → `unreachable`；路径被反复失效 ⇒ 不等满 2.4 秒直接进阶梯；到达判定分水平/垂直两轴，"站错层"优先于"别人的锅"报 |
+| `check-action-scheduler` | 147/0 | 动作调度器：资源登记/父子复用 `actionId`/撞车记账/**排队 + 抢占**/中断释放/ALS 死锁防线；**紧急动作一律可抢**（不受 `observe-only` 影响）、`releaseAll` 会真 abort |
+| `check-perf-monitor` | 79/0 | 性能监测：`cpuRatio` 判据（**夹到 1 + `cpuRatioRaw` + `cpuOverWall`**，因为它是**整进程** CPU 不是主线程占墙钟）、同步调用记账、短样本不给占比、开关零成本；**P50/P95**（判据看 p95 不看均值）、**四类耗时**（CPU/等服务器/等事件/等寻路，归属走 `AsyncLocalStorage` 不串味；**墙钟归属三项 ≤ 墙钟**，不是"四项 ≈ 墙钟"）、**CPU 高但没堵住事件循环 ⇒ 不判值得搬**、慢但不烧 CPU ⇒ 明说"不要搬 Worker" |
+| `check-move-progress` | 108/0 | 移动进度监控：只认"既没挪动也没靠近"、正常等待豁免有上限、脱困阶梯 → `unreachable`；路径被反复失效 ⇒ 不等满 2.4 秒直接进阶梯；到达判定分水平/垂直两轴，"站错层"优先于"别人的锅"报；**到达时出发地形改名 `terrainAtStart` + 落点重算 `arrivedTerrain`** |
 | `check-bridge` | 108/0 | 搭路状态机：铺一块→回读确认→才走一格、危险/落差/血量/材料任一项不过就停、断点续铺；`avoidBlockIds` 把要命方块交给寻路器绕开 |
-| `check-terrain` | 132/0 | 地形分类（危险/沟/落差/台阶/窄道/平地）与按类调权重：优先级从最要命的往下、一格台阶不把平地判成台阶、用户配置永远赢；**导航缓存**（没挪窝、世界没变就不重扫，`unknown` 不缓存）+ 实测判决「一次扫描 0.193ms ⇒ 不需要 Worker」 |
-| `check-water-navigation` | 95/0 | 水下出口搜索：只读扫描 + 6 邻域分层 BFS、三类出口（干燥落脚点 > 可呼吸空间 > 可通行水道）、空气口袋只当中间目标、预算用完/找不到都如实报 |
-| `check-water-recovery` | 103/0 | 水下恢复控制器：氧气/掉血/没进展触发、"搜出口 → 执行 → 复核真的动了吗"循环、没走通就拉黑换下一条、**绝不偷偷接管**（每次都 `agent.steer` 通知 AI） |
+| `check-terrain` | 135/0 | 地形分类（危险/沟/落差/台阶/窄道/平地）与按类调权重：优先级从最要命的往下、一格台阶不把平地判成台阶、用户配置永远赢；**导航缓存**（没挪窝、世界没变就不重扫，`unknown` 不缓存）+ 实测判决「一次扫描 0.193ms ⇒ 不需要 Worker」 |
+| `check-water-navigation` | 95/0 | 水下出口搜索：只读扫描 + 6 邻域分层 BFS、三类出口（干燥落脚点 > 可呼吸空间 > 可通行水道）、空气口袋只当中间目标、**有搜索时间预算**（超时如实回 `budget-out` 且**保留已找到的候选**）、**未加载区块单独计数**（`unknownCells` / `partial`，不当墙也不当水道）、找不到时说清"数据不全"与"真没有" |
+| `check-water-recovery` | 115/0 | 水下恢复控制器：氧气/掉血/没进展触发、"搜出口 → 执行 → 复核真的动了吗"循环、**每轮放大搜索半径**、没走通就拉黑换下一条、气到危险线直接上浮、**"换了气"≠"出水"**（还在水里只能报 `breathed`，`escaped` 必须为 false）、**绝不偷偷接管**（每次都 `agent.steer` 通知 AI）；反射层自救**进调度器**（紧急级 / 占 movement / 没抢到如实回 `busy`）并**自己开移动预算** |
 | `check-module-load` | 30/0 | 拆出去的模块全都 import 得进来（含 `core.mjs ≤ 1000` 行） |
-| `selfcheck.mjs` | **866 ✅ / 0 ❌** | 源码文本断言大合集（改了产品代码要同步改它） |
+| `selfcheck.mjs` | **875 ✅ / 0 ❌** | 源码文本断言大合集（改了产品代码要同步改它） |
 
 > 🔴 静态断言（"读源码文本 → 正则匹配"那一类）**在拆分模块时最容易悄悄失效** ——
 > 代码搬到别的文件、`this.` 改成 `self.`，断言还在原地找，于是一直红着没人看。
@@ -217,7 +219,8 @@ node tools\check-all.mjs --only check-core-dig   # 只跑一个
 | `connection.mjs` | 连接与保活：`connect` / `scheduleReconnect` / `disconnect`；断线时 `actionScheduler().releaseAll()` |
 | `runtime.mjs` | 运行时管线：`reportError`（唯一错误上报口）/ `withBudget`（超时闸门）/ `stopPathing` / `interruptMove` / `setAbortSignal` / `holdControl` / `waitForChunks` / `requireBot` |
 | `status.mjs` | 连接/状态视图（`connectionViewOf` / `statusOf`，离线 ghost/reconnecting，在线坐标/朝向/生存/氧气/手持/在线时长） |
-| `config.mjs` | 配置默认值与合并（715 行） |
+| `config.mjs` | 配置默认值与合并（758 行） |
+| `commands.mjs` | 服务器指令目录（7 组 77 条，名字 + 中文说明 + `danger`）—— **只有名字和说明，放不放行一律由 `config.mjs` 的 `commandAllowed()` 说了算** |
 | `accounts.mjs` / `auth-session.mjs` | 账户管理与认证（**全插件唯一碰凭据的地方**：`authOnly` / `makeSession` / `refresh` / `authenticate`） |
 | `ping.mjs` / `lan.mjs` | STATUS ping / 局域网多播监听（`lan.mjs` 全程不抛） |
 | `plugins.mjs` | vendor 依赖加载器（`MC_DEPS` / `loadMcDep` / `loadPathfinder`）＋ 装配（`setupPathfinder` / `movements` / `setupPlugins`） |
@@ -228,12 +231,14 @@ node tools\check-all.mjs --only check-core-dig   # 只跑一个
 | `terrain.mjs` | 地形分类 + 路径评分（导航 P2）：量脚边一圈的柱子，归成**危险 / 沟 / 落差 / 台阶 / 窄道 / 平地**，每类给一套寻路权重（`maxDropDown`/`liquidCost`/`digCost`/`placeCost`）。**只调权重、不换算法**；用户显式配置（`walkMaxDropDown` 之类）永远赢；判不出来就按平地走。结果按 `TERRAIN_CACHE_MS` 缓存，`blockUpdate`/区块加载卸载就作废 |
 | `water-navigation.mjs` | **水下出口搜索**（只读 + 纯计算，**一行按键操作都没有**）：以脚下为中心，水平 8 格 / 上下 8 格做 6 邻域分层 BFS，把格子分成水 / 空气 / 挡路 / 未加载，挑出三类出口 —— **干燥落脚点（最优先）> 可呼吸空间 > 可通行水道**。不只看"是不是空气"：要查脚位 + 头位 + 脚下支撑 + 一条真的连得通的路；空气口袋只当**中间目标**；预算用完老实回 `budget-out`，找不到回 `no-exit-found`，**不假装找到路** |
 | `water-recovery.mjs` | **水下恢复控制器**：`waterStateOf` 读氧气/血/在水里，`waterTriggerOf`（纯函数）判该不该救，`recoverFromWater` 走"**搜出口 → 用现有接口执行 → 复核真的动了吗** → 没走通就把这条拉黑再搜"的循环。移动全靠注入的 `ctx.walkTo` / `ctx.swimUp`（**不另起一套游泳按键控制**）；复核不认"离目标够近"（出口就在头顶一格时人没动也够近），认"真到了 / 真近了 / 气回来了 / 出水了" |
+| `msa.mjs` | **微软正版登录**（叶子模块，只 import `node:*`）：`Authflow` 走**设备码**（`flow:'live'` + `authTitle` = 官方 clientId + `deviceType:'Nintendo'`），令牌缓存按账户分（`<stateDir>/msa/<innerID>/`）；`msaLogin` 给「MC设置 → 账户」的显式登录用，`msaSession` 给连接用 —— 后者**绝不停下来等用户**（缓存没了就报 `needUserAction` 指路去设置页）；`msaJobOf` 给 HTTP 层的状态**只含 state/设备码/结果，绝不含令牌** |
 | `mining.mjs` | 挖掘：`breakBlock`（够不着/没落地/换不上工具/时间不够都不动手；服务端说"复原"就不报成功）＋ `dig`（一条路走过去挖，服务端不认就如实说） |
 | `dig-guard.mjs` | 采集/落地守卫：`collectBusy` / `cancelCollect`（停任务 + 松控制位，等不到就清队列）/ `waitGrounded` / `withHeld` |
 | `dig-speed.mjs` | 挖矿速度修正（上游把 108 个方块的 `material` 写成品级门标签，铁矿石要 4.5 秒） |
 | `server-break.mjs` | 服务端破坏判决（`watchServerBreak` 三态：真挖掉 / 复原 / 没证据；`awaitServerBreak` 等服务端的包，可晚到约 1 秒） |
 | `pickup.mjs` | 捡掉落物（`grabDrops` 按背包差报数；捡不到显式收尾，不让采集任务挂着） |
-| `attack.mjs` | 攻击（`who` 中英文名/玩家名都认；`pvp.attack` 只是设目标，自己轮询等它消失） |
+| `attack.mjs` | 攻击（`who` 中英文名/玩家名都认；`pvp.attack` 只是设目标，自己轮询等它消失）。**现在是「评估 → 执行一个战斗阶段 → 重新观察」的循环**，策略由下一行那个纯函数模块决定 |
+| `combat-strategy.mjs` | 战斗策略（**纯函数，一行 `bot.xxx()` 都没有**）：`assessCombat`（威胁/人数/远程/挨打速度/地形危险）→ `chooseStrategy`（engage / equip / reposition / defend / retreat）→ `combatOutcomeOf`（`damaged`/`killed`/`retreated`/`unreachable`/`aborted`/`timeout`/`unknown`，**故意不叫 `outcome`** —— 那个键是跨工具的统一结局，`outcomeOf()` 会把 `combat` 翻过去）。走位、换武器、撤退**一律走 `core.mjs` 传进来的 `moveTo`/`equipTo` 回调** —— 所以它长不成第二套移动控制器 |
 | `world-use.mjs` | 使用/交互：`useBlock`（容器看窗口、门看属性翻没翻）/ `useItem` / `interact`（look·place·break·toward 分流）/ `equip` |
 | `world-scan.mjs` | 感知最后两块：`scanAround`（方块计数/点名，按距离升序）/ `entitiesNear`（附近有谁：分类/血量/远程/上下差） |
 | `world-observer.mjs` | 只读观察：`entityHealth` / `inWaterNow` / `slowDigWhy` / `dropsNear` / `dropHint` / `blockReachOf` / `stateNameOf` |
@@ -242,6 +247,7 @@ node tools\check-all.mjs --only check-core-dig   # 只跑一个
 | `camera.mjs` | 朝向/相机：`lookAnglesTo` / `aimAt`（直接写 `entity.yaw/pitch`，绕开会挂的 `bot.lookAt`）/ `lookAt` |
 | `inventory.mjs` | 背包那一层（读 + 动）：`heldText` / `invSnap` / `invUsed` / `canHarvestNow` / `toolKinds` / `countOf` / `freeSlot` / `inventoryView` / `giveItem` / `clearInventory` / `tossItem` / `equipFor` |
 | `sequence.mjs` | 连串动作调度：`runSequence`（预算/中断/从第几步续跑；不为没执行的步骤记账）/ `runStep` |
+| `danger.mjs` | **长循环的"挨打就停"判据**（纯只读，不动 bot、不发指令、不占资源）：`healthOf`（读不到回 `null`，**不是 0**）/ `nearestHostile` / `dangerNow`（掉血优先于怪）/ `dangerText`。`sequence` / `build` / `mining` 三个长循环**每步之间**都查它，命中就带着进度退出（`interrupted:"danger"`） |
 | `task-runner.mjs` | 可恢复的任务状态机（落 `<记忆根>\tasks.json`，只记账不下发动作）＋ 结构化目标与步骤表（`GOAL_TYPES` / `STEP_STATUSES` / `defaultSteps` / `normSteps` / `migrateTask` / `stepBegin` / `stepDone` / `stepFail` / `stepReset`） |
 | `task-exec.mjs` | 任务执行器：每轮只推一步（`observe()` 看现场 → `goalDone()` 复核 → 取当前步 → `call(op,args)` 调真工具 → 记账）；四道闸门（`budgetMs` / `maxRounds` / `maxAttempts` / 工具自己的 11 秒）；"结果未知"不记失败；**自己不碰 bot**，工具由 core 通过 `TOOL_HANDLERS` 回调进来 |
 | `task-report.mjs` | 任务收工报告（三种形状并存）：`taskHave` / `verdictLine`（三态判决）/ `taskSettle` ＋ 任务门面 `taskStart`/`taskList`/`taskGet`/`taskResume`/`taskNote`/`taskDone`/`taskCancel`/`taskForget`/`taskPlan`/`taskStep` |
@@ -291,21 +297,33 @@ node tools\check-all.mjs --only check-core-dig   # 只跑一个
 
 ```
 index.js / selfcheck.mjs / client.js   宿主侧
-src\                                   61 个模块（见上表）
+src\                                   65 个模块（见上表）
 extensions\                            7 个扩展 + mc_util.mjs
-tools\check-*.mjs                      41 个离线自检套件
+tools\check-*.mjs                      42 个离线自检套件
 tools\check-all.mjs                    一条命令全跑完 + ✓/✗ 汇总表
 tools\scan-moved-assertions.mjs        顾问型：搬模块后的断言扫描
 实机验证\                               真服脚本（跑的时候要服务器开着）
- 合成\ 熔炼\ 存取\ 搭方块\ 搭路\ 采集收尾\ 走路\ 用物品\ 溺水\ 皮肤\ 自主\ 打怪\ 攻击\ 地图\ 背包\ 挖方块\ 复原包\ 挖矿速度\ 感知\ 视角\
+ 合成\ 熔炼\ 存取\ 搭方块\ 搭路\ 采集收尾\ 走路\ 用物品\ 溺水\ 皮肤\ 自主\ 打怪\ 攻击\ 战斗\ 地图\ 背包\ 挖方块\ 复原包\ 挖矿速度\ 感知\ 视角\ 调度\ 性能\
 备份\                                  回滚用
 presets\ locale\                       权限补丁 / 中英文案
 README.md / 插件说明.md / 踩坑档案.md / PATHFINDER.md / CHANGELOG.md
 ```
 
 `实机验证\` 每个脚本都是"真服真跑 + 期望条数"（如 `live-place.mjs` 13/0、`live-restore.mjs` 11/0、
-`live-digtime.mjs` 8/0、`live-percept.mjs` 26/0），部分支持把账号名当参数传
+`live-digtime.mjs` 8/0、`live-percept.mjs` 26/0、`调度\live-sched.mjs` 23/0、`战斗\live-combat.mjs` 20/0、
+`溺水\live-water-rig.mjs` 31/0、`性能\live-perf.mjs` 37/0），部分支持把账号名当参数传
 （`node live-dig.mjs wcdig_run5` —— 位置存在服务端，旧账号可能卡在坑里，换个新名字就回出生点开阔地）。
+
+`实机验证\战斗\live-combat.mjs` 也是"必须实机"的典型：它逮到的那个 bug（**"打死了僵尸"却报
+"没读到过它掉血"**）在离线自检里**永远复现不出来** —— 假实体身上恰好带了 `e.health`，
+那条兜底在测试里成立、在真服上不成立（真服上血量在 `metadata[9]`，而现成的助手会把它算成 `NaN`）。
+所以凡是"读外部数据"的助手，回归断言都得用**真服抓下来的形状**，不能只用假数据里顺手带的那几个字段。
+
+`实机验证\调度\live-sched.mjs` 值得单独说一句：它验的是**调度器与自主层的一致性**，
+做法是「假宿主 + 真插件 + **从真工具入口调**」（`tools.get('mc_task').execute(...)`），
+走的就是 `asTool.execute → perfWrap → runScheduled → ActionScheduler → 工具实现` 那条真链。
+**只调 `ActionScheduler` 类的单元测试看不到它逮到的那个 bug** —— 那个 bug 在任务台账的状态机里，
+不在调度器里。凡是"验证一致性"的活，都要先问一句：我这一路走的，和真的那一路是同一条吗？
 
 `备份\` 里：`core.mjs.原版`、`watchdog.mjs.orig`、`selfcheck.mjs.orig`、
 `dsh-mc-agent-index.js.orig`、`dsh-mc-agent-index.js.before-session-memory`、
@@ -457,7 +475,7 @@ README.md / 插件说明.md / 踩坑档案.md / PATHFINDER.md / CHANGELOG.md
 | --- | --- | --- |
 | 本文件 | 开发者 | 装、跑自检、配置速查、工具速查、架构速览、拆分模块的规矩 |
 | [插件说明.md](插件说明.md) | **使用者** | 装到 DSH、账户与凭据、MC 模式/MC+ 与权限隔离、提示词怎么进去、安全边界、已知限制、English |
-| [踩坑档案.md](踩坑档案.md) | 开发者 | 113 个真 bug 的**现象 → 根因 → 证据 → 修法 → 回归**（"为什么现在这么写"） |
+| [踩坑档案.md](踩坑档案.md) | 开发者 | 138 个真 bug 的**现象 → 根因 → 证据 → 修法 → 回归**（"为什么现在这么写"） |
 | [PATHFINDER.md](PATHFINDER.md) | 开发者 | 寻路/防卡住专题：为什么用现成的、装在哪、打过的补丁、上游复核、已知缺口 |
 | [CHANGELOG.md](CHANGELOG.md) | 开发者 | 按日期的改动流水（含拆 core.mjs 的 43 刀） |
 | `%USERPROFILE%\.dsh\profiles\<profile>\vendor\mc-deps\README.md` | 运维 | 那棵独立依赖树装了什么、重装后怎么体检 |

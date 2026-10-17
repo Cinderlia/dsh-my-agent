@@ -1,0 +1,65 @@
+
+══════ 前置：真连本地服 ══════
+  · {"connected":true,"account":{"innerID":"acc-1d505ba8","id":null,"login":null,"name":"DeepS
+  ✓ 连上了 — 🟢 active ｜ 我在 (32, 8, 24) ｜ 朝 yaw 2.59 / pitch 0 ｜ 血 15.5/20 ｜ 食 19 ｜
+  · 我在 (32,8,24)
+  ✓ `mc_diag {resetPerf:true}` 真的把**别的**样本清空了 — 剩下的=["mc_diag"]
+
+══════ ① 真跑：mc_observe / mc_map / mc_scan / 寻路(mc_move) / 任务执行(mc_task) ══════
+  ✓ 性能监测是开着的 — resolutionMs=100
+  ✓ 🔴 记到了 `mc_observe` 的样本 — n=4 p50=380.1ms p95=736.3ms
+  ✓ 🔴 记到了 `mc_map` 的样本 — n=4 p50=18.9ms p95=31.9ms
+  ✓ 🔴 记到了 `mc_scan` 的样本 — n=4 p50=3.4ms p95=5.9ms
+  ✓ 🔴 记到了 `mc_move` 的样本 — n=4 p50=2437.6ms p95=2749.6ms
+  ✓ 🔴 记到了 `mc_task` 的样本 — n=4 p50=0.1ms p95=1ms
+
+══════ ② P50/P95 与四类耗时（真数据） ══════
+  动作            n        p50      p95      p95CPU   CPU%     等服务器     等寻路      等事件      
+  mc_observe    4        380.1    736.3    797      100%     0        0        0        
+  mc_map        4        18.9     31.9     47       —        0        0        0        
+  mc_scan       4        3.4      5.9      16       —        0.1      0        0        
+  mc_move       4        2437.6   2749.6   734      17%      0        2165     0        
+  mc_task       4        0.1      1        0        —        0.3      0        0        
+  ✓ mc_observe：p50 / p95 都算出来了 — p50=380.1 p95=736.3
+  ✓ mc_observe：p95 ≥ p50（分位数没算反） — 380.1 ≤ 736.3
+  ✓ mc_observe：墙钟归属的三类（寻路/事件/服务器）之和不超墙钟 — 寻路 0 + 服务器 0 + 事件 0 = 0 ≤ 492
+  ✓ mc_observe：`cpuRatio` 夹在 1 以内（超了就不是"比例"） — ratio=1 raw=1.14
+  ✓ mc_observe：标了 `cpuOverWall` 就说明原始占比真超过 1（不是误标） — raw=1.14 wall=492 cpu=562.5
+  ✓ mc_map：p50 / p95 都算出来了 — p50=18.9 p95=31.9
+  ✓ mc_map：p95 ≥ p50（分位数没算反） — 18.9 ≤ 31.9
+  ✓ mc_map：墙钟归属的三类（寻路/事件/服务器）之和不超墙钟 — 寻路 0 + 服务器 0 + 事件 0 = 0 ≤ 24.7
+  ✓ mc_map：`cpuRatio` 夹在 1 以内（超了就不是"比例"） — ratio=null raw=null
+  ✓ mc_scan：p50 / p95 都算出来了 — p50=3.4 p95=5.9
+  ✓ mc_scan：p95 ≥ p50（分位数没算反） — 3.4 ≤ 5.9
+  ✓ mc_scan：墙钟归属的三类（寻路/事件/服务器）之和不超墙钟 — 寻路 0 + 服务器 0.1 + 事件 0 = 0.1 ≤ 4.1
+  ✓ mc_scan：`cpuRatio` 夹在 1 以内（超了就不是"比例"） — ratio=null raw=null
+  ✓ mc_move：p50 / p95 都算出来了 — p50=2437.6 p95=2749.6
+  ✓ mc_move：p95 ≥ p50（分位数没算反） — 2437.6 ≤ 2749.6
+  ✓ mc_move：墙钟归属的三类（寻路/事件/服务器）之和不超墙钟 — 寻路 2165 + 服务器 0 + 事件 0 = 2165 ≤ 2175
+  ✓ mc_move：`cpuRatio` 夹在 1 以内（超了就不是"比例"） — ratio=0.17 raw=0.17
+  ✓ mc_task：p50 / p95 都算出来了 — p50=0.1 p95=1
+  ✓ mc_task：p95 ≥ p50（分位数没算反） — 0.1 ≤ 1
+  ✓ mc_task：墙钟归属的三类（寻路/事件/服务器）之和不超墙钟 — 寻路 0 + 服务器 0.3 + 事件 0 = 0.3 ≤ 0.3
+  ✓ mc_task：`cpuRatio` 夹在 1 以内（超了就不是"比例"） — ratio=null raw=null
+  ✓ 🔴 「等寻路」这一类真的被 `src/movement.mjs` 上报了（不是恒 0） — mc_observe:0 mc_map:0 mc_scan:0 mc_move:2165 mc_task:0
+
+══════ ③ Worker 判据（说清值不值得搬，而不是"看着慢就搬"） ══════
+  ✓ `mc_diag.perf.verdict` 给了结论
+  ⏳ 等寻路（pathfinder 在算）（**不要**搬 Worker —— 搬过去只是换个线程继续等）：mc_move（p95 墙钟 2749.6ms，其中等 2165ms、CPU 375ms）
+  ℹ️ `mc_observe` 的 CPU 占比**超过了 100%**（已夹到 1，原始值在 `cpuRatioRaw`）：`process.cpuUsage()` 是**整个进程**的（含 GC / Worker / 编译线程），不是"主线程占了多少墙钟"。**四类耗时不是互斥的饼图** —— CPU 与"等寻路"会重叠（寻路那一段主线程也在烧），判"值不值得搬"时别只看这个占比。
+  ✓ 如果判成 CPU 密集，必须同时说"值得搬" — ⏳ 等寻路（pathfinder 在算）（**不要**搬 Worker —— 搬过去只是换个线程继续等）：mc_move（p95 墙钟 2749.6ms，其中等 2165ms、CPU 375ms）
+ℹ️ `mc_observe` 的 CPU
+  ✓ 🔴 结论里把"在等什么"说清楚了（慢 ≠ 该搬） — ⏳ 等寻路（pathfinder 在算）（**不要**搬 Worker —— 搬过去只是换个线程继续等）：mc_move（p95 墙钟 2749.6ms，其中等 2165ms、CPU 375ms）
+ℹ️ `mc_observe` 的 CPU 占比**超过了 100%**（已夹到 1，原始值在 `cpuRatioRaw`
+  ✓ 🔴 `mc_observe` 的 CPU 占比超过墙钟 ⇒ 如实标 `cpuOverWall`（进程级 CPU，不是主线程占墙钟） — ratio=1 raw=1.14 wall=492 cpu=562.5
+  ✓ `mc_observe`：夹过的占比不会超过 1（拿它比大小不会得到"110%"这种怪数） — ratio=1
+  ✓ 🔴 结论里说清了"四类不是互斥的饼图"（CPU 与等寻路会重叠） — ⏳ 等寻路（pathfinder 在算）（**不要**搬 Worker —— 搬过去只是换个线程继续等）：mc_move（p95 墙钟 2749.6ms，其中等 2165ms、CPU 375ms）
+ℹ️ `mc_observe` 的 CPU 占比**超过了 100%**（已夹到 1，原始值在 `cpuRatioRaw`）：`process.cpuUsage()` 是**整个进程**的（含 GC /
+  ✓ 🔴 依赖实时游戏状态的操作没被判成"该搬"
+
+══════ 收尾 ══════
+  · 全局事件循环：{"p50Ms":105.1,"p99Ms":528.7,"maxMs":913.3}
+  · 汇总：{"online":true,"version":"1.21.9","physicsEnabled":true,"controlState":{"forward":false,"jump":false,"sneak":false},"velocity":{"x":0,"y":-0.0784000015258789,"z":0},"onGround":true,"inWater":false,"su
+
+──────────────────────────────────────────────────
+live-perf：pass=37 fail=0

@@ -178,8 +178,19 @@ section('8. F10 mc_disconnect 把"关不掉"说成"本来就没挂"')
 {
   ok(/watchErr \? `关不掉（\$\{watchErr\}）`/.test(INDEX),
     'disarm 抛错时如实说"关不掉"（不再吞成"本来就没挂"）')
-  ok(/online: Boolean\(sess\.bot\.online\)/.test(INDEX),
+  ok(/const stillOnline = Boolean\(sess\.bot\.online\)/.test(INDEX),
     'online 按真实连接状态回（不再硬编码 false）')
+  /* 🔴 2026-10-17 审计：这里原来**无条件** `sess.mode = 'standby'`。`disconnect()` 是
+   *    "优雅优先、走不掉才强断"，强断也失败时机器人还在游戏里 —— 那时 mode 写 standby
+   *    会让 `modeView()` 里 `mode:"standby"` 和 `online:true` 自相矛盾。必须**只在真下线时**切。 */
+  ok(/if \(!stillOnline\) sess\.mode = 'standby'/.test(INDEX),
+    '🔴 只有真的下线了才把 mode 切成 standby（还在线就如实留着）')
+  /* 只在 mc_disconnect 这一块里判"不许无条件切" —— `stopSession`（强制停止）本来就该切，
+   * 那是另一个语义，别一刀切。 */
+  const dcAt = INDEX.indexOf("name: 'mc_disconnect'")
+  const dcBlock = dcAt < 0 ? '' : INDEX.slice(dcAt, INDEX.indexOf('ctx.tools.register', dcAt + 10))
+  ok(dcBlock.length > 0 && !/^\s*sess\.mode = 'standby'\s*$/m.test(dcBlock),
+    '🔴 mc_disconnect 里不许再出现无条件的 sess.mode = standby')
 }
 
 // ── 9. F11 mc_config 别凭空创建看门狗 ─────────────────────────────────────────

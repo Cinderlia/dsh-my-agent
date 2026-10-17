@@ -616,30 +616,61 @@ export class PluginConfig {
   commandAllowed (command) {
     // 「MC设置 → 指令白名单」页的开关：允许所有指令
     if (this.get('allowAllCommands') === true) return true
-    const wl = this.get('commandWhitelist')
-    if (!Array.isArray(wl)) return false
-    const name = String(command ?? '').trim().replace(/^\//, '').split(/\s+/)[0].toLowerCase()
-    if (!name) return false
-    for (const entry of wl) {
-      const e = String(entry).trim()
-      if (!e) continue
-      if (e === '*') return true
-      // 正则写法：`/^gi.*/` 或 `/^gi.*/i`（首尾都有 `/`）
-      if (e.length > 1 && e.startsWith('/') && e.lastIndexOf('/') > 0) {
-        const end = e.lastIndexOf('/')
-        try {
-          if (new RegExp(e.slice(1, end), e.slice(end + 1) || 'i').test(name)) return true
-        } catch { /* 坏正则忽略 */ }
-        continue
-      }
-      /* 🟡 2026-10-15 审计（报告 E 第 6 条）：`/tp` 这种"带前导斜杠的指令名"原来**静默失效** ——
-       *   正则分支要求 `lastIndexOf('/') > 0`（`/tp` 的是 0），于是落到下面那句精确比较，
-       *   `'/tp' !== 'tp'` 永远不成立。用户按直觉写 `/tp` 会以为放行了，其实一条都放不过。
-       *   这里把前导斜杠剥掉再比（正则那种首尾都有斜杠的已在上面 `continue` 掉）。 */
-      if (e.replace(/^\//, '').toLowerCase() === name) return true
-    }
-    return false
+    return matchCommandList(this.get('commandWhitelist'), command)
   }
+
+  /**
+   * **只看名单**放不放行这条指令（不看「允许所有指令」那个开关）。
+   *
+   * 给「MC设置 → 指令白名单」页画开关用：那个页面要展示的是"名单里有没有它"，
+   * 而不是"最终放不放行" —— 否则打开「允许所有指令」时所有开关都会亮，
+   * 看着像用户自己把它们全开了。
+   */
+  commandInList (command) {
+    return matchCommandList(this.get('commandWhitelist'), command)
+  }
+}
+
+/**
+ * 名单匹配（`commandAllowed` 与 `commandInList` **共用这一份**，不许各写一遍）。
+ *
+ * 条目三种写法：`*`（全放行）/ `/^gi…/` 或 `/^gi…/i`（正则）/ 精确名（可带前导 `/`）。
+ * （上面正则里写 `…` 不是偷懒：JSDoc 里出现 `星号紧跟斜杠` 会把注释**提前闭合**。）
+ */
+export function matchCommandList (wl, command) {
+  if (!Array.isArray(wl)) return false
+  const name = String(command ?? '').trim().replace(/^\//, '').split(/\s+/)[0].toLowerCase()
+  if (!name) return false
+  for (const entry of wl) {
+    const e = String(entry).trim()
+    if (!e) continue
+    if (e === '*') return true
+    // 正则写法：`/^gi.*/` 或 `/^gi.*/i`（首尾都有 `/`）
+    if (e.length > 1 && e.startsWith('/') && e.lastIndexOf('/') > 0) {
+      const end = e.lastIndexOf('/')
+      try {
+        if (new RegExp(e.slice(1, end), e.slice(end + 1) || 'i').test(name)) return true
+      } catch { /* 坏正则忽略 */ }
+      continue
+    }
+    /* 🟡 2026-10-15 审计（报告 E 第 6 条）：`/tp` 这种"带前导斜杠的指令名"原来**静默失效** ——
+     *   正则分支要求 `lastIndexOf('/') > 0`（`/tp` 的是 0），于是落到下面那句精确比较，
+     *   `'/tp' !== 'tp'` 永远不成立。用户按直觉写 `/tp` 会以为放行了，其实一条都放不过。
+     *   这里把前导斜杠剥掉再比（正则那种首尾都有斜杠的已在上面 `continue` 掉）。 */
+    if (e.replace(/^\//, '').toLowerCase() === name) return true
+  }
+  return false
+}
+
+/**
+ * 这条名单条目是"正则写法"吗（`/^gi…/` 或 `/^gi…/i`）。
+ *
+ * 判断规矩和 `matchCommandList()` 里那条**必须一致** —— `/tp` 的前导斜杠不算正则
+ * （`lastIndexOf('/') === 0`），`/^tp/` 才算。
+ */
+export function isRegexEntry (entry) {
+  const e = String(entry ?? '').trim()
+  return e.length > 1 && e.startsWith('/') && e.lastIndexOf('/') > 0
 }
 
 /* ─────────────── 内部工具 ─────────────── */

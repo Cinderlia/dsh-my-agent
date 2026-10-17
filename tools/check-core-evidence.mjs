@@ -305,6 +305,13 @@ const useSrc = strip(readFileSync(new URL('../src/world-use.mjs', import.meta.ur
     && /async build \(opts = \{\}\) \{ return await buildImpl\(this, opts\) \}/.test(coreSrc),
     'build 只算复核过的 placed（实现已搬到 src\\build.mjs，core 有薄包装且确实导入）')
   ok(/if \(!want && cur && !isAir\(cur\)\)/.test(buildSrc), 'build 不给 name 时跳过已占用的格子')
+  /* 🔴 2026-10-16（用户 m11195 采纳的 F3）：`mc_build` 缺料时以前会**教 AI 原样重发** ——
+   *    hint 写着"再叫一次 mc_build（同一个范围就行）"，AI 照做，一遍遍重发、
+   *    每轮撞 5 个失败然后 break，刷一堆调用全白费。光看 failures（"现在那里是 未加载"）读不出是没材料。 */
+  ok(/import \{ heldText, countOf \} from '\.\/inventory\.mjs'/.test(buildSrc), 'build 用 countOf 量材料')
+  ok(/const bagLeft = want \? countOf\(b, want\) : null/.test(buildSrc), '🔴 build 报 bagLeft（countOf 读不到回 null，正好区分"不知道"和"真没了"）')
+  ok(/const outOfMat = Boolean\(want\) && bagLeft === 0 && blockedEmpty > 0/.test(buildSrc), '缺料判据 = 指定了方块 + 背包里 0 个 + 有"空位上放不下去"的失败')
+  ok(/outOfMaterial: want, hint:/.test(buildSrc), '🔴 缺料时 hint 换成"别原样重发"（不再是"再叫一次 mc_build"）')
   /* 路线图第 ④ 条第四十刀：`dig` 已搬进 `src\mining.mjs`（core 只剩薄包装）。 */
   const mineSrc = strip(readFileSync(new URL('../src/mining.mjs', import.meta.url), 'utf8'))
   ok(/没挖成/.test(mineSrc)

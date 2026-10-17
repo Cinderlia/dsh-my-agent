@@ -264,7 +264,8 @@ section('⑤ 场景⑧：上岸后重新看状态，并把"要不要继续原任
 /* ─────────── ⑥ 兜底与失败路径 ─────────── */
 section('⑥ 兜底：没出口时先试着上浮；预算/轮数/前置条件都要有明确交代')
 {
-  /* 没有出口，但上浮之后氧气回升 ⇒ 算逃出来了（surface） */
+  /* 没有出口，但上浮之后氧气回升 —— 🔴 人**还在水里**，所以只能算"换了气"（breathed），
+   * 绝不能报 escaped。这条断言以前钉的是 `reason === 'escaped'`，等于把"换了口气"当成"逃出生天"。 */
   const w = mkWorld()
   w.box(-2, 54, -2, 2, 54, 2, 'stone')
   w.box(-2, 55, -2, 2, 60, 2, 'stone')
@@ -274,16 +275,37 @@ section('⑥ 兜底：没出口时先试着上浮；预算/轮数/前置条件�
   const self = { requireBot: () => b }
   const ctx = mkCtx(b, { swimUp: async () => { b.oxygenLevel = 20; b.entity.position = { x: 0.5, y: 57, z: 0.5 } } })
   const res = await recoverFromWater(self, {}, ctx)
-  ok(res.ok === true && res.reason === 'escaped', '🔴 没找到出口但上浮后气回来了 ⇒ 算逃出来', `${res.ok}/${res.reason}`)
+  ok(res.ok === true && res.reason === 'breathed', '🔴 没找到出口但上浮后气回来了 ⇒ 只能说 breathed（还在水里）', `${res.ok}/${res.reason}`)
+  ok(res.escaped === false, '🔴 还在水里 ⇒ escaped 必须是 false（reason 和 escaped 不许打架）', String(res.escaped))
   ok(res.kind === 'surface', '类型标成 surface（不是"上岸"）', String(res.kind))
   ok(res.log.some((l) => l.includes('没找到出口')), '日志里交代了"没找到出口"', JSON.stringify(res.log))
+
+  /* 反面：上浮之后**真的出水了** ⇒ 这时才该叫 escaped */
+  const bOut = w.bot(0.5, 57, 0.5)
+  bOut.oxygenLevel = 5
+  const ctxOut = mkCtx(bOut, { swimUp: async () => { bOut.oxygenLevel = 20; bOut.entity.position = { x: 0.5, y: 61, z: 0.5 } } })
+  const resOut = await recoverFromWater({ requireBot: () => bOut }, {}, ctxOut)
+  ok(resOut.ok === true && resOut.reason === 'escaped' && resOut.escaped === true, '🔴 上浮之后真出水了 ⇒ escaped', `${resOut.ok}/${resOut.reason}/${resOut.escaped}`)
 
   /* 没有出口 + 上浮也没用 ⇒ 老实失败，理由用搜索的 reason */
   const b2 = w.bot(0.5, 57, 0.5)
   const ctx2 = mkCtx(b2, { swimUp: async () => {} })
   const res2 = await recoverFromWater({ requireBot: () => b2 }, {}, ctx2)
   ok(res2.ok === false && res2.reason === 'no-exit-found', '上浮也没用 ⇒ no-exit-found', `${res2.ok}/${res2.reason}`)
-  ok(res2.note.includes('别在原地一直游'), '人话里劝它别原地打转', res2.note)
+  /* 🔴 2026-10-16 审计：「没找到出口」原来只有一句话 —— 但里面混着两种完全不同的情况：
+   *    「看遍了，真没有」和「有块地方压根没加载，我没看」。这个假世界里水柱外面的方块
+   *    根本没定义（`blockAt` 回 null）⇒ 必须走**后者**那条文案。 */
+  ok(res2.partial === true && res2.unknownCells > 0, '🔴 有区块没加载 ⇒ 如实标 partial（"没找到"不等于"确认没有"）', `${res2.partial}/${res2.unknownCells}`)
+  ok(res2.note.includes('区块没加载') && res2.note.includes('不算'), '🔴 人话里把"数据不全"和"真没有"分开说（别让 AI 拿半张地图下结论）', res2.note)
+
+  /* 反过来：整片都加载了（没有 unknown）⇒ 才敢说"别在原地一直游" */
+  const w6 = mkWorld()
+  w6.box(-9, 49, -9, 9, 65, 9, 'stone')
+  for (let y = 55; y <= 60; y++) w6.set(0, y, 0, 'water')
+  const b6 = w6.bot(0.5, 57, 0.5)
+  const res6 = await recoverFromWater({ requireBot: () => b6 }, {}, mkCtx(b6, { swimUp: async () => {} }))
+  ok(res6.reason === 'no-exit-found' && res6.unknownCells === 0, '🔴 整片都加载了 ⇒ 这才是"确认没有出口"', `${res6.reason}/${res6.unknownCells}`)
+  ok(res6.note.includes('别在原地一直游'), '真·没有出口时才劝它换方向', res6.note)
 
   /* 预算用光 */
   const w3 = sceneTwoExits()
@@ -346,7 +368,8 @@ section('⑧ 接线：移动层自动接管、反射层通知 AI、都不另起�
   ok(/import \{ recoverFromWater, waterReportText \} from '\.\.\/src\/water-recovery\.mjs'/.test(au),
     '🔴 反射层也用同一份恢复控制器（同一份知识只有一个出处）')
   ok(/const startWaterRecover = \(s, sess, cfg, t, info\) =>/.test(au), '反射层有"水下自救"入口')
-  ok(/recoverFromWater\(bot, \{\}, \{/.test(au), '它调的就是 recoverFromWater')
+  ok(/recoverFromWater\(bot, \{ budgetMs: WATER_RECOVER_MS_INNER \}, \{/.test(au),
+    '🔴 它调的就是 recoverFromWater（而且给了明确的恢复预算）')
   ok(/walkTo: \(self, p, o\) => bot\.walkTo\(/.test(au) && /swimUp: \(self, o\) => bot\.swimUp\(/.test(au),
     '🔴 反射层的移动也走现有接口（bot.walkTo / bot.swimUp）')
   ok(/agent\.steer\(userMessage\(\{/.test(au) && /waterReportText\(res, trigger\)/.test(au),
@@ -363,6 +386,20 @@ section('⑧ 接线：移动层自动接管、反射层通知 AI、都不另起�
   /* 自救这一路自己不许按键盘（按 jump 抬一下是**原有**的濒死保命动作，不在这条里） */
   const recFn = au.slice(au.indexOf('const startWaterRecover ='), au.indexOf('const avoid = (s, sess, cfg, t)'))
   ok(recFn.length > 200 && !/setControlState/.test(recFn), '自救这一路一行 setControlState 都没有')
+
+  /* ── P0-1 场景二：自救要进调度器，不能"绕过表直接驱动 bot" ── */
+  ok(/const grantMoveBudget = \(bot, ms\) =>/.test(au) && /setCallDeadline\?\.\(n\)/.test(au),
+    '🔴 自主动作会自己开一段移动预算（`setCallDeadline`）—— 不然空闲 tick 里 `msLeft()` 恒 0')
+  ok(/grantMoveBudget\(bot, WATER_RECOVER_MAX_MS\)/.test(au),
+    '🔴 开自救**之前**就把预算发下去（不是等到 walkTo 里才发现没时间）')
+  ok(/const sch = sess\?\.bot\?\.actionScheduler\?\.\(\)/.test(au), '自救会去拿动作调度器')
+  ok(/name: 'auto:water'/.test(au) && /resources: \['movement'\]/.test(au) && /priority: 'emergency'/.test(au),
+    '🔴 自救登记成**紧急级、占 movement** 的动作（不再是"表里写着 mc_move、实际动的是它"）')
+  ok(/cancelPoint: 'safe'/.test(au), '自救标了 `cancelPoint`（被抢时知道在哪能安全停）')
+  ok(/r\.status === 'busy'/.test(au) && /没轮到我/.test(auSrc),
+    '🔴 没抢到就如实回 `busy`（不假装自己救过了）')
+  ok(/grantMoveBudget\(sess\.bot, WALK_BUDGET \+ 800\)/.test(au),
+    '🔴 跟随玩家那条自主动路也开预算（同一类"空闲 tick 里没预算"的坑）')
 }
 
 console.log(`\n结果：${pass}/${pass + fail} 通过，${fail} 失败`)

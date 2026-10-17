@@ -14,7 +14,7 @@
 import { readFileSync } from 'node:fs'
 
 const mod = await import(new URL('../src/perf-monitor.mjs', import.meta.url))
-const { perfEnabled, perfResolution, perfKeep, perfWrap, perfSnapshot, perfVerdict, perfText, perfReset } = mod
+const { perfEnabled, perfResolution, perfKeep, perfWrap, perfSnapshot, perfVerdict, perfText, perfReset, perfWait } = mod
 
 let pass = 0
 let fail = 0
@@ -25,6 +25,8 @@ const section = (t) => console.log(`\n── ${t} ──`)
 const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+/** 真烧 CPU 的忙等（`setTimeout` 会睡掉、CPU 计不上，造样本必须真转） */
+const busy = (ms) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { /* 转 */ } }
 
 const OLD_ENV = { ...process.env }
 const restore = () => {
@@ -37,8 +39,12 @@ const restore = () => {
 section('① perfVerdict：把数字翻成"该不该搬 Worker"（纯函数）')
 {
   const heavy = perfVerdict([{ name: 'mc_map', wallMs: 180, cpuMs: 170, cpuRatio: 0.94, sync: true }])
-  ok(heavy.length === 1 && /值得搬 Worker/.test(heavy[0]) && /mc_map/.test(heavy[0]),
-    'CPU 密集（cpuMs≥30 且占比≥0.5）⇒ 判"值得搬 Worker"', JSON.stringify(heavy))
+  ok(heavy.length >= 1 && /值得搬 Worker/.test(heavy[0]) && /mc_map/.test(heavy[0]),
+    'CPU 密集（p95 够大 + 在堵事件循环）⇒ 判"值得搬 Worker"', JSON.stringify(heavy))
+  /* 🔴 实机补的：贴着 bot 的工具被点名"值得搬"时，**必须**同时说清"只能搬纯计算那一段" ——
+   *    否则模型会真去把整段（含 `bot.blockAt()`）搬走，拿过期快照做决定。 */
+  ok(heavy.some((l) => /贴着 bot/.test(l) && /必须留在主线程/.test(l)),
+    '🔴 点名"值得搬"时同时说清"读世界那一段必须留在主线程，只能搬纯计算"', JSON.stringify(heavy))
   const wait = perfVerdict([{ name: 'mc_move', wallMs: 9000, cpuMs: 12, cpuRatio: 0.001 }])
   ok(wait.length === 1 && /不要.*搬 Worker/.test(wait[0]) && /mc_move/.test(wait[0]),
     '🔴 在等服务器（墙钟≥1000ms 但 CPU 占比<0.2）⇒ 判"**不要**搬 Worker"', JSON.stringify(wait))
@@ -49,7 +55,14 @@ section('① perfVerdict：把数字翻成"该不该搬 Worker"（纯函数）')
     { name: 'mc_map', wallMs: 180, cpuMs: 170, cpuRatio: 0.94, sync: true },
     { name: 'mc_move', wallMs: 9000, cpuMs: 12, cpuRatio: 0.001 },
   ])
-  ok(both.length === 2 && /值得搬 Worker/.test(both[0]) && /不要/.test(both[1]), '两种都有时两条都给')
+  ok(both.length >= 2 && /值得搬 Worker/.test(both[0]) && both.some((l) => /不要/.test(l)),
+    '两种都有时两条都给（中间可能夹一条"贴着 bot"的提醒）', JSON.stringify(both))
+  /* 🔴 实机补的第三条判据：**CPU 高但没堵住事件循环**的活，搬它没有收益。
+   *    `sync: false` 且期间事件循环 p99 延迟很低 ⇒ 不算"持续占用事件循环"。 */
+  const noBlock = perfVerdict([{ name: 'x', wallMs: 200, wallP95Ms: 200, cpuMs: 190, cpuP95Ms: 190, cpuRatio: 0.95, sync: false, loopP99Ms: 4 }])
+  ok(!/值得搬/.test(noBlock.join('\n')), '🔴 CPU 高但**没堵住事件循环**（p99 只有 4ms）⇒ 不判"值得搬"', JSON.stringify(noBlock))
+  const blocks = perfVerdict([{ name: 'x', wallMs: 200, wallP95Ms: 200, cpuMs: 190, cpuP95Ms: 190, cpuRatio: 0.95, sync: false, loopP99Ms: 120 }])
+  ok(/值得搬/.test(blocks.join('\n')), '🔴 异步但期间事件循环 p99 120ms ⇒ 算"持续占用事件循环"，该搬', JSON.stringify(blocks))
   ok(/整段是同步的/.test(perfVerdict([{ name: 'x', wallMs: 100, cpuMs: 100, cpuRatio: 1, sync: true }])[0]),
     '同步调用在结论里额外点名"整段是同步的"（那是它比异步更该搬的理由）')
   /* 边界：cpuMs 够大但占比低 ⇒ 不算 CPU 密集（在等 I/O） */
@@ -169,8 +182,86 @@ section('③ 开关（关掉必须零成本、零副作用）')
   perfReset()
   await perfWrap('x', () => 1)
   const t = perfText()
-  ok(/动作 ｜ 次数 ｜ 墙钟\(均\) ｜ CPU\(均\) ｜ CPU占比/.test(t), 'perfText 有表头')
+  ok(/动作 ｜ 次数 ｜ 墙钟 p50\/p95 ｜ CPU p50\/p95 ｜ CPU占比 ｜ 四类耗时/.test(t), 'perfText 有表头（P50/P95 + 四类耗时）')
   ok(/· x ｜ 1 ｜/.test(t), 'perfText 每个动作一行')
+}
+
+/* ═══════════════ ③b P50/P95 + 四类耗时（2026-10-16 审计 P1） ═══════════════ */
+section('③b P50 / P95（判据看 p95，不看均值）')
+{
+  perfReset()
+  /* 造一组**长尾**样本：9 次快（约 1ms）+ 1 次慢（60ms）。
+   * 均值会被那次慢的拖到 ~7ms，而 p95 会如实报出 60 —— 这正是"要不要搬 Worker"要看的东西。 */
+  for (let i = 0; i < 9; i++) await perfWrap('t', () => busy(1))
+  await perfWrap('t', () => busy(60))
+  const c = perfSnapshot().calls.find((x) => x.name === 't')
+  ok(c.wallP50Ms != null && c.wallP95Ms != null, '快照里同时有 p50 和 p95', `p50=${c.wallP50Ms} p95=${c.wallP95Ms}`)
+  ok(c.wallP95Ms > c.wallP50Ms, '🔴 p95 明显高于 p50（长尾被如实报出来）', `p50=${c.wallP50Ms} p95=${c.wallP95Ms}`)
+  ok(c.wallP95Ms >= 55, 'p95 抓到了那次 60ms 的慢样本', `p95=${c.wallP95Ms}`)
+  ok(c.wallMs < c.wallP95Ms, '🔴 均值**低于** p95 —— 所以"只看均值"会漏掉长尾', `均值=${c.wallMs} p95=${c.wallP95Ms}`)
+  ok(c.cpuP50Ms != null && c.cpuP95Ms != null, 'CPU 也有 p50/p95')
+  ok(perfVerdict([{ name: 't', wallMs: 7, wallP95Ms: 60, cpuMs: 7, cpuP95Ms: 60, cpuRatio: 0.9, sync: true }])[0].includes('值得搬 Worker'),
+    '🔴 判"CPU 密集"看的是 p95 CPU（均值 7ms 根本够不到 30ms 那条线）')
+}
+
+section('③c 四类耗时：等寻路 / 等事件 / 等服务器分得开')
+{
+  perfReset()
+  /* 一个"慢但几乎不烧 CPU、而且明确是在等寻路"的动作（真的等，不然"四类≈墙钟"这条不成立） */
+  await perfWrap('mc_move', async () => {
+    const t0 = Date.now(); await sleep(50); perfWait('path', Date.now() - t0)
+    const t1 = Date.now(); await sleep(50); perfWait('path', Date.now() - t1)
+  })
+  const c = perfSnapshot().calls.find((x) => x.name === 'mc_move')
+  ok(c.wait.pathMs >= 90 && c.wait.pathMs <= 140, '🔴 两次上报累加到同一次调用上（≈100ms）', `pathMs=${c.wait.pathMs}`)
+  ok(c.wait.eventMs === 0 && c.wait.reportedServerMs === 0, '没上报的两类保持 0（不瞎猜）')
+  ok(c.wait.serverMs >= 0, '"剩下的算等服务器"不为负', `serverMs=${c.wait.serverMs}`)
+  /* 🔴 实机改口径（2026-10-16，`实机验证\性能\live-perf.mjs`）：四类**不是互斥的饼图** ——
+   *    `cpu` 是**进程级**（含 GC / Worker / 编译线程），可能超过墙钟；
+   *    `path` / `event` / `server` 才是**墙钟归属**，三者之和 ≤ 墙钟。
+   *    寻路那一段主线程通常也在烧 CPU ⇒ "CPU"和"等寻路"会重叠。
+   *    所以这里钉的是"墙钟归属三项 ≤ 墙钟"，不是"四项加起来等于墙钟"。 */
+  ok(c.wait.pathMs + c.wait.eventMs + c.wait.serverMs <= c.wait.wallMs + 2,
+    '🔴 墙钟归属的三项（寻路 / 事件 / 服务器）之和 ≤ 墙钟（没重复记账）', JSON.stringify(c.wait))
+  ok(!c.cpuOverWall || c.cpuRatioRaw > 1, '`cpuOverWall` 只在原始占比真超过 1 时为真')
+  ok(c.cpuRatio == null || c.cpuRatio <= 1, '🔴 `cpuRatio` 夹在 1 以内（超了就不是"比例"，不能拿去比大小）', `ratio=${c.cpuRatio} raw=${c.cpuRatioRaw}`)
+
+  /* 🔴 实机逮到的那一条：`process.cpuUsage()` 是**整个进程**的 ⇒ `cpuMs` 可能超过墙钟。
+   *    以前 `cpuRatio` 会算出 1.1（实测 `mc_observe` 就是），拿它跟 0.5 比大小是错的。
+   *    现在：夹到 1、原始值留 `cpuRatioRaw`、并打 `cpuOverWall` 让判据别信它。 */
+  perfReset()
+  await perfWrap('overwall', async () => {
+    /* 模拟"这段墙钟里别的线程也在烧"：手动灌一个大 CPU 样本没法做，
+     * 所以直接验判据那一侧（下面静态断言 + 纯函数），这里只验形状字段在。 */
+    await sleep(40)
+  })
+  const ow = perfSnapshot().calls.find((x) => x.name === 'overwall')
+  ok('cpuRatioRaw' in ow && 'cpuOverWall' in ow, '快照里带 `cpuRatioRaw` 与 `cpuOverWall` 两个字段')
+  ok(ow.cpuRatio <= 1, '短样本/正常样本下 `cpuRatio` 也不会超过 1', `ratio=${ow.cpuRatio}`)
+
+  /* 归属：并发的两个动作不许互相偷等待 */
+  perfReset()
+  await Promise.all([
+    perfWrap('a', async () => { await busy(2); perfWait('path', 40) }),
+    perfWrap('b', async () => { await busy(2); perfWait('event', 30) }),
+  ])
+  const A = perfSnapshot().calls.find((x) => x.name === 'a')
+  const B = perfSnapshot().calls.find((x) => x.name === 'b')
+  ok(A.wait.pathMs === 40 && A.wait.eventMs === 0, '🔴 并发时 a 的"等寻路"没被记到 b 头上', JSON.stringify(A.wait))
+  ok(B.wait.eventMs === 30 && B.wait.pathMs === 0, '🔴 并发时 b 的"等事件"也没串味', JSON.stringify(B.wait))
+
+  /* 不在任何 perfWrap 里上报 ⇒ 静默丢弃，不报错（叶子模块可能被别处直接用） */
+  perfReset()
+  let threw = null
+  try { perfWait('path', 10) } catch (e) { threw = e }
+  ok(threw === null, '🔴 没有外层动作时 perfWait 静默返回（叶子模块不因为监测而报错）')
+
+  /* 判据：等寻路 ⇒ 明确说"不要搬 Worker" */
+  const v = perfVerdict([{
+    name: 'mc_move', wallMs: 3000, wallP95Ms: 3000, cpuMs: 10, cpuP95Ms: 10, cpuRatio: 0.003,
+    wait: { cpuMs: 10, pathMs: 2600, eventMs: 0, serverMs: 390, wallMs: 3000 },
+  }])
+  ok(v.some((x) => /等寻路/.test(x) && /不要.*搬 Worker/.test(x)), '🔴 等寻路 ⇒ 归"不要搬 Worker"', JSON.stringify(v))
 }
 
 /* ═══════════════ ④ 静态接线 ═══════════════ */
@@ -193,6 +284,23 @@ section('④ 静态接线')
   const all = read('./check-all.mjs')
   ok(/check-perf-monitor\.mjs/.test(all) && /check-action-scheduler\.mjs/.test(all),
     'check-all.mjs 的 ORDER 里登记了这两套（跑的顺序稳定）')
+
+  /* ── 2026-10-16 审计 P1 新增：四类耗时必须有"真来源"，不能只有空桶 ── */
+  const mv = strip(read('../src/movement.mjs'))
+  const wt = strip(read('../src/wait.mjs'))
+  ok(/import \{ perfWait \} from '\.\/perf-monitor\.mjs'/.test(mv), '🔴 movement.mjs 上报"等寻路"')
+  ok(/perfWait\('path', Date\.now\(\) - pfT0\)/.test(mv), '🔴 上报点就在 `goto` 那一轮的 finally 里（continue/throw 都会记）')
+  ok(/import \{ perfWait \} from '\.\/perf-monitor\.mjs'/.test(wt), '🔴 wait.mjs 上报"等事件"')
+  ok(/perfWait\('event', waitedMs\)/.test(wt), '🔴 上报的是实测的 `waitedMs`')
+  ok(/AsyncLocalStorage/.test(self) && /als\.run\(\{ wait \}, fn\)/.test(self),
+    '🔴 归属走 AsyncLocalStorage（跨 await 才分得清是哪个动作在等）')
+  ok(/st\.wait\[k\] \+= n/.test(self), 'perfWait 往"当前动作"的桶里累加')
+  ok(/export function perfWait \(kind, ms\) \{\s*if \(!perfEnabled\(\)\) return/.test(self),
+    '🔴 关掉时 perfWait 也零成本（第一行就 return）')
+  ok(/wallP50Ms: pct\(s\.wall, 50\), wallP95Ms: pct\(s\.wall, 95\)/.test(self), '快照里有墙钟 p50/p95')
+  ok(/cpuP50Ms: pct\(s\.cpu, 50\), cpuP95Ms: pct\(s\.cpu, 95\)/.test(self), '快照里有 CPU p50/p95')
+  ok(/pathMs: waitPathMs/.test(self) && /eventMs: waitEventMs/.test(self) && /serverMs:/.test(self),
+    '快照里有四类耗时（cpu / path / event / server）')
 }
 
 restore()

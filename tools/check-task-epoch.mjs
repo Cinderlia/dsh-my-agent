@@ -25,7 +25,7 @@ const stripComments = (s) => String(s).replace(/\/\*[\s\S]*?\*\//g, '').replace(
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8')
 
 const R = await import(new URL('../src/task-runner.mjs', import.meta.url))
-const { TaskRunner, migrateTask, outcomeOf, verdictText, TASK_EPOCH_START, OUTCOME_LABEL } = R
+const { TaskRunner, migrateTask, outcomeOf, verdictText, TASK_EPOCH_START, OUTCOME_LABEL, suggestAction } = R
 const { TaskExecutor } = await import(new URL('../src/task-exec.mjs', import.meta.url))
 
 const runnerSrc = read('../src/task-runner.mjs')
@@ -68,13 +68,13 @@ section('① 台账层：epoch 从 1 开始；只有"换了一代要干什么"�
   ok(L.epochOf(t.taskId) === 1, 'epochOf 读得到')
 
   /* 这些是"这一代之内的正常记账"，**一律不许换代** ——
-   * 换了的话执行器每轮都会被自己刚写的账判成"过期"，等于自锁。 */
+   * 换了的话执行器每轮都会被自己刚写的账判成"过期"，等于自锁。
+   * ⚠️ `pause` / `wait` **不在**这一组里：它们不是"记账"，是**状态转变**
+   *    （从"在做"变成"暂停/等条件"）—— 见下面的 ①d。 */
   const before = t.epoch
   L.progress(t.taskId, { add: 1, total: 8 })
   L.fail(t.taskId, { action: 'mc_dig', reason: '够不着' })
   L.note(t.taskId, '随便记一笔')
-  L.pause(t.taskId, '玩家的事优先')
-  L.wait(t.taskId, '等条件')
   L.checkpoint(t.taskId, { x: 1, y: 2, z: 3 })
   L.stepBegin(t.taskId, 's1')
   L.stepDone(t.taskId, 's1')
@@ -82,7 +82,7 @@ section('① 台账层：epoch 从 1 开始；只有"换了一代要干什么"�
   L.stepSkip(t.taskId, 's2', '不用做')
   L.stepFail(t.taskId, 's2', '没成')
   L.touch(t.taskId, { meta: { a: 1 } })
-  ok(t.epoch === before, '记进度 / 记失败 / 备忘 / 暂停 / 等条件 / 检查点 / 步骤记账 都**不**换代', `epoch=${t.epoch}`)
+  ok(t.epoch === before, '记进度 / 记失败 / 备忘 / 检查点 / 步骤记账 都**不**换代', `epoch=${t.epoch}`)
 
   L.setSteps(t.taskId, STEPS2)
   ok(t.epoch === before + 1, '重排步骤表 ⇒ 换代', `epoch=${t.epoch}`)
@@ -97,6 +97,49 @@ section('① 台账层：epoch 从 1 开始；只有"换了一代要干什么"�
   L.finish(t2.taskId, { ok: true })
   ok(t2.epoch === 2, '收工 ⇒ 换代', `epoch=${t2.epoch}`)
   ok(/收工/.test(String(t2.epochWhy)), '收工的原因记下来了', `why=${t2.epochWhy}`)
+}
+
+/* ═══════════════ ①d 状态转变也要换代（2026-10-16 审计 P0-1，场景三） ═══════════════ */
+section('①d 暂停 / 等条件 ⇒ 换代（断线时在飞那一步的结果不许写回台账）')
+{
+  /* 🔴 审计原话：**"`pause` 不 `#bump`（断线是'换了一代'的语义，代码没这么算）"**。
+   *   断线走 `src/connection.mjs` 的 `tasks.pause(...)`；这时正在飞的那一步
+   *   （`task-exec` 的 `await this.call(...)`）回来只查代次 —— 代次没变 ⇒ 判不出过期
+   *   ⇒ **把"断线时那一步"记成已完成 / 已失败**，等下一轮开头才发现任务已经 paused。
+   *   `wait` 同理（`task-exec` 自己在掉线 / 等条件时调它）。 */
+  const L = mkLedger()
+  const t = L.start({ kind: 'custom', steps: STEPS2 })
+  const e0 = t.epoch
+  L.pause(t.taskId, '断线了（等重连）')
+  ok(t.epoch === e0 + 1, '暂停 ⇒ 换代', `epoch=${t.epoch}`)
+  ok(/断线/.test(String(t.epochWhy)), '暂停的原因记进换代原因', `why=${t.epochWhy}`)
+  ok(t.status === 'paused', '状态也真的变成 paused')
+  const e1 = t.epoch
+  L.wait(t.taskId, '等条件')
+  ok(t.epoch === e1 + 1, '等条件 ⇒ 换代', `epoch=${t.epoch}`)
+  ok(L.staleOf(t.taskId, e1).stale === true, '换代之后，手里那份旧代次判成过期')
+
+  /* 🔴 2026-10-16 实机验收（P0-1「真实调用链」）逮到的死胡同：
+   *   `resume` 原来**只给提示、不改状态** —— 任务一旦进了 `waiting`
+   *   （实测：`mc_dig {name:'dirt',count:4}` 报 `no-target`「附近找不到 dirt」），
+   *   `run` 在循环开头看见 `waiting` 就「这一轮先停手」，而 `resume` 又回
+   *   「接着做（用同样的参数再叫一次就好）」⇒ 两边互相推诿，**只剩 `cancel` 一条路**。
+   *   「恢复」的意思就是"接着做"，所以它**必须真把任务拉回 running**，
+   *   并且**换代**（恢复之前飞在半路的那一步不该再写回这一代的台账）。 */
+  const e2 = t.epoch
+  const r1 = L.resume(t.taskId, { countOf: null })
+  ok(r1.revived === true, '🔴 resume 真的把任务从 waiting 拉回来了', `revived=${r1.revived}`)
+  ok(t.status === 'running', '🔴 状态真的变回 running（不然 run 会一直"先停手"）', `status=${t.status}`)
+  ok(r1.wasStatus === 'waiting', '把"原来是什么状态"回给调用方', `wasStatus=${r1.wasStatus}`)
+  ok(t.epoch === e2 + 1, '🔴 resume 也换代（恢复前飞在半路的那一步不许写回台账）', `epoch=${t.epoch}`)
+  ok(L.staleOf(t.taskId, e2).stale === true, '换代之后，手里那份旧代次判成过期')
+  ok(t.pauseReason === null && t.note === null, '拉回来时清掉"等条件"的原因（它已经不成立了）')
+  /* 反面：本来就在跑的任务，`resume` 不换代、不改状态 —— 否则模型每次问一句
+   * 「我该干什么」都会把在飞的那一步作废。 */
+  const e3 = t.epoch
+  const r2 = L.resume(t.taskId, { countOf: null })
+  ok(r2.revived === false, '反面：本来就是 running ⇒ 不算"拉回来"')
+  ok(t.epoch === e3, '反面：本来就在跑 ⇒ 不换代（问一句不该把在飞的活作废）')
 }
 
 section('①b staleOf：对不上就说过期（含"任务没了"）')
@@ -182,7 +225,50 @@ section('②b 被取消 ⇒ 同样作废（而且任务状态不许被改成"完
   ok(/取消/.test(String(r.reason)) || /取消/.test(String(r.hint)), '话里点到了"取消"')
 }
 
-/* ═══════════════ ③ 执行器：看现场的时候被重排 ⇒ 立刻停手 ═══════════════ */
+/* ═══════════════ ②c 干到一半断线 / 被暂停 ⇒ 同样不记账（2026-10-16 审计 P0-1，场景三） ═══════════════ */
+section('②c 断线把任务暂停 ⇒ 在飞那一步的结果**不许**记成已完成 / 已失败')
+{
+  /* 🔴 审计原话：**"`src/task-exec.mjs:340` 之后缺一次 `cur.status` 复查"**。
+   *   断线走 `src/connection.mjs` 的 `tasks.pause(...)` —— 这一步的 `await this.call(...)`
+   *   回来时代次虽然变了（`pause` 现在换代），但**状态**才是那条路上的第一手事实。
+   *   两道检查都要在：代次答"这一代要干什么变了没有"，状态答"任务还在做吗"。 */
+  const L = mkLedger()
+  const t = L.start({ kind: 'custom', steps: [{ id: 's1', op: 'mc_dig', args: { name: 'stone' } }] })
+  const E = mkExec(L, {
+    call: async () => {
+      L.pause(t.taskId, '断线了（等重连）')      // 就在这一步在飞的时候断线
+      return { ok: true, note: '服务端已确认挖到了' }   // 一个**看起来成功**的结果
+    },
+  })
+  const r = await E.run({ taskId: t.taskId, maxRounds: 2 })
+  ok(r.stale === true, '如实说"这一份作废了"', `stale=${r.stale}`)
+  const after = L.get(t.taskId)
+  ok(after.status === 'paused', '🔴 任务状态还是 paused（没被这一步的结果改成 done / failed）', `status=${after.status}`)
+  ok(stepOf(L, t.taskId, 's1').status !== 'done', '🔴 步骤没被标成完成', `status=${stepOf(L, t.taskId, 's1').status}`)
+  ok(Object.keys(after.attempts ?? {}).length === 0, '🔴 也没被记成失败', `attempts=${JSON.stringify(after.attempts)}`)
+  ok(/不在做了|暂停|paused|改过/.test(String(r.reason)) || /暂停|♻️/.test(r.lines.join('\n')),
+    '话里点明"任务已经不在做了 / 这一代作废了"', `reason=${r.reason}`)
+  /* 两道检查谁先拦住都行（`pause` 现在**也**换代 ⇒ 代次那道通常先命中），
+   * 但 hint 必须把模型引回 `mc_task`，别让它照着旧计划再干一遍。 */
+  ok(/mc_task/.test(String(r.hint)), 'hint 把模型引回 mc_task', `hint=${r.hint}`)
+}
+
+section('②d 断线那一步在飞、`pause` 之后又来一个"看起来成功"的结果 ⇒ 依然作废')
+{
+  /* 反面用例：确认上面那条不是"因为代次变了才拦住的" —— 这里**只**改状态、
+   * 让代次保持不动（直接改 `status` 字段），考的是新加的那道**状态复查**本身。 */
+  const L = mkLedger()
+  const t = L.start({ kind: 'custom', steps: [{ id: 's1', op: 'observe' }] })
+  const E = mkExec(L, {
+    call: async () => {
+      L.get(t.taskId).status = 'paused'    // 只动状态，不动 epoch
+      return { ok: true, note: '服务端已确认' }
+    },
+  })
+  const r = await E.run({ taskId: t.taskId, maxRounds: 2 })
+  ok(r.stale === true, '🔴 代次没变、只有状态变了 ⇒ **也要**判作废（这道检查是新加的）', `stale=${r.stale}`)
+  ok(stepOf(L, t.taskId, 's1').status !== 'done', '步骤照样没记账', `status=${stepOf(L, t.taskId, 's1').status}`)
+}
 section('③ 看现场（observe）的时候被重排 ⇒ 停手，不再按旧计划动手')
 {
   const L = mkLedger()
@@ -257,12 +343,28 @@ section('⑤ 静态接线')
   ok(/if \(r\.stale === true\) return 'stale'/.test(rn), 'outcomeOf 认 stale')
   ok(/OUTCOME_LABEL = \{[^}]*stale:/.test(rn), 'OUTCOME_LABEL 里有 stale')
 
-  /* 换代只发生在三处 —— 多一处就要有人解释为什么 */
+  /* 换代只发生在六处 —— 多一处就要有人解释为什么。
+   * 2026-10-16 审计（P0-1）从三处加到五处：**`pause` / `wait` 也是换代**（状态转变，
+   * 不是记账）—— 断线时正在飞的那一步必须被判成过期，否则会被记成已完成/已失败。
+   * 同日实机验收再加一处：**`resume` 把 `waiting`/`blocked`/`paused` 拉回 `running` 时换代**
+   * （原来的死胡同：`run` 说"先停手"、`resume` 说"接着做"，谁都不动状态）。
+   * 反过来，`progress` / `note` / `checkpoint` / `stepXxx` / `touch` 这些**记账**
+   * 一律不许换代（换了执行器会被自己刚写的账判成过期 = 自锁）。 */
   const bumps = [...rn.matchAll(/this\.#bump\(/g)].length
-  ok(bumps === 3, '🔴 全文件只有 3 处 #bump（重排步骤表 / 取消 / 收工）', `实际 ${bumps} 处`)
+  ok(bumps === 6, '🔴 全文件只有 6 处 #bump（重排 / 取消 / 收工 / 暂停 / 等条件 / 恢复）', `实际 ${bumps} 处`)
   ok(/#bump\(t, '步骤表被重排'\)/.test(rn), 'setSteps 换代')
   ok(/#bump\(t, `任务被取消：\$\{why\}`\)/.test(rn), 'cancel 换代')
   ok(/#bump\(t, ok \? '任务已收工' : '任务已判失败'\)/.test(rn), 'finish 换代')
+  ok(/#bump\(t, `暂停：\$\{why\}`\)/.test(rn), '🔴 pause 换代（断线走这条）')
+  ok(/#bump\(t, `等条件：\$\{why\}`\)/.test(rn), '🔴 wait 换代（掉线 / 缺条件走这条）')
+  ok(/#bump\(t, `接着做（原来是 \$\{wasStatus\}/.test(rn), '🔴 resume 把任务拉回 running 时换代')
+  /* 记账方法里一个 `#bump` 都不许有 —— 这条是"自锁"的结构性防线。
+   * 分两段取：① `progress` → `pause`（progress / checkpoint / fail / note）
+   *            ② `stepReset` → `resume`（stepBegin / stepDone / stepFail / stepSkip） */
+  const writes1 = rn.slice(rn.indexOf('  progress (taskId'), rn.indexOf('  pause (taskId'))
+  const writes2 = rn.slice(rn.indexOf('  stepReset (taskId'), rn.indexOf('  resume (taskId'))
+  ok(!/#bump/.test(writes1), '🔴 记账方法（progress / checkpoint / fail / note）里一个 #bump 都没有')
+  ok(!/#bump/.test(writes2), '🔴 步骤记账方法（stepBegin / stepDone / stepFail / stepSkip / stepReset）里一个 #bump 都没有')
 
   ok(/let epoch0 = this\.ledger\.epochOf\(t\.taskId\)/.test(ex), '执行器在开跑时记下代次')
   ok(/const began = this\.ledger\.stepBegin\(t\.taskId, step\.id\)/.test(ex), 'stepBegin 的返回值收下了')
@@ -278,6 +380,114 @@ section('⑤ 静态接线')
   ok(ex.indexOf('staleNow') < ex.indexOf('this.ledger.fail'), '也排在 fail 之前')
   ok(/stoppedWhy = 'epoch'/.test(ex), '停手时记的是 epoch 原因')
   ok(/stale: true, rounds, task: brief\(\), lines/.test(ex), '返回值里带 stale:true')
+}
+
+/* ────────────────────────────────────────────────────────────
+ * ⑤ `suggestAction`：任务"下一步建议"（`resume()` 的 `action` 字段）
+ *
+ * 🔴 为什么单独测（2026-10-17 全项目审计）：这个函数**一个断言都没有**，
+ *    而它给出的 `{ tool, args }` 是**模型照着发的**。它曾经有两处会在不报错的前提下骗人：
+ *      · `kind:'chest'` 传 `{ chest: … }` —— `mc_chest` 根本没有 `chest` 参数
+ *        （根 schema 不拦额外字段 ⇒ 静默丢掉），而不给 `action` 时 `mc_chest` 默认是 `list`
+ *        ⇒ 这条"建议"实际是在让模型去**列一遍箱子**，看着像给了下一步、其实什么都没给；
+ *      · `kind:'dig'` 直接透传 `need` —— `mc_dig` 的 `count` 上限是 16，超了**静默截断**
+ *        ⇒ `need:40` 只挖 16 个，模型以为该挖的都挖完了。
+ * ──────────────────────────────────────────────────────────── */
+section('⑤ suggestAction（"下一步建议"里的 tool/args 必须真能用）')
+{
+  const T = (kind, params = {}) => ({ taskId: 't1', kind, params })
+  const d5 = suggestAction(T('dig', { item: 'iron_ore' }), 5)
+  ok(d5?.tool === 'mc_dig' && d5.args.name === 'iron_ore' && d5.args.count === 5, '挖矿：把 need 透给 count')
+  ok(d5.args.maxDistance === 16, '挖矿：maxDistance 默认 16')
+  const d40 = suggestAction(T('dig', { item: 'iron_ore', maxDistance: 32 }), 40)
+  ok(d40.args.count === 16, '🔴 挖矿：need 超过 16 时夹到 16（`mc_dig` 上限就是 16，超了会静默截断）')
+  ok(d40.args.maxDistance === 32, '挖矿：params.maxDistance 优先')
+
+  const c3 = suggestAction(T('craft', { item: 'iron_pickaxe' }), 3)
+  ok(c3?.tool === 'mc_craft' && c3.args.count === 3, '合成：用 `count`')
+  ok(!('times' in c3.args), '🔴 合成：**不许**出现 `times`（`mc_craft` 只认 `count`）')
+
+  const s2 = suggestAction(T('smelt', { item: 'iron_ingot' }), 2)
+  ok(s2?.tool === 'mc_furnace' && s2.args.count === 2, '烧炼：用 `count`')
+  ok(!('times' in s2.args), '🔴 烧炼：**不许**出现 `times`')
+
+  const m = suggestAction(T('move', { item: 'x', to: { x: 1, y: 2, z: 3 } }), null)
+  ok(m?.tool === 'mc_move' && m.args.x === 1 && m.args.y === 2 && m.args.z === 3, '移动：to 摊成 x/y/z')
+  ok(!('count' in m.args), '移动：不带 count')
+
+  const chNo = suggestAction(T('chest', { item: 'iron_ore' }), 4)
+  ok(chNo === null, '🔴 箱子：**不知道往哪搬就不给建议**（旧代码给的是个不存在的 `chest` 键 ⇒ 模型会去列箱子）')
+  const chPut = suggestAction(T('chest', { item: 'iron_ore', action: 'put' }), 4)
+  ok(chPut?.tool === 'mc_chest' && chPut.args.action === 'put' && chPut.args.name === 'iron_ore' && chPut.args.count === 4, '箱子：params.action=put ⇒ 建议 put')
+  const chTake = suggestAction(T('chest', { item: 'iron_ore', action: 'take' }), null)
+  ok(chTake.args.action === 'take' && !('count' in chTake.args), '箱子：take 且 need 未知时不给 count')
+  ok(!('chest' in chPut.args) && !('chest' in chTake.args), '🔴 任何箱子建议里都**不许**出现 `chest` 这个键')
+
+  ok(suggestAction(T('dig', {}), 1) === null, '没有 item 就没有建议（返回 null，不是空对象）')
+  ok(suggestAction(T('unknown-kind', { item: 'x' }), 1) === null, '认不出的 kind 返回 null')
+
+  /* 结构性防线：建议里出现的每个参数名，都必须在**目标工具**的 `parameters` 里声明过。
+   * 这里只钉我们真的会建议的那几个工具（跨文件读源码，和 check-token-budget 同一套做法）。 */
+  const INDEX = read('../index.js')
+  const ext = (f) => read(`../extensions/${f}.mjs`)
+  const declOf = (src, toolName) => {
+    const at = src.indexOf(`name: '${toolName}'`)
+    if (at < 0) return null
+    const pi = src.indexOf('parameters:', at)
+    if (pi < 0) return null
+    const open = src.indexOf('{', pi)
+    if (open < 0) return null
+    /* 括号匹配出 parameters 那个对象（跳过字符串/注释），再取**深度 1 的键** ——
+     * `x: {…}, y: {…}, z: {…}` 写在同一行也认得。 */
+    let depth = 0; let i = open; let quote = null; let line = false; let blk = false
+    let end = -1
+    while (i < src.length) {
+      const c = src[i]; const n = src[i + 1]
+      if (line) { if (c === '\n') line = false; i++; continue }
+      if (blk) { if (c === '*' && n === '/') { blk = false; i++ } i++; continue }
+      if (quote) { if (c === '\\') { i += 2; continue } if (c === quote) quote = null; i++; continue }
+      if (c === '/' && n === '/') { line = true; i += 2; continue }
+      if (c === '/' && n === '*') { blk = true; i += 2; continue }
+      if (c === '"' || c === "'" || c === '`') { quote = c; i++; continue }
+      if (c === '{') depth++
+      else if (c === '}') { depth--; if (depth === 0) { end = i; break } }
+      i++
+    }
+    if (end < 0) return null
+    const obj = src.slice(open, end + 1)
+    const keys = new Set()
+    depth = 0; i = 0; quote = null; line = false; blk = false
+    while (i < obj.length) {
+      const c = obj[i]; const n = obj[i + 1]
+      if (line) { if (c === '\n') line = false; i++; continue }
+      if (blk) { if (c === '*' && n === '/') { blk = false; i++ } i++; continue }
+      if (quote) { if (c === '\\') { i += 2; continue } if (c === quote) quote = null; i++; continue }
+      if (c === '/' && n === '/') { line = true; i += 2; continue }
+      if (c === '/' && n === '*') { blk = true; i += 2; continue }
+      if (c === '"' || c === "'" || c === '`') { quote = c; i++; continue }
+      if (c === '{' || c === '[') { depth++; i++; continue }
+      if (c === '}' || c === ']') { depth--; i++; continue }
+      if (depth === 1) {
+        const mm = /^([A-Za-z_$][\w$]*)\s*:/.exec(obj.slice(i))
+        if (mm && (i === 0 || /[\s{,]/.test(obj[i - 1]))) { keys.add(mm[1]); i += mm[0].length; continue }
+      }
+      i++
+    }
+    return keys
+  }
+  const cases = [
+    ['mc_dig', d40.args, INDEX],
+    ['mc_craft', c3.args, ext('mc_craft')],
+    ['mc_furnace', s2.args, ext('mc_furnace')],
+    ['mc_move', m.args, INDEX],
+    ['mc_chest', chPut.args, ext('mc_chest')],
+  ]
+  for (const [tool, args, src] of cases) {
+    const decl = declOf(src, tool)
+    ok(decl && decl.size > 0, `读到 ${tool} 的参数表（${decl ? decl.size : 0} 个）`)
+    const bad = Object.keys(args).filter((k) => !decl?.has(k))
+    ok(bad.length === 0, `🔴 ${tool} 的建议里每个键都是它真认的参数`, bad.length ? `多出：${bad.join('、')}` : '')
+  }
 }
 
 console.log(`\n${pass} ✅ / ${fail} ❌`)

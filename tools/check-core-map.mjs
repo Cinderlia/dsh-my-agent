@@ -506,6 +506,43 @@ try {
     ok(/⚠️/.test(tfa) && /脚底那一格是 \*\*空的\*\*/.test(tfa) && /别往下挖，先挪一步/.test(tfa),
       '脚底是空气 ⇒ 还是原来那句"别往下挖，先挪一步"')
   }
+  {
+    /* 🔴 2026-10-17 实机（用户报：「这个实际脚下是水」）——
+     *    机器人在水坑里（脚那一格是水、人一直在游），竖列图却说
+     *    「往下 24 格全是实心 —— **可以放心往下挖**」。
+     *    下面那串 `runs` 扫的是 `feetY-1` **往下**，**不含机器人自己站的这一格** ⇒
+     *    报告对"你现在处在什么环境里"一个字都没说。
+     *    游戏里那个 AI 的思考记录紧接着就写「simplest: **dig down**! The column says y=59..36 all solid,
+     *    no caves」—— 照着挖下去，水就灌进坑里了。 */
+    const mk2 = (here, below = null) => {
+      const w = mkWorld({ fill: 'stone' })   // 全实心 ⇒ unloaded=0、无空腔 ⇒ 走到"可以放心往下挖"那条
+      w.set(0, 64, 0, here)                  // 机器人**自己站的这一格**（不在往下扫的范围里）
+      for (const [y, n] of Object.entries(below ?? {})) w.set(0, Number(y), 0, n)
+      return columnOf(mkBot({ pos: [0, 64, 0], world: w }), { yBottom: -8 })
+    }
+    const INW = mk2('water')
+    const INL = mk2('lava')
+    const INA = mk2('air')
+
+    ok(INW.here?.kind === 'water' && INW.here?.y === 64,
+      '🔴 here 报出"你自己站的这一格"是水（它不在下面那串 runs 里）', JSON.stringify(INW.here))
+    ok(INA.here?.kind === 'air' && INL.here?.kind === 'lava', 'here 把空气 / 岩浆也分得清')
+
+    const tw2 = columnText(INW); const tl2 = columnText(INL); const ta2 = columnText(INA)
+    ok(/🌊 你现在\*\*这一格（y=64）是水\*\*/.test(tw2) && /泡在水里/.test(tw2),
+      '🔴 人泡在水里 ⇒ 抬头先点名（不能只说"下面全是实心"）')
+    ok(/你人泡在水里/.test(tw2) && !/可以放心往下挖/.test(tw2),
+      '🔴 泡在水里时**不许**说"可以放心往下挖" —— 挖开水会灌进坑')
+    ok(/🔥 你现在\*\*这一格（y=64）就是岩浆\*\*/.test(tl2) && !/可以放心往下挖/.test(tl2),
+      '🔴 人在岩浆里 ⇒ 先让人出来，别说"放心挖"')
+    ok(!/你现在/.test(ta2) && /可以放心往下挖/.test(ta2),
+      '站在空气里 ⇒ 一个字都不多说，还是原来那句"可以放心往下挖"')
+
+    /* 脚底那格也是水时，"水会灌下来"是句废话（人已经在泡了）—— 该说的是"你先出去" */
+    const t1 = columnText(mk2('water', { 63: 'water' }))
+    ok(/你自己就在水里/.test(t1) && !/水会灌下来/.test(t1),
+      '🔴 脚底是水 + 人也在水里 ⇒ 说"先游出去"，不是"水会灌下来"')
+  }
 
   // ═══════════════════════════════════════════════════════════════════════════
   section('⑤ 静态接线（core.mjs / index.js）')
@@ -565,6 +602,9 @@ try {
     'index：column 分支直接调 map-render 的 columnOf（不经过 core 薄包装）')
   ok(/parseXZ\(args\.target\)/.test(strip(idx)), 'index：column 用 target 定 x/z（复用老参数，不加新参数 —— token 预算只剩几十字符）')
   ok(/text: columnText\(col\)/.test(strip(idx)), 'index：column 的 text 走 columnText()')
+  ok(/here: col\.here/.test(strip(idx)), 'index：column 分支把 here（你自己站的那一格）透传出去')
+  ok(/const hereName = b\?\.blockAt\?\.\(new Vec3\(fx, fy, fz\)\)\?\.name \?\? null/.test(strip(mapSrc)),
+    'map-render：columnOf 真的去读机器人自己那一格（here 不是编的）')
   ok(/"column"（竖列/.test(idx), 'index：mc_map 描述里写了 column 模式')
   ok(/export function columnOf \(b, \{ x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX \} = \{\}\) \{/.test(mapSrc),
     'map-render：columnOf(b, {x,z,yTop,yBottom,maxDepth})')

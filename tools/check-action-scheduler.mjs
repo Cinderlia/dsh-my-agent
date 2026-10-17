@@ -56,7 +56,7 @@ ok(JSON.stringify(resourceSpecOf('mc_move')?.resources) === '["movement"]', 'mc_
 ok(JSON.stringify(resourceSpecOf('mc_dig')?.resources) === '["interaction","movement"]', 'mc_dig ⇒ movement + interaction')
 ok(resourceSpecOf('mc_act', { mode: 'look' }) === null, 'mc_act {mode:"look"} 不占资源 ⇒ null')
 ok(JSON.stringify(resourceSpecOf('mc_act', { mode: 'place' })?.resources) === '["interaction","movement"]', 'mc_act {mode:"place"}')
-ok(JSON.stringify(resourceSpecOf('mc_act', { mode: 'attack' })?.resources) === '["combat","movement"]', 'mc_act {mode:"attack"}')
+ok(JSON.stringify(resourceSpecOf('mc_act', { mode: 'attack' })?.resources) === '["combat","inventory","movement"]', 'mc_act {mode:"attack"}（战斗会中途换武器 ⇒ 占着背包）')
 ok(resourceSpecOf('mc_act', { mode: '不存在的模式' }) === null, 'mc_act 认不出的 mode ⇒ 不占资源')
 ok(resourceSpecOf('mc_act') === null, 'mc_act 不给 mode 时按默认 "look" ⇒ 不占资源（"看一眼"不该阻塞寻路）')
 ok(resourceSpecOf('mc_task', { action: 'list' }) === null && resourceSpecOf('mc_task') === null, 'mc_task 记账动作不占资源')
@@ -531,7 +531,14 @@ section('⑦ 静态接线（谁在用它、有没有接对）')
     '🔴 抢占要求**严格**高于（同级不抢 —— 否则同优先级的动作互相叫停）')
   ok(/!PREEMPT_BLOCKED_POINTS\.includes/.test(sch), '取消边界在 `cleanup` / `unknown` 时不抢')
   ok(/#release \(rec, added\) \{[\s\S]{0,400}?#wakeWaiters\(\)/.test(sch), '🔴 `#release()` 里叫醒排队的人')
-  ok(/releaseAll \(why = ''\) \{[\s\S]{0,600}?#wakeWaiters\(\)/.test(sch), '🔴 `releaseAll()`（断线）也叫醒排队的人')
+  ok(/releaseAll \(why = '', \{ abort = true \} = \{\}\) \{[\s\S]{0,900}?#wakeWaiters\(\)/.test(sch), '🔴 `releaseAll()`（断线）也叫醒排队的人')
+  /* ── 2026-10-16 审计（P0-1）补的三条 ── */
+  ok(/for \(const r of recs\) \{[\s\S]{0,200}?r\.controller\.abort\(\)/.test(sch),
+    '🔴 断线/叫停时 `releaseAll` **真的 abort 在飞动作**（以前只清表不叫停 —— 表说没事了、手还在动）')
+  ok(/const emergency = prio >= PRIORITY\.emergency/.test(sch) && /if \(conflicts\.length && \(this\.mode === 'enforce' \|\| emergency\)\)/.test(sch),
+    '🔴 紧急级不受观察模式限制（拿命去"观察"没有意义）')
+  ok(/if \(emergency\) \{[\s\S]{0,400}?\} else if \(waitBudget > 0\)/.test(sch),
+    '🔴 紧急级抢完**不排队**（急救等不起"它自己收尾"）')
   ok(/rec\.controller = controller/.test(sch) && /b\.rec\.controller\?\.abort\(\)/.test(sch), '抢占的把手就是 `rec.controller.abort()`')
   ok(/let controller = parentRec\?\.controller \?\? null/.test(sch), '🔴 子步骤**共用父动作的 controller**（抢父 = 抢整棵子树）')
   ok(/waited: this\.waited/.test(sch) && /preemptions: this\.preemptions/.test(sch) && /waiting: this\._waiters\.length/.test(sch),

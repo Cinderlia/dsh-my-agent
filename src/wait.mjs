@@ -18,6 +18,7 @@
  */
 
 import { waitUntil } from './async-util.mjs'
+import { perfWait } from './perf-monitor.mjs'
 
 /**
  * 等在途事件。四种收工条件：
@@ -62,6 +63,10 @@ export async function waitForEvents ({
     ms: Number(waitSec) * 1000, pollMs, signal, label: '等在途事件', now, sleep,
   })
   const waitedMs = now() - startedAt
+  /* 🔴 2026-10-16 审计（P1，四类耗时）：这段等待是"等事件"，**不是**"烧 CPU" ——
+   *    上报给性能监测，`mc_events` 才不会在 `perf` 里显示成"慢得可疑"。
+   *    没人包 `perfWrap` 时它自己就是空操作（零成本）。 */
+  perfWait('event', waitedMs)
   if (r.reason === 'aborted') return { waitedMs, interrupted: false, reason: '用户停止' }
   if (interruptedNow()) return { waitedMs, interrupted: true, reason: sess?.waitInterruptReason ?? '唤醒' }
   if (hasFresh()) return { waitedMs, interrupted: false, reason: '有事件' }

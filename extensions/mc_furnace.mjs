@@ -753,7 +753,20 @@ export async function apply (api) {
         // `Array.isArray(inv) ? … : []`，条件永远为假，这行"背包：…"从来没打印过。
         const inv = mc.inventory()
         const bag = Array.isArray(inv?.items) ? inv.items.slice(0, 12) : []
-        if (bag.length) lines.push('　背包：' + bag.map((i) => `${i.name}×${i.count}`).join('、'))
+        /* 收工这一刻**再量一次**空位：`:708` 那个 `free` 是"取成品之前"的，取完就变了。
+         * 🔴 为什么非报不可：熔炉的整个设计就是"装好料就走、过会儿回来取"，空位是这条流程的
+         *    硬前置 —— 而 `free === 1` 时以前**什么都不说**，AI 高高兴兴再叫一次，
+         *    下一炉就卡在"烧好了但取不出来"（`:721` 那条才报，已经白跑一趟）。 */
+        const freeNow = typeof bot.inventory?.emptySlotCount === 'function' ? bot.inventory.emptySlotCount() : null
+        if (bag.length) {
+          lines.push('　背包：' + bag.map((i) => `${i.name}×${i.count}`).join('、')
+            + (freeNow == null ? '' : `（还有 ${freeNow} 个空位）`))
+        }
+        // 背包本来就满那条已经在 `:721` 说过了，这里只管"快满但还没满"的情形
+        if (freeNow != null && freeNow <= 2 && fullWarn === 0) {
+          lines.push(`⚠️ 背包只剩 ${freeNow} 个空位 —— 下一炉取出来可能放不下；`
+            + '先 `mc_chest` 存一趟，或者 `mc_act {mode:"toss"}` 丢掉没用的')
+        }
         logLine(`mc_furnace：${t.input}→${t.output} 得到 ${took} 个（${ms}ms，装了 ${batch} 个，燃料 ${f?.name ?? '（上一轮放的）'}）`)
         return { text: lines.join('\n'), input: t.input, output: t.output, got: took, loaded: batch, fuel: f?.name ?? null }
       } finally {

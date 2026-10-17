@@ -39,6 +39,15 @@ export const WATER_MAX_NODES = 900
 export const WATER_MAX_CANDIDATES = 12
 /** 走到离出口这么近就算到了（和 `walkPathfinder` 的默认到达半径同量级） */
 export const WATER_ARRIVE = 1.6
+/**
+ * 一次搜索最多花多少毫秒。
+ *
+ * 🔴 2026-10-16 审计：原来**只有节点预算**（`WATER_MAX_NODES`），一格一格数 ——
+ *    可"一格的价钱"不是常数：`swimmableAt` 要读 2 格、`hazardNear` 要读 7 格，
+ *    在区块边缘每次 `blockAt` 都可能触发一次慢查询。格子数没超，时间照样能超。
+ *    这是**兜底**，不是主预算（主预算是节点数）：正常情况下 900 格远花不到这么多。
+ */
+export const WATER_MAX_MS = 400
 
 export const WATER_KINDS = ['dry', 'breath', 'passage']
 
@@ -109,6 +118,17 @@ export function hazardNear (b, x, y, z) {
   return null
 }
 
+/**
+ * 这一格（脚或头）是不是"读不到" —— 也就是**区块没加载**。
+ *
+ * 🔴 2026-10-16 审计：`swimmableAt` 把 `blocked` 和 `unknown` 一起判 false，
+ *    调用方从此分不清"这里有墙"和"这里我没看"。搜出口时这两者必须分开数：
+ *    前者是结论，后者只是**数据缺口** —— 拿缺口当结论就会告诉 AI"这里没有出口"。
+ */
+export function unknownAt (b, x, y, z) {
+  return cellKindAt(b, x, y, z) === 'unknown' || cellKindAt(b, x, y + 1, z) === 'unknown'
+}
+
 /* ─────────── 有限范围分层 BFS ─────────── */
 
 const NEIGHBORS = [[0, 1, 0], [0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]]
@@ -121,19 +141,25 @@ const keyOf = (x, y, z) => `${x},${y},${z}`
  * 这里用分层 BFS（每层记距离），**6 邻域**而不是 26 邻域：斜着穿墙角在游戏里会卡住，
  * 少找几个候选，比"找到一条走不通的路"强。
  *
- * @returns {{ found, kind, target, path, distance, candidates, scanned, reason, note }}
+ * ⚠️ 水平边界是**方形**（Chebyshev：`|dx| <= radius` 且 `|dz| <= radius`），不是圆 ——
+ *    对角线方向实际能搜到 `radius * √2` 格远。这是**有意的**（方块世界里"方形视野"
+ *    比"圆形"更符合直觉，也不会让某个方向先没得搜）；返回值里的 `bounds` 把这件事
+ *    明说出来，免得调用方以为是个圆。
+ *
+ * @returns {{ found, kind, target, path, distance, candidates, scanned, unknownCells, partial, bounds, reason, note }}
  */
-export function waterExitSearch (b, { feet = null, radius = WATER_RADIUS, up = WATER_UP, down = WATER_DOWN, maxNodes = WATER_MAX_NODES, avoid = null } = {}) {
+export function waterExitSearch (b, { feet = null, radius = WATER_RADIUS, up = WATER_UP, down = WATER_DOWN, maxNodes = WATER_MAX_NODES, maxMs = WATER_MAX_MS, avoid = null } = {}) {
   const f = feet ?? feetOfBot(b)
+  const bounds = { radius, up, down, square: true }
   if (!f) {
-    return { found: false, kind: null, target: null, path: [], distance: null, candidates: [], scanned: 0, reason: 'unknown-world', note: '读不到自己在哪 —— 搜不了出口' }
+    return { found: false, kind: null, target: null, path: [], distance: null, candidates: [], scanned: 0, unknownCells: 0, partial: false, bounds, reason: 'unknown-world', note: '读不到自己在哪 —— 搜不了出口' }
   }
   const sx = Math.floor(f.x); const sy = Math.floor(f.y); const sz = Math.floor(f.z)
   /* 只有**真的泡在水里**才值得搜出口。注意判据是 `inWaterAt`（脚或头是水），
    * **不是** `swimmableAt` —— 站在干燥的岸上时"脚空气 + 头空气"也是可通行的，
    * 拿后者当门会变成"站在岸上还要找出口"。 */
   if (!inWaterAt(b, { x: sx, y: sy, z: sz })) {
-    return { found: false, kind: null, target: null, path: [], distance: null, candidates: [], scanned: 0, reason: 'not-in-water', note: '我现在不在水里 —— 这条是给"泡在水里出不来"用的' }
+    return { found: false, kind: null, target: null, path: [], distance: null, candidates: [], scanned: 0, unknownCells: 0, partial: false, bounds, reason: 'not-in-water', note: '我现在不在水里 —— 这条是给"泡在水里出不来"用的' }
   }
 
   const seen = new Set([keyOf(sx, sy, sz)])
@@ -143,15 +169,29 @@ export function waterExitSearch (b, { feet = null, radius = WATER_RADIUS, up = W
   const candidates = []
   let scanned = 1
   let head = 0
+  /* 🔴 审计：未加载的格子被当成墙静默剪掉 —— 于是"没找到出口"里混着两种完全不同的情况：
+   *    「看遍了，真没有」和「有块地方压根没加载，我没看」。这两种对 AI 的下一步决定
+   *    天差地别（前者该换方向，后者该等区块加载 / 靠近一点再搜）。分开数。 */
+  const unknownSeen = new Set()
+  const deadline = Date.now() + Math.max(0, Number(maxMs) || 0)
 
   while (head < queue.length && scanned < maxNodes) {
+    /* 时间兜底：每 64 格看一眼表（`Date.now()` 本身也要钱，不能每格都问）。 */
+    if ((head & 63) === 0 && Date.now() >= deadline) break
     const [x, y, z] = queue[head++]
     const d = dist.get(keyOf(x, y, z))
     /* 顺手把这一格本身是不是出口记下来（起点不算：站在起点说"找到出口了"是废话） */
     if (d > 0) {
       const kind = standableAt(b, x, y, z) ? 'dry' : (breathableAt(b, x, y, z) ? 'breath' : null)
       if (kind) {
-        candidates.push({ x, y, z, kind, distance: d, safe: hazardNear(b, x, y, z) == null })
+        const haz = hazardNear(b, x, y, z)
+        candidates.push({
+          x, y, z, kind, distance: d,
+          /* `safe` 只代表"**没看到**危险"，不代表"看过了、确认安全" —— `hazardKnown`
+           * 才区分这两件事（未加载的格子读不到方块名，`hazardNear` 会当"没危险"）。 */
+          safe: haz == null,
+          hazardKnown: !unknownAt(b, x, y, z),
+        })
       }
     }
     for (const [dx, dy, dz] of NEIGHBORS) {
@@ -160,7 +200,11 @@ export function waterExitSearch (b, { feet = null, radius = WATER_RADIUS, up = W
       if (ny > sy + up || ny < sy - down) continue
       const k = keyOf(nx, ny, nz)
       if (seen.has(k)) continue
-      if (!swimmableAt(b, nx, ny, nz)) continue
+      if (!swimmableAt(b, nx, ny, nz)) {
+        /* 记一笔"这里因为没加载所以没搜"（同一个格子从不同邻居会被看到多次，去重）。 */
+        if (!unknownSeen.has(k) && unknownAt(b, nx, ny, nz)) unknownSeen.add(k)
+        continue
+      }
       seen.add(k)
       prev.set(k, keyOf(x, y, z))
       dist.set(k, d + 1)
@@ -170,31 +214,44 @@ export function waterExitSearch (b, { feet = null, radius = WATER_RADIUS, up = W
     }
   }
 
+  /* 「没搜完」的三种原因分开报 —— 合成一句"没找到出口"会让 AI 做错决定。 */
+  const timedOut = Date.now() >= deadline && scanned < maxNodes
+  const truncated = scanned >= maxNodes || timedOut
+  const unknownCells = unknownSeen.size
+  const partial = truncated || unknownCells > 0
+  const truncatedWhy = scanned >= maxNodes ? `格子数到顶（${maxNodes}）` : (timedOut ? '时间到顶' : null)
+
   const rank = { dry: 3, breath: 2, passage: 1 }
   /* 分阶段筛选：先把"会要命的"候选踢掉（除非一个安全的都没有，那时才退而求其次）。 */
   const safeOnes = candidates.filter((c) => c.safe)
   const pool = safeOnes.length ? safeOnes : candidates
   /* `avoid` = 上一轮走过但没走通的目标（用户要求"路线失败则排除旧路线再次搜索"）。
    * 注意只在**挑选**时排除，`candidates` 里仍然留着 —— AI 该看到的东西不能藏。 */
+  const tail = { scanned, unknownCells, partial, bounds }
   const usable = avoid ? pool.filter((c) => !avoid.has(keyOf(c.x, c.y, c.z))) : pool
   usable.sort((a, c) => (rank[c.kind] - rank[a.kind]) || (a.distance - c.distance))
   if (avoid && pool.length && !usable.length) {
     return {
-      found: false, kind: null, target: null, path: [], distance: null, candidates: pool, scanned,
+      found: false, kind: null, target: null, path: [], distance: null, candidates: pool, ...tail,
       reason: 'all-tried',
-      note: '找得到的出口都试过了、都没走通 —— 换个方向再叫我一次，或者扩大范围',
+      note: '找得到的出口都试过了、都没走通 —— 换个方向再叫我一次' + (unknownCells > 0 ? `（另外还有 ${unknownCells} 格因为区块没加载没看）` : ''),
     }
   }
 
   let best = usable[0] ?? null
   if (!best) {
-    /* 🔴 预算用完了（`maxNodes` 卡住）就**老实地承认没搜完**，不许拿"随便一个更开阔的水格"
-     *   冒充出口 —— 用户说的"本轮预算内没结果就扩大范围或返回明确的失败，不能假装找到路径"。 */
-    if (scanned >= maxNodes) {
+    /* 🔴 预算用完了（`maxNodes` / `maxMs` 卡住）就**老实地承认没搜完**，不许拿"随便一个更开阔的水格"
+     *   冒充出口 —— 用户说的"本轮预算内没结果就扩大范围或返回明确的失败，不能假装找到路径"。
+     * 🔴 审计：原来这里把 `candidates` 清成 `[]`，**已经看到的候选被丢掉** —— 明明有几条路
+     *   摆在眼前，只因为"没走完"就一条都不告诉 AI。改成原样带上（挑选出来的 `best` 仍然是
+     *   没有的，`found:false` 不变 —— 差的是"看见了什么"，不是"选了哪条"）。 */
+    if (truncated) {
       return {
-        found: false, kind: null, target: null, path: [], distance: null, candidates: [], scanned,
+        found: false, kind: null, target: null, path: [], distance: null,
+        candidates: pool.slice(0, WATER_MAX_CANDIDATES), ...tail,
         reason: 'budget-out',
-        note: `这次搜索的预算（${maxNodes} 格）用完了还没找到出口 —— 过一会儿再叫我一次，或者换个方向`,
+        note: `这次搜索没搜完（${truncatedWhy}）就撞上预算了 —— 过一会儿再叫我一次，或者换个方向` +
+          (pool.length ? `。不过已经看到 ${pool.length} 个候选，你可以先挑一个` : ''),
       }
     }
     /* 一类出口都没找到 —— 退一步：找一个"比起点更开阔"的可游格，用来脱离局部死路。
@@ -204,9 +261,14 @@ export function waterExitSearch (b, { feet = null, radius = WATER_RADIUS, up = W
 
   if (!best) {
     return {
-      found: false, kind: null, target: null, path: [], distance: null, candidates: [], scanned,
+      found: false, kind: null, target: null, path: [], distance: null, candidates: [], ...tail,
       reason: 'no-exit-found',
-      note: `半径 ${radius} 格 / 上下 ${up}+${down} 格以内（翻了 ${scanned} 格）没找到任何出口 —— **别在原地一直游**，换个方向再叫我一次`,
+      /* 🔴 审计：`unknown`（区块没加载）的格子**被当成墙静默剪掉**，于是"没找到出口"里混着
+       *   两种完全不同的情况：「看遍了，真没有」和「有块地方压根没加载，我没看」。前者该换方向，
+       *   后者该先靠近 / 等加载。分开说，别让 AI 拿着半张地图下结论。 */
+      note: unknownCells > 0
+        ? `半径 ${radius} 格 / 上下 ${up}+${down} 格以内（翻了 ${scanned} 格）没找到出口，而且有 ${unknownCells} 格因为**区块没加载**根本没看到 —— 这不算"确认没有出口"。先游回自己认得的地方，或者叫我用 mc_scan 看一眼再定`
+        : `半径 ${radius} 格 / 上下 ${up}+${down} 格以内（翻了 ${scanned} 格）没找到任何出口 —— **别在原地一直游**，换个方向再叫我一次`,
     }
   }
 
@@ -218,9 +280,9 @@ export function waterExitSearch (b, { feet = null, radius = WATER_RADIUS, up = W
     path,
     distance: best.distance,
     candidates: pool.slice(0, WATER_MAX_CANDIDATES),
-    scanned,
+    ...tail,
     reason: 'ok',
-    note: waterNote(best, pool),
+    note: waterNote(best, pool) + (unknownCells > 0 ? `（还有 ${unknownCells} 格没加载，没看）` : ''),
   }
 }
 

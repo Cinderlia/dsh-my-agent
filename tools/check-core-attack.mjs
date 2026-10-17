@@ -482,6 +482,24 @@ section('⑤ 静态接线')
   has(atkNo, '24 格内实际有：', 'attack.mjs：找不到时列出半径内实际有谁')
   has(atkNo, 'const inReach = needle ? all : all.filter((x) => x.d <= 4.5 || rankOf(x) === 0)',
     'attack.mjs：不给 who 时只追怪（动物/玩家限 4.5 格）')
+  /* 🔴 2026-10-16（用户 m11195 采纳的 ①）：`mc_act{mode:"attack"}` 打完目标后**顺带报附近还有谁** ——
+   *    以前只报"打死了 / 打了多少血"，AI 得再单独调一次 `mc_entities` 才知道旁边还站着两只。
+   *    数据本来就在手（`all` 已列了 24 格内全部实体），零额外遍历；没怪时返回 `{}`（常态零结果 token）。 */
+  has(atkNo, 'const foesNear = (exclude) =>', 'attack.mjs：附近还有谁的辅助函数')
+  has(atkNo, 'const NEARBY_R = 16', 'attack.mjs：附近半径是具名常量（不是散落的魔法数）')
+  has(atkNo, 'nearbyNote: `⚠️ 附近还有 ${foes.length} 只怪：`', 'attack.mjs：附近有怪时给一行人话（不只是 JSON）')
+  /* 🔴 2026-10-17（战斗策略层）：`attack()` 从"两条 return 路径"变成了"唯一一个对外出口" ——
+   *    pvp 与非 pvp 的执行搬进了 `engagePvp()` / `engageSwing()` 两个**内部**函数，
+   *    它们返回的是内部结果（带 `_sawDamage` 这类下划线字段），由策略循环统一组装。
+   *    所以判据从"至少两处"改成"**有且只有一处，而且在最后一个 return 里**" ——
+   *    这比原来更强：任何一条新的早返回都会当场露馅（那意味着有条路绕过了 foesNear 和 outcome）。 */
+  const foesNearHits = [...atkNo.matchAll(/\.\.\.foesNear\(/g)].length
+  ok(foesNearHits === 1, '🔴 foesNear 只挂在唯一那个对外出口上（不再有两条 return 路径）', String(foesNearHits))
+  {
+    const lastRet = atkNo.lastIndexOf('return {')
+    ok(lastRet > 0 && atkNo.slice(lastRet).includes('...foesNear(target)'),
+      '🔴 最后一个 return（唯一的对外出口）带上 foesNear —— 没有别的路绕过它', `idx=${lastRet}`)
+  }
   has(minNo, 'Math.max(2500, Math.floor(left * 0.6))', 'mining：dig 单个目标预算封顶')
   /* 🔴 2026-10-08：`dig()` 不再把方块交给 collectBlock（"挖完又复原 + 之后几分钟走不了路"的根因），
    *    那条路上的"临时压低 thinkTimeout 再还原"也就跟着删了。这里改成钉死"不碰插件配置"。 */
@@ -515,6 +533,29 @@ section('⑤ 静态接线')
     'attack.mjs：pvp.stop() 不 await（它最多等 5 秒 path_stop，会把预算吃光）')
   has(woNo, 'export function entityHealth (b, e)', 'world-observer：血量助手 entityHealth（第十刀搬过去的）')
   has(atkNo, 'const hpBefore = entityHealth(b, target)', 'attack.mjs：动手前先记目标血量')
+  /* 🔴 2026-10-17 实机：`entityHealth()` 在真服上**永远回 null** ⇒ "打死必须有掉血证据"永远不成立
+   *    （拳头打死僵尸，报的却是 combat:"unknown" + "没读到过它掉血"，掉落提示也从不出现）。
+   *    根因：`@nxg-org/mineflayer-util-plugin` 的 `getHealth()` 算
+   *    `metadata[9] + Number(metadata[13]) ?? 0`，第 13 格是 undefined ⇒ `Number(undefined)` 是 NaN
+   *    ⇒ `NaN ?? 0` **还是 NaN**（`??` 只兜 null/undefined）⇒ 整条返回值是 NaN。
+   *    下面这些形状全是实机探针（`实机验证/战斗/probe-health.mjs`）打出来的真数据。 */
+  {
+    const { entityHealth } = await import(new URL('../src/world-observer.mjs', import.meta.url))
+    const B19 = { version: '1.21.9' }
+    ok(entityHealth(B19, { metadata: [null, null, null, null, null, null, null, null, null, 20] }) === 20,
+      '🔴 血量：1.21.9 真形状（第 9 格 = 20）读得出来', String(entityHealth(B19, { metadata: [null, null, null, null, null, null, null, null, null, 20] })))
+    ok(entityHealth({ version: '1.21.9', util: { entity: { getHealth: () => NaN } } }, { metadata: [null, null, null, null, null, null, null, null, null, 14.5] }) === 14.5,
+      '🔴 血量：现成助手回 NaN 也不影响（就是它把实机搞瞎的）')
+    ok(entityHealth({ version: '1.16.5' }, { metadata: [null, null, null, null, null, null, null, 18] }) === 18,
+      '血量：1.16 及以前走第 7 格')
+    ok(entityHealth(B19, { metadata: [null, null, null, null, null, null, null, null, null, 12, null, null, null, 4] }) === 16,
+      '血量：吸收血量要加上去（第 13 格），且**单独判有限性**（别再犯 `??` 那个错）')
+    ok(entityHealth(B19, { metadata: [null, null, null, null, null, null, null, null, null, 0] }) === null,
+      '血量：0（已经死了）⇒ null，不许回 0 冒充"活着但没血"')
+    ok(entityHealth(B19, {}) === null && entityHealth(B19, null) === null,
+      '血量：读不到 / 没实体 ⇒ null（读不到不要编）')
+    ok(entityHealth(B19, { health: 7 }) === 7, '血量：兜底还认老版本实体上的 e.health')
+  }
   has(atkNo, 'b.pvp?.wasInRange', 'attack.mjs：用 wasInRange 区分"没打死"和"没追上"')
   /* 🔴 2026-10-15 审计：`killed: gone` 把"怪走出服务端实体追踪距离 / 区块卸载"当成"我打死了它"
    *    （还会顺带报一份不存在的掉落物提示）。现在只有**消失前读到过掉血**才算打死。 */
@@ -531,6 +572,350 @@ section('⑤ 静态接线')
     'core：attack 是薄包装（把 bot + t/callLeft/abortSignal/hasPvp 传进去）')
   ok(!/b\.pvp\.attack\(/.test(coreNo) && !/inReach = needle/.test(coreNo),
     'core：没有残留的选目标 / pvp.attack 实现')
+}
+
+/* ─────────── ⑦ 战斗策略层（纯函数，不碰 bot） ───────────
+ * 用户 2026-10-17 的战斗方案要求"对纯策略使用模拟测试，对真实寻路与命中使用实机验证"。
+ * 这一节就是"纯策略"那半 —— 全是纯函数，不需要真 bot、不需要真服务器。 */
+section('⑦ 战斗策略层 —— 威胁排序 / 换武器 / 状态机 / 结局（纯函数，不碰 bot）')
+{
+  const S = await import(new URL('../src/combat-strategy.mjs', import.meta.url))
+  const {
+    threatOf, rankTargets, weaponScoreOf, weaponChoiceOf, isShield, hurtRateOf,
+    assessCombat, chooseStrategy, combatOutcomeOf, retreatPointOf, approachPointOf,
+  } = S
+
+  /* 威胁分：不是"是不是敌对"一个判据 */
+  ok(threatOf({ hostile: true, distance: 3 }) > threatOf({ hostile: true, distance: 18 }),
+    '威胁分：同是敌对，近的比远的急', `${threatOf({ hostile: true, distance: 3 })} vs ${threatOf({ hostile: true, distance: 18 })}`)
+  ok(threatOf({ hostile: true, distance: 8, attackingMe: true }) > threatOf({ hostile: true, distance: 8 }),
+    '威胁分：正在打我的排前面', `${threatOf({ hostile: true, distance: 8, attackingMe: true })} vs ${threatOf({ hostile: true, distance: 8 })}`)
+  ok(threatOf({ hostile: true, distance: 8, ranged: true }) > threatOf({ hostile: true, distance: 8 }),
+    '威胁分：远程比近战急（它够得着我，我未必够得着它）')
+  ok(threatOf({ hostile: true, distance: 8, canReach: false }) < threatOf({ hostile: true, distance: 8 }),
+    '威胁分：够不着的先别管（降权）')
+  ok(threatOf({ hostile: true, distance: 8, dangerousTerrain: true }) < threatOf({ hostile: true, distance: 8 }),
+    '威胁分：打它要把自己送进岩浆/悬崖 ⇒ 降权')
+
+  /* 目标排序：敌对 > 玩家 > 动物 —— 这条**必须**保住（不能因为新增威胁评分就去自动打无关玩家） */
+  {
+    const animal = { name: 'cow', hostile: false, player: false, distance: 1 }
+    const player = { name: 'Bluezi', hostile: false, player: true, distance: 6 }
+    const mob = { name: 'zombie', hostile: true, distance: 12 }
+    const r = rankTargets([animal, player, mob])
+    ok(r[0] === mob, '排序：敌对优先于玩家和动物（哪怕它最远）', r.map((x) => x.name).join(','))
+    ok(r[1] === player && r[2] === animal, '排序：玩家优先于动物（别因为近就去揍牛）', r.map((x) => x.name).join(','))
+  }
+  {
+    const far = { name: 'zombie', hostile: true, distance: 14 }
+    const near = { name: 'skeleton', hostile: true, distance: 5, attackingMe: true }
+    ok(rankTargets([far, near])[0] === near, '排序：同为敌对时按威胁分（正在打我的近怪优先）')
+  }
+
+  /* 武器分级与选择 */
+  ok(weaponScoreOf('diamond_sword') > weaponScoreOf('iron_sword') && weaponScoreOf('iron_sword') > weaponScoreOf('wooden_sword'),
+    '武器分级：钻石剑 > 铁剑 > 木剑', `${weaponScoreOf('diamond_sword')}/${weaponScoreOf('iron_sword')}/${weaponScoreOf('wooden_sword')}`)
+  ok(weaponScoreOf('iron_axe') > weaponScoreOf('iron_pickaxe') && weaponScoreOf('iron_pickaxe') > 0,
+    '武器分级：斧 > 镐 > 空手')
+  ok(weaponScoreOf(null) === 0 && weaponScoreOf('cobblestone') === 0, '武器分级：空手和建材都是 0')
+  ok(weaponScoreOf('modded_sword') > 0, '武器分级：认不出材质但认得出是剑 ⇒ 给中间分（不当空手）')
+  ok(weaponChoiceOf({ held: null, items: ['diamond_sword'] })?.name === 'diamond_sword',
+    '换武器：空手 + 背包有剑 ⇒ 建议换上')
+  ok(weaponChoiceOf({ held: 'diamond_sword', items: ['wooden_sword'] }) === null,
+    '换武器：手里的已经更好 ⇒ 不换（别把好剑换成木剑）')
+  ok(weaponChoiceOf({ held: null, items: ['diamond_sword'], inDanger: true }) === null,
+    '🔴 换武器：危险中不换（换装那几百毫秒里手是无防备的）')
+  ok(isShield('shield') && isShield('white_shield') && !isShield('iron_sword'),
+    '盾牌判定：shield / 各种材质的盾都认，剑不是盾')
+
+  /* 武器耐久：用户方案"武器耐久很低 ⇒ 在安全条件下更换备用武器；无备用武器时评估是否继续战斗" */
+  {
+    const worn = weaponChoiceOf({ held: 'diamond_sword', items: ['stone_sword'], heldPct: 0.05 })
+    ok(worn?.name === 'stone_sword',
+      '🔴 耐久换武器：钻石剑只剩 5% ⇒ 换上评分**更低**的石剑（能用的烂剑胜过要断的好剑）', JSON.stringify(worn))
+    const healthy = weaponChoiceOf({ held: 'diamond_sword', items: ['stone_sword'], heldPct: 0.6 })
+    ok(healthy === null, '耐久够就别降级（60% 的钻石剑不该换成石剑）', JSON.stringify(healthy))
+    const noSpare = weaponChoiceOf({ held: 'diamond_sword', items: [], heldPct: 0.05 })
+    ok(noSpare?.name === null && /没有备用/.test(String(noSpare?.warn)),
+      '🔴 快坏了又没备用 ⇒ 不换，但**必须说出来**（"评估是否继续战斗"是 AI 的活）', JSON.stringify(noSpare))
+    const allWorn = weaponChoiceOf({ held: 'diamond_sword', items: ['stone_sword'], heldPct: 0.05, pctOf: () => 0.1 })
+    ok(allWorn?.name === null && /没有备用/.test(String(allWorn?.warn)),
+      '备用的也快坏了 ⇒ 不算备用（换上一把快断的没意义）', JSON.stringify(allWorn))
+    const danger = weaponChoiceOf({ held: 'diamond_sword', items: ['stone_sword'], heldPct: 0.05, inDanger: true })
+    ok(danger?.name === null && /不安全/.test(String(danger?.warn)),
+      '🔴 危险中不换装，但也要说清"现在不安全，先不换"', JSON.stringify(danger))
+    const snap = assessCombat({ health: 20, now: 1000, target: { name: 'zombie', distance: 3, hostile: true }, held: 'diamond_sword', items: [], heldPct: 0.05 })
+    ok(snap.weaponWarn != null && snap.notes.some((n) => /没有备用/.test(n)),
+      '🔴 战况快照里带 weaponWarn（不然 AI 只看到"在打"，不知道武器要断了）', JSON.stringify({ w: snap.weaponWarn, n: snap.notes }))
+  }
+
+  /* 掉血速度 */
+  {
+    const now = 100_000
+    ok(hurtRateOf([{ at: now - 4_000, health: 20 }, { at: now, health: 12 }], now) === 2,
+      '掉血速度：4 秒掉 8 血 ⇒ 2 点/秒', String(hurtRateOf([{ at: now - 4_000, health: 20 }, { at: now, health: 12 }], now)))
+    ok(hurtRateOf([{ at: now - 30_000, health: 20 }, { at: now, health: 12 }], now) === 0,
+      '掉血速度：窗口外的老样本不算（不然一分钟前挨的那下会一直吓唬人）')
+    ok(hurtRateOf([{ at: now, health: 12 }], now) === 0, '掉血速度：只有一个样本 ⇒ 0（算不出斜率就不编）')
+    ok(hurtRateOf([{ at: now - 2_000, health: 12 }, { at: now, health: 20 }], now) === 0,
+      '掉血速度：回血不算掉血')
+  }
+
+  /* 战况快照 */
+  {
+    const low = assessCombat({ health: 4, now: 1000 })
+    ok(low.mustRetreat === true, '战况：血 4 ⇒ mustRetreat（必须撤）')
+    const mid = assessCombat({ health: 10, now: 1000 })
+    ok(mid.mustRetreat === false && mid.shouldStopAdvancing === true, '战况：血 10 ⇒ 停止冒进但还能打')
+    const okHp = assessCombat({ health: 20, now: 1000 })
+    ok(okHp.mustRetreat === false && okHp.shouldStopAdvancing === false, '战况：血 20 ⇒ 正常打')
+  }
+  {
+    /* 🔴 第一版没加"够得着"门槛，结果 10 格外一只骷髅就让"打僵尸"变成"见骷髅就跑" */
+    const lone = assessCombat({
+      health: 20, now: 1000,
+      foes: [{ name: 'skeleton', ranged: true, distance: 10, hostile: true }],
+    })
+    ok(lone.rangedThreat === false, '🔴 战况：10 格外**孤零零一只**骷髅不算威胁（别见骷髅就跑）')
+    const pair = assessCombat({
+      health: 20, now: 1000,
+      foes: [{ name: 'skeleton', ranged: true, distance: 8, hostile: true },
+        { name: 'skeleton', ranged: true, distance: 9, hostile: true }],
+    })
+    ok(pair.rangedThreat === true, '战况：两个远程 ⇒ 算威胁')
+    const shooting = assessCombat({
+      health: 20, now: 1000,
+      foes: [{ name: 'skeleton', ranged: true, distance: 8, hostile: true, attackingMe: true }],
+    })
+    ok(shooting.rangedThreat === true, '战况：一个远程但正在打我 ⇒ 算威胁')
+  }
+  {
+    const c = assessCombat({ health: 20, now: 1000, foes: [{ name: 'zombie', distance: 3, hostile: true }, { name: 'zombie', distance: 4, hostile: true }, { name: 'zombie', distance: 5, hostile: true }] })
+    ok(c.surrounded === true && c.crowd === 3, '战况：三只 ⇒ surrounded', `crowd=${c.crowd}`)
+  }
+
+  /* 状态机 */
+  const base = { health: 20, now: 1000, target: { name: 'zombie', distance: 3, hostile: true }, sawDamage: true, targetGone: false, targetReachable: true, hasPvp: true }
+  {
+    const st = chooseStrategy(assessCombat({ ...base, targetGone: true, sawDamage: true }))
+    ok(st.action === 'complete' && st.reason === 'gone-after-damage',
+      '🔴 状态机：目标消失 + 读到过掉血 ⇒ 收工，但**只说"不见了"、不说"打死了"**（打死由 killed 一处判）', JSON.stringify(st))
+    const st2 = chooseStrategy(assessCombat({ ...base, targetGone: true, sawDamage: false }))
+    ok(st2.action === 'complete' && st2.reason === 'gone-no-damage', '🔴 状态机：目标消失但没读到掉血 ⇒ 收工/说不清（不许误报击杀）', JSON.stringify(st2))
+    /* 🔴 实机 2026-10-17：结果里同时出现 `reason:"killed"` 和 `killed:false`、`gone:false`
+     *    —— 策略层拿 `sawDamage` 当"打死了"，而 `killed` 是 `gone && sawDamage`。同一个问题两处判据。
+     *    这里的**不变量**：`reason` 永远不许出现 `killed`（那是 `killed`/`combat` 两个字段的活）。 */
+    const all = [st, st2]
+    ok(all.every((x) => x.reason !== 'killed'), '🔴 不变量：策略层的 reason 永远不许说 "killed"（打死只由 killed 一处判）',
+      JSON.stringify(all.map((x) => x.reason)))
+  }
+  {
+    const st = chooseStrategy(assessCombat({ ...base, health: 4 }))
+    ok(st.action === 'retreat' && st.reason === 'low-health', '状态机：血 4 ⇒ retreat（排在进攻前面）', JSON.stringify(st))
+    const st2 = chooseStrategy(assessCombat({ ...base, hurt: [{ at: 0, health: 20 }, { at: 1000, health: 14 }] }))
+    ok(st2.action === 'retreat' && st2.reason === 'low-health', '状态机：每秒掉 6 点 ⇒ retreat（比"血量低"更早发现正在挨打）', JSON.stringify(st2))
+  }
+  {
+    /* 🔴 实机逮到的 bug：一个空手 bot 挨一只简单僵尸大约 2 点/秒。
+     *    阈值设成 1.5 时，`mc_act{attack}` 对**每一只落单的僵尸**都掉头就跑
+     *    （实机第一轮 `actions: ["retreat"]`，一下都没打）——"掉血"不是撤退理由，
+     *    "掉得快到来不及脱身"才是。 */
+    const lone = assessCombat({ ...base, hurt: [{ at: 0, health: 20 }, { at: 1000, health: 18 }] })
+    ok(lone.hurtDps === 2, '掉血速度算得对（20→18，1 秒 ⇒ 2/秒）', String(lone.hurtDps))
+    const st = chooseStrategy(lone)
+    ok(st.action === 'engage', '🔴 落单僵尸啃我 2/秒 ⇒ 照打（不许每只僵尸都掉头就跑）', JSON.stringify(st))
+    const acute = assessCombat({ ...base, hurt: [{ at: 0, health: 20 }, { at: 1000, health: 16 }] })
+    ok(chooseStrategy(acute).action === 'retreat', '🔴 4/秒 ⇒ retreat（20 血撑不过 5 秒，来不及脱身）', JSON.stringify(chooseStrategy(acute)))
+    ok(S.HURT_RETREAT_DPS >= 3, '🔴 急症阈值不许被调回 1.5（那会让 attack 对落单怪也逃跑）', String(S.HURT_RETREAT_DPS))
+  }
+  {
+    const st = chooseStrategy(assessCombat({
+      ...base,
+      foes: [{ name: 'zombie', distance: 3, hostile: true }, { name: 'zombie', distance: 4, hostile: true }, { name: 'zombie', distance: 5, hostile: true }],
+    }))
+    ok(st.action === 'defend' && st.reason === 'surrounded', '状态机：被围 ⇒ defend', JSON.stringify(st))
+    /* 用户方案："没有盾牌或无法防御 ⇒ 不进入依赖盾牌的策略"，且要说清退化成什么 */
+    ok(st.shield === false && /没有盾牌/.test(String(st.why)), '🔴 没盾时 defend 明说是"拉开距离"（不是假装举盾）', JSON.stringify(st.why))
+    const withShield = chooseStrategy(assessCombat({
+      ...base,
+      hasShield: true,
+      foes: [{ name: 'zombie', distance: 3, hostile: true }, { name: 'zombie', distance: 4, hostile: true }, { name: 'zombie', distance: 5, hostile: true }],
+    }))
+    ok(withShield.shield === true && /有盾/.test(String(withShield.why)), '有盾时如实说"边挡边退"', JSON.stringify(withShield.why))
+  }
+  {
+    const st = chooseStrategy(assessCombat({ ...base, held: null, items: ['diamond_sword'] }))
+    ok(st.action === 'equip' && st.name === 'diamond_sword', '状态机：有更好的武器 ⇒ equip', JSON.stringify(st))
+    const st2 = chooseStrategy(assessCombat({ ...base, held: null, items: ['diamond_sword'] }), { equips: 1, lastEquipAt: 1000 })
+    ok(st2.action !== 'equip', '状态机：刚换过（冷却里）⇒ 不再换（别一秒钟换十次）', JSON.stringify(st2))
+  }
+  {
+    const st = chooseStrategy(assessCombat({ ...base, targetReachable: false }), { lastInRange: false, repositions: 0 })
+    ok(st.action === 'reposition', '状态机：够不着且还没试过 ⇒ reposition（真的换个位置）', JSON.stringify(st))
+    const st2 = chooseStrategy(assessCombat({ ...base, targetReachable: false }), { lastInRange: false, repositions: 2 })
+    ok(st2.action === 'stop' && st2.reason === 'unreachable', '🔴 状态机：试满次数还够不着 ⇒ stop/unreachable（不无限试）', JSON.stringify(st2))
+  }
+  {
+    const st = chooseStrategy(assessCombat(base))
+    ok(st.action === 'engage' && st.state === 'engage', '状态机：其余情况 ⇒ 进攻', JSON.stringify(st))
+  }
+
+  /* 结局（机器可读，判据全是证据） */
+  ok(combatOutcomeOf({ killed: true, retreated: true }) === 'killed', '结局：打死优先于其它')
+  ok(combatOutcomeOf({ aborted: true, sawDamage: true }) === 'aborted', '结局：被打断优先于"打到了"')
+  ok(combatOutcomeOf({ retreated: true }) === 'retreated', '结局：主动撤退')
+  ok(combatOutcomeOf({ unreachable: true }) === 'unreachable', '结局：够不着')
+  ok(combatOutcomeOf({ sawDamage: true }) === 'damaged', '结局：打到了但没打死')
+  ok(combatOutcomeOf({ timedOut: true }) === 'timeout', '结局：这一轮时间到了')
+  ok(combatOutcomeOf({ gone: true }) === 'unknown', '结局：目标不见了但没证据 ⇒ unknown（不许猜）')
+  ok(combatOutcomeOf({}) === 'unknown', '结局：什么证据都没有 ⇒ unknown')
+  ok(S.COMBAT_OUTCOMES.includes(combatOutcomeOf({ killed: true })) && S.COMBAT_OUTCOMES.length === 7,
+    '结局：只在这七个词里取值（用户方案里点名的那七个）', S.COMBAT_OUTCOMES.join(','))
+
+  /* 几何：撤退点 / 找位点 */
+  {
+    const pt = retreatPointOf({ x: 0, y: 64, z: 0 }, { x: 0, z: 5 }, 10)
+    ok(pt && pt.z < 0 && Math.abs(pt.z + 10) < 0.01, '撤退点：往**背离**目标的方向走（目标在 +z ⇒ 我往 -z）', JSON.stringify(pt))
+    const same = retreatPointOf({ x: 0, y: 64, z: 0 }, { x: 0, z: 0 }, 10)
+    ok(same && Number.isFinite(same.x), '🔴 撤退点：和目标重合也要给个点（回 null 会让"撤退"变成原地不动）', JSON.stringify(same))
+    ok(retreatPointOf({ x: NaN, y: 64, z: 0 }, { x: 0, z: 5 }) === null, '撤退点：坐标读不到 ⇒ null（不许编）')
+    const ap = approachPointOf({ x: 0, y: 64, z: 0 }, { x: 0, y: 64, z: 10 }, 3)
+    ok(ap && Math.abs(ap.z - 3) < 0.01, '找位点：朝目标走 step 格', JSON.stringify(ap))
+    ok(approachPointOf({ x: 0, y: 64, z: 0 }, { x: 0, y: 64, z: 0 }, 3) === null, '找位点：重合 ⇒ null')
+  }
+}
+
+/* ─────────── ⑧ 策略层真的接进了 attack()（端到端，真调 attack） ───────────
+ * 用户方案的验收表：低血量撤退 / 多敌人 / 换武器 / 停止命令 / 不误报击杀。
+ * 这里用**真的 `attack()`**（不是纯函数），但移动与装备走**假的 ctx 能力回调** ——
+ * 这样既能验证"它真的去调了 moveTo/equipTo"，又不需要真寻路（真寻路留给实机）。 */
+section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会停（端到端，假能力回调）')
+{
+  const { attack } = await import(new URL('../src/attack.mjs', import.meta.url))
+  const mkCtx = (o = {}) => {
+    const calls = { move: [], equip: [] }
+    const ctx = {
+      t: (p) => p,
+      callLeft: () => 60_000,
+      abortSignal: o.abort ?? null,
+      hasPvp: true,
+      ...(o.noMove ? {} : { moveTo: async (pos, opts) => { calls.move.push({ pos, opts }) } }),
+      ...(o.noEquip ? {} : { equipTo: async (n) => { calls.equip.push(n) } }),
+    }
+    return { ctx, calls }
+  }
+  const zombieAt = (id, z) => ent({ id, name: 'zombie', type: 'hostile', kind: 'Hostile mobs', pos: { x: 0, y: 64, z } })
+
+  {   /* 低血量 ⇒ 主动撤退，且走的是现成的移动实现 */
+    const f = mkFightBot([zombieAt('z1', 2)])
+    f.bot.health = 4
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(r.combat === 'retreated' && r.retreated === true, '🔴 血 4 ⇒ 主动撤退（不再一直往前顶）', JSON.stringify({ combat: r.combat }))
+    ok(calls.move.length === 1, '撤退走的是 ctx.moveTo（现成的 walkTo），不是自己按键', String(calls.move.length))
+    ok(r.killed === false && !r.pickup, '撤退时不谎报击杀、也不报掉落物')
+    ok(f.calls.attack.length === 0, '🔴 撤退时一下都没打（血 4 还往上顶才是 bug）', String(f.calls.attack.length))
+    ok(r.strategy === 'retreat' && r.actions.includes('retreat'), '结果里写明策略与动作序列', JSON.stringify({ s: r.strategy, a: r.actions }))
+    /* 用户方案第五节点名要 `reason`（机器可读的"为什么"），和给人看的 `note` 分开 */
+    ok(r.reason === 'low-health', '🔴 结果里带机器可读的 reason（为什么这么做）', String(r.reason))
+  }
+  {   /* 想撤却没给移动能力 ⇒ 如实说，不假装撤了 */
+    const f = mkFightBot([zombieAt('z1', 2)])
+    f.bot.health = 4
+    const { ctx } = mkCtx({ noMove: true })
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(/没给我移动能力/.test(String(r.strategyError)), '🔴 想撤却没移动能力 ⇒ 如实说（不假装撤了）', String(r.strategyError))
+    ok(r.retreated !== true, '撤不了就不许报 retreated（说谎比失败更坏）')
+  }
+  {   /* 被围 ⇒ 拉开距离 */
+    const f = mkFightBot([zombieAt('z1', 3), zombieAt('z2', 4), zombieAt('z3', 5)])
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(r.strategy === 'defend' && calls.move.length === 1, '🔴 三只怪围着 ⇒ 先拉开距离', JSON.stringify({ s: r.strategy, moves: calls.move.length }))
+    ok(r.combat === 'retreated', '被围拉开距离 ⇒ 结局是 retreated')
+  }
+  {   /* 换武器：空手 + 背包有剑 */
+    const f = mkFightBot([zombieAt('z1', 2)])
+    f.bot.inventory = { items: () => [{ name: 'diamond_sword' }] }
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(calls.equip.length === 1 && calls.equip[0] === 'diamond_sword', '🔴 空手 + 背包有剑 ⇒ 换一次（且只换一次）', JSON.stringify(calls.equip))
+    ok(r.actions.includes('equip'), 'actions 里能看到换过武器', JSON.stringify(r.actions))
+  }
+  {   /* 停止命令：abortSignal 一置位就收手 */
+    const f = mkFightBot([zombieAt('z1', 2)])
+    const { ctx } = mkCtx({ abort: { aborted: true } })
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(r.combat === 'aborted', '🔴 停止命令 ⇒ aborted（不被内部循环重新启动）', String(r.combat))
+    ok(f.calls.attack.length === 0, '被中止时一下都没打')
+  }
+  {   /* 目标消失但没伤害证据 ⇒ 不许误报 */
+    const f = mkFightBot([])
+    const { ctx } = mkCtx()
+    let err = null
+    try { await attack(f.bot, { who: 'zombie', budget: 300 }, ctx) } catch (e) { err = e }
+    ok(/附近找不到/.test(String(err?.message)), '目标本来就不在 ⇒ 如实报找不到（不是"打死了"）', String(err?.message ?? '').slice(0, 50))
+  }
+  {   /* 附近还有怪 ⇒ 顺带报一句（既有能力，别被重构弄丢） */
+    const f = mkFightBot([zombieAt('z1', 2), zombieAt('z2', 9)])
+    f.bot.health = 20
+    const { ctx } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 300 }, ctx)
+    ok(Array.isArray(r.nearby) && r.nearby.some((x) => x.name === 'zombie'), '附近还有谁照样报（重构没弄丢）', JSON.stringify(r.nearby))
+  }
+  {   /* 正常单挑：不该撤、不该换，就是打 */
+    const f = mkFightBot([zombieAt('z1', 2)])
+    f.bot.health = 20
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 300 }, ctx)
+    ok(f.calls.attack.length >= 1 && r.strategy === 'engage', '正常单挑 ⇒ 进攻（策略层不该碍事）', JSON.stringify({ s: r.strategy, atk: f.calls.attack.length }))
+    ok(calls.move.length === 0, '正常单挑时不该乱走位', String(calls.move.length))
+    ok(typeof r.combat === 'string' && r.combat.length > 0, '每次战斗都带机器可读的 combat（战斗结局）', String(r.combat))
+  }
+  {   /* 🔴 战斗结局**不许占用** `outcome`（跨工具的统一结局）—— 两个字段都要在，且各说各的 */
+    const { outcomeOf } = await import(new URL('../src/task-runner.mjs', import.meta.url))
+    const map = {
+      killed: 'confirmed', damaged: 'confirmed', retreated: 'confirmed',
+      unreachable: 'failed', aborted: 'unknown', timeout: 'unknown', unknown: 'unknown',
+    }
+    for (const [c, want] of Object.entries(map)) {
+      ok(outcomeOf({ combat: c, killed: false }) === want,
+        `outcomeOf 把 combat:"${c}" 翻成 "${want}"`, String(outcomeOf({ combat: c, killed: false })))
+    }
+    /* 撤退时 note 里常带"走不过去/够不着" —— 那不能被文本正则判成失败 */
+    ok(outcomeOf({ combat: 'retreated', note: '想撤，但够不着安全点' }) === 'confirmed',
+      '🔴 撤退带"够不着"字样的 note，也仍然是"做到了"（文本正则不许抢先）')
+    /* 没给 combat 时，统一结局照旧按证据判（战斗层不许污染别的工具） */
+    ok(outcomeOf({ arrived: true }) === 'confirmed', '别的工具不带 combat 时判据完全不受影响')
+  }
+  {   /* 静态接线：core.mjs 必须把能力回调传下去（不然策略层永远是瘸的） */
+    const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    const coreNo = strip(readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8'))
+    const atkNo = strip(readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8'))
+    const has = (s, t, label) => ok(s.includes(t), label, t)
+    has(coreNo, 'moveTo: async (pos, o = {}) => await this.walkTo(pos, o)',
+      '🔴 core：attack 的 ctx 里传了 moveTo（走位/撤退复用现成 walkTo）')
+    has(coreNo, 'equipTo: async (name) => await this.equip({ name })',
+      '🔴 core：attack 的 ctx 里传了 equipTo（换武器复用现成 equip）')
+    ok(!/setControlState/.test(atkNo), '🔴 attack.mjs 里一处 setControlState 都没有（没有第二套移动控制）')
+    ok(!/tasks\./.test(atkNo), '🔴 attack.mjs 里没有 tasks.* 调用（没有第二个任务状态机）')
+    ok(!/self\.(dig|placeBlock|useItem)\(/.test(atkNo), 'attack.mjs 不自己调别的动作能力（只走 ctx 回调）')
+    has(atkNo, "from './combat-strategy.mjs'", 'attack.mjs 真的 import 了策略层')
+    has(atkNo, 'if (Date.now() - t00 >= budget - 100)', '🔴 attack.mjs：循环有总预算闸门（不然一轮轮各吃满预算）')
+    has(atkNo, 'const phaseMs = () => callBudget(Math.min(budgetLeft(), COMBAT_PHASE_MS), 4_000)',
+      '🔴 attack.mjs：一个战斗阶段比总预算短（否则"重新观察"永远不发生）')
+    has(atkNo, 'foes: foes.map((f) => ({ ...f, isTarget: f.id === target.id }))',
+      '🔴 attack.mjs：把当前目标按**身份**标出来（按名字标会把同类怪一起剔光，"被围"就数不出来）')
+    has(atkNo, 'heldPct: pctOfItem(heldItem),', '🔴 attack.mjs：把手里武器的剩余耐久喂给策略层')
+    has(atkNo, 'pctOf: (n) => (bagPct.has(n) ? bagPct.get(n) : null),', '🔴 attack.mjs：背包里同名武器取**最好的一把**')
+    has(atkNo, 'durabilityOf', 'attack.mjs 复用现成的 durabilityOf（不自己算耐久）')
+    has(atkNo, '...(lastSnap?.weaponWarn ? { weaponWarn: lastSnap.weaponWarn } : {}),',
+      '🔴 attack.mjs：武器快坏了要把话带出去（不然 AI 只看到"在打"）')
+    /* 用户方案："没有盾牌或无法防御 ⇒ 不进入依赖盾牌的策略"。
+     * 我们**根本不举盾** —— 那就要钉死"不许凭空调用防御 API"。 */
+    ok(!/activateItem|useItem\(|raiseShield|blockWithShield/.test(atkNo),
+      '🔴 attack.mjs 里没有任何"举盾/使用物品"的调用（没有盾牌就不进依赖盾牌的策略）')
+  }
 }
 
 // ── 收尾 ──────────────────────────────────────────────────────────────────────

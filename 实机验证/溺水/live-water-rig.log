@@ -1,0 +1,71 @@
+[12:40:56] 连 127.0.0.1:25565（wcwater_rig）…
+[12:40:57] 连上了：(2998,95,3000) 维度=overworld 模式=survival 血=18
+[12:40:57] 
+══════ 前置：OP 与造景能力 ══════
+[12:40:58]   ✓ bot 有 OP（/fill 真的生效了） — (400,102,400)=stone
+[12:40:58] 
+══════ ① 浅水（2 格深的水沟，旁边就是干岸）—— 成功 + 失败 ══════
+[12:40:59]   ✓ 成功用例：bot 真的泡在水里 — {"feet":{"x":397,"y":97,"z":400},"inWater":true}
+[12:41:00]   · 浅水 ⇒ ok=true escaped=false reason=improved kind=dry rounds=1
+[12:41:00]       话：挪近了 / 气在回 —— 还没脱险，接着来
+[12:41:00]   ✓ 🔴 旁边就是干岸 ⇒ 要么真出水，要么如实说"挪近了还没脱险"（不许含糊） — escaped=false reason=improved kind=dry
+[12:41:00]   ✓ 🔴 报 escaped 时，复核也必须同意"确实不在水里了" — inWater=true escaped=false
+[12:41:02]   ✓ 失败用例：bot 也在水里 — {"inWater":true}
+[12:41:16]   · 封闭 ⇒ ok=false escaped=false reason=budget-out kind=null rounds=1
+[12:41:16]       话：这一轮的 5 秒用完了 —— 过一会儿再叫我一次
+[12:41:16]   ✓ 🔴 密闭水里**不许**报 escaped（不许谎报脱险） — escaped=false reason=budget-out
+[12:41:16]   ✓ 收场原因是个说得通的码 — reason=budget-out
+[12:41:16] 
+══════ ② 封闭水下洞穴（六面包死、里面灌满水）—— 成功 + 失败 ══════
+[12:41:20]   ✓ 成功用例：bot 在洞穴水里 — {"inWater":true,"feet":{"x":400,"y":140,"z":400}}
+[12:41:30]   · 洞穴(封死) ⇒ ok=false escaped=false reason=rounds-out kind=passage rounds=2
+[12:41:30]       话：试了 2 条路线都没走通 —— 别在原地继续游，换个方向或者叫我用 mc_scan 看看四周
+[12:41:30]   ✓ 🔴 六面包死 ⇒ 不许报脱险 — escaped=false
+[12:41:30]   ✓ 话里给了下一步（别原地打转） — note=试了 2 条路线都没走通 —— 别在原地继续游，换个方向或者叫我用 mc_scan 看看四周
+[12:41:37]   · 洞穴(通天) ⇒ ok=true escaped=false reason=breathed kind=breath rounds=1
+[12:41:37]       话：到了那个能换气的地方（空气口袋），**但我还在水里** —— 这不算脱险，只是能喘口气
+[12:41:37]   ✓ 🔴 头顶通到天 ⇒ 要么真出水，要么如实说"还没走完"（不许含糊） — escaped=false kind=breath reason=breathed
+[12:41:37]   ✓ 🔴 报 escaped 时复核也得同意（人确实不在水里） — inWater=true escaped=false
+[12:41:37] 
+══════ ③ 狭窄竖井（1×1 水柱，只有头顶通）—— 成功 + 失败 ══════
+[12:41:43]   ✓ （水柱里位置可能被服务端挤出来，仍照测） — inWater=true
+[12:41:45]   · 竖井 ⇒ ok=true escaped=false reason=breathed kind=breath rounds=1
+[12:41:45]       话：到了那个能换气的地方（空气口袋），**但我还在水里** —— 这不算脱险，只是能喘口气
+[12:41:45]   ✓ 🔴 只有头顶通 ⇒ 应当**上浮**（breath/surface），不是往下钻 — escaped=false kind=breath reason=breathed
+[12:41:45]   ✓ 确实往上走了（y 没下降） — y 161.0 → 187.9
+[12:41:55]   · 竖井(封顶) ⇒ ok=false escaped=false reason=rounds-out kind=passage rounds=2
+[12:41:55]       话：试了 2 条路线都没走通 —— 别在原地继续游，换个方向或者叫我用 mc_scan 看看四周
+[12:41:55]   ✓ 🔴 封顶后**不许**报脱险 — escaped=false reason=rounds-out
+[12:41:55] 
+══════ ④ 空气口袋（水面上方有个能换气的口袋，但石顶还在）—— 成功 + 失败 ══════
+[12:41:58]   · 搜索层先看一眼：found=true kind=breath reason=ok candidates=12 unknown=0
+[12:41:58]   ✓ 🔴 搜索层认得水面之上那个空气口袋 — found=true kind=breath
+[12:41:59]   · 空气口袋 ⇒ ok=true escaped=false reason=breathed kind=breath rounds=1
+[12:41:59]       话：到了那个能换气的地方（空气口袋），**但我还在水里** —— 这不算脱险，只是能喘口气
+[12:41:59]   ✓ 整体判有进展（换到气也算） — ok=true reason=breathed
+[12:41:59]   ✓ 🔴 空气口袋不是终点：还在水里 ⇒ `escaped` 不许为 true — inWater=true escaped=false reason=breathed
+[12:41:59]   ✓ 话里明说"还在水里、不算脱险" — note=到了那个能换气的地方（空气口袋），**但我还在水里** —— 这不算脱险，只是能喘口气
+[12:42:13]   · 遗迹(灌满) ⇒ ok=false escaped=false reason=rounds-out kind=passage rounds=2
+[12:42:13]       话：试了 2 条路线都没走通 —— 别在原地继续游，换个方向或者叫我用 mc_scan 看看四周
+[12:42:13]   ✓ 🔴 没出口 ⇒ 不报脱险 — escaped=false reason=rounds-out
+[12:42:13] 
+══════ ⑤ 未知区块（没加载的格子必须单独计数）—— 成功 + 失败 ══════
+[12:42:13]   ✓ 远处区块确实没加载（`nameAt` 回 null） — nameAt=null
+[12:42:13]   ✓ 🔴 `unknownAt` 把"没加载"单独判出来（不当墙、也不当水道）
+[12:42:13]   ✓ 🔴 已加载的实心方块**不是** unknown（两者不能混）
+[12:42:18]   · 边缘处：(2999,97,3000) inWater=true
+[12:42:18]   · 边缘搜索：found=true reason=ok scanned=900 unknownCells=0 partial=true
+[12:42:18]   ✓ 🔴 搜索层把"未知格数"单独报出来了 — unknownCells=0
+[12:42:18]   ✓ 🔴 `partial` 明确说"这份结果不全" — partial=true
+[12:42:18]   ✓ 🔴 `partial` 与"截断 / 有未知格"一致（不虚报也不漏报） — partial=true truncated=true scanned=900 unknownCells=0
+[12:42:19]   · 边缘 ⇒ ok=true escaped=false reason=improved kind=dry rounds=1
+[12:42:19]       话：挪近了 / 气在回 —— 还没脱险，接着来
+[12:42:19]   ✓ 恢复层也把 `escaped` 说清楚（布尔，不是靠 reason 猜） — escaped=false
+[12:42:19]   ✓ 恢复层把 `unknownCells` 透传出来 — unknownCells=0
+[12:42:19]   ✓ 🔴 不变量：还泡在水里 ⇒ `escaped` 不许为 true — inWater=true escaped=false
+[12:42:19] 
+══════ 收尾：拆景 ══════
+[12:42:19]   ✓ 收尾指令已发（造景已拆）
+[12:42:19] 
+──────────────────────────────────────────────────
+[12:42:19] live-water-rig：pass=31 fail=0

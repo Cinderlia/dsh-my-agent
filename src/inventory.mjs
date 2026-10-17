@@ -135,6 +135,13 @@ export function toolDurability (b, { low = DUR_LOW, critical = DUR_CRITICAL } = 
   return out
 }
 
+/** 快坏的那几件拼成一行（`durabilityText` 与 `durWarnText` 共用同一份排版） */
+const badDurText = (bad) => {
+  const head = bad.some((i) => i.warn === 'critical') ? '🔴 马上要坏' : '⚠️ 快坏了'
+  return `${head}：` + bad.map((i) =>
+    `${i.name} ${i.left}/${i.max}（${Math.round(i.pct * 100)}%${i.where === 'equipped' ? '，穿在身上' : ''}）`).join('、')
+}
+
 /**
  * 上面那行的**文字版**（给 `mc_inventory` / `mc_observe` 用）：
  * - 全都好好的 ⇒ 一句"都还好，最紧的是 X"（**不报具体数字堆**，免得占地方）；
@@ -149,9 +156,20 @@ export function durabilityText (b, opts = {}) {
     const w = list[0]
     return `耐久：${list.length} 件会磨损的东西都还好（最紧的是 ${w.name} ${w.left}/${w.max}，${Math.round(w.pct * 100)}%）`
   }
-  const head = bad.some((i) => i.warn === 'critical') ? '🔴 马上要坏' : '⚠️ 快坏了'
-  return `${head}：` + bad.map((i) =>
-    `${i.name} ${i.left}/${i.max}（${Math.round(i.pct * 100)}%${i.where === 'equipped' ? '，穿在身上' : ''}）`).join('、')
+  return badDurText(bad)
+}
+
+/**
+ * **只报快坏的**那一版：全好 ⇒ `null`。
+ *
+ * 给"会磨损工具的动作"用（`mc_dig` / `mc_act{break}`）—— 这些动作每轮都在跑，
+ * 全好时也念一句"都还好"就是稳定噪声。而缺了它后果很实：镐子在 `mc_dig`
+ * **执行中间**爆掉时，AI 拿到的结果和"挖得好好的"一模一样，只能靠自己
+ * `mc_inventory` 去查（通常不会查）。坏的时候输出与 `durabilityText` 逐字相同。
+ */
+export function durWarnText (b, opts = {}) {
+  const bad = toolDurability(b, opts).filter((i) => i.warn)
+  return bad.length ? badDurText(bad) : null
 }
 
 /** 装备栏一行字（`头 空 · 身 铁胸甲x1 · 耐久 200/240 · 腿 空 · 脚 空 · 副手 空`） */

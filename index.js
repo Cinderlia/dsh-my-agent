@@ -49,8 +49,10 @@ import { perfWrap, perfSnapshot, perfText, perfReset } from './src/perf-monitor.
 import { terrainCacheStats } from './src/terrain.mjs'
 import { workerPoolStats } from './src/worker-pool.mjs'
 import { MemoryStore } from './src/memory.mjs'
-import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, personaTextKeyOf, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS } from './src/config.mjs'
+import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, personaTextKeyOf, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS, matchCommandList, isRegexEntry } from './src/config.mjs'
+import { COMMAND_GROUPS, catalogNames } from './src/commands.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
+import { msaCacheDir, msaHasCache, msaJobOf, msaJobStart, msaJobClear, msaSupported } from './src/msa.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, legacyAgentsMdPath, migrateLegacyAgentsMd, readAgentsMd, writeAgentsMd, resetAgentsMd, syncRulesVersion } from './src/agentsmd.mjs'
 import { wsConfigPath, isWsConfigData, migrate as migrateWorkspaceConfig, values as workspaceConfigValues, patch as patchWorkspaceConfig, readRulesVersion, readVersionPromptVersion } from './src/wsconfig.mjs'
 import { PROTECTED_FILES, isProtectedPathArg, WRITE_FILE_TOOLS, MEMORY_WRITE_ACTIONS, rejectionText } from './src/protected.mjs'
@@ -741,6 +743,9 @@ export function apply(ctx, rawConfig) {
    * 🔴 LLM 永远拿不到密码/token：工具只回基本信息；凭据只在这两个 helper 里出现，且不外传。
    * ------------------------------------------------------------------------ */
   const accounts = new AccountStore({ dir: stateDir, logger: ctx.logger ?? null })
+  /* 正版账户的令牌缓存**不在**宿主凭据服务里，而是 `prismarine-auth` 自己的一堆 json 文件
+     （`<stateDir>/msa/<innerID>/`）。账户库要能回答"这个正版号登录过没有"，就得知道目录怎么算。 */
+  accounts.msaDirOf = (innerID) => msaCacheDir(stateDir, innerID)
   /* 🔴 2026-10-15 审计（报告 E 第 1 条）：账户库读失败时**绝不能** `ensureDefaults()` + 写盘 ——
    *    那会把用户的账户库覆盖成"空库 + 一个默认离线号"，账户**永久丢失**（旧代码就是这么干的，
    *    而且一声不响）。读失败时只报错、不动盘，让人去修文件或从备份恢复。 */
@@ -772,6 +777,28 @@ export function apply(ctx, rawConfig) {
     const view = accounts.view(acc)
     if (acc.type === 'offline') {
       return { innerID: acc.innerID, label: view.name, auth: { mode: 'offline', name: view.name, uuid: view.uuid } }
+    }
+    /* 正版（Microsoft）：凭据是 `prismarine-auth` 的**令牌缓存文件**，没有密码、也没有我们自己的 token。
+       邮箱必填（缓存文件名认它）。登录本身不在这里做 —— 那是「MC设置 → 账户」里的一次设备码流程。 */
+    if (acc.type === 'microsoft') {
+      const email = String(acc.login ?? '').trim()
+      if (!email) {
+        const e = new Error(`正版账户「${view.name}」没有填微软邮箱`)
+        e.needUserAction = true
+        e.hint = '请在「MC设置」里给它补上邮箱，再点「登录」走一遍设备码'
+        throw e
+      }
+      if (!msaSupported()) {
+        const e = new Error('这台机器上找不到 prismarine-auth，正版登录用不了')
+        e.needUserAction = true
+        e.hint = '它应该跟 mineflayer 一起装在插件依赖里；缺了就重装一次插件'
+        throw e
+      }
+      return {
+        innerID: acc.innerID,
+        label: view.name,
+        auth: { mode: 'microsoft', msaEmail: email, msaCacheDir: msaCacheDir(stateDir, acc.innerID) },
+      }
     }
     const srv = accounts.listAuthServers().find((s) => s.id === acc.serverId)
     if (!srv) {
@@ -809,14 +836,16 @@ export function apply(ctx, rawConfig) {
     try {
       const acc = accounts.get(resolved.innerID)
       if (!acc) return
-      if (acc.type === 'yggdrasil') {
+      if (acc.type === 'yggdrasil' || acc.type === 'microsoft') {
         const patch = {}
         const uuid = dashUuid(profile?.id)
         if (uuid) patch.uuid = uuid
         if (profile?.name) patch.name = String(profile.name)
         if (session?.user?.id) patch.id = String(session.user.id)
         if (Object.keys(patch).length) accounts.update(resolved.innerID, patch)
-        if (session?.accessToken) {
+        /* ⚠️ 只有皮肤站把令牌写进宿主凭据服务：正版的令牌归 `prismarine-auth` 自己管
+           （写在 `<stateDir>/msa/<innerID>/`），我们**不碰**它 —— 抄一份反而会两边不同步。 */
+        if (acc.type === 'yggdrasil' && session?.accessToken) {
           const cur = await accounts.getCredential(resolved.innerID)
           await accounts.setCredential(resolved.innerID, {
             password: resolved.auth.authPass ?? cur?.password ?? null,
@@ -882,6 +911,8 @@ export function apply(ctx, rawConfig) {
        * （真正的异常在下面的 catch 里记 `quitError`）—— 名字跟语义反了，而且 `out` 会 JSON
        * 给前端看。改名 `quitOk`。 */
       quit: null, quitOk: false, killedJobs: [],
+      /* 调度器清账的结果（见 ② 后面的 `releaseAll`）—— 清不掉要说出来，别假装干净了 */
+      released: null, releaseError: null,
     }
 
     /** 停 LLM：优先 sessionController.cancel（宿主正路），退到 agent.cancel */
@@ -926,6 +957,15 @@ export function apply(ctx, rawConfig) {
       sess.mode = 'standby'
       out.order.push('quit-game')
     }
+    /* 🔴 2026-10-16 审计（P0-1，场景一）：**调度器要在"停"这条路上显式清一次**。
+     *   断线确实会 `releaseAll`（`src/connection.mjs` 的 `end` 事件），但那条路只在
+     *   **真的从在线变成离线**时走 —— 机器人本来就掉线、或者强断失败时，`end` 不会再响，
+     *   而表里可能还留着上一轮的动作（它们占着 movement / interaction 不放）。
+     *   人按「强制停止」的语义就是"全都停下"，所以这里不依赖事件、直接清。 */
+    try {
+      const rel = sess?.bot?.actionScheduler?.()?.releaseAll?.(`强制停止：${reason}`)
+      out.released = rel ?? null
+    } catch (e) { out.releaseError = String(e?.message ?? e) }
 
     // ③ 再强清该会话全部后台任务
     //
@@ -1047,6 +1087,35 @@ export function apply(ctx, rawConfig) {
       workspaceName: hasWorkspace ? workspaceTitleOfCwd(cwd) : null,
       commandWhitelist: pluginConfig.get('commandWhitelist'),
       allowAllCommands: pluginConfig.get('allowAllCommands'),
+      /* 「指令白名单」页那一排开关：目录（名字 + 说明 + danger）由 `src/commands.mjs` 给，
+       * `on` **一律由服务端算**（`commandInList`，只看名单）—— 客户端一行 import 都没有，
+       * 再抄一份匹配逻辑就等于有两个真相（踩坑档案第 103 条那个教训）。 */
+      commandCatalog: COMMAND_GROUPS.map((g) => ({
+        group: g.group,
+        items: g.items.map((it) => ({
+          name: it.name,
+          desc: it.desc,
+          ...(it.danger ? { danger: true } : {}),
+          on: pluginConfig.commandInList(it.name),
+        })),
+      })),
+      /* 白名单里"不是目录里某个精确名"的那些条目（正则 / `*` / 目录外的名字）。
+       * 设置页把它们**单独列出来带一个 ×**，绝不允许静默丢；`covers` 说清它现在罩着目录里哪几条
+       * —— 用户把 `give` 的开关拨下去却发现它还亮着时，答案就在这里。 */
+      commandExtra: (() => {
+        const names = catalogNames()
+        const wl = pluginConfig.get('commandWhitelist')
+        if (!Array.isArray(wl)) return []
+        const out = []
+        for (const raw of wl) {
+          const entry = String(raw ?? '').trim()
+          if (!entry) continue
+          // 目录里的精确名由上面那排开关负责，这里不重复列
+          if (!isRegexEntry(entry) && entry !== '*' && names.includes(entry.replace(/^\//, '').toLowerCase())) continue
+          out.push({ entry, covers: names.filter((n) => matchCommandList([entry], n)) })
+        }
+        return out
+      })(),
       injectDshMcAgentAgentsMd: ws ? ws.injectDshMcAgentAgentsMd : null,
       injectWorkspaceAgentsMd: ws ? ws.injectWorkspaceAgentsMd : null,
       // 「提示词」页的「随版本更新」（默认开；按工作区）
@@ -1264,9 +1333,35 @@ export function apply(ctx, rawConfig) {
       return ok({ account: accounts.view(accounts.get(acc.innerID)) })
     }
     if (path === '/api/mc/accounts' && req.method === 'PATCH') {
+      const innerID = String(body.innerID ?? '')
+      const cur = accounts.get(innerID)
+      if (!cur) throw new Error(`没有这个账户：${innerID}`)
       const patch = { ...body }
       delete patch.innerID
-      return ok({ account: accounts.update(String(body.innerID ?? ''), patch) })
+      delete patch.password
+      /* 第三方账户：和 POST 同一套 —— 允许换认证服务器（resolve-or-create）、顺手改名。
+         🔴 少了这一段，「编辑第三方账户」发来的 `serverUrl`/`password` 会被 `update()`
+            **静默忽略**（它只认 name / uuid / login / id / serverId / default），
+            用户改完会觉得"点了保存但没生效"。 */
+      if (cur.type === 'yggdrasil') {
+        let serverId = body.serverId ? String(body.serverId) : null
+        if (!serverId && body.serverUrl) {
+          const u = normalizeServerUrl(String(body.serverUrl))
+          const existing = accounts.listAuthServers().find((s) => s.url === u)
+          serverId = existing ? existing.id : accounts.addAuthServer({ name: body.serverName ?? null, url: u }).id
+        }
+        if (serverId) patch.serverId = serverId
+        if (serverId && body.serverName) {
+          const s = accounts.listAuthServers().find((x) => x.id === serverId)
+          const nm = String(body.serverName).trim()
+          if (s && nm && nm !== s.name) accounts.renameAuthServer(serverId, nm)
+        }
+      }
+      accounts.update(innerID, patch)
+      // 🔴 密码**留空 = 不改**：没给 `password` 就保持原来的那份凭据
+      if (body.password) await accounts.setCredential(innerID, { password: String(body.password) })
+      await accounts.refreshCredentialIndex()
+      return ok({ account: accounts.view(accounts.get(innerID)) })
     }
     if (path === '/api/mc/accounts' && req.method === 'DELETE') {
       return ok(await accounts.remove(String(body.innerID ?? '')))
@@ -1277,10 +1372,60 @@ export function apply(ctx, rawConfig) {
       if (resolved.auth.mode === 'offline') {
         return ok({ account: accounts.view(accounts.get(innerID)), note: '离线账户不需要认证（UUID 按名字派生）' })
       }
+      /* 正版账户**不能**在这里走 `authOnly` —— 缓存失效时它会启动一次设备码流程，
+         而用户在这条 HTTP 请求里根本看不到那个码（白等十几分钟才过期）。只如实报缓存状态。 */
+      if (resolved.auth.mode === 'microsoft') {
+        const has = msaHasCache(resolved.auth.msaCacheDir)
+        return ok({
+          account: accounts.view(accounts.get(innerID)),
+          note: has
+            ? '令牌缓存还在（真正的续期由 prismarine-auth 在连接时自己做）'
+            : '这个正版账户还没登录过（或缓存被清掉了）—— 点「登录」走一遍设备码',
+        })
+      }
       let captured = null
       await probeBot().authOnly(resolved.auth, { onSession: (s) => { captured = s } })
       if (captured) await persistAuth(resolved, captured.selectedProfile, captured)
       return ok({ account: accounts.view(accounts.get(innerID)) })
+    }
+    /* ── 正版（Microsoft）登录：设备码流程 ───────────────────────────────────
+     * 🔴 **绝不能占着一次 HTTP 请求等用户去浏览器点** —— POST 起一条后台任务后立刻返回，
+     *    前端拿 `userCode`/`verificationUri` 显示出来，再轮询 GET 看好了没有。
+     *    一个账户同时只跑一条（两条设备码会互相作废）。
+     * ---------------------------------------------------------------------- */
+    if (path === '/api/mc/accounts/msa' && req.method === 'POST') {
+      const innerID = String(body.innerID ?? '')
+      const acc = accounts.get(innerID)
+      if (!acc) throw new Error(`没有这个账户：${innerID}`)
+      if (acc.type !== 'microsoft') throw new Error('这个账户不是正版（微软）账户')
+      const email = String(acc.login ?? '').trim()
+      if (!email) throw new Error('这个正版账户还没填微软邮箱（先在「编辑」里补上）')
+      if (!msaSupported()) throw new Error('这台机器上找不到 prismarine-auth，正版登录用不了')
+      const job = msaJobStart({
+        innerID,
+        email,
+        cacheDir: msaCacheDir(stateDir, innerID),
+        /* 登录成功后把**游戏内名字/UUID**回写进账户库（跟皮肤站那条走同一个落点） */
+        onDone: (res) => {
+          try {
+            const patch = {}
+            const uuid = dashUuid(res?.uuid)
+            if (uuid) patch.uuid = uuid
+            if (res?.name) patch.name = String(res.name)
+            if (Object.keys(patch).length) accounts.update(innerID, patch)
+            logLine(`正版账户「${res?.name ?? email}」登录成功`)
+          } catch (e) { ctx.logger?.warn?.(`[dsh-mc-agent] 正版账户回写失败：${e.message}`) }
+        },
+      })
+      return ok({ job, account: accounts.view(accounts.get(innerID)) })
+    }
+    if (path === '/api/mc/accounts/msa' && req.method === 'GET') {
+      const innerID = String(url?.searchParams?.get('innerID') ?? '')
+      return ok({ job: innerID ? msaJobOf(innerID) : null, account: innerID ? accounts.view(accounts.get(innerID)) : null })
+    }
+    if (path === '/api/mc/accounts/msa' && req.method === 'DELETE') {
+      const innerID = String(body.innerID ?? url?.searchParams?.get('innerID') ?? '')
+      return ok({ cleared: msaJobClear(innerID) })
     }
     if (path === '/api/mc/authservers' && req.method === 'POST') {
       let url = body.url ? String(body.url) : null
@@ -1356,6 +1501,17 @@ export function apply(ctx, rawConfig) {
             path: null,
             isDefault: true,
             defaultText: DEFAULT_AGENTS_MD,
+            // 无工作区：两块都只是内置默认（只读展示），形状与有工作区分支保持一致
+            default: {
+              text: DEFAULT_AGENTS_MD,
+              source: 'default',
+              path: null,
+              exists: false,
+              isDefault: true,
+              bytes: Buffer.byteLength(DEFAULT_AGENTS_MD),
+              builtinText: DEFAULT_AGENTS_MD,
+              sharedWithSession: true,
+            },
             followVersion: false,
             rulesVersion: null,
             pluginVersion: PLUGIN_VERSION,
@@ -1379,12 +1535,32 @@ export function apply(ctx, rawConfig) {
         const wsPath = join(workspaceRootFor(safeAgentById(sessionId)), 'AGENTS.md')
         const cur = readAgentsMd(promptDir)
         const vp = readVersionPrompt(promptDir, PLUGIN_VERSION)
+        /* 「提示词」页分成**上下两块**（用户 2026-10-15）：
+         *   · 上：**默认提示词** = **基根**那份（`memoryBaseFor`）。新会话的记忆根是
+         *     `seedSessionRoot()` 从基根**拷** RULES.md 播种的（见 SESSION_SEED_FILES），
+         *     所以基根那份就是"以后新建的会话拿到的"，改它只影响**以后**的会话。
+         *   · 下：**会话提示词** = `memoryRootFor()`（本会话那份，就是 `cur`）。
+         * 🔴 没开 `memoryPerSession` 时 `base === promptDir`，两块是**同一份文件** —— 这时
+         *    必须如实告诉前端（`sharedWithSession`），不然"改上面那块"会让人以为没生效。 */
+        const baseDir = memoryBaseFor(cwd)
+        const baseCur = readAgentsMd(baseDir)
         return ok({
           text: cur.text,
           source: cur.source,
           path: cur.path,
           isDefault: cur.source === 'default',
           defaultText: DEFAULT_AGENTS_MD,
+          // 「默认提示词」那一块（基根 / 新会话的种子）
+          default: {
+            text: baseCur.text,
+            source: baseCur.source,
+            path: baseCur.path,
+            exists: existsSync(baseCur.path),
+            isDefault: baseCur.source === 'default',
+            bytes: Buffer.byteLength(baseCur.text),
+            builtinText: DEFAULT_AGENTS_MD,
+            sharedWithSession: baseDir === promptDir,
+          },
           // 「随版本更新」：开关 + 当前内容对应的版本 —— 都来自本工作区的 config.json（src/wsconfig.mjs）
           followVersion: wsCfgValues(cwd).rulesFollowVersion !== false,
           rulesVersion: readRulesVersion(promptDir),
@@ -1411,20 +1587,53 @@ export function apply(ctx, rawConfig) {
           readOnly: false,
         })
       }
-      // PUT / DELETE：写入必须有工作区（顺带建档）；target 选哪一份（rules 默认 / version）
+      // PUT / DELETE：写入必须有工作区（顺带建档）
+      //   · `target` 选哪一份（`rules` 默认 / `version` 版本提示）
+      //   · `scope`  选哪一块（`session` 默认 = 本会话那份 / `default` = **基根**那份，
+      //     也就是"以后新建的会话会拿到的那份"，见 `seedSessionRoot` / `SESSION_SEED_FILES`）
+      //   · `from`   （只对 DELETE + scope=session 有意义）`default` = 把**基根那份**重新播种进
+      //     本会话，而不是写回内置默认 —— 用户在「默认提示词」里定制过之后，"恢复默认"该回到
+      //     **他自己定的那个默认**，不是插件的出厂值。
       const gate = await gateOf(body)
       if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
-      const promptDir = memoryRootFor(gate.cwd, agentIdOf(safeAgentById(sessionId)))
+      const sessionDir = memoryRootFor(gate.cwd, agentIdOf(safeAgentById(sessionId)))
+      const baseDir = memoryBaseFor(gate.cwd)
       const isVersion = String(body.target ?? 'rules') === 'version'
+      const scope = String(body.scope ?? 'session') === 'default' ? 'default' : 'session'
+      // 版本提示只有会话那一份（不参与"默认 / 会话"分块）
+      const dir = (scope === 'default' && !isVersion) ? baseDir : sessionDir
       if (req.method === 'PUT') {
         return ok(isVersion
-          ? { ...writeVersionPrompt(promptDir, body.text, PLUGIN_VERSION), source: 'custom', target: 'version' }
-          : { ...writeAgentsMd(promptDir, body.text), source: 'custom', target: 'rules' })
+          ? { ...writeVersionPrompt(dir, body.text, PLUGIN_VERSION), source: 'custom', target: 'version', scope }
+          : { ...writeAgentsMd(dir, body.text), source: 'custom', target: 'rules', scope })
       }
       if (req.method === 'DELETE') {
-        return ok(isVersion
-          ? { ...resetVersionPrompt(promptDir, PLUGIN_VERSION), source: 'default', target: 'version' }
-          : { ...resetAgentsMd(promptDir), source: 'default', target: 'rules' })
+        if (isVersion) return ok({ ...resetVersionPrompt(dir, PLUGIN_VERSION), source: 'default', target: 'version', scope })
+        if (scope === 'default') return ok({ ...resetAgentsMd(dir), source: 'default', target: 'rules', scope })
+        // scope=session 且 from=default：用基根那份**重新播种**本会话
+        if (String(body.from ?? '') === 'default') {
+          const src = agentsMdPath(baseDir)
+          const dst = agentsMdPath(sessionDir)
+          // 没开 memoryPerSession 时两者是同一个文件 —— 拷自己会 EBUSY/EPERM，直接当"已经是默认"
+          if (src === dst) {
+            const same = readAgentsMd(sessionDir)
+            return ok({
+              restored: true, from: 'default', sharedWithSession: true, path: same.path,
+              bytes: Buffer.byteLength(same.text), source: same.source, target: 'rules', scope: 'session',
+            })
+          }
+          if (!existsSync(src)) return sendJson(res, 400, { ok: false, error: '默认提示词那份文件还不存在（先去上面那块点保存）' })
+          try {
+            if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true })
+            copyFileSync(src, dst)
+            const now = readAgentsMd(sessionDir)
+            return ok({
+              restored: true, from: 'default', path: now.path,
+              bytes: Buffer.byteLength(now.text), source: now.source, target: 'rules', scope: 'session',
+            })
+          } catch (e) { return sendJson(res, 500, { ok: false, error: `从默认播种失败：${e.message}` }) }
+        }
+        return ok({ ...resetAgentsMd(sessionDir), source: 'default', target: 'rules', scope })
       }
     }
     throw new Error(`未知的设置接口：${req.method} ${path}`)
@@ -2037,8 +2246,10 @@ export function apply(ctx, rawConfig) {
     description: '探测**局域网里的 Minecraft 服务器**（只读：不连接、不进服）。只听原版"对局域网开放"那条多播公告（`224.0.2.60:4445`，`[MOTD]…[/MOTD][AD]端口[/AD]`，1.5 秒一次），听到就拿到地址+端口+MOTD。\n'
       + '🔴 不扫端口、不发探测包，所以**恒定在 `seconds` 秒内返回**（默认 3，上限 15）；拿到 host/port 后用 `mc_connect` 进服。\n'
       + '没听到时：确认对方真开了"对局域网开放"（或 `enable-lan-visibility`）；部分 WiFi / VPN / 容器会挡多播，那种直接问对方地址。',
+    /* 🔴 审计：原来 parameters 里还声明了 mode（探测模式，目前只有 broadcast），但 execute 里
+     * 是**写死** broadcast、从不读 args.mode —— 声明一个读了也没用的旋钮，模型会以为能切模式。
+     * 删掉（真要加模式时再连实现一起加）。 */
     parameters: {
-      mode:    { type: 'string', description: '探测模式。目前只有 `broadcast`（默认）：听局域网公告' },
       seconds: { type: 'number', description: '听多久（默认 3 秒，上限 15）' },
     },
     output: text(),
@@ -2257,10 +2468,14 @@ export function apply(ctx, rawConfig) {
         try { watchOff = sess.watchdog.disarm(`下线：${why}`, { notify: true }) } catch (e) { watchErr = e?.message ?? String(e) }
       }
       const quit = await sess.bot.disconnect(why)      // 优雅优先，走不掉才强断
-      sess.mode = 'standby'
+      /* 🔴 审计：这里原来**无条件** `sess.mode = 'standby'`。可是 `disconnect()` 是"优雅优先、
+       * 走不掉才强断"，强断也失败时机器人**还在游戏里** —— 那时把 mode 写成 standby，
+       * 就是让 `modeView()` 里 `mode:"standby"` 与 `online:true` 自相矛盾（AI 会以为已经下线）。
+       * 只在真的下线了才切 standby；还在线就如实留着原模式。 */
+      const stillOnline = Boolean(sess.bot.online)
+      if (!stillOnline) sess.mode = 'standby'
       return {
-        // 🔴 审计报告 F10：`online` 别再硬编码 false —— 按真状态报（强断失败时它可能还在线）
-        online: Boolean(sess.bot.online), quit,
+        online: stillOnline, quit,
         watchdog: watchErr ? `关不掉（${watchErr}）` : watchOff ? '已关闭并已提醒' : '本来就没挂',
       }
     },
@@ -2370,9 +2585,11 @@ export function apply(ctx, rawConfig) {
             + '（协议数据更全），但属于未验证；连不上就如实反馈，别反复硬试。',
         },
         auth: {
-          modes: ['offline（离线账户）', 'yggdrasil（皮肤站/外置登录）'],
-          notSupported: ['microsoft（Mojang 官方正版登录）—— 暂不支持'],
-          note: '凭据只存本机 DSH 凭据库；AI 只能看到账户基本信息（innerID/ID/名字/UUID/服务器），看不到密码或 token。',
+          modes: ['offline（离线账户）', 'yggdrasil（皮肤站/外置登录）', 'microsoft（微软正版，设备码登录）'],
+          notSupported: msaSupported() ? [] : ['microsoft（微软正版）—— 这台机器上没找到 prismarine-auth，装不上就用不了'],
+          note: '凭据只存本机 DSH 凭据库（正版登录的令牌缓存按账户放在 <stateDir>/msa/<账户>/）；'
+            + 'AI 只能看到账户基本信息（innerID/ID/名字/UUID/服务器），看不到密码或 token。'
+            + '正版账户要先在「MC设置 → 账户」里点「登录」走一次设备码（在浏览器里输码），AI 替不了这一步。',
         },
         tools: {
           namespaces: {
@@ -2573,6 +2790,7 @@ export function apply(ctx, rawConfig) {
         return {
           mode: 'column', x: col.x, z: col.z, feetY: col.feetY, from: col.from, to: col.to,
           solidRun: col.solidRun, firstGap: col.firstGap, gaps: col.gaps, hazards: col.hazards,
+          here: col.here,
           unloaded: col.unloaded, complete: col.complete, runs: col.runs, layers: col.layers,
           text: columnText(col),
         }
@@ -2769,7 +2987,7 @@ export function apply(ctx, rawConfig) {
       + '· break  破坏 (x,y,z)：**先自动换对的工具**；换不上就拒绝\n'
       + '· use    使用方块或实体(who)：开门、按钮、拉杆、喂动物；都不给=用手上的东西\n'
       + '· useitem 用手上的东西：扔眼睛/雪球、拉弓、喝药水\n'
-      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。约 10 秒\n'
+      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。会看血/被围决定进退，结果看 outcome。约 10 秒\n'
       + '· equip  装备(name)：护甲自动穿到对应格（盾→副手），其余拿到手上；to 指定格子\n'
       + '· enchant 附魔台：自动开窗放料；option:0-2 真附魔，不给只报选项\n'
       + '· anvil   铁砧：action:combine(默认) / rename；item + name\n'
@@ -2940,6 +3158,7 @@ export function apply(ctx, rawConfig) {
        *    宿主的参数校验直接拒掉。与 `mc_sequence` 的 `steps` 保持同一种写法。 */
       steps: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '步骤表：[{id:"…", op:"mc_dig", args:{…}}, …]（也认纯字符串 id）' },
       force: { type: 'boolean', description: 'run 强行继续' },
+      budgetMs: { type: 'number', description: 'run 每轮预算毫秒（默认 8000）' },
     },
     output: text(),
     async execute(args, exec) {
@@ -3018,6 +3237,7 @@ export function apply(ctx, rawConfig) {
         if (!r?.ok) return { text: `📋 没有可恢复的任务（${r?.reason ?? '现在没有在做的事'}）。要开一件：直接 mc_dig {count:16} 这类"一次干一批"的调用，会自动开工。` }
         const t = r.task
         lines.push(`📋 ${t.taskId} · ${t.kind} · ${t.goal ?? ''} · ${t.status}`)
+        if (r.revived) lines.push(`▶️ 从「${r.wasStatus}」拉回「进行中」—— 可以接着做了`)
         if (r.step) lines.push(`步骤：${r.step}${r.stepAttempts ? `（当前这步试过 ${r.stepAttempts} 次）` : ''}`)
         lines.push(`现场复核：${r.verified ? `背包里有 ${r.have} 个，还差 ${r.need} 个` : `复核不了（${r.verifyNote ?? '读不到背包'}）`}`)
         lines.push(`下一步：${r.next} —— ${r.hint}`)
@@ -3122,6 +3342,7 @@ export function apply(ctx, rawConfig) {
       gap: { type: 'number', description: 'grid：格子间距（默认 8）' },
       labels: { type: 'array', items: { type: 'string' }, description: 'grid：每格标签（可中文）' },
       title: { type: 'string', description: 'grid：整图标题' },
+      x: { type: 'number' }, y: { type: 'number' },
     },
     output: text(),
     timeoutMs: 120_000,
@@ -4014,12 +4235,24 @@ export function apply(ctx, rawConfig) {
       if (mig.created) logDebug(`已建立工作区配置：${wsConfigPath(root)}${mig.seeded.length ? `（沿用了 ${mig.seeded.join('/')} 的旧全局值）` : ''}`)
       if (mig.markerRemoved) logDebug(`提示词版本标记已并入工作区配置：${wsConfigPath(root)}（旧的 .rules-version 已删除）`)
       if (mig.error) logLine(`工作区配置迁移跳过（不影响使用）：${mig.error}`)
-      /* 「随版本更新」（默认开，**按工作区**）：插件版本变了就用新版本默认准则替换文件里那份。
+      /* 「随版本更新」（默认开，**按工作区**）：插件版本变了就用新版本默认准则替换**基根**那份
+       * （=「默认提示词」，也就是以后新建的会话会拿到的模板）。
+       * 🔴 用户 2026-10-15：「对升级只动默认的，会话的不动」—— 所以这里同步的是 `memoryBaseFor(cwd)`，
+       * 不是本会话的 `root`：正在跑的那个会话不该被一次升级半路换掉规矩。
+       * 开关（`rulesFollowVersion`）仍从**本工作区**的 config.json 读（页面上的开关就写在那儿）。
+       * 覆盖前留一份 `RULES.md.bak-<旧版本>`（基根那份往往就是用户自己改过的模板）。
        * 第一次遇到（没有版本记录）只记版本、不覆盖；关着时也只记版本。 */
-      const sync = syncRulesVersion(root, PLUGIN_VERSION, { follow: workspaceConfigValues(root).rulesFollowVersion !== false })
-      if (sync.action === 'replaced') logLine(`插件已更新到 v${sync.to}：「随版本更新」开启 → 行事准则已替换为新版本默认内容（原为 v${sync.from}）`)
-      else if (sync.action === 'created') logLine(`已写入默认行事准则：${agentsMdPath(root)}（v${sync.to}）`)
-      else if (sync.error) logLine(`行事准则版本同步失败（不影响使用）：${sync.error}`)
+      const syncDir = memoryBaseFor(cwd)
+      const sync = syncRulesVersion(syncDir, PLUGIN_VERSION, {
+        follow: workspaceConfigValues(root).rulesFollowVersion !== false,
+        backup: true
+      })
+      if (sync.action === 'replaced') logLine(`插件已更新到 v${sync.to}：「随版本更新」开启 → **默认提示词**（基根那份）已替换为新版本默认内容（原为 v${sync.from}）${sync.backup ? `，旧的留在 ${sync.backup}` : ''}；本会话那份没动`)
+      else if (sync.action === 'created') logLine(`已写入默认提示词：${agentsMdPath(syncDir)}（v${sync.to}）`)
+      else if (sync.error) logLine(`默认提示词版本同步失败（不影响使用）：${sync.error}`)
+      /* 会话根那份**内容一个字不动**，但版本标记还是跟上 —— 页面上「注入本提示词 RULES.md」的
+       * 说明行显示的就是它（"当前内容对应：v…"）。`follow: false` = 只记版本、绝不覆盖内容。 */
+      try { syncRulesVersion(root, PLUGIN_VERSION, { follow: false }) } catch { /* 只记版本，失败无所谓 */ }
       /* 版本提示（`版本提示.md`，用户 2026-10-08 从硬编码提示词挪成文件）：与 RULES.md 同一套
        * 「随版本更新」语义，标记独立（`config.json` 的 `versionPromptVersion`）。 */
       const vpsync = syncVersionPrompt(root, PLUGIN_VERSION, { follow: workspaceConfigValues(root).rulesFollowVersion !== false })

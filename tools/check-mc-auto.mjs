@@ -563,7 +563,14 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
   ok('氧气 ≤4：按住 jump 抬一下（保命动作，和"脚下是岩浆"同类）', jumped(g) >= 1, JSON.stringify(g.w.calls.controls))
   ok('抬一下 + 水下自救都不还手、不打断 AI', g.w.calls.attacks.length === 0 && g.w.calls.interrupts.length === 0,
     JSON.stringify({ walks: g.w.walks.length, attacks: g.w.calls.attacks.length }))
-  ok('同一 tick 也照旧叫醒 AI（不是默默自救）', g.agent.steers.length === 1, String(g.agent.steers.length))
+  /* 🔴 2026-10-16 审计（P0-2）：氧气到危险线时 `recoverFromWater` 走"直接上浮换气"那条**短路**
+   *    （`src/water-recovery.mjs` 的 `air-out`），整条链路是同步的 ⇒ 同一个 tick 里既叫醒、
+   *    又立刻报"没出来"。所以这里不能再钉 `=== 1`：要钉的是**叫醒那条必须在**，
+   *    以及**走完照样报结果**（用户要求"绝不偷偷接管"）。 */
+  ok('同一 tick 也照旧叫醒 AI（不是默默自救）',
+    g.agent.steers.length >= 1 && /这不是被打/.test(steered(g)), String(g.agent.steers.length))
+  ok('🔴 自救走完照样报结果（绝不偷偷接管）—— 氧气不够时如实说"没出来"，不假装成功',
+    /我在水里没出来/.test(steered(g)) && /氧气/.test(steered(g)), steered(g).slice(-160))
 
   // ③ 氧气满：在水里也不叫醒（别神经过敏）
   const fine = setup({ world: { inWater: true, air: 20, health: 20 }, patch: { lookAround: false } })

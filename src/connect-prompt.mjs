@@ -32,7 +32,7 @@ export function buildConnectPrompt (ctx) {
     'Call mc_connect with that address and account, then use mc_events to see what happened.',
     // 注：曾经在这里注入过两句「单次调用 ≤N 秒」的英文规则（2026-10-08 加）。
     //     用户 2026-10-08 要求**取消注入**，规则挪进 `RULES.md`（行事准则，每个 MC 会话开场都会读）
-    //     —— 见 src/agentsmd.mjs 的 DEFAULT_AGENTS_MD「## 不用替我省 token」。
+    //     —— 见 src/agentsmd.mjs 的 DEFAULT_AGENTS_MD「## 感知」里那条「单次调用别超过 11 秒」。
   ]
   if (via === 'lan') {
     lines.push('The address points to a server on the local network and may be temporary.')

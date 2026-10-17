@@ -297,13 +297,6 @@ window.__ModuleLoader__.load({
 [data-wc-injectstatus]{font-size:12px;line-height:18px;color:var(--dsh-text-2,#9aa0a6);margin:0 0 8px;}
 [data-wc-injectstatus] [data-wc-note]{font-size:11px;line-height:16px;color:var(--dsh-text-3,#7a8085);margin-top:2px;}
 [data-wc-hint] strong{font-weight:600;color:var(--dsw-alias-label-primary,#e6e6e6);}
-/* 版本提示（**文件**，可编辑）：整块按普通小节排；只有说明行与折叠的"内置默认"用小灰字 */
-[data-wc-verprompt]{margin:0 0 10px;}
-[data-wc-verprompt] > [data-wc-note]{font-size:12px;line-height:17px;color:var(--dsh-text-2,#9aa0a6);margin:2px 0 6px;}
-[data-wc-verprompt] details{margin-top:6px;font-size:12px;color:var(--dsh-text-2,#9aa0a6);}
-[data-wc-verprompt] summary{cursor:pointer;}
-[data-wc-verprompt] pre{margin:6px 0 0;padding:8px 10px;border-radius:6px;white-space:pre-wrap;
-  background:var(--dsw-alias-bg-overlay);color:var(--dsh-text-1,#e6e6e6);font:inherit;font-size:11px;line-height:16px;}
 [data-wc-acctsub]{font-size:11px;line-height:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap;color:var(--dsw-alias-label-tertiary);}
 [data-wc-acctacts]{flex:none;display:flex;align-items:center;gap:2px;}
@@ -318,6 +311,11 @@ window.__ModuleLoader__.load({
   color:var(--dsw-alias-label-primary);}
 [data-wc-chip][data-wc-chip-default]{background:transparent;
   border:1px solid var(--dsw-alias-border-l3,var(--dsw-alias-border-l2,rgba(128,128,128,.3)));}
+/* ── 正版（微软）设备码登录：网址 + 大号代码（代码要能一眼看清、能选中） ── */
+[data-wc-msauri]{font-size:12px;line-height:18px;word-break:break-all;margin:6px 0 2px;}
+[data-wc-msacode]{font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);
+  font-size:26px;font-weight:700;letter-spacing:3px;text-align:center;padding:10px 0;
+  user-select:all;color:var(--dsw-alias-label-primary);}
 
 /* ── 新建/编辑：类型选择 / 字段 / 已缓存服务器标签 ─────────────────────── */
 [data-wc-typelist]{display:flex;flex-direction:column;gap:8px;}
@@ -483,9 +481,10 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       return e.hint ? `${msg}｜${e.hint}` : msg
     }
 
-    const whitelistToText = (arr) => (Array.isArray(arr) ? arr.join('\n') : '')
-    const textToWhitelist = (text) =>
-      String(text ?? '').split('\n').map((s) => s.trim()).filter(Boolean)
+    /* 2026-10-15 用户：「把命令都列出来并配上开关，把白名单和保存给去了」
+     *   ⇒ 白名单页不再是一个多行文本框，`whitelistToText` / `textToWhitelist` 这两个
+     *      "数组 ↔ 多行文本"的助手随之删掉（名单现在是数组，服务端下发 `commandCatalog`
+     *      逐条给 `on`）。 */
 
     /* ==================================================================
      * 现有：状态条（3s 轮询 /api/mc/status）
@@ -1357,16 +1356,28 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         acc.default ? h('span', { 'data-wc-chip': '', 'data-wc-chip-default': '' }, '默认') : null,
         h('span', { 'data-wc-spacer': '' }),
         h('div', { 'data-wc-acctacts': '' },
-          offline
-            ? h('button', {
-              type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: rowBusy,
-              onClick: () => props.onEdit(acc),
-            }, '编辑')
+          acc.type === 'microsoft'
+            /* 正版账户没有密码：身份是浏览器里输一次设备码换来的，所以主按钮是「登录」；
+               邮箱填错了就进「编辑」改（改了邮箱等于换了缓存目录，要重新登录一次）。 */
+            ? [
+              h('button', {
+                key: 'login', type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
+                disabled: rowBusy, title: '走设备码登录（在浏览器里输一次代码）',
+                onClick: () => props.onLogin(acc),
+              }, '登录'),
+              h('button', {
+                key: 'edit', type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: rowBusy,
+                title: '改名字 / 邮箱 / 认证服务器',
+                onClick: () => props.onEdit(acc),
+              }, '编辑'),
+            ]
+            /* 用户 2026-10-15：行里一律给「编辑」（原来第三方那格是「刷新」，改不了填错的东西）；
+               「刷新」挪到页头，一下刷全部（见 AccountsPane）。 */
             : h('button', {
               type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: rowBusy,
-              title: '刷新登录状态',
-              onClick: () => props.onRefresh(acc),
-            }, '刷新'),
+              title: offline ? '改名字 / UUID' : '改名字 / 账号 / 认证服务器',
+              onClick: () => props.onEdit(acc),
+            }, '编辑'),
           pendingDelete
             ? [
               h('button', {
@@ -1399,7 +1410,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const types = [
         { k: 'new-offline', name: '离线账户', desc: '不需要密码，名字就是身份' },
         { k: 'new-yggdrasil', name: '第三方账户', desc: '皮肤站等外置登录' },
-        { k: 'microsoft', name: '微软账户', desc: '未实现', off: true },
+        { k: 'new-microsoft', name: '正版账户', desc: '微软账号，走设备码登录' },
       ]
       return h('div', { 'data-wc-pane-page': 'accounts' },
         h('div', { 'data-wc-panehead': '' },
@@ -1473,7 +1484,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
     }
 
     /**
-     * 新建**第三方**账户（皮肤站）：**先填认证服务器，再填账号密码**。
+     * 新建 / 编辑**第三方**账户（皮肤站）：**先填认证服务器，再填账号密码**。
+     * 编辑时把现值填回去，**密码留空 = 不改密码**（认证服那边只在给了新密码时才覆盖凭据）。
      * 服务器那一块上面是**已缓存的**标签：点一下自动填进输入框，× 从缓存里删掉
      * （LittleSkin 也只是预置的缓存项，一样能删）。
      * 输入框下面有一块**看得见的虚线拽托区**：把 authlib-injector 卡片拖进来即可。
@@ -1483,12 +1495,20 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      *    **不是**"游戏内名字"——角色名是认证服返回的档案名，问用户填毫无意义（登录后被覆盖）。
      */
     function YggdrasilForm(props) {
-      const { servers = [], busyKey } = props
-      const [picked, setPicked] = React.useState(null)
-      const [url, setUrl] = React.useState('')
-      const [srvName, setSrvName] = React.useState('')
-      const [login, setLogin] = React.useState('')
-      const [asDefault, setAsDefault] = React.useState(false)
+      const { servers = [], busyKey, mode = 'new', account } = props
+      /* 新建 / 编辑共用同一个表单（`MicrosoftForm` 同款约定）。
+         🔴 2026-10-15 用户报的 bug：以前这里**只能新建**，而账户行里给第三方账户的「编辑」
+            被路由到了**离线表单**（那个表单没有服务器/密码，改完就把账户写成了离线）。
+         编辑时：现值填回去、**密码留空 = 不改密码**、标题与按钮换字。 */
+      const editing = mode === 'edit'
+      const srvUrl = editing ? (account?.server?.url ?? '') : ''
+      // 认证服务器可能已经从缓存里被删了（那时 `server.url` 是 null、名字是「(已移除的服务器)」）
+      const srvCached = srvUrl ? (servers.find((s) => s.url === srvUrl) ?? null) : null
+      const [picked, setPicked] = React.useState(srvCached ? srvCached.id : null)
+      const [url, setUrl] = React.useState(srvUrl)
+      const [srvName, setSrvName] = React.useState(srvCached ? (srvCached.name || '') : '')
+      const [login, setLogin] = React.useState(editing ? (account?.login ?? '') : '')
+      const [asDefault, setAsDefault] = React.useState(editing ? account?.default === true : false)
       const [dragging, setDragging] = React.useState(false)
       // 🔴 密码**不进 state**：非受控 input + ref，提交时读一次就丢；也不进任何 data-*
       const passRef = React.useRef(null)
@@ -1501,12 +1521,12 @@ select[data-wc-in]{appearance:none;padding-right:22px;
        *    让按钮的禁用条件与提交守卫完全一致，并且**提前把还差哪几项写出来**。
        */
       const [hasPass, setHasPass] = React.useState(false)
-      const busy = busyKey === 'new:yggdrasil'
+      const busy = busyKey === (editing ? `row:${account.innerID}:save` : 'new:yggdrasil')
       const pickedSrv = picked === null ? null : (servers.find((s) => s.id === picked) ?? null)
       const missing = []
       if (!url.trim()) missing.push('认证服务器地址')
       if (!login.trim()) missing.push('账号')
-      if (!hasPass) missing.push('密码')
+      if (!editing && !hasPass) missing.push('密码')
 
       /** 拖入 authlib-injector 卡片：交给后端解析、加进缓存，然后自动选中并填进输入框 */
       const onDropCard = (e) => {
@@ -1523,27 +1543,32 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const submit = () => {
         const u = url.trim()
         const p = passRef.current ? passRef.current.value : ''
-        if (!u || !login.trim() || !p) return
+        if (!u || !login.trim() || (!editing && !p)) return
         const nm = srvName.trim()
         // 账户显示名：先按账号名兜一个（登录/刷新成功后会被档案名覆盖）
         const fallback = login.trim().split('@')[0].replace(/[^\w\u4e00-\u9fa5.]/g, '').slice(0, 32) || 'MC'
-        props.onCreate({
+        const payload = {
           type: 'yggdrasil',
-          name: fallback,
+          // 编辑时**不碰显示名** —— 那多半已经被登录后的档案名覆盖过了，拿账号前缀盖回去是退步
+          ...(editing ? {} : { name: fallback }),
           login: login.trim(),
-          password: p,
           default: asDefault,
           // 选中的就是缓存里那条 → 用 serverId（改了名字才带上 serverName，让后端改名）
           ...(pickedSrv && pickedSrv.url === u
             ? { serverId: pickedSrv.id, ...(nm && nm !== pickedSrv.name ? { serverName: nm } : {}) }
             : { serverUrl: u, ...(nm ? { serverName: nm } : {}) }),
-        }, 'new:yggdrasil').then((ok) => { if (ok) props.onDone() })
+        }
+        // 🔴 编辑时密码留空 = 不改：后端只在给了 `password` 时才覆盖凭据
+        if (p) payload.password = p
+        const key = editing ? `row:${account.innerID}:save` : 'new:yggdrasil'
+        const run = editing ? props.onPatch(account.innerID, payload, key) : props.onCreate(payload, key)
+        run.then((ok) => { if (ok) props.onDone() })
       }
 
       return h('div', { 'data-wc-pane-page': 'accounts' },
         h('div', { 'data-wc-panehead': '' },
           h('button', { type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', onClick: props.onBack }, '← 返回'),
-          h('div', { 'data-wc-h': '' }, '新建第三方账户'),
+          h('div', { 'data-wc-h': '' }, editing ? '编辑第三方账户' : '新建第三方账户'),
         ),
         h(Field, { label: '认证服务器' },
           servers.length
@@ -1586,7 +1611,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             'data-wc-in': '', value: login, disabled: busy, autoComplete: 'off',
             onChange: (e) => setLogin(e.target.value),
           })),
-        h(Field, { label: '密码' },
+        h(Field, { label: editing ? '密码（留空 = 不改）' : '密码' },
           h('input', {
             'data-wc-in': '', type: 'password', ref: passRef, disabled: busy, autoComplete: 'off',
             onChange: (e) => { const v = e.target.value; setHasPass((prev) => ((v.length > 0) === prev ? prev : v.length > 0)) },
@@ -1605,7 +1630,130 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             disabled: busy || missing.length > 0,
             title: missing.length ? '还差：' + missing.join('、') : '',
             onClick: submit,
-          }, busy ? '创建中…' : '创建'),
+          }, busy ? (editing ? '保存中…' : '创建中…') : (editing ? '保存' : '创建')),
+        ),
+      )
+    }
+
+    /**
+     * 新建 / 编辑**正版（微软）**账户。
+     * 这一步只收**邮箱** —— 它是 `prismarine-auth` 认令牌缓存的那把钥匙（缓存文件名按它起）。
+     * 游戏内名字要等登录成功才拿得到，所以这里不填也行（登录后后端会回写）。
+     */
+    function MicrosoftForm(props) {
+      const { busyKey, mode = 'new', account } = props
+      const editing = mode === 'edit'
+      const [email, setEmail] = React.useState(editing ? (account?.login ?? '') : '')
+      const key = editing ? 'row:' + account.innerID + ':save' : 'new:microsoft'
+      const busy = busyKey === key
+      const ok = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+
+      const submit = () => {
+        if (!ok || busy) return
+        if (editing) {
+          props.onPatch(account.innerID, { login: email.trim() }, key).then((r) => { if (r) props.onDone() })
+        } else {
+          props.onCreate({ type: 'microsoft', login: email.trim() }, key).then((r) => { if (r) props.onDone() })
+        }
+      }
+
+      return h('div', { 'data-wc-pane-page': 'accounts' },
+        h('div', { 'data-wc-panehead': '' },
+          h('button', { type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', onClick: props.onBack }, '← 返回'),
+          h('div', { 'data-wc-h': '' }, editing ? '编辑正版账户' : '新建正版账户'),
+        ),
+        h(Field, { label: '微软账号邮箱' },
+          h('input', {
+            'data-wc-in': '', value: email, disabled: busy, autoFocus: true, spellCheck: false,
+            placeholder: 'you@example.com',
+            onChange: (e) => setEmail(e.target.value),
+            onKeyDown: (e) => { if (e.key === 'Enter') submit() },
+          })),
+        h('div', { 'data-wc-note': '' },
+          '不用在这里输密码。建好之后点那个账户的「登录」，页面会给一个 8 位代码和一个网址，去浏览器里输一次就行。'),
+        h('div', { 'data-wc-acts': '' },
+          h('span', { 'data-wc-spacer': '' }),
+          h('button', {
+            type: 'button', 'data-wc-btn': '', 'data-wc-primary': '', disabled: busy || !ok,
+            onClick: submit,
+          }, busy ? '保存中…' : (editing ? '保存' : '创建')),
+        ),
+      )
+    }
+
+    /**
+     * 正版账户的**设备码登录**界面。
+     * 服务端起一条后台任务（`onStart`），这里把 `userCode` / `verificationUri` 显示出来，
+     * 然后每 2 秒问一次「好了没有」（`onPoll`）。
+     * 🔴 码是**一次性**的：点「重新开始」会拿到新码，旧码作废。
+     */
+    function MicrosoftLogin(props) {
+      const { account, onBack, onReload, onStart, onPoll } = props
+      const innerID = account.innerID
+      const [job, setJob] = React.useState(null)
+      const [err, setErr] = React.useState('')
+      const [copied, setCopied] = React.useState(false)
+      const state = err ? 'error' : (job?.state ?? 'starting')
+
+      const start = React.useCallback(() => {
+        setErr(''); setJob(null); setCopied(false)
+        Promise.resolve()
+          .then(() => onStart(innerID))
+          .then((j) => setJob(j))
+          .catch((e) => setErr(errorText(e)))
+      }, [innerID, onStart])
+
+      React.useEffect(() => { start() }, [start])
+
+      React.useEffect(() => {
+        if (state !== 'pending') return undefined
+        const t = setInterval(() => {
+          Promise.resolve()
+            .then(() => onPoll(innerID))
+            .then((j) => { if (j) setJob(j) })
+            .catch(() => { /* 单次轮询失败不算数，下一次接着问 */ })
+        }, 2000)
+        return () => clearInterval(t)
+      }, [state, innerID, onPoll])
+
+      React.useEffect(() => {
+        if (state === 'done') { try { onReload?.() } catch { /* 刷新列表失败不影响登录结果 */ } }
+      }, [state, onReload])
+
+      const code = job?.code?.userCode ?? null
+      const uri = job?.code?.verificationUri ?? null
+      const done = job?.state === 'done'
+
+      return h('div', { 'data-wc-pane-page': 'accounts', 'data-wc-msalogin': '' },
+        h('div', { 'data-wc-panehead': '' },
+          h('button', { type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', onClick: onBack }, '← 返回'),
+          h('div', { 'data-wc-h': '' }, `登录「${account.name}」`),
+        ),
+        err ? h('div', { 'data-wc-warnnote': '' }, err) : null,
+        done
+          ? h('div', { 'data-wc-oknote': '' },
+            `登录成功：${job?.result?.name ?? account.name}。现在可以连服务器了。`)
+          : job?.state === 'error'
+            ? h('div', { 'data-wc-warnnote': '' },
+              `登录失败：${job?.error ?? '原因不明'}`,
+              h('div', { 'data-wc-dim': '' }, '点下面的「重新开始」会给你一个新代码。'))
+            : h('div', null,
+              h('div', { 'data-wc-dim': '' }, '在浏览器里打开下面这个网址，输入代码，然后回来等一会儿（这个页面会自己更新）。'),
+              h('div', { 'data-wc-msauri': '' },
+                uri
+                  ? h('a', { href: uri, target: '_blank', rel: 'noreferrer' }, uri)
+                  : h('span', { 'data-wc-dim': '' }, '正在向微软要代码…')),
+              h('div', { 'data-wc-msacode': '' }, code ?? '……'),
+              h('div', { 'data-wc-acts': '' },
+                h('button', {
+                  type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: !code,
+                  onClick: () => { try { navigator.clipboard.writeText(code); setCopied(true) } catch { /* 剪贴板不给用就算了 */ } },
+                }, copied ? '已复制' : '复制代码'),
+                h('span', { 'data-wc-spacer': '' }),
+                h('span', { 'data-wc-dim': '' }, job?.state === 'pending' ? '等你在浏览器里完成…' : '正在准备…'),
+              )),
+        h('div', { 'data-wc-acts': '' },
+          h('button', { type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', onClick: start }, '重新开始'),
         ),
       )
     }
@@ -1618,6 +1766,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
      */
     function AccountsPane(props) {
       const { accounts = [], servers = [], busyKey } = props
+      const busy = busyKey !== null
       const [view, setView] = React.useState('list')
       const [editing, setEditing] = React.useState(null)
       const back = () => { setEditing(null); setView('list') }
@@ -1629,10 +1778,24 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           onBack: back, onDone: back, onPatch: props.onPatch, onCreate: props.onCreate,
         })
       }
-      if (view === 'new-yggdrasil') {
+      if (view === 'new-yggdrasil' || view === 'edit-yggdrasil') {
         return h(YggdrasilForm, {
-          servers, busyKey, onBack: back, onDone: back, onCreate: props.onCreate,
+          mode: view === 'edit-yggdrasil' ? 'edit' : 'new', account: editing, busyKey,
+          servers, onBack: back, onDone: back, onPatch: props.onPatch, onCreate: props.onCreate,
           onRemoveServer: props.onRemoveServer, onAddCard: props.onAddCard,
+        })
+      }
+      /* 正版（微软）：先建账户（只填邮箱），再点「登录」走设备码 */
+      if (view === 'new-microsoft' || view === 'edit-microsoft') {
+        return h(MicrosoftForm, {
+          mode: view === 'edit-microsoft' ? 'edit' : 'new', account: editing, busyKey,
+          onBack: back, onDone: back, onPatch: props.onPatch, onCreate: props.onCreate,
+        })
+      }
+      if (view === 'msa-login' && editing) {
+        return h(MicrosoftLogin, {
+          account: editing, onBack: back, onReload: props.onReload,
+          onStart: props.onMsaStart, onPoll: props.onMsaPoll,
         })
       }
 
@@ -1640,6 +1803,13 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         h('div', { 'data-wc-panehead': '' },
           h('div', { 'data-wc-h': '' }, `账户（${accounts.length}）`),
           h('span', { 'data-wc-spacer': '' }),
+          /* 用户 2026-10-15：刷新挪到页头（在「添加」左边）—— 原来每行一个，只能刷那一个；
+             现在一下刷全部（逐个走刷新接口，各自按类型处理：离线不认证、正版只报缓存状态）。 */
+          h('button', {
+            type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: busy,
+            title: '刷新所有账户的登录状态',
+            onClick: () => props.onRefreshAll?.(),
+          }, busyKey === 'acct:refreshAll' ? '刷新中…' : '刷新'),
           h('button', {
             type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
             onClick: () => setView('pick'),
@@ -1648,74 +1818,94 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         accounts.length
           ? accounts.map((a) => h(AccountRow, {
             key: a.innerID, account: a, busyKey,
-            onEdit: (acc) => { setEditing(acc); setView('edit-offline') },
-            onRefresh: props.onRefresh, onDelete: props.onDelete,
+            onEdit: (acc) => {
+              setEditing(acc)
+              // 🔴 三种类型各有各的表单：第三方账户漏了分支就会被送进**离线表单**
+              //    （2026-10-15 用户报的 bug：「我用的是第三方皮肤站账号，点编辑进去还是离线账号」）
+              setView(acc.type === 'microsoft' ? 'edit-microsoft' : acc.type === 'yggdrasil' ? 'edit-yggdrasil' : 'edit-offline')
+            },
+            onLogin: (acc) => { setEditing(acc); setView('msa-login') },
+            onDelete: props.onDelete,
           }))
           : h('div', { 'data-wc-dim': '' }, '还没有账户，点右上角「添加」。'),
       )
     }
 
     /* ---------------------------------------------------------- 页 2：指令白名单 */
-
+    /*
+     * 2026-10-15 用户：「把命令都列出来并配上开关，把白名单和保存给去了」
+     *   ⇒ 不再是一个自由文本框 + 「保存」，而是**目录里每条指令一个开关，拨一下就存**。
+     *   🔴 `on` 一律是**服务端**算好下发的（`commandInList`，只看名单）—— 客户端一行 import
+     *      都没有，自己再抄一份匹配逻辑就等于有两个真相（踩坑档案第 103 条那个教训）。
+     *   🔴 白名单里"不在目录里"的条目（正则 / `*` / 目录外的名字）**单独列出来带一个 ×**，
+     *      绝不静默丢掉 —— 否则用户永远不知道为什么关了开关那条指令还能用。
+     */
     function WhitelistPane(props) {
-      const { wlText, allowAll, busyKey, cfgOk, onWlText, onAllowAll, onSave } = props
+      const {
+        catalog = [], extra = [],
+        allowAll, busyKey, cfgOk,
+        onAllowAll, onToggleCmd, onDropEntry,
+      } = props
       const busy = busyKey !== null
-      const saveBusy = busyKey === 'wl:save'
-      // 开关**一拨就存**（用户 2026-09-16 定）；下面那份白名单仍然要点「保存」
+      // 开关**一拨就存**（用户 2026-09-16 定）
       const allowBusy = busyKey === 'cfg:allowAll'
       /**
-       * 🔴 2026-10-15 审计（报告第 2 条）：`/api/mc/config` 没读出来 ⇒ `wlText` 是初始空串。
-       *    「保存」在那种状态下会把服务端真实白名单**清空**，所以这里硬禁用。
-       *    （开关是单键写入、写的是用户明确选的值，不具破坏性，不禁用。）
+       * 🔴 2026-10-15 审计（报告第 2 条）：`/api/mc/config` 没读出来 ⇒ 名单是空的、目录也是空的。
+       *    那种状态下拨任何一个开关都会拿"空的名单 + 这一条"去覆盖服务端真实白名单，所以全部禁用。
+       *    （「允许所有指令」是单键写入、写的是用户明确选的值，不具破坏性，不禁用。）
        */
       const cfgBad = cfgOk === false
+      const locked = allowAll === true
+      const rowOff = busy || cfgBad || locked
 
-      return React.createElement(
-        'div',
-        { 'data-wc-pane-page': 'whitelist' },
-        React.createElement('div', { 'data-wc-sec': '' },
-          React.createElement(Switch, {
+      return h('div', { 'data-wc-pane-page': 'whitelist' },
+        h('div', { 'data-wc-sec': '' },
+          h(Switch, {
             label: '允许所有指令',
             disabled: allowBusy,
             on: allowAll === true,
             onToggle: (next) => onAllowAll(next),
           }),
-          React.createElement('div', { 'data-wc-h': '' }, '指令白名单（一行一条）'),
+          h('div', { 'data-wc-h': '' }, '指令白名单'),
           cfgBad
-            ? React.createElement('div', { 'data-wc-warnnote': '' },
-              '配置没读出来，白名单内容不可信 —— 「保存」已禁用（现在保存会清空服务端真实白名单）。关掉再打开这个窗口重试。')
+            ? h('div', { 'data-wc-warnnote': '' },
+              '配置没读出来，下面的开关不可信 —— 已全部禁用（现在改会拿空名单覆盖服务端真实白名单）。关掉再打开这个窗口重试。')
             : null,
-          allowAll
-            ? React.createElement('div', { 'data-wc-warnnote': '' }, '已允许所有指令，白名单不再生效。')
+          locked
+            ? h('div', { 'data-wc-warnnote': '' }, '已允许所有指令，白名单不再生效（关掉上面的开关才能改）。')
             : null,
-          React.createElement('textarea', {
-            'data-wc-textarea': '',
-            ...(allowAll ? { 'data-wc-dimmed': '', readOnly: true } : {}),
-            value: wlText,
-            spellCheck: false,
-            disabled: busy && !allowAll,
-            placeholder: 'tp\ngive\n/^gi.+/',
-            title: allowAll ? '已允许所有指令，白名单暂不生效（关掉上面的开关才能编辑）' : '一行一条',
-            onChange: (e) => { if (!allowAll) onWlText(e.target.value) },
-          }),
-          React.createElement(
-            'p',
-            { 'data-wc-hint': '' },
-            '精确名 ', React.createElement('code', { 'data-wc-code': '' }, 'tp'),
-            ' · 正则 ', React.createElement('code', { 'data-wc-code': '' }, '/^gi.+/'),
-            ' · ', React.createElement('code', { 'data-wc-code': '' }, '*'),
-            ' 全部放行',
-          ),
-          React.createElement(
-            'div',
-            { 'data-wc-acts': '' },
-            React.createElement('button', {
-              type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
-              disabled: busy || cfgBad,
-              title: cfgBad ? '配置没读出来，先别保存' : '',
-              onClick: onSave,
-            }, saveBusy ? '保存中…' : '保存'),
-          ),
+          extra.length
+            ? h('div', { 'data-wc-cmdextra': '' },
+              h('div', { 'data-wc-cmdgrouph': '' }, '自定义条目'),
+              ...extra.map((x) => h('div', { 'data-wc-cmdrow': '' },
+                h('div', { 'data-wc-cmdmain': '' },
+                  h('span', { 'data-wc-cmdname': '' }, h('code', { 'data-wc-code': '' }, x.entry)),
+                  h('span', { 'data-wc-cmddsc': '' },
+                    (x.covers ?? []).length
+                      ? `罩着：${x.covers.slice(0, 10).join('、')}${x.covers.length > 10 ? ` 等 ${x.covers.length} 条` : ''}`
+                      : '没匹配到目录里的任何指令'),
+                ),
+                h('button', {
+                  type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '',
+                  disabled: busy || cfgBad,
+                  title: '从白名单里删掉这一条',
+                  onClick: () => onDropEntry(x.entry),
+                }, '×'),
+              )),
+            )
+            : null,
+          ...catalog.map((g) => h('div', { 'data-wc-cmdgroup': '' },
+            h('div', { 'data-wc-cmdgrouph': '' }, g.group),
+            ...g.items.map((it) => h(Switch, {
+              label: h('span', { 'data-wc-cmdname': '' }, it.name,
+                it.danger ? h('span', { 'data-wc-danger': '' }, '危险') : null),
+              desc: it.desc,
+              on: it.on === true,
+              disabled: rowOff,
+              title: it.danger ? '会不可逆地影响世界 / 服务器 / 别人' : `放行 ${it.name}`,
+              onToggle: (next) => onToggleCmd(it.name, next),
+            })),
+          )),
         ),
       )
     }
@@ -1730,16 +1920,17 @@ select[data-wc-in]{appearance:none;padding-right:22px;
          *    上层已经把 `mdPath` 当 prop 传进来了（`:2349`），补上解构即可。 */
         mdText, mdSource, mdPath, wsExists, rulesExists, injectStatus,
         injectWc, injectWs, busyKey, onMdText, onSave, onReset, onInjectWc, onInjectWs,
-        followVersion, rulesVersion, pluginVersion, versionPrompt, onFollowVersion, hasWorkspace,
-        vpText, onVpText, onVpSave, onVpReset,
+        followVersion, rulesVersion, pluginVersion, onFollowVersion, hasWorkspace,
+        // 「默认提示词」那一块（基根 / 新会话的种子）
+        dfText, dfInfo, dfReady, onDfText, onDfSave, onDfReset,
       } = props
       const busy = busyKey !== null
       const [confirmReset, setConfirmReset] = React.useState(false)
-      const [confirmVpReset, setConfirmVpReset] = React.useState(false)
+      const [confirmDfReset, setConfirmDfReset] = React.useState(false)
       const saveBusy = busyKey === 'md:save'
       const resetBusy = busyKey === 'md:reset'
-      const vpSaveBusy = busyKey === 'vp:save'
-      const vpResetBusy = busyKey === 'vp:reset'
+      const dfSaveBusy = busyKey === 'df:save'
+      const dfResetBusy = busyKey === 'df:reset'
       const followBusy = busyKey === 'cfg:follow'
       const seg = injectStatus?.segments ?? {}
       const mark = (on) => (on ? '✓' : '✗')
@@ -1760,10 +1951,76 @@ select[data-wc-in]{appearance:none;padding-right:22px;
                 : null,
             )
             : null,
-          // 🔴 2026-10-08：注入**只投一行指针**（文件路径 + 读法），正文由会话自己
-          //    `mc_kit_memory {action:"read"}` 去读 ⇒ 改这里**立刻生效**，不用重启、不用重投。
+        ),
+
+        /* ── 上块：默认提示词（基根那份 = 新会话的种子）─────────────────────────
+         * 用户 2026-10-15：「分为会话提示词和默认提示词」。新会话的记忆根是
+         * `seedSessionRoot()` 从**基根**拷 `RULES.md` 播种的 ⇒ 改这块只影响**以后**的会话。 */
+        React.createElement('div', { 'data-wc-sec': '', 'data-wc-defprompt': '' },
+          React.createElement('div', { 'data-wc-h': '' },
+            '默认提示词 ',
+            h(FileName, { key: 'f', name: 'RULES.md', missing: dfInfo?.exists === false })),
           React.createElement('div', { 'data-wc-note': '' },
-            '规则放在文件里，注入只投一行指针（路径 + 读法），正文由会话自己去读 —— 所以改完立刻生效，不用重启。'
+            '以后新建的会话用的就是这一份（新会话的记忆根会从它拷一份过去）—— '
+            + '改它不影响当前会话。'
+            + (dfInfo?.path ? `文件：${dfInfo.path}` : '')),
+          // 🔴 没开 memoryPerSession 时基根 === 会话根，两块是**同一份文件**。
+          //    不说清楚的话，用户会以为"改上面那块对本会话没生效"，其实是同一处。
+          dfInfo?.sharedWithSession === true
+            ? React.createElement('div', { 'data-wc-warnnote': '' },
+              '⚠️ 「记忆按会话分」没开（memoryPerSession），这一块和下面的「会话提示词」其实是'
+              + '同一份文件 —— 在这里改就等于改本会话。')
+            : null,
+          // 🔴 服务端还没重载时（改了 index.js 但 DSH 宿主没重启/没重载插件），GET 回的仍是旧形状
+          //    ⇒ 这里读不到内容。**必须挡住保存**：旧服务端不认 `scope:'default'`，
+          //    会把这段文字写进**本会话**那份，看着像"改默认"，其实是把当前会话覆盖了。
+          !dfReady
+            ? React.createElement('div', { 'data-wc-warnnote': '' },
+              '⚠️ 服务端还没重载（index.js 改过之后要重启 DSH 或重新加载插件才生效）—— '
+              + '这一块现在读不到内容，也先别保存（旧服务端会把它写进当前会话那份）。')
+            : null,
+          React.createElement('textarea', {
+            'data-wc-textarea': '', 'data-wc-tall': '', value: dfText, spellCheck: false,
+            disabled: busy || !dfReady,
+            ...(hasWorkspace ? {} : { readOnly: true, 'data-wc-dimmed': '' }),
+            onChange: (e) => { if (hasWorkspace && dfReady) onDfText(e.target.value) },
+          }),
+          hasWorkspace && dfReady
+            ? React.createElement(
+              'div',
+              { 'data-wc-acts': '' },
+              React.createElement('button', {
+                type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
+                disabled: busy, onClick: onDfSave,
+              }, dfSaveBusy ? '保存中…' : '保存'),
+              confirmDfReset
+                ? React.createElement('button', {
+                  type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-danger': '', disabled: busy,
+                  title: '再点一次确认',
+                  onClick: () => { setConfirmDfReset(false); onDfReset() },
+                }, dfResetBusy ? '恢复中…' : '确认恢复')
+                : React.createElement('button', {
+                  type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-danger': '', disabled: busy,
+                  title: '恢复成插件内置的那份（出厂值）',
+                  onClick: () => setConfirmDfReset(true),
+                }, '恢复内置默认'),
+              confirmDfReset
+                ? React.createElement('button', {
+                  type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: busy,
+                  onClick: () => setConfirmDfReset(false),
+                }, '取消')
+                : null,
+            )
+            : null,
+        ),
+
+        /* ── 下块：会话提示词（本会话正在用的那份）─────────────────────────── */
+        React.createElement('div', { 'data-wc-sec': '', 'data-wc-sessionprompt': '' },
+          React.createElement('div', { 'data-wc-h': '' },
+            '会话提示词 ',
+            h(FileName, { key: 'f', name: 'RULES.md', missing: rulesExists === false })),
+          React.createElement('div', { 'data-wc-note': '' },
+            '本会话正在用的那份。'
             + (mdPath ? `文件：${mdPath}` : '（还没有工作区，这份是内置默认，只读）')),
           // 无工作区：正文只读、展示内置默认提示词（服务端回的 text 就是默认那份）
           React.createElement('textarea', {
@@ -1788,9 +2045,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
                 }, resetBusy ? '恢复中…' : '确认恢复')
                 : React.createElement('button', {
                   type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-danger': '', disabled: busy,
-                  title: '恢复默认提示词',
+                  title: '用上面「默认提示词」那一份重新播种本会话',
                   onClick: () => setConfirmReset(true),
-                }, '恢复默认'),
+                }, '恢复为默认'),
               confirmReset
                 ? React.createElement('button', {
                   type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: busy,
@@ -1802,69 +2059,17 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         ),
         React.createElement('div', { 'data-wc-sec': '' },
           React.createElement('div', { 'data-wc-h': '' }, '注入'),
-          // 🔴 版本提示**现在是文件**（`<记忆根>/版本提示.md`，用户 2026-10-08：
-          //    "把规则放在文件里，让每个新会话直接去读文件"）。
-          //    注入只投**一行指针**（路径 + 读法），正文由会话自己 `mc_kit_memory {action:"read"}`
-          //    去读 ⇒ 这里改完**立刻生效**，不用重启、也不用重投。
-          //    「随版本更新」对它同样有效（只有插件版本变了才替换）。
-          //    无工作区时照样显示（它跟工作区无关），只是只读。
-          versionPrompt
-            ? React.createElement('div', { 'data-wc-sec': '', 'data-wc-verprompt': '' },
-              React.createElement('div', { 'data-wc-h': '' },
-                '版本提示 ',
-                h(FileName, { key: 'f', name: '版本提示.md', missing: versionPrompt.source === null }),
-                versionPrompt.version
-                  ? React.createElement('span', { 'data-wc-dim': '' }, `（dsh-mc-agent v${versionPrompt.version}）`)
-                  : null),
-              React.createElement('div', { 'data-wc-note': '' },
-                `当前内容对应：${versionPrompt.versionPromptVersion ? `v${versionPrompt.versionPromptVersion}` : '未知（还没同步过）'}`
-                + `　·　本插件：v${versionPrompt.version || '?'}`
-                + '　·　注入只投一行指针，正文由会话自己去读（改这里立刻生效，不用重启）'),
-              React.createElement('textarea', {
-                'data-wc-textarea': '', 'data-wc-tall': '', value: vpText, spellCheck: false,
-                disabled: busy,
-                ...(hasWorkspace ? {} : { readOnly: true, 'data-wc-dimmed': '' }),
-                onChange: (e) => { if (hasWorkspace) onVpText(e.target.value) },
-              }),
-              hasWorkspace
-                ? React.createElement(
-                  'div',
-                  { 'data-wc-acts': '' },
-                  React.createElement('button', {
-                    type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
-                    disabled: busy, onClick: onVpSave,
-                  }, vpSaveBusy ? '保存中…' : '保存'),
-                  confirmVpReset
-                    ? React.createElement('button', {
-                      type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-danger': '', disabled: busy,
-                      title: '再点一次确认',
-                      onClick: () => { setConfirmVpReset(false); onVpReset() },
-                    }, vpResetBusy ? '恢复中…' : '确认恢复')
-                    : React.createElement('button', {
-                      type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-danger': '', disabled: busy,
-                      title: '恢复成插件内置的那份',
-                      onClick: () => setConfirmVpReset(true),
-                    }, '恢复默认'),
-                  confirmVpReset
-                    ? React.createElement('button', {
-                      type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: busy,
-                      onClick: () => setConfirmVpReset(false),
-                    }, '取消')
-                    : null,
-                )
-                : null,
-              React.createElement('details', {},
-                React.createElement('summary', {}, '看内置默认（「恢复默认」用的就是这一份）'),
-                React.createElement('pre', {}, String(versionPrompt.defaultText ?? ''))),
-            )
-            : null,
+          // 🔴 用户 2026-10-15：「这两个去掉」—— 版本提示那一块的界面入口去掉。
+          //    文件 `<记忆根>/版本提示.md` 仍在、仍然注入（页面顶部状态行里还看得见它），
+          //    只是不再在设置页里编辑。
           // 三个开关只在**有工作区**时出现（它们的值按工作区存）
           hasWorkspace
             ? [
-              // 「随版本更新」（默认开）：插件升级时用新版本默认准则替换当前这份（会覆盖你的修改）
+              // 「随版本更新」（默认开）：插件升级时用新版本默认内容替换**「默认提示词」那一块**
+              // 🔴 用户 2026-10-15：「对升级只动默认的，会话的不动」—— 所以「会话提示词」不会被它碰。
               React.createElement(Switch, {
                 key: 'follow', label: '随版本更新', mark: true,
-                desc: followBusy ? '保存中…' : '插件升级时，用新版本的默认提示词替换当前内容（会覆盖你的修改）',
+                desc: followBusy ? '保存中…' : '插件升级时，用新版本默认内容替换「默认提示词」那一块（会覆盖你的修改）；「会话提示词」不动',
                 disabled: busy,
                 on: followVersion === true,
                 onToggle: (next) => onFollowVersion(next),
@@ -2287,31 +2492,43 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [accounts, setAccounts] = React.useState([])
       const [servers, setServers] = React.useState([])
       const [defaultAccount, setDefaultAccount] = React.useState(null)
-      const [wlText, setWlText] = React.useState('')
+      /* 指令白名单：**存数组**（不再是一个多行文本框）—— 设置页把它画成一排开关，
+       * 拨一下就 PATCH 一次，服务端回来的新名单/新目录直接覆盖这两份 state。 */
+      const [wlList, setWlList] = React.useState([])
+      const [cmdCatalog, setCmdCatalog] = React.useState([])
+      const [cmdExtra, setCmdExtra] = React.useState([])
       const [allowAll, setAllowAll] = React.useState(false)
       /**
        * 🔴 2026-10-15 审计（报告第 2 条）：`/api/mc/config` **读成功过没有**。
        *    config 分支的 `.catch` 只 `setError` 就吞掉了 rejection ⇒ `Promise.all` 恒 resolve
        *    ⇒ `.then(() => setLoaded(true))` 恒执行，页面看起来"加载好了"，但
-       *    `wlText` / `shareBase` 还是初始 `''`。这时点「保存」会发
-       *    `commandWhitelist: []` / `expressBase: ''` —— **把服务端真实配置覆盖成空**。
-       *    所以：读失败 ⇒ `cfgOk = false` ⇒ 所有"会把配置写小"的按钮禁用、调用也硬拒。
+       *    `wlList` / `shareBase` 还是初始空值。这时改白名单会发
+       *    `commandWhitelist: [...]`（只有刚拨的那一条）—— **把服务端真实配置覆盖掉**。
+       *    所以：读失败 ⇒ `cfgOk = false` ⇒ 所有"会把配置写小"的入口禁用、调用也硬拒。
        */
       const [cfgOk, setCfgOk] = React.useState(false)
       const [mdText, setMdText] = React.useState('')
       const [mdSource, setMdSource] = React.useState('default')
       const [mdPath, setMdPath] = React.useState('')
+      /**
+       * 「提示词」页分**上下两块**（用户 2026-10-15：「分为会话提示词和默认提示词」）：
+       *   · 上 = **默认提示词**：**基根**那份（`<memoryDir>/RULES.md`）。新会话的记忆根是
+       *     `seedSessionRoot()` 从基根**拷** RULES.md 播种的（`SESSION_SEED_FILES`）⇒
+       *     改它只影响**以后**新建的会话，不动本会话。
+       *   · 下 = **会话提示词**：本会话那份（`memoryRootFor()`），就是上面的 `mdText`。
+       * 🔴 没开 `memoryPerSession` 时两块指向**同一份文件**（服务端回 `sharedWithSession:true`），
+       *    这时必须如实提示，不能让用户以为"改上面那块没生效"。
+       */
+      const [dfText, setDfText] = React.useState('')
+      const [dfInfo, setDfInfo] = React.useState(null)
+      // 🔴 服务端有没有回 `default` 那一块（没回 = 宿主还没重载新代码）⇒ 见 PromptPane 里的警示。
+      const [dfReady, setDfReady] = React.useState(true)
       const [injectWc, setInjectWc] = React.useState(true)
       const [injectWs, setInjectWs] = React.useState(false)
       // 「提示词 → 随版本更新」（默认开）：开关与版本记录都**按工作区**存（.dsh-mc-agent/config.json）
       const [followVersion, setFollowVersion] = React.useState(true)
       const [rulesVersion, setRulesVersion] = React.useState(null)
       const [pluginVersion, setPluginVersion] = React.useState('')
-      // 版本提示（用户 2026-10-08 从"内置只读提示词"改成**文件** `<记忆根>/版本提示.md`）：
-      //   注入只投一行指针、正文由会话自己去读 ⇒ 这里**可编辑**，改完立刻生效。
-      //   无工作区时照样显示（它跟工作区无关），只是只读。
-      const [versionPrompt, setVersionPrompt] = React.useState(null)
-      const [vpText, setVpText] = React.useState('')
       // 「文件分享」：模式（off 关闭 / online 在线）+ base + 发布区现状
       const [shareOn, setShareOn] = React.useState(false)
       const [shareBase, setShareBase] = React.useState('')
@@ -2377,11 +2594,13 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             setDefaultAccount(a.defaultAccount ?? null)
           }),
           apiGet(withSid('/api/mc/config')).then((c) => {
-            setCfgOk(true)                    // 🔴 报告第 2 条：这一句就是"白名单可以安全保存"的凭证
+            setCfgOk(true)                    // 🔴 报告第 2 条：这一句就是"白名单可以安全改"的凭证
             const hasWs = c.hasWorkspace === true
             setHasWorkspace(hasWs)
             setWorkspaceName(String(c.workspaceName ?? ''))
-            setWlText(whitelistToText(c.commandWhitelist))
+            setWlList(Array.isArray(c.commandWhitelist) ? c.commandWhitelist : [])
+            setCmdCatalog(Array.isArray(c.commandCatalog) ? c.commandCatalog : [])
+            setCmdExtra(Array.isArray(c.commandExtra) ? c.commandExtra : [])
             setAllowAll(c.allowAllCommands === true)
             setInjectWc(c.injectDshMcAgentAgentsMd !== false)
             setInjectWs(c.injectWorkspaceAgentsMd === true)
@@ -2404,11 +2623,13 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             setMdText(String(m.text ?? ''))
             setMdSource(m.source === 'custom' ? 'custom' : 'default')
             setMdPath(String(m.path ?? ''))
+            // 「默认提示词」那一块（基根那份 / 新会话的种子）
+            setDfText(String(m.default?.text ?? ''))
+            setDfInfo(m.default ?? null)
+            setDfReady(m.default != null)
             setWsPath(String(m.workspacePath ?? ''))
             setWsExists(m.workspaceExists === true)
             setRulesExists(m.rulesExists !== false)
-            setVersionPrompt(m.versionPrompt ?? null)
-            setVpText(String(m.versionPrompt?.text ?? ''))
             setInjectStatus(m.injection ?? null)
             setFollowVersion(m.followVersion !== false)
             setRulesVersion(m.rulesVersion ?? null)
@@ -2475,10 +2696,17 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const patchAccount = React.useCallback((innerID, patch, key) =>
         run(key, () => apiPatch(withSid('/api/mc/accounts'), { innerID, ...patch }), '账户已更新'), [run])
 
-      const refreshAccount = React.useCallback((acc) =>
-        run('row:' + acc.innerID + ':refresh',
-          () => apiPost(withSid('/api/mc/accounts/refresh'), { innerID: acc.innerID }),
-          `「${acc.name}」刷新完成`), [run])
+      /* 页头那个「刷新」：逐个刷（各自按类型处理），一个失败不影响其余，最后把列表读回来。
+         正版账户在这条路径上**只会报缓存状态**，不会启动设备码（服务端就是这么写的）。 */
+      const refreshAllAccounts = React.useCallback((list) =>
+        run('acct:refreshAll', async () => {
+          const bad = []
+          for (const acc of list ?? []) {
+            try { await apiPost(withSid('/api/mc/accounts/refresh'), { innerID: acc.innerID }) } catch (e) { bad.push(`${acc.name || acc.innerID}：${errorText(e)}`) }
+          }
+          if (bad.length) throw new Error(`有 ${bad.length} 个没刷成功 —— ${bad.join('；')}`)
+          return { ok: true }
+        }, '账户状态已刷新'), [run])
 
       const deleteAccount = React.useCallback((acc) =>
         run('row:' + acc.innerID + ':delete',
@@ -2487,6 +2715,23 @@ select[data-wc-in]{appearance:none;padding-right:22px;
 
       const createAccount = React.useCallback((body, key) =>
         run(key, () => apiPost(withSid('/api/mc/accounts'), body), '账户已新建'), [run])
+
+      /* ── 正版（微软）登录：设备码流程 ────────────────────────────────────────
+       * 服务端**不能**占着一次请求等用户在浏览器里点（那要十几分钟），所以 POST 起一条
+       * 后台任务后立刻返回；这里只负责「起一次」和「每 2 秒问一次」。
+       * ⚠️ 依赖写 `[sessionId, wsCwd]` 而不是 `[withSid]` —— `withSid` 每次渲染都是新函数，
+       *    把它当依赖会让 `MicrosoftLogin` 的启动 effect 每次渲染都重跑一次（码会被反复作废）。 */
+      const msaStart = React.useCallback((innerID) =>
+        apiPost(withSid('/api/mc/accounts/msa'), { innerID }).then((r) => r?.job ?? null),
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [sessionId, wsCwd])
+
+      const msaPoll = React.useCallback((innerID) =>
+        apiGet(withSid('/api/mc/accounts/msa?innerID=' + encodeURIComponent(innerID))).then((r) => r?.job ?? null),
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [sessionId, wsCwd])
+
+      const reloadAccounts = React.useCallback(() => load(), [load])
 
       const addServer = React.useCallback((body) =>
         run('server:add', () => apiPost(withSid('/api/mc/authservers'), body), '认证服务器已添加'), [run])
@@ -2517,17 +2762,47 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           .then((ok) => { if (!ok) setAllowAll(prev); return ok })   // 失败回滚
       }, [run, allowAll])
 
-      const saveWhitelist = React.useCallback(() => {
-        // 🔴 报告第 2 条：配置没读出来时 `wlText` 还是初始 ''，存下去就是清空白名单。
+      /**
+       * 白名单改一条：拨一下就发一次 PATCH，**服务端回来的新名单/新目录直接覆盖本地 state**
+       *   —— 所以"拨下去却没关掉"（还被某条正则罩着）这种事，界面自己会纠正回来。
+       * 目录里有没有这条、`on` 到底是不是真，全以服务端那份为准（客户端不判）。
+       */
+      const applyWhitelist = React.useCallback((next, key, msg) => run(key, async () => {
+        const r = await apiPatch(withSid('/api/mc/config'), { commandWhitelist: next })
+        if (Array.isArray(r?.commandWhitelist)) setWlList(r.commandWhitelist)
+        if (Array.isArray(r?.commandCatalog)) setCmdCatalog(r.commandCatalog)
+        if (Array.isArray(r?.commandExtra)) setCmdExtra(r.commandExtra)
+        return r
+      }, msg), [run])
+
+      const toggleCmd = React.useCallback((name, on) => {
+        // 🔴 报告第 2 条：配置没读出来时本地名单是空的，写下去就是拿"只有这一条"覆盖真实名单。
         if (!cfgOk) {
-          setError('配置没读出来，先别保存 —— 现在保存会把服务端真实白名单清空。'
+          setError('配置没读出来，先别改白名单 —— 现在改会覆盖服务端真实配置。'
             + '先关掉再打开这个窗口重试。')
           return Promise.resolve(false)
         }
-        return run('wl:save', () => apiPatch(withSid('/api/mc/config'), {
-          commandWhitelist: textToWhitelist(wlText),
-        }), '指令白名单已保存')
-      }, [run, wlText, cfgOk])
+        /* 关掉时**只删同名精确条目**（`/tp` 这种带前导斜杠的算精确名），正则与 `*` 一律留着
+         * —— 它们不是"这一条指令"，删了会连带影响一大片。删不掉的那种情况（还被正则罩着），
+         * 服务端回来的 `on` 仍是 true，开关自己弹回去，用户看得到。 */
+        const isRe = (t) => t.length > 1 && t.startsWith('/') && t.lastIndexOf('/') > 0
+        const next = on
+          ? (wlList.some((e) => String(e).trim().replace(/^\//, '').toLowerCase() === name) ? wlList : [...wlList, name])
+          : wlList.filter((e) => {
+            const t = String(e).trim()
+            if (!t || t === '*' || isRe(t)) return true
+            return t.replace(/^\//, '').toLowerCase() !== name
+          })
+        return applyWhitelist(next, `wl:cmd:${name}`, on ? `已放行 ${name}` : `已关掉 ${name}`)
+      }, [applyWhitelist, wlList, cfgOk])
+
+      const dropCmdEntry = React.useCallback((entry) => {
+        if (!cfgOk) {
+          setError('配置没读出来，先别改白名单 —— 现在改会覆盖服务端真实配置。')
+          return Promise.resolve(false)
+        }
+        return applyWhitelist(wlList.filter((e) => String(e) !== String(entry)), 'wl:drop', `已删掉条目 ${entry}`)
+      }, [applyWhitelist, wlList, cfgOk])
 
       /* ── 页 3：提示词：保存 / 恢复默认 / 两个注入开关 ──
        * 🔴 2026-10-15 审计（报告第 1 条）：这四处原来写死 `'/api/mc/agents-md'`，**只把
@@ -2538,22 +2813,38 @@ select[data-wc-in]{appearance:none;padding-right:22px;
        *    同文件其它十几处设置写操作全都用了 `withSid`（把 sessionId + cwd 拼进 query），
        *    只有这四处漏了。改成和 GET（`agentsMdPath`）走同一条路。 */
       const saveAgentsMd = React.useCallback(() =>
-        run('md:save', () => apiPut(withSid('/api/mc/agents-md'), { text: mdText, sessionId }), '已保存'),
+        run('md:save', () => apiPut(withSid('/api/mc/agents-md'), { text: mdText, sessionId }), '会话提示词已保存'),
       [run, mdText, sessionId, wsCwd])
 
+      /* 「会话提示词 → 恢复为默认」：用**基根那份**重新播种本会话（`from:'default'`）。
+       * 🔴 语义（用户 2026-10-15 把这一页分成两块之后）：这里的"默认"= **上面那块**，
+       *    不是插件出厂值 —— 用户在「默认提示词」里定制过之后，"恢复默认"该回到
+       *    **他自己定的那个默认**。想出厂的，用上面那块自己的「恢复内置默认」。 */
       const resetAgentsMd = React.useCallback(() =>
-        run('md:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId }), '已恢复默认'),
-      [run, sessionId, wsCwd])
+        run('md:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId, from: 'default' }),
+          '已按默认提示词重新播种本会话'), [run, sessionId, wsCwd])
 
-      /* 版本提示**文件**（`<记忆根>/版本提示.md`）：同一组接口，`target:'version'` 选它。
-       * 注入只投一行指针、正文由会话自己去读 ⇒ 改完**立刻生效**（不用重启）。 */
-      const saveVersionPrompt = React.useCallback(() =>
-        run('vp:save', () => apiPut(withSid('/api/mc/agents-md'), { text: vpText, sessionId, target: 'version' }),
-          '版本提示已保存'), [run, vpText, sessionId, wsCwd])
+      /* 「默认提示词」那一块（基根 / 新会话的种子）：`scope:'default'`。
+       * 🔴 改它**不动本会话** —— 只影响以后新建的会话（新会话记忆根从基根播种）。
+       * 🔴 服务端没重载时（`dfReady === false`）**必须硬拒**：旧服务端不认 `scope`，
+       *    会把它当成会话那份写下去 —— 看着像"改默认"，其实是把**当前会话**覆盖了。 */
+      const saveDefaultMd = React.useCallback(() => {
+        if (!dfReady) {
+          setError('服务端还没重载（要重启 DSH 或重新加载插件）—— 现在保存会写进当前会话那份，先别存。')
+          return Promise.resolve(false)
+        }
+        return run('df:save', () => apiPut(withSid('/api/mc/agents-md'), { text: dfText, sessionId, scope: 'default' }),
+          '默认提示词已保存（影响以后新建的会话）')
+      }, [run, dfText, sessionId, wsCwd, dfReady, setError])
 
-      const resetVersionPrompt = React.useCallback(() =>
-        run('vp:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId, target: 'version' }),
-          '版本提示已恢复默认'), [run, sessionId, wsCwd])
+      const resetDefaultMd = React.useCallback(() => {
+        if (!dfReady) {
+          setError('服务端还没重载（要重启 DSH 或重新加载插件）—— 先别动这一块。')
+          return Promise.resolve(false)
+        }
+        return run('df:reset', () => apiDelete(withSid('/api/mc/agents-md'), { sessionId, scope: 'default' }),
+          '默认提示词已恢复内置那份')
+      }, [run, sessionId, wsCwd, dfReady, setError])
 
       const toggleInjectWc = React.useCallback((next) =>
         run('cfg:wc', () => apiPatch(withSid('/api/mc/config'), { injectDshMcAgentAgentsMd: next === true }),
@@ -2632,17 +2923,18 @@ select[data-wc-in]{appearance:none;padding-right:22px;
 
       const pane = tab === 'whitelist'
         ? React.createElement(WhitelistPane, {
-          wlText, allowAll, busyKey, cfgOk,
-          onWlText: setWlText, onAllowAll: toggleAllowAll, onSave: saveWhitelist,
+          catalog: cmdCatalog, extra: cmdExtra, allowAll, busyKey, cfgOk,
+          onAllowAll: toggleAllowAll, onToggleCmd: toggleCmd, onDropEntry: dropCmdEntry,
         })
         : (tab === 'prompt'
           ? React.createElement(PromptPane, {
             key: 'prompt:' + mdSource + ':' + wsExists + ':' + (hasWorkspace ? 'ws' : 'nows'),
             mdText, mdSource, mdPath, wsPath, wsExists, rulesExists, injectStatus, injectWc, injectWs, busyKey,
-            followVersion, rulesVersion, pluginVersion, versionPrompt, hasWorkspace,
-            vpText,
+            followVersion, rulesVersion, pluginVersion, hasWorkspace,
+            // 「默认提示词」那一块（基根那份 / 新会话的种子）
+            dfText, dfInfo, dfReady,
             onMdText: setMdText, onSave: saveAgentsMd, onReset: resetAgentsMd,
-            onVpText: setVpText, onVpSave: saveVersionPrompt, onVpReset: resetVersionPrompt,
+            onDfText: setDfText, onDfSave: saveDefaultMd, onDfReset: resetDefaultMd,
             onInjectWc: toggleInjectWc, onInjectWs: toggleInjectWs, onFollowVersion: toggleFollowVersion,
           })
           : (tab === 'share'
@@ -2653,9 +2945,11 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             })
             : React.createElement(AccountsPane, {
             accounts, servers, defaultAccount, busyKey,
-            onPatch: patchAccount, onRefresh: refreshAccount, onDelete: deleteAccount,
+            onPatch: patchAccount, onDelete: deleteAccount,
             onCreate: createAccount, onAddServer: addServer, onAddCard: addServerCard,
             onRemoveServer: removeServer,
+            onMsaStart: msaStart, onMsaPoll: msaPoll, onReload: reloadAccounts,
+            onRefreshAll: () => refreshAllAccounts(accounts),
           })))
 
       // 头部显示的工作区名（仅"有工作区"时显示）：注册表 title → 回退路径尾段；default-workspace 给中文名

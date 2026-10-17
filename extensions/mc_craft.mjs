@@ -25,6 +25,7 @@ import {
   clamp, itemNameOf, itemIdOf, blockIdOf, countOf, canPlaceInto, blockAtXYZ, findPlaceSpot,
 } from './mc_util.mjs'
 import { withTimeout, CALL_MS } from '../src/core.mjs'
+import { dropsNear } from '../src/world-observer.mjs'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -676,6 +677,8 @@ async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null
     let threw = false
     let got = 0
     const tStep = Date.now()
+    /* 整步开工前的背包总数（判断"料到底有没有被扣走"，用来区分"没做成"和"做成了但掉地上"）。 */
+    const invAllBefore = invSnapMap(bot)
     for (let attempt = 0; attempt < 3; attempt++) {
       threw = false
       // 🔴 每次重试都按"本轮还剩多少时间"给超时，别 3 次各 30 秒把调用拖到 90 秒
@@ -814,6 +817,20 @@ async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null
       /* 报错前先把窗口关干净：合成格里可能还留着材料，关窗口 = 服务端把它们退回背包，
        * 不然下一轮 mc_craft 看到的还是"背包里 0 根原木"。 */
       await closeMaybeWindow()
+      /* 🔴 2026-10-17（实机 AI 复盘原话：「合成的时候背包满了，造出来的东西会掉地上，机器人不知道」）：
+       *    背包满时服务端把产物 `spawn_entity` **掉在脚边**，背包一个都不涨 —— 这不是"点格子没生效"。
+       *    判据两条同时成立才算：① 料真被扣走了（背包总数变少）② 脚边真有掉落物。 */
+      let drops = []
+      try { drops = dropsNear(bot, 6) } catch { drops = [] }
+      const totalOf = (m) => { let n = 0; for (const c of m.values()) n += c; return n }
+      const shrank = totalOf(invSnapMap(bot)) < totalOf(invAllBefore)
+      /* 料被扣走了、背包里却没多出来 ⇒ 不是"点格子没生效"，而是"做出来了但没进背包"。
+       * 到底掉地上还是卡在合成格里，看脚边有没有掉落物。 */
+      if (shrank) {
+        const err = new Error(`第 ${i + 1} 步「${s.name}」的产物没进背包（料被扣走了）`)
+        err.mcDropped = { step: s.name, drops: drops.length, at: drops[0]?.e?.position ?? null, distance: drops[0]?.d ?? null }
+        throw err
+      }
       throw new Error(threw
         ? `第 ${i + 1} 步「${s.name}」失败：${lastErr?.message ?? '未知错误'}`
         : `第 ${i + 1} 步「${s.name}」合成没有产出（连试 3 次背包都没变 —— mineflayer 点格子没生效，材料可能留在合成格里）`)
@@ -983,10 +1000,35 @@ export async function apply (api) {
       /* ④ 执行 */
       const t0 = Date.now()
       const notes = []
+      /* 🔴 2026-10-17（实机 AI 复盘原话：「合成的时候背包满了，造出来的东西会掉地上，机器人不知道」）：
+       *    背包满时服务端会把合成产物**掉在脚边**（`spawn_entity`），而 `bot.craft()` 照常 resolve
+       *    ⇒ 背包里的数对不上，AI 却看到「✅ 合成完成」。做法：记下开工前的数与空位，
+       *    收工后拿"计划声称做出来的个数"与"背包实际增量"对账，对不上就扫脚边的掉落物点名报出来。 */
+      const before0 = countOf(bot, target.item.id, null)
+      const free0 = (() => { try { return bot.inventory.emptySlotCount() } catch { return null } })()
       let done
       try {
         done = await runPlan(bot, plan, table, 30_000, notes, () => mc.msLeft?.() ?? Infinity)
       } catch (e) {
+        /* 🔴 2026-10-17（用户实机：「合成的时候背包满了，造出来的东西会掉地上，机器人不知道」）：
+         *    这不是"合成中断"，是"做出来了、只是没进背包" —— 必须分开说，并且点名可执行动作。
+         *    报成"❌ 中断"会让模型以为白做了，然后拿同样的料再做一遍。 */
+        if (e?.mcDropped) {
+          const d = e.mcDropped
+          const freeNow = (() => { try { return bot.inventory.emptySlotCount() } catch { return null } })()
+          const out = [...head, ...notes,
+            `⚠️ **产物没进背包** —— 「${d.step}」的料被扣走了，背包里却没多出来。`,
+            ...(freeNow === 0 ? ['　根因：**背包一个空位都没有**（服务端只能把产物丢在地上）。'] : []),
+            ...(d.drops > 0
+              ? [`　脚边就有 **${d.drops} 个掉落物**（最近的离我 ${Number(d.distance).toFixed(1)} 格`
+                + `${d.at ? ` @ (${Math.floor(d.at.x)},${Math.floor(d.at.y)},${Math.floor(d.at.z)})` : ''}）`
+                + '　→ `mc_move` 走过去就自动捡（掉落物几分钟就消失）']
+              : ['　（脚边没扫到 —— 可能卡在合成格里，关一次窗口再看背包）']),
+            '　→ **下次合成前先腾空位**：`mc_chest` 存一趟、或者丢掉点不值钱的。',
+          ].filter(Boolean)
+          logLine(`mc_craft：${target.item.name} ×${want} 产物没进背包（${d.step}，脚边 ${d.drops} 个掉落物）`)
+          return { text: out.join('\n'), dropped: true, step: d.step, onGround: d.drops }
+        }
         const text = [...head, ...notes, `❌ 合成中断：${e.message}`, describePlan(plan, target.item.name, want)].filter(Boolean).join('\n')
         logLine(`mc_craft：${target.item.name} ×${want} 失败：${e.message}`)
         return { text }
@@ -1005,6 +1047,32 @@ export async function apply (api) {
         lines.push(`✅ 合成完成（${(ms / 1000).toFixed(1)}s）：${done.map((d) => `${d.name} ×${d.got}`).join('、')}`)
       }
       lines.push(`　背包里现在有 **${target.item.name} ×${got}**`)
+      /* 🔴 对账：计划说做了几个 vs 背包真的多了几个。对不上就是"掉地上了"（或卡在合成格里）。 */
+      const madeExpected = done.length ? Number(done[done.length - 1].got ?? 0) : 0
+      const madeActual = got - before0
+      const lost = Math.max(0, madeExpected - madeActual)
+      let mine = []
+      if (lost > 0) {
+        /* 🔴 掉落物实体的 `name` 恒为 `'item'`、`displayName` 恒为 `'Item'` —— mineflayer **不解析**
+         *    那个 metadata 槽，所以从实体对象上读不出"这是哪种物品"。⇒ 只能按"脚边有几个掉落物"
+         *    来点名，别假装认得出是哪一种（认错了比不说更坏）。 */
+        try { mine = dropsNear(bot, 8) } catch { mine = [] }
+        lines.push(`⚠️ **做出来了 ${madeExpected} 个，背包里只多了 ${madeActual} 个** —— 差的 ${lost} 个`
+          + `${free0 === 0 ? '是因为**背包一个空位都没有**，' : '很可能'}掉在脚边了。`)
+        if (mine.length) {
+          const at = mine[0].e.position
+          lines.push(`　脚边就有 **${mine.length} 个掉落物**（最近的一个离我 ${mine[0].d.toFixed(1)} 格 @ `
+            + `(${Math.floor(at.x)},${Math.floor(at.y)},${Math.floor(at.z)})）`
+            + '　→ `mc_move` 走过去就自动捡（掉落物几分钟就消失）')
+        } else {
+          lines.push('　（脚边暂时没扫到，可能已经被别人/别的东西捡走，或者卡在合成格里 —— '
+            + '关一次窗口再看看背包）')
+        }
+        lines.push('　→ **下次合成前先腾空位**：`mc_chest` 存一趟、或者丢掉点不值钱的。')
+      } else if (free0 !== null && free0 <= 1 && madeExpected > 0) {
+        lines.push(`⚠️ 背包只剩 ${free0} 个空位了 —— 再合成/再挖，产物和掉落物就会掉地上（几分钟就消失）。`
+          + '先去 `mc_chest` 存一趟。')
+      }
       // 🔴 `mc.inventory()` 回的是 `{ text, held, items }`，**不是数组** —— 这里以前写
       // `Array.isArray(inv) ? … : []`，条件永远为假，这行"背包：…"从来没打印过。
       const inv = mc.inventory()
@@ -1012,7 +1080,11 @@ export async function apply (api) {
       if (bag.length) lines.push('　背包：' + bag.map((i) => `${i.name}×${i.count}`).join('、'))
       logLine(`mc_craft：${target.item.name} ×${want} ${done.length ? '完成' : '没做新的（背包里已经够了）'}`
         + `（${done.length} 步 / ${ms}ms）`)
-      return { text: lines.join('\n'), steps: done, target: target.item.name, count: got }
+      return {
+        text: lines.join('\n'), steps: done, target: target.item.name, count: got,
+        /* 机器可读的"少了几个"（0 或缺失 = 都对上了）。 */
+        ...(lost > 0 ? { lost, madeExpected, madeActual, onGround: mine.length } : {}),
+      }
     },
   }))
 

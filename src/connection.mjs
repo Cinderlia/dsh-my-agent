@@ -131,7 +131,7 @@ export async function connect (self, opts = {}, ctx = {}) {
         client.uuid = uuid
         client.username = profile.name
         client.emit('session', session)
-        // 🔴 只有**皮肤站**（有真凭据）才 haveCredentials=true；离线账户必须 false，
+        // 🔴 只有**真凭据**（皮肤站 / 微软正版）才 haveCredentials=true；离线账户必须 false，
         //    否则 encrypt.js 会拿假 token 去 sessionserver 做 session join → ForbiddenOperationException
         //    → 悬空拒绝 → 宿主 fail-loud exit(1)（2026-09-17 真炸过，见 .agent-docs）
         const flags = ctx.auth.sessionFlags(auth.mode)
@@ -140,6 +140,10 @@ export async function connect (self, opts = {}, ctx = {}) {
           options.accessToken = session.accessToken
           options.session = session
         }
+        /* 正版账户在 1.19+ 上要**聊天签名**：`msa.mjs` 顺手把证书捞回来挂在 session 上，
+         * 上游的 `microsoftAuth.js` 是 `Object.assign(client, certificates)` —— 同一套做法。
+         * 拿不到证书也能连（只是这条会话不能签聊天），所以吞掉任何形状问题。 */
+        if (session.certificates) { try { Object.assign(client, session.certificates) } catch { /* 拿不到签名能力而已 */ } }
         // ⚠️ 必须显式调用；而且**必须接住它的 rejection**：
         //    皮肤站的 session join 失败（令牌失效）会从这里冒出来，
         //    不接住就是"未处理的 Promise 拒绝"→ 宿主的 fail-loud 直接 exit(1)（2026-09-17 真炸过）。

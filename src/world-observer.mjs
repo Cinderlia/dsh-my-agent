@@ -15,16 +15,38 @@ import { isDropEntity } from './entity-names.mjs'
 /**
  * 读一个实体的血量（读不到就 null）。
  *
- * 优先用现成的 `bot.util.entity.getHealth()`（`@nxg-org/mineflayer-util-plugin`，`mc_observe` 的"程序检测到"也用这个），
- * 退到 `entity.health`。**读不到不要编**：`attack()` 靠它报"打掉多少血"，编了就等于谎报。
+ * 🔴 2026-10-17 实机：**以前这个函数在真服上永远回 null**，于是 `attack()` 的
+ *    "打死必须有掉血证据"永远不成立 —— 拳头把僵尸打死了，报的却是
+ *    `combat:"unknown"` + "没读到过它掉血"（连带 `pickup` 掉落提示也从不出现）。
+ *
+ *    根因不在我们这儿，在 `@nxg-org/mineflayer-util-plugin` 的 `getHealth()`：
+ *    它算 `metadata[9] + Number(metadata[13]) ?? 0`，而怪身上第 13 格是 `undefined`
+ *    ⇒ `Number(undefined)` 是 `NaN`，`NaN ?? 0` **还是 NaN**（`??` 只兜 null/undefined）
+ *    ⇒ 整个返回值是 NaN。所以这里**自己读 metadata**，别指望那个助手。
+ *
+ *    槽位跟它一样按版本分：1.16 及以前是 7，1.17+ 是 9；
+ *    吸收血量在 `槽位 + 4`（**要单独判有限性**，不能再犯上面那个 `??` 的错）。
+ *
+ * @param {object} b mineflayer bot
+ * @param {object} e prismarine-entity 实体
+ * @returns {number|null} 血量（保留一位小数）；读不到 / 已死（<=0）回 null
  */
 export function entityHealth (b, e) {
-  try {
-    const h = Number(b?.util?.entity?.getHealth?.(e))
-    if (Number.isFinite(h) && h > 0) return Math.round(h * 10) / 10
-  } catch { /* 助手不可用就往下退 */ }
-  const h2 = Number(e?.health)
-  return Number.isFinite(h2) && h2 > 0 ? Math.round(h2 * 10) / 10 : null
+  if (!e) return null
+  const fin = (v) => {
+    const n = Number(v)
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 10) / 10 : null
+  }
+  /* ① 自己读 metadata（唯一在真服上验证过能用的路） */
+  const minor = Number(String(b?.version ?? '').split('.')[1])
+  const slot = Number.isFinite(minor) && minor <= 16 ? 7 : 9
+  const abs = Number(e?.metadata?.[slot + 4])
+  const direct = fin(Number(e?.metadata?.[slot]) + (Number.isFinite(abs) ? abs : 0))
+  if (direct != null) return direct
+  /* ② 现成的助手（对 bot 自己的实体它另有来源，可能比 metadata 靠谱） */
+  try { const viaUtil = fin(b?.util?.entity?.getHealth?.(e)); if (viaUtil != null) return viaUtil } catch { /* 助手不可用 */ }
+  /* ③ 兜底：老版本 mineflayer 会在实体上直接放 `health` */
+  return fin(e?.health)
 }
 
 /** 我现在在水里吗（脚在水的 AABB 里，或眼睛那格是水）。

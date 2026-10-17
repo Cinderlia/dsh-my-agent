@@ -17,8 +17,9 @@
  */
 import vec3pkg from 'vec3'
 import { isAir } from './block-names.mjs'
-import { heldText } from './inventory.mjs'
+import { heldText, countOf } from './inventory.mjs'
 import { callSecText } from './budget.mjs'
+import { dangerNow, dangerText, healthOf } from './danger.mjs'
 
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 /**
@@ -37,14 +38,28 @@ export async function build (self, { x1, y1, z1, x2, y2, z2, name = null, max = 
   // 🔴 单次调用 ≤11 秒：到点就带着已放好的结果返回，剩下的下次再叫。
   //    再叫一次时**已经放对的点会跳过**（不报"这格已经有方块"），所以直接重发同一个范围就行。
   // 🔴 `self.callLeft()`：本轮已经用掉的时间要算进去（`mc_sequence` 里"走一段再搭"只剩几秒）。
-  const deadline = Date.now() + self.callLeft()
+  const callLeftMs = self.callLeft()
+  const deadline = Date.now() + callLeftMs
+  /* 🔴 2026-10-17（实机：「mc_sequence 会假失败：秒回报 stoppedAt:0 / 本轮时间不够，但方块其实已经挖掉了」）：
+   *    `callLeft()` 太小 ⇒ 下面 `deadline - Date.now() < 300` 立刻成立 ⇒ **一块都不放**。
+   *    这是"没做"，不是"没做成" —— 必须分开说，否则模型会把已经放好的重放一遍、
+   *    或者在 `mc_task` 里反复撞同一堵墙（踩坑档案第 107 条）。 */
+  const noBudget = callLeftMs < 300
   const ok = []
   const fail = []
   const skipped = []
   const held0 = heldText(b)
   let used = null                       // 实际用了哪种方块（"搭完手里还剩什么"是模型最缺的一条）
   let done = 0
+  /* 有多少次失败是"空着的位置放不下去"（= 多半没材料了），而不是"被别的方块占住" */
+  let blockedEmpty = 0
+  /* 🔴 2026-10-17（用户报"工具排队执行、延迟很大"）：一次调用是**原子**的 —— 挨打了也得把
+   *    这一轮走完才轮得到 AI。搭高的时候最容易招怪（站在柱子上、没掩体），所以每放一块查一次。 */
+  const hp0 = healthOf(b)
+  let danger = null
   for (const p of pts) {
+    danger = dangerNow(b, { hp0 })
+    if (danger) break
     if (deadline - Date.now() < 300) break
     done++
     const at = `${p.x},${p.y},${p.z}`
@@ -58,18 +73,39 @@ export async function build (self, { x1, y1, z1, x2, y2, z2, name = null, max = 
       const r = await self.placeBlock({ ...p, name })
       /* 🔴 只有**复核过真放上去了**才算 placed（2026-10-08 审计：旧版无条件 ok.push，
        *    placeBlock 回 placed:false 时也照算 ⇒ mc_build 报的数量是假的） */
-      if (r?.placed) { if (!used) used = r.placed; ok.push(at) } else { fail.push(`${at}: 现在那里是 ${r?.now ?? '未加载'}`); if (fail.length >= 5) break }
+      if (r?.placed) { if (!used) used = r.placed; ok.push(at) } else {
+        const nowName = r?.now ?? null
+        if (nowName == null || isAir(nowName)) blockedEmpty++
+        fail.push(`${at}: 现在那里是 ${nowName ?? '未加载'}`)
+        if (fail.length >= 5) break
+      }
     } catch (e) { fail.push(`${at}: ${e.message}`); if (fail.length >= 5) break }
   }
   const left = pts.length - done
   const held = heldText(b)
+  /* 材料还剩多少：`countOf` 读不到回 `null`，正好拿来区分"不知道"和"真没了"。
+   * 🔴 为什么非报不可：缺料时下面那条 `hint` 正在教 AI「再叫一次 mc_build（同一个范围就行）」，
+   *    而它会把这句话**照做** —— 一遍遍重发、每轮撞 5 个失败然后 break，刷一堆调用全白费。
+   *    光看 `failures`（"现在那里是 未加载"）读不出这是"没材料"。 */
+  const bagLeft = want ? countOf(b, want) : null
+  const outOfMat = Boolean(want) && bagLeft === 0 && blockedEmpty > 0
   return {
     requested: pts.length, placed: ok.length, failed: fail.length, failures: fail.slice(0, 5),
+    ...(want ? { bagLeft } : {}),
     ...(skipped.length ? { skipped: skipped.length, skippedWhy: `这 ${skipped.length} 格本来就有方块（不是我要放的那种），没动它们：${skipped.slice(0, 3).join('、')}` } : {}),
     ...(used ? { used } : {}),
     ...(held !== held0 ? { held, heldBefore: held0 } : { held }),
-    ...(left > 0
-      ? { remaining: left, hint: `这一轮的 ${callSecText()}用完了，还有 ${left} 个没放 —— 再叫一次 mc_build（同一个范围就行，放对的会跳过）` }
-      : {}),
+    ...(left > 0 ? { remaining: left } : {}),
+    ...(danger ? { interrupted: 'danger', danger: { ...danger, text: dangerText(danger) } } : {}),
+    ...(noBudget && ok.length === 0 ? { noBudget: true, callLeftMs } : {}),
+    ...(danger
+      ? { hint: `⚠️ 有东西贴上来了（${dangerText(danger)}）—— 先处理它：\`mc_act {mode:"attack"}\` 打掉、或者 \`mc_move\` 躲开、\`mc_act {mode:"equip"}\` 换上装备。安全了再叫一次 mc_build（同一个范围就行，放对的会跳过）` }
+      : noBudget && ok.length === 0
+        ? { noBudget: true, callLeftMs, hint: `⚠️ 这次调用**自己没分到时间**（外层只剩 ${callLeftMs}ms）—— **一块都没放**。`
+          + '**这不等于那些格子还是空的**：先 `mc_scan` / `mc_map` 复核一下，'
+          + '确认真没放再单独叫一次 mc_build（**别塞在 mc_task 里**）。' }
+        : outOfMat
+          ? { outOfMaterial: want, hint: `背包里 ${want} 已经用完了（还有 ${left} 个位置没放）—— 先 mc_craft {name:"${want}"} 或 mc_dig 补料，或者换一种方块；**别原样重发**` }
+          : (left > 0 ? { hint: `这一轮的 ${callSecText()}用完了，还有 ${left} 个没放 —— 再叫一次 mc_build（同一个范围就行，放对的会跳过）` } : {})),
   }
 }

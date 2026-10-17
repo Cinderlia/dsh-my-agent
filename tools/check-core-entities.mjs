@@ -294,6 +294,27 @@ section('⑨ 静态检查（实体工具已并进 mc_observe 感知块、不看�
   ok(r1 && r2 && r1 === r2, 'RANGED_RE 与 mc_auto 的 RANGED 逐字一致',
     r1 === r2 ? '' : `core=${String(r1).slice(0, 40)} auto=${String(r2).slice(0, 40)}`)
   ok(/from '\.\/entity-names\.mjs'/.test(core), 'core.mjs 确实从 entity-names.mjs 导入（别只搬不接）')
+
+  /* 🔴 2026-10-17 审计：名单"逐字一致"只防漂移，不防**漏**。
+   *    实情：`RANGED_RE` 早就把 bogged/evoker/illusioner/breeze 算成"远程怪"，
+   *    而 `HOSTILE_RE` 里没有它们 —— 代码自己知道它们会远程打你，却不认为它们是敌人。
+   *    同理 `extensions/mc_view-render.mjs` 的渲染名单比 `HOSTILE_RE` 多一大截，
+   *    也就是说**画图的时候认得是怪，打架的时候不认得**。
+   *    这两条断言把"漏"钉住：远程怪（除 llama，羊驼是被惹了才吐口水）必须都是敌人；
+   *    渲染层认的怪也必须都是敌人。以后再加新怪，三处一起加。 */
+  const namesOf = (lit) => String(lit ?? '')
+    .replace(/^\/\(?/, '').replace(/\)?\/[a-z]*$/, '').split('|').filter(Boolean)
+  const HOSTILE_RE = new RegExp(String(h1 ?? '/$^/').replace(/^\/|\/[a-z]*$/g, ''), 'i')
+  const rangedOnly = namesOf(r1).filter((n) => n !== 'llama' && !HOSTILE_RE.test(n))
+  ok(rangedOnly.length === 0,
+    '🔴 远程怪名单里除 llama 外，每一个都必须在敌对名单里（会远程打你的不可能不是敌人）',
+    rangedOnly.join(' / '))
+  const renderSrc = readFileSync(new URL('../extensions/mc_view-render.mjs', import.meta.url), 'utf8')
+  const renderNames = namesOf(pick(renderSrc, 'HOSTILE'))
+  const renderOnly = renderNames.filter((n) => n !== 'illager' && !HOSTILE_RE.test(n))
+  ok(renderNames.length > 10 && renderOnly.length === 0,
+    '🔴 渲染层认的怪也必须在敌对名单里（画图认得、打架不认得 = 反射层瞎了）',
+    renderOnly.join(' / '))
 }
 
 // ── 收尾 ────────────────────────────────────────────────────────────────────

@@ -21,6 +21,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash, randomBytes } from 'node:crypto'
+import { msaHasCache } from './msa.mjs'
 
 /**
  * **预置**认证服务器（首次建库时写进去当便利，**不是内置、可以删**）。
@@ -103,6 +104,8 @@ export class AccountStore {
     this.loadFailed = false
     this.loadError = null
     this.load()
+    /** 正版账户的令牌缓存目录怎么算（`innerID → 目录`）—— 由 `index.js` 注入，见 `src/msa.mjs` */
+    this.msaDirOf = null
     /** 有凭据的 innerID 缓存（`list()` 是同步的，所以要缓存；启动/增删时刷新） */
     this._withCred = new Set()
     this.credIndexError = null
@@ -184,7 +187,9 @@ export class AccountStore {
     const srv = this.data.authServers.find((s) => s.id === acc.serverId) ?? null
     const server = acc.type === 'offline'
       ? { kind: 'offline', name: '离线', url: null }
-      : { kind: 'yggdrasil', name: srv?.name ?? '(已移除的服务器)', url: srv?.url ?? null }
+      : acc.type === 'microsoft'
+        ? { kind: 'microsoft', name: '微软正版', url: 'https://www.minecraft.net' }
+        : { kind: 'yggdrasil', name: srv?.name ?? '(已移除的服务器)', url: srv?.url ?? null }
     const uuid = acc.uuid ?? (acc.type === 'offline' ? offlineUuid(acc.name) : null)
     return {
       innerID: acc.innerID,
@@ -195,7 +200,11 @@ export class AccountStore {
       uuidSource: acc.uuid ? 'custom' : (acc.type === 'offline' ? 'derived-from-name' : 'unknown'),
       type: acc.type,                           // offline | yggdrasil
       server,
-      hasCredential: this._withCred.has(acc.innerID),
+      /* 正版账户的"登录凭据"= prismarine-auth 的**令牌缓存目录里有没有东西**（不在凭据服务里）；
+         皮肤站/离线走宿主凭据服务。两种都只回布尔，绝不含令牌。 */
+      hasCredential: acc.type === 'microsoft'
+        ? (typeof this.msaDirOf === 'function' ? msaHasCache(this.msaDirOf(acc.innerID)) : false)
+        : this._withCred.has(acc.innerID),
       /* 🟡 2026-10-15 审计（报告 E 第 2 条）：凭据索引刷失败时上面的 `hasCredential` 可能已经过时，
        *    如实告诉调用方"这个值可不可信"，别让它把"读不出来"当成"没有密码"。 */
       credIndexOk: !this.credIndexError,
@@ -235,9 +244,19 @@ export class AccountStore {
   /** 新建账户（凭据另行 setCredential 写入） */
   add ({ type, name, uuid = null, serverId = null, login = null, id = null } = {}) {
     const t = String(type ?? '').trim()
-    if (t === 'microsoft') throw new Error('微软账户暂不支持（宿主侧还在做）')
-    if (t !== 'offline' && t !== 'yggdrasil') throw new Error(`不支持的账户类型：${t}（离线 offline / 皮肤站 yggdrasil）`)
-    const nm = String(name ?? '').trim()
+    if (t !== 'offline' && t !== 'yggdrasil' && t !== 'microsoft') {
+      throw new Error(`不支持的账户类型：${t}（离线 offline / 皮肤站 yggdrasil / 正版 microsoft）`)
+    }
+    /* 正版账户：邮箱是**认缓存的那把钥匙**（prismarine-auth 按第一个参数给缓存文件命名），必填。
+       游戏内名字要等登录成功才拿得到，所以这里先用邮箱前缀占位（`persistAuth` 登录后会覆盖它）。 */
+    let nm = String(name ?? '').trim()
+    if (t === 'microsoft') {
+      const mail = String(login ?? '').trim()
+      if (!mail) throw new Error('正版账户要填微软账号的邮箱（登录时靠它认缓存）')
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mail)) throw new Error(`邮箱格式不对：${mail}`)
+      login = mail
+      if (!nm) nm = mail.split('@')[0].replace(/[^\w\u4e00-\u9fa5.]/g, '_').slice(0, 32) || 'Microsoft'
+    }
     if (!nm) throw new Error('账户名不能为空')
     if (!/^[\w\u4e00-\u9fa5.]{1,32}$/.test(nm)) throw new Error('账户名只能用中英文/数字/下划线/点，最长 32')
     if (t === 'yggdrasil') {

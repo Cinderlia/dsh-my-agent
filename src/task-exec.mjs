@@ -355,6 +355,22 @@ export class TaskExecutor {
             hint: '按**现在**的步骤表重来：先 mc_task {action:"get"} 看一眼，再 mc_task {action:"run"}',
           }
         }
+        /* 🔴 2026-10-16 审计（P0-1，场景三）：**代次对上还不够**。代次回答的是"这一代要干什么变了
+         *    没有"，而"任务被暂停 / 等待 / 取消"是**另一件事**：它不换步骤表，只要求**别记账**。
+         *    断线（`src/connection.mjs` 的 `tasks.pause`）、看门狗、AI 自己喊停都走这条路。
+         *    上面那个 `await` 可能好几秒，这中间任务完全可能已经不是 running 了 ——
+         *    再查一次**状态**，别把"断了线的那一步"记成已完成 / 已失败。 */
+        const nowStatus = this.ledger.get(t.taskId)?.status ?? null
+        if (nowStatus && nowStatus !== 'running') {
+          lines.push(`⏸ 「${step.id}」跑完时任务已经是「${nowStatus}」了 —— 结果不记账`)
+          return {
+            ok: false, stale: true, rounds, task: brief(), lines,
+            reason: `这一步（${step.id}）跑完时任务已经不在做了（现在：${nowStatus}）—— 结果作废，没往台账上写`,
+            hint: nowStatus === 'paused'
+              ? '先弄清为什么停了（断线？被别的指令抢了？），处理完再 mc_task {action:"resume"}'
+              : '先处理掉挡路的条件，再 mc_task {action:"resume"}',
+          }
+        }
         const out = res && typeof res === 'object' ? res : {}
         /* 失败原因可能落在好几个字段里（工具回的是 `{text:'❌ 没挖成 …'}`，
          * 底层异常回的是 `{error:'…'}`）—— 全拼起来再分类，别漏。

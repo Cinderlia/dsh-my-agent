@@ -194,5 +194,176 @@ section('⑥ 接线（路线图第 ④ 条第六刀）')
     'core.mjs 里没有残留定义（搬干净了）')
 }
 
+/* ─────────────────────── ⑦ 原地搭高：必须先跳起来再放 ─────────────────────── */
+/* 用户 2026-10-17 报的「一直尝试放方块」：
+ *   `place.mjs` 的"悬空就先垫一块"那一支，落点 = `underFeet.position + (0,1,0)`
+ *   = **机器人自己站着的那一格**。站着放，服务端必拒（不把方块放进玩家身体里），
+ *   而且那次调用**不在** try/catch 里 ⇒ 英文原文直接冒泡给模型 ⇒ 模型一遍遍重试同一点位。
+ * 这一节把"必须先离地"钉死，免得以后又被改回站着放。 */
+section('⑦ 原地搭高（垫脚）—— 必须先离地再放')
+{
+  const placeSrc = readFileSync(new URL('../src/place.mjs', import.meta.url), 'utf8')
+  const { placeWhileJumping } = await import('../src/place.mjs')
+
+  // 假 bot：站着时 `position.y` 是整数；按下 jump 之后下一拍才离地（小数部分 ≠ 0）。
+  // `placeBlock` 只在离地时成功 —— 照抄服务端的真实行为。
+  const makeBot = ({ alwaysRefuse = false } = {}) => {
+    const calls = []
+    const bot = {
+      _air: false,
+      _jump: false,
+      entity: { position: { x: 0.5, y: 20, z: 0.5 } },
+      setControlState (k, v) {
+        if (k !== 'jump') return
+        calls.push(`jump:${v}`)
+        this._jump = v
+        if (v) setTimeout(() => { if (this._jump) { this._air = true; this.entity.position.y = 20.3 } }, 30)
+        else { this._air = false; this.entity.position.y = 20 }
+      },
+      async placeBlock () {
+        calls.push(this._air ? 'place:air' : 'place:ground')
+        if (alwaysRefuse || !this._air) {
+          throw new Error('Server refused to place cobblestone at (0,20,0): the block is still air')
+        }
+      },
+      lookAt: async () => {},
+    }
+    const ref = { name: 'cobblestone', boundingBox: 'block', position: { x: 0, y: 19, z: 0 } }
+    return { bot, calls, ref }
+  }
+
+  // ① 站着会拒、跳起来能成：一次调用就够
+  {
+    const { bot, calls, ref } = makeBot()
+    let err = null
+    try { await placeWhileJumping(bot, ref, { x: 0, y: 1, z: 0 }) } catch (e) { err = e }
+    ok(err == null, '跳起来之后放成功了（不再报"the block is still air"）', err ? String(err.message).slice(0, 60) : '')
+    ok(calls[0] === 'jump:true', '第一件事是把 jump 按下去（不是先放）', `calls=${calls.join(',')}`)
+    ok(calls.includes('place:air'), '🔴 真正发包那一刻是**离地**的', `calls=${calls.join(',')}`)
+    ok(calls[calls.length - 1] === 'jump:false', '放完把 jump 松开（别一直蹦）', `calls=${calls.join(',')}`)
+  }
+  // ② 服务端一直拒 ⇒ 抛错，但 jump 必须已经松开（finally）
+  {
+    const { bot, calls, ref } = makeBot({ alwaysRefuse: true })
+    let err = null
+    try { await placeWhileJumping(bot, ref, { x: 0, y: 1, z: 0 }, { tries: 2 }) } catch (e) { err = e }
+    ok(err != null && /refused/i.test(String(err?.message ?? '')), '一直拒 ⇒ 抛出来（不假装成功）')
+    ok(calls[calls.length - 1] === 'jump:false', '🔴 抛错也必须松开 jump（finally —— 别把控制位留在按下状态）', `calls=${calls.join(',')}`)
+    ok(calls.filter((c) => c === 'place:air').length >= 2, '会重试（不是试一次就放弃）', `calls=${calls.join(',')}`)
+  }
+  // ③ 静态：垫脚那一支必须走 placeWhileJumping，且失败要被抓住
+  ok(/placeWhileJumping\(b, underFeet, \{ x: 0, y: 1, z: 0 \}\)/.test(placeSrc),
+    '垫脚那一放走的是 placeWhileJumping（先跳再放）')
+  ok(!/await ctx\.t\(b\.placeBlock\(underFeet/.test(placeSrc),
+    '🔴 不再站着往自己脚下放（那正是用户报的"一直尝试放方块"）')
+  ok(/catch \(e\) \{ padError = e \}/.test(placeSrc),
+    '垫脚失败被抓住（原来是裸 await，英文原文直接冒泡给模型）')
+  ok(/别再对着同一个点位试了/.test(placeSrc),
+    '失败提示明说"别再对着同一个点位试"（防模型原地重试）')
+  ok(/Server refused to place/.test(placeSrc) && /服务端拒了在/.test(placeSrc),
+    '英文 "Server refused to place" 仍然翻译成人话（且带上坐标）')
+  ok(/export async function placeWhileJumping/.test(placeSrc), 'placeWhileJumping 是导出的（可单测）')
+}
+
+/* ─────────────────────── ⑧ 目标格 = 自己站的那一格 ⇒ 跳起来放 ─────────────────────── */
+/* 用户 2026-10-17 实机（游戏里 AI 的原话）：
+ *   「mc_act {mode:"place"} 放不了自己脚下，经典 pillar-jump 做不成，
+ *     这是我在竖井里爬不上去、反复淹死的直接原因」
+ *   「既然寻路器能往自己脚下放，说明服务端是收的 —— 被挡的是 mc_act place 自己那层预检」
+ * ⇒ 目标格正是自己身体占着的那一格（脚下 / 齐腰）时必须**跳起来再放**。
+ *   水/岩浆能过 `canPlaceInto` 那一关，所以以前是"预检放行、服务端拒"，报的还是英文原文。 */
+section('⑧ 目标格 = 自己站的那一格 —— 必须跳起来放（pillar-jump）')
+{
+  const { placeBlock } = await import('../src/place.mjs')
+  const V = (x, y, z) => ({
+    x, y, z,
+    offset (dx, dy, dz) { return V(x + dx, y + dy, z + dz) },
+    floored () { return V(Math.floor(x), Math.floor(y), Math.floor(z)) },
+    plus (o) { return V(x + o.x, y + o.y, z + o.z) },
+    distanceTo (o) { return Math.hypot(x - o.x, y - o.y, z - o.z) },
+  })
+  /* 假 bot：站着时 `position.y` 是整数；按下 jump 之后才离地（照抄服务端"不放方块进玩家身体"的行为）。 */
+  const makeSelf = ({ world = {}, refuseAlways = false } = {}) => {
+    const calls = []
+    const W = new Map(Object.entries(world))
+    const at = (p) => {
+      const k = `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`
+      const blk = W.get(k) ?? { name: 'air', boundingBox: 'empty' }
+      return { position: V(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z)), ...blk }
+    }
+    const bot = {
+      _air: false, _jump: false,
+      game: { gameMode: 'survival' },
+      entity: { position: { x: 0.5, y: 20, z: 0.5, floored () { return V(0, Math.floor(this.y), 0) } }, eyeHeight: 1.62 },
+      inventory: { items: () => [{ name: 'cobblestone', type: 1, count: 64 }] },
+      blockAt: (p) => at(p),
+      setControlState (k, v) {
+        if (k !== 'jump') return
+        calls.push(`jump:${v}`)
+        this._jump = v
+        if (v) setTimeout(() => { if (this._jump) { this._air = true; this.entity.position.y = 20.3 } }, 25)
+        else { this._air = false; this.entity.position.y = 20 }
+      },
+      async equip () { calls.push('equip') },
+      async lookAt () {},
+      async placeBlock (ref, face) {
+        // 落点 = ref.position + face（照 mineflayer 的算法）
+        const dest = { x: ref.position.x + face.x, y: ref.position.y + face.y, z: ref.position.z + face.z }
+        // 服务端只在"落点是自己身体占着的那一格"时才拒（别的格子站着放照样能成）
+        const ownCell = dest.x === 0 && dest.z === 0 && (dest.y === 20 || dest.y === 21)
+        calls.push(this._air ? 'place:air' : 'place:ground')
+        if (refuseAlways || (ownCell && !this._air)) {
+          throw new Error('Server refused to place cobblestone at (0,20,0): the block is still air')
+        }
+        W.set(`${dest.x},${dest.y},${dest.z}`, { name: 'cobblestone', boundingBox: 'block' })
+      },
+    }
+    const self = { requireBot: () => bot, walkTo: async () => { calls.push('walkTo') }, flyTo: async () => {}, giveItem: async () => {} }
+    return { self, bot, calls }
+  }
+  const ctx = { t: (p) => p }
+
+  // ① 目标 = 自己脚下那一格 ⇒ 走"跳起来放"
+  {
+    const { self, calls } = makeSelf({ world: { '0,19,0': { name: 'stone', boundingBox: 'block' }, '0,20,0': { name: 'water', boundingBox: 'empty' } } })
+    const r = await placeBlock(self, { x: 0, y: 20, z: 0, name: 'cobblestone' }, ctx)
+    ok(r.placed === 'cobblestone', '放到自己脚下那一格（水格）成功了', JSON.stringify({ placed: r.placed, now: r.now }))
+    ok(calls.includes('jump:true'), '🔴 先跳起来（不是站着就往自己身体里放）', `calls=${calls.join(',')}`)
+    ok(calls.includes('place:air'), '🔴 真正发包那一刻是**离地**的', `calls=${calls.join(',')}`)
+    ok(!calls.includes('place:ground'), '没有一次"站着放"（那必被服务端拒）', `calls=${calls.join(',')}`)
+    ok(r.pillar === true, '结果里报 pillar:true（模型才知道自己刚垫高了一格）', JSON.stringify({ pillar: r.pillar }))
+  }
+  // ② 目标 = 齐腰那一格（身体也占着）⇒ 同样要跳
+  {
+    const { self, calls } = makeSelf({ world: { '0,20,0': { name: 'stone', boundingBox: 'block' }, '0,21,0': { name: 'water', boundingBox: 'empty' } } })
+    const r = await placeBlock(self, { x: 0, y: 21, z: 0, name: 'cobblestone' }, ctx)
+    ok(r.placed === 'cobblestone' && calls.includes('place:air'), '齐腰那一格也走"跳起来放"', `calls=${calls.join(',')} placed=${r.placed}`)
+  }
+  // ③ 目标**不是**自己占着的格子 ⇒ 照旧站着放（别把普通放置也搞成蹦蹦跳跳）
+  {
+    const { self, calls } = makeSelf({ world: { '0,19,0': { name: 'stone', boundingBox: 'block' }, '1,19,0': { name: 'stone', boundingBox: 'block' }, '1,20,0': { name: 'air', boundingBox: 'empty' } } })
+    const r = await placeBlock(self, { x: 1, y: 20, z: 0, name: 'cobblestone' }, ctx)
+    ok(r.placed === 'cobblestone', '旁边那一格照常放成功', JSON.stringify({ placed: r.placed }))
+    ok(!calls.includes('jump:true') && !calls.includes('place:air'), '🔴 普通放置**不跳**（只在自己身上才跳）', `calls=${calls.join(',')}`)
+    ok(r.pillar === undefined, '普通放置不带 pillar 标记', JSON.stringify({ pillar: r.pillar }))
+  }
+  // ④ 跳了还是被拒 ⇒ 提示必须点明"那一格是我自己占着的"
+  {
+    const { self } = makeSelf({
+      refuseAlways: true,
+      world: { '0,19,0': { name: 'stone', boundingBox: 'block' }, '0,20,0': { name: 'water', boundingBox: 'empty' } },
+    })
+    let err = null
+    try { await placeBlock(self, { x: 0, y: 20, z: 0, name: 'cobblestone' }, ctx) } catch (e) { err = e }
+    ok(err != null && /我自己身体占着/.test(String(err?.message ?? '')), '被拒时说清"那一格是我自己身体占着的"', String(err?.message ?? '').slice(0, 90))
+    ok(/跳起来放/.test(String(err?.message ?? '')), '并说明"已经试过跳起来放"（别让模型以为是没跳）', String(err?.message ?? '').slice(0, 120))
+  }
+  // ⑤ 静态：判据 + 分支都在
+  const placeSrc2 = readFileSync(new URL('../src/place.mjs', import.meta.url), 'utf8')
+  ok(/const isOwnCell = Boolean\(feetNow\)/.test(placeSrc2), 'place.mjs 里有 isOwnCell 判据')
+  ok(/pos\.y === feetNow\.y \|\| pos\.y === feetNow\.y \+ 1/.test(placeSrc2), '脚下与齐腰两格都算"自己占着"')
+  ok(/if \(isOwnCell\) await ctx\.t\(placeWhileJumping/.test(placeSrc2), '自己占着的那一格走 placeWhileJumping')
+}
+
 console.log(`\n${fail === 0 ? '✓ 全部通过' : '✗ 有失败'}：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

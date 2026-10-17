@@ -15,7 +15,14 @@
 // 敌对 / 远程怪名单 —— 供 `mobs()` 分类用。
 // 🔴 与 `extensions/mc_auto.mjs` 里的 `HOSTILE` / `RANGED` **保持一致**：那边为了能离线自检
 //    故意自带一份（见那个文件头部"只依赖 ../src/user-message.mjs"），改这里记得同步改那边。
-export const HOSTILE_RE = /zombie|skeleton|creeper|spider|witch|enderman|slime|pillager|vindicator|ravager|phantom|drowned|husk|stray|blaze|ghast|hoglin|piglin|wither|warden|silverfish|guardian|shulker/i
+/* 🔴 2026-10-17 审计：这份名单原来漏了 10 种**真的会打你**的怪 —— `endermite` / `magma_cube` /
+ *    `vex` / `zoglin` / `bogged` / `evoker` / `illusioner` / `breeze` / `giant` / `ender_dragon`。
+ *    后果不是"少打一只怪"，而是**反射层瞎了**：`mc_auto` 的 `hostilesNear()`、`danger.mjs` 的
+ *    `nearestHostile()`、`world-scan.mjs` 的 `entitiesNear(kind:'hostile')` 全都走这一份 ——
+ *    一只 `breeze`（1.21 的风袭怪）贴脸射你，它既不会叫醒 AI，也不会把正在挖的串砍断。
+ *    更刺眼的是 `RANGED_RE` 早就把 `bogged`/`evoker`/`illusioner`/`breeze` 算成"远程怪"了，
+ *    也就是说**代码自己知道它们会远程打你，却不认为它们是敌人**。 */
+export const HOSTILE_RE = /zombie|skeleton|creeper|spider|witch|enderman|slime|pillager|vindicator|ravager|phantom|drowned|husk|stray|blaze|ghast|hoglin|piglin|wither|warden|silverfish|guardian|shulker|endermite|magma_cube|vex|zoglin|bogged|evoker|illusioner|breeze|giant|ender_dragon/i
 export const RANGED_RE = /skeleton|stray|bogged|pillager|vindicator|witch|blaze|ghast|guardian|shulker|llama|illusioner|evoker|breeze|wither|drowned/i
 
 /**

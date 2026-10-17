@@ -145,10 +145,35 @@ const DROWN_SUBMERGE_GAP_MS = 20_000
 const WATER_RECOVER_GAP_MS = 15_000
 /** 🔴 水下自动救援一次的墙钟上限（毫秒）：超了就放弃这一轮（`recoverFromWater` 自己也有 12 秒预算） */
 const WATER_RECOVER_MAX_MS = 15_000
+/** 交给 `recoverFromWater` 的**内层**预算（毫秒）：比墙钟上限短一截，
+ *  好让"预算用完"由它自己带着 `reason:'budget-out'` 如实返回，而不是被外面的 `withTimeout` 砍掉、
+ *  变成一条看不出进度的超时。 */
+const WATER_RECOVER_MS_INNER = 12_000
 
 /* ─────────────────────────── 小工具 ─────────────────────────── */
 
 const num = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d)
+
+/**
+ * 给**反射层自己发起**的动作开一段预算。
+ *
+ * 🔴 2026-10-16 审计（P0-2）：`McBot` 的 `msLeft()` 读的是 `callDeadlineAt` —— 那根
+ *    截止时刻**只有工具调用会设**（`index.js` 的 `asTool.execute` 每次 `setCallDeadline(CALL_MS)`）。
+ *    反射层是 `setInterval` 驱动的，**不在任何工具调用里**：
+ *      · 从没调用过工具 ⇒ `msLeft()` 返回 11000（`core.mjs:462-466` 的兜底）—— 看着没问题；
+ *      · 调用过一次、并且**那次早就超时了** ⇒ `callDeadlineAt` 是过去时刻 ⇒ `msLeft()` 恒为 0。
+ *    于是 `walkTo` 在 `src/movement.mjs:335` 直接返回 `reason:'call-over'`、`swimUp` 在
+ *    `:127-133` 一个控制位都不按 —— **自主动作在空闲 tick 里一步都走不动，而且返回值看着
+ *    像"路走不通"**（"反射层执行了"变成"反射层空转"）。这里给它一段自己的截止时刻。
+ *
+ * 传进去的毫秒数是**这次动作的墙钟上限**，不是"还剩多少"：反射层要的是"从现在起给我 N 毫秒"。
+ * 下一次工具调用会把它重新设成 `CALL_MS`，所以这里不会污染模型的预算。
+ */
+const grantMoveBudget = (bot, ms) => {
+  const n = num(ms, 0)
+  if (!(n > 0)) return
+  try { bot?.setCallDeadline?.(n) } catch { /* 没这个方法就算了（老版本 / 假 bot） */ }
+}
 const randBetween = (rng, a, b) => a + rng() * (b - a)
 
 /** 带超时的 await：超时 reject，迟到结果被丢掉（照抄 src/core.mjs 的语义） */
@@ -198,8 +223,8 @@ const mkPos = (x, y, z) => ({
  *  这里原来自己写了一份正则，漏了 `soul_fire` / `soul_campfire`（灵魂火也是火），
  *  而且两份名单迟早会走岔。搭路那边认的危险方块，反射层这边就该认同一批。 */
 const DANGER = BRIDGE_FATAL
-/** 敌对生物（名字/类型里出现就躲） */
-const HOSTILE = /zombie|skeleton|creeper|spider|witch|enderman|slime|pillager|vindicator|ravager|phantom|drowned|husk|stray|blaze|ghast|hoglin|piglin|wither|warden|silverfish|guardian|shulker/i
+/** 敌对生物（名字/类型里出现就躲）—— 🔴 必须与 `src/entity-names.mjs` 的 `HOSTILE_RE` 逐字一致 */
+const HOSTILE = /zombie|skeleton|creeper|spider|witch|enderman|slime|pillager|vindicator|ravager|phantom|drowned|husk|stray|blaze|ghast|hoglin|piglin|wither|warden|silverfish|guardian|shulker|endermite|magma_cube|vex|zoglin|bogged|evoker|illusioner|breeze|giant|ender_dragon/i
 /** 不是"掉落物"的实体（船/矿车/展示框…），捡东西时跳过 */
 const NOT_DROP = /boat|minecart|armor_stand|item_frame|painting|arrow|snowball|egg|ender_pearl|eye_of_ender|fireball|fishing_bobber|potion|tnt|falling_block|leash|knot|shulker_bullet|llama_spit|wind_charge/i
 
@@ -951,16 +976,46 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     s.waterRecoverBusy = true
     s.waterRecoverAt = t
     const trigger = info?.trigger ?? null
+    /* 🔴 审计 P0-2：自主动作没有工具调用的截止时刻 ⇒ 空闲 tick 里 `msLeft()` 是 0，
+     *    `walkTo`/`swimUp` 会**一格都不动**却回一个像样的"走不通"。先给自己开一段预算。 */
+    grantMoveBudget(bot, WATER_RECOVER_MAX_MS)
     void (async () => {
       let res = null
+      const runRecover = () => withTimeout(
+        recoverFromWater(bot, { budgetMs: WATER_RECOVER_MS_INNER }, {
+          walkTo: (self, p, o) => bot.walkTo({ x: p.x, y: p.y, z: p.z }, o ?? {}),
+          swimUp: (self, o) => bot.swimUp(o ?? {}),
+        }),
+        WATER_RECOVER_MAX_MS, '水下自救',
+      )
       try {
-        res = await withTimeout(
-          recoverFromWater(bot, {}, {
-            walkTo: (self, p, o) => bot.walkTo({ x: p.x, y: p.y, z: p.z }, o ?? {}),
-            swimUp: (self, o) => bot.swimUp(o ?? {}),
-          }),
-          WATER_RECOVER_MAX_MS, '水下自救',
-        )
+        /* 🔴 2026-10-16 审计（P0-1，场景二）：以前这里**直接调 `bot.walkTo` / `bot.swimUp`**，
+         *    完全不进动作调度器 —— 于是"表里写着 `mc_move` 占着 movement，实际驱动 bot 的是
+         *    水下自救"，两者只靠 `_moveGen`（后进者赢）仲裁，谁都不告诉谁。
+         *    现在把它登记成一个**紧急级**动作：占 `movement`、有 actionId、能被 `mc_diag` 看见。
+         *    `priority:'emergency'`（100）比 `mc_move` 的 `user`（60）高 ⇒ 它**真的会抢占**
+         *    在跑的寻路（`src/action-scheduler.mjs` 的规矩：紧急级不受观察模式限制 ——
+         *    拿命去"观察"没有意义），被抢的那个收到 abort、如实以"被抢占"收场。 */
+        const sch = sess?.bot?.actionScheduler?.()
+        if (!sch) {
+          res = await runRecover()
+        } else {
+          const r = await sch.run({
+            name: 'auto:water',
+            owner: 'auto',
+            resources: ['movement'],
+            priority: 'emergency',
+            cancelPoint: 'safe',
+            execute: runRecover,
+          })
+          if (r.status === 'busy') {
+            res = { ok: false, escaped: false, reason: 'busy', note: `没轮到我：${r.note ?? 'movement 被别人占着'}`, tried: [], log: [] }
+          } else if (r.status === 'failed') {
+            throw r.error
+          } else {
+            res = r.result
+          }
+        }
       } catch (e) {
         res = { ok: false, reason: 'error', note: `自救过程出错：${e?.message ?? e}`, tried: [], log: [] }
       }
@@ -1146,6 +1201,8 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     if (!target) return false
     if (target.distance <= cfg.followDistance) return true
     s.busy = true
+    /* 🔴 同 `startWaterRecover`：反射层自己发起的走路要先开预算，否则空闲 tick 里一步不走。 */
+    grantMoveBudget(sess.bot, WALK_BUDGET + 800)
     withTimeout(sess.bot.walkTo({ x: target.position.x, y: target.position.y, z: target.position.z },
       { arrive: cfg.followDistance, budget: WALK_BUDGET }), WALK_BUDGET + 800, '跟随')
       .then(() => { s.stats.follows++; s.lastAction = `跟上 ${target.username}` })

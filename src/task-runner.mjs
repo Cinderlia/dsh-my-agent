@@ -311,6 +311,20 @@ export function outcomeOf (res, { expect = null } = {}) {
    *    而实际上这一步在新计划里可能**根本不存在**。 */
   if (r.stale === true) return 'stale'
 
+  /* 🔴 战斗策略层（2026-10-17）：`attack()` 自带一个**战斗结局** `combat`
+   *    （`damaged` / `killed` / `retreated` / `unreachable` / `aborted` / `timeout` / `unknown`）。
+   *    它**故意不叫 `outcome`** —— 那个键是跨工具的统一结局，被它占了以后
+   *    `withOutcome()` 会原样放过（`index.js:1989`），AI 就再也看不到"这事成没成"。
+   *    这里把战斗结局**翻译**成统一结局，两个字段各说各的、都能看见。
+   *    排在最前面：`retreated` 是**做到了我想做的事**，不能被下面那条
+   *    "够不着 / NoPath"的文本正则误判成失败（撤退时 note 里常常带"走不过去"）。 */
+  if (r.combat != null) {
+    const c = s(r.combat)
+    if (c === 'killed' || c === 'damaged' || c === 'retreated') return 'confirmed'
+    if (c === 'unreachable') return 'failed'
+    return 'unknown'   // aborted / timeout / unknown：可能已经打中了，别当失败
+  }
+
   // ① 明确失败：被拒 / 够不着 / 服务端复原 / 路不通
   if (r.restored === true) return 'failed'
   if (r.broken === false && r.refused === true) return 'failed'
@@ -624,6 +638,13 @@ export class TaskRunner {
     if (!t || t.status === 'done') return t
     t.status = 'paused'
     t.pauseReason = String(why)
+    /* 🔴 2026-10-16 审计（P0-1，场景三）：`pause` 以前**不换代**，于是"断线了"这条路上
+     *    正在飞的那一步完全不受影响 —— `task-exec` 在 `await this.call(...)` 之后只查代次
+     *    （`staleOf`），代次没变 ⇒ 判不出 stale ⇒ **断线时正在做的那一步照样记成已完成 /
+     *    已失败**（`stepDone` / `stepFail`），等下一轮开头才发现任务已经 paused。
+     *    语义上"暂停"就是"这一代不干了" —— 它和 `cancel` / `finish` 同类，该换代。
+     *    （`progress` / `note` 这类**记进度**的方法仍然不许换代 —— 换了执行器会被自己刚写的账判成过期。） */
+    this.#bump(t, `暂停：${why}`)
     this.note(taskId, `暂停：${why}`, { save: false })
     t.updatedAt = this.now()
     this.save()
@@ -636,6 +657,8 @@ export class TaskRunner {
     if (!t || t.status === 'done') return t
     t.status = 'waiting'
     t.pauseReason = String(why)
+    /* 同 `pause`：从"在做"变成"等条件"也是换代 —— 在飞那一步的结果不该再写回台账。 */
+    this.#bump(t, `等条件：${why}`)
     this.note(taskId, `等条件：${why}`, { save: false })
     t.updatedAt = this.now()
     this.save()
@@ -869,8 +892,30 @@ export class TaskRunner {
       ? `第 ${t.steps.indexOf(cur) + 1} 步「${cur.id}」试了 ${cur.attempts}/${max} 次都没成 —— 换个做法，或者问一下玩家`
       : null
 
+    /* 🔴 实机验收逮到的死胡同（2026-10-16，P0-1「真实调用链」验证）：
+     *    `resume` 原来**只给建议、不改状态**。于是任务一旦进了 `waiting`
+     *    （例如 `no-target`「附近找不到 dirt」），`run` 会在循环开头看见 `waiting` 就
+     *    「这一轮先停手」，而 `resume` 又回一句「接着做（用同样的参数再叫一次就好）」——
+     *    两边互相推诿，**AI 只剩 `cancel` 重开一条路**，那句 hint 是假的。
+     *    「恢复」的意思就是"接着做"，所以它必须真把任务拉回 `running`。
+     *    换代理由同 `pause` / `wait`：这是**状态转变**，不是记账 ——
+     *    恢复之前飞在半路的那一步，结果不该再写回这一代的台账。 */
+    const wasStatus = t.status
+    let revived = false
+    if (wasStatus === 'waiting' || wasStatus === 'blocked' || wasStatus === 'paused') {
+      this.#bump(t, `接着做（原来是 ${wasStatus}：${t.pauseReason ?? t.note ?? '没写原因'}）`)
+      t.status = 'running'
+      t.loopDetected = null
+      t.pauseReason = null
+      t.note = null
+      t.updatedAt = this.now()
+      this.save()
+      revived = true
+    }
+
     return {
       ok: true, task: taskBrief(t), have, need, verified, verifyNote,
+      revived, wasStatus,
       next, hint: stepHint ?? cls?.hint ?? '接着做（用同样的参数再叫一次就好）',
       action: suggestAction(t, need),
       loopDetected: t.loopDetected ?? null,
@@ -887,7 +932,9 @@ export function suggestAction (t, need = null) {
   const n = need == null ? null : Math.max(1, Number(need))
   switch (t.kind) {
     case 'dig':
-      return { tool: 'mc_dig', args: { name: item, count: n ?? 8, maxDistance: t.params?.maxDistance ?? 16 } }
+      /* 🔴 审计：`mc_dig` 的 `count` **上限是 16**（`src\mining.mjs` 里 `Math.min(…, 16)`，超了**静默截断**）。
+       * 这里不夹一下，`need: 40` 就会建议 `count: 40`，工具只挖 16 个、模型以为该挖的都挖完了。 */
+      return { tool: 'mc_dig', args: { name: item, count: Math.min(16, n ?? 8), maxDistance: t.params?.maxDistance ?? 16 } }
     case 'craft':
       /* 🔴 审计 F3：`mc_craft` 的参数叫 `count`，**没有** `times` —— 传 `times:8` 会被
        * `extensions\mc_craft.mjs` 静默忽略（`Number(args.count) || 1` ⇒ 只保证 1 个）。
@@ -895,8 +942,16 @@ export function suggestAction (t, need = null) {
       return { tool: 'mc_craft', args: { name: item, ...(n ? { count: n } : {}) } }
     case 'smelt':
       return { tool: 'mc_furnace', args: { name: item, ...(n ? { count: n } : {}) } }
-    case 'chest':
-      return { tool: 'mc_chest', args: { ...(t.params?.chest ? { chest: t.params.chest } : {}) } }
+    case 'chest': {
+      /* 🔴 审计：`mc_chest` 的参数是 `action` / `name` / `count` / `all` / `keep` / `x,y,z` / `radius`
+       * —— **没有 `chest`**。旧代码 `{ chest: t.params.chest }` 是个不存在的键（根 schema 不拦额外字段，
+       * 于是它被**静默忽略**），而 `mc_chest` 不给 `action` 时默认是 `list`（只列箱子、不搬东西）
+       * ⇒ 这条"建议"实际是在让模型去列一遍箱子，看着像给了下一步、其实什么都没给。
+       * 方向只有 `params.action` 能给；拿不到就**别硬编**，返回 null 让模型自己看步骤表。 */
+      const act = String(t.params?.action ?? '').toLowerCase()
+      if (act !== 'put' && act !== 'take') return null
+      return { tool: 'mc_chest', args: { action: act, name: item, ...(n ? { count: n } : {}) } }
+    }
     case 'move':
       return { tool: 'mc_move', args: { ...(t.params?.to ? { x: t.params.to.x, y: t.params.to.y, z: t.params.to.z } : {}) } }
     default:

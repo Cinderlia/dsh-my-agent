@@ -115,7 +115,7 @@ section('③ 空背包')
 section('⑤ 装备与工具耐久：会磨损的东西看得见还剩多少')
 {
   const invMod = await import(new URL('../src/inventory.mjs', import.meta.url))
-  const { durabilityOf, durText, durWarnOf, toolDurability, durabilityText, equipmentOf, equipmentText, DUR_LOW, DUR_CRITICAL } = invMod
+  const { durabilityOf, durText, durWarnOf, toolDurability, durabilityText, durWarnText, equipmentOf, equipmentText, DUR_LOW, DUR_CRITICAL } = invMod
 
   const pick = (used, max = 250) => ({ name: 'iron_pickaxe', count: 1, durabilityUsed: used, maxDurability: max })
 
@@ -188,6 +188,14 @@ section('⑤ 装备与工具耐久：会磨损的东西看得见还剩多少')
     ok(durabilityText({ inventory: { items: () => [{ name: 'dirt', count: 1 }] } }) === null, '一件会磨损的都没有 ⇒ null（调用方别 push 空行）')
     const worn = { inventory: { items: () => [], slots: (() => { const s = []; s[6] = { name: 'iron_chestplate', count: 1, durabilityUsed: 235, maxDurability: 240 }; return s })() } }
     ok(durabilityText(worn).includes('穿在身上'), '穿在身上的会标出来（免得 AI 去背包里找）', String(durabilityText(worn)))
+    /* 🔴 2026-10-16（用户 m11195 采纳的 F1）：`durWarnText` 是"只报快坏的"那一版 ——
+     *    给 `mc_dig` / `mc_act{break}` 这种**每轮都在跑**的动作用：全好时返回 `null`（不占地方），
+     *    坏的时候与 `durabilityText` 逐字相同。缺了它的后果很实：镐子在 `mc_dig` **执行中间**
+     *    爆掉时，AI 拿到的结果和"挖得好好的"一模一样，只能靠自己 `mc_inventory` 去查（通常不会查）。 */
+    ok(durWarnText(good) === null, '🔴 durWarnText 全好 ⇒ null（每轮都跑的动作不能刷"都还好"噪声）', String(durWarnText(good)))
+    ok(durWarnText(bad) === b2, '有快坏的 ⇒ 与 durabilityText 逐字相同（共用同一份排版，不许各写一套）', String(durWarnText(bad)))
+    ok(durWarnText({ inventory: { items: () => [{ name: 'dirt', count: 1 }] } }) === null, '没有会磨损的东西 ⇒ null')
+    ok(durWarnText({}) === null, '没 bot ⇒ null，不炸')
   }
 
   // ⑤ 装备栏字符串里也带耐久
