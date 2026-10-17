@@ -615,6 +615,9 @@ export const COLUMN_GLYPH = { solid: '#', air: '.', water: '~', lava: '≈', unl
 export const COLUMN_LABEL = { solid: '实心', air: '空腔', water: '水', lava: '岩浆', unloaded: '未加载' }
 /** 一次最多往下看几格（再深就该用 mc_scan 或 mc_move 了） */
 export const COLUMN_MAX = 96
+/** 头顶一次最多往上看几格（默认 40 —— 跟 `isUnderground` 判"地下"用的 40 格同一个数） */
+export const COLUMN_UP_DEFAULT = 40
+export const COLUMN_UP_MAX = 96
 
 /**
  * 一格方块在"会不会托住你"这个意义上的分类。
@@ -651,9 +654,10 @@ export function parseXZ (t) {
  * 空腔底下是什么。
  *
  * @returns {{x:number,z:number,feetY:number,from:number,to:number,layers:Array,runs:Array,
- *            solidRun:number,firstGap:object|null,gaps:Array,unloaded:number,complete:boolean}}
+ *            solidRun:number,firstGap:object|null,gaps:Array,unloaded:number,complete:boolean,
+ *            here:object,above:object}}
  */
-export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX } = {}) {
+export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX, up = null } = {}) {
   const feet = b?.entity?.position
   /* 🔴 2026-10-15（踩过的坑）：**`Number(null)` 是 `0`，而 `Number.isFinite(0)` 为真** ——
    *    直接写 `Number.isFinite(Number(x))` 会让"没传"变成"传了 0"：不传 x/z 时永远看 (0,0)、
@@ -707,6 +711,51 @@ export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, m
   const hereName = b?.blockAt?.(new Vec3(fx, fy, fz))?.name ?? null
   const here = { y: fy, name: hereName, kind: columnKindOf(hereName) }
 
+  /* ── 头顶：往上扫（2026-10-18 用户需求：「map竖井模式加上头上有什么」）──
+   * 往下扫回答"挖下去会不会掉"；往上扫回答另外三个问题：**跳不跳得起来**、
+   * **头顶是什么封着 / 封在哪一格**、**上面是不是水或岩浆**。
+   * 🔴 起算点是 `fy + 2`：`fy` 是脚、`fy + 1` 是脑袋 —— 从 `fy + 1` 起算就把自己的头算成方块了。
+   * 这条补的是 `PATHFINDER.md` 里的已知缺口「竖井里**必须先能跳**（头顶要有空位）才垫得动」：
+   * 以前竖列图只报脚下，AI 不知道头顶被板子封死，于是拿"垫脚"去试一个不可能的动作。 */
+  const upN = Math.max(1, Math.min(given(up) ? Math.floor(Number(up)) : COLUMN_UP_DEFAULT, COLUMN_UP_MAX))
+  const headFrom = fy + 2
+  const headLayers = []
+  for (let y = headFrom; y < headFrom + upN; y++) {
+    const blk = b?.blockAt?.(new Vec3(fx, y, fz))
+    const name = blk ? blk.name : null
+    const kind = columnKindOf(name)
+    headLayers.push({ y, name, kind, glyph: COLUMN_GLYPH[kind] })
+  }
+  const headRuns = []
+  for (const l of headLayers) {
+    const last = headRuns[headRuns.length - 1]
+    if (last && last.kind === l.kind) { last.to = l.y; last.n++; if (l.name && !last.names.includes(l.name)) last.names.push(l.name) }
+    else headRuns.push({ kind: l.kind, from: l.y, to: l.y, n: 1, names: l.name ? [l.name] : [] })
+  }
+  /* 头顶连续"不挡路"几格：实心挡路；**未加载是"不知道"，也停下**（别替世界下结论） */
+  let headroom = 0
+  for (const l of headLayers) {
+    if (l.kind === 'solid' || l.kind === 'unloaded') break
+    headroom++
+  }
+  const headSolid = headLayers.find((l) => l.kind === 'solid') ?? null
+  const above = {
+    from: headFrom,
+    to: headFrom + upN - 1,
+    head: { y: headFrom, name: headLayers[0]?.name ?? null, kind: headLayers[0]?.kind ?? 'unloaded' },
+    headroom,
+    ceiling: headSolid ? { y: headSolid.y, name: headSolid.name } : null,
+    /* 看到上限还没碰到实心 ⇒ 只能说"这一段是空的"，**不能说"通天"** */
+    truncated: !headSolid,
+    unloaded: headLayers.filter((l) => l.kind === 'unloaded').length,
+    hazards: {
+      lava: headRuns.filter((r) => r.kind === 'lava').map((r) => ({ y: r.from, to: r.to, thickness: r.n })),
+      water: headRuns.filter((r) => r.kind === 'water').map((r) => ({ y: r.from, to: r.to, thickness: r.n })),
+    },
+    runs: headRuns,
+    layers: headLayers,
+  }
+
   return {
     x: fx, z: fz, feetY: fy, from, to, layers, runs,
     solidRun,
@@ -714,6 +763,7 @@ export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, m
     gaps,
     hazards,
     here,
+    above,
     unloaded,
     complete: unloaded === 0,
     mode: 'column',
@@ -734,11 +784,58 @@ function gapAdvice (g, feetY) {
 
 const hazardSpan = (h) => (h.y === h.to ? `y=${h.y}` : `y=${h.y}..${h.to}`)
 
+/**
+ * 头顶那几行 —— "我跳不跳得起来 / 头上封着的是什么 / 上面是不是水或岩浆"（2026-10-18 用户需求）。
+ *
+ * 三件事必须分开说，因为后果不一样：**跳不起来**会让"垫脚往上爬"变成不可能的动作
+ * （`PATHFINDER.md` 那个已知缺口：1×1 竖井 + 头顶 jungle_planks ⇒ 出不来），
+ * **封着的是什么 / 在第几格**决定要挖多久，**水 / 岩浆**决定要不要立刻停手。
+ */
+function aboveLines (col) {
+  const a = col.above
+  if (!a || !a.layers?.length) return []
+  const out = []
+  /* `above` 本身用 `from`，`hazards` 里的段用 `y`（和下面那串 hazards 同一个形状）—— 两个都认 */
+  const span = (r) => {
+    const y0 = r.y ?? r.from
+    return y0 === r.to ? `y=${y0}` : `y=${y0}..${r.to}`
+  }
+  /* ① 头顶第一格就不知道 ⇒ 只说"不知道"，既别说"空"，也别说"能跳" */
+  if (a.head?.kind === 'unloaded') {
+    out.push(`  ? 头顶那一格（y=${a.from}）**没加载**（是"不知道"，不是"空的"）—— 挪一步再看。`)
+  } else if (!a.ceiling) {
+    /* ② 扫到上限都没碰到实心：能跳、也能垫；但**只看到这儿**，别当成"上面一路通天" */
+    out.push(a.unloaded
+      ? `  ☁️ 头顶 ${a.layers.length} 格（${span(a)}）里没碰到实心，不过其中有 ${a.unloaded} 格没加载（"不知道"，不是"空的"）。`
+      : `  ☁️ 头顶 ${a.layers.length} 格（${span(a)}）没有实心方块 —— 能跳、也能垫脚往上；**再往上没扫**（不代表通天）。`)
+  } else if (a.headroom === 0) {
+    /* ③ 头顶那一格就是实心 ⇒ 跳不起来（这就是"垫了也上不去"的那个原因） */
+    out.push(`  🧱 头顶那一格（y=${a.ceiling.y}）就是 **${a.ceiling.name}** —— **跳不起来**。`
+      + '要往上只能先挖掉它（或从旁边绕），**别在原地试垫脚**。')
+  } else {
+    /* 只空 1 格时别写成 `y=66..66` */
+    const roomSpan = a.headroom === 1 ? `y=${a.from}` : `y=${a.from}..${a.from + a.headroom - 1}`
+    out.push(`  ☁️ 头顶连续 ${a.headroom} 格没有实心（${roomSpan}），`
+      + `再往上 y=${a.ceiling.y} 是 **${a.ceiling.name}** —— 能跳；但上面封住了，想上去得挖开或垫脚。`)
+  }
+  /* ④ 头顶的水 / 岩浆：和"空腔"不是一回事 —— "从上面浇下来"比"往下掉"更难救 */
+  for (const h of a.hazards?.lava ?? []) {
+    out.push(`  🔥 头顶上方是**岩浆**（${span(h)}，${h.thickness} 格）—— **别往上挖**：挖开岩浆就浇下来。`)
+  }
+  for (const h of a.hazards?.water ?? []) {
+    out.push(`  🌊 头顶上方有**水**（${span(h)}，${h.thickness} 格）—— 你在水的下面；往上挖会灌下来。`)
+  }
+  if (a.unloaded && a.head?.kind !== 'unloaded') out.push(`  ? 头顶有 ${a.unloaded} 格没加载 —— 那几格是"不知道"，不是"空"。`)
+  return out
+}
+
 /** 竖列图 → 人话（AI 真正要读的就是这几行） */
 export function columnText (col) {
   if (!col || !col.layers?.length) return '🕳 竖列图：这一列一格都没读到（区块没加载？）'
   const where = (col.x === undefined) ? '' : `(${col.x}, ${col.z})`
-  const out = [`🕳 竖列 ${where}：脚底 y=${col.feetY}，从 y=${col.from} 往下扫到 y=${col.to}`]
+  /* 抬头里把"往上也看了"写出来 —— 只报脚下的时候，AI 会以为这就是全部信息 */
+  const upSpan = col.above?.layers?.length ? `，头顶看 y=${col.above.from}..${col.above.to}` : ''
+  const out = [`🕳 竖列 ${where}：脚底 y=${col.feetY}，从 y=${col.from} 往下扫到 y=${col.to}${upSpan}`]
   /* 先说你**自己**那一格是什么 —— 它不在下面那串 runs 里（扫的是脚底往下），
    * 但"泡在水里/岩浆里"和"站在空气里"完全是两回事，不说清就会得出"可以放心往下挖"。 */
   const hk = col.here?.kind
@@ -792,5 +889,7 @@ export function columnText (col) {
   if (deepLava.length) out.push(`  🔥 再往下还有 **岩浆**（${deepLava.map(hazardSpan).join('、')}）—— 上面那层挖开了也够呛。`)
   if (deepWater.length) out.push(`  🌊 再往下还有 **水**（${deepWater.map(hazardSpan).join('、')}）。`)
   if (col.unloaded) out.push(`  ? 有 ${col.unloaded} 格没加载，那几行是"不知道"，不是"实心"。`)
+  /* 最后说头顶：先说自己、再说下面、最后说上面 —— 读的人从"我"往外推 */
+  out.push(...aboveLines(col))
   return out.join('\n')
 }

@@ -545,6 +545,93 @@ try {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  section('⑪ 头顶（2026-10-18 用户需求："map竖井模式加上头上有什么"）')
+
+  {
+    /* 站在 y=64 的竖井底：脚底 y=63 实心、自己 y=64 空气、脑袋 y=65 空气 ⇒ **头顶第一格是 y=66**。
+     * `above` 必须从 `fy + 2` 起算 —— 从 `fy + 1` 起算的话，第一格永远是"自己的脑袋"，永远"实心"。 */
+    const shaft = (cells = {}, up = null) => {
+      const w = mkWorld({ fill: 'air' })
+      w.set(0, 63, 0, 'stone')
+      for (const [y, n] of Object.entries(cells)) w.set(0, Number(y), 0, n)
+      return columnOf(mkBot({ pos: [0, 64, 0], world: w }), { yBottom: -4, up })
+    }
+
+    /* ① 默认值 / 坐标范围 */
+    const OPEN = shaft()
+    ok(OPEN.above?.from === 66 && OPEN.above?.to === 105 && OPEN.above?.layers.length === 40,
+      '🔴 头顶从 y=66（脚 64 + 2）看到 y=105，默认 40 格', `${OPEN.above?.from}..${OPEN.above?.to}`)
+    ok(OPEN.above.head?.y === 66 && OPEN.above.head?.kind === 'air', 'head = 头顶第一格（y=66）')
+    ok(OPEN.layers[0].y === 63, '往下那一段还是从脚底 63 起（头顶没把下面挤掉）')
+    ok(OPEN.above.ceiling === null && OPEN.above.headroom === 40 && OPEN.above.truncated === true,
+      '头顶 40 格全空 ⇒ 没有天花板、headroom=40、truncated（只看到这里，不代表通天）')
+    const tOpen = columnText(OPEN)
+    ok(/头顶 40 格（y=66\.\.105）没有实心方块/.test(tOpen) && /能跳、也能垫脚往上/.test(tOpen),
+      '🔴 头顶全空 ⇒ 明说"能跳、能垫脚往上"')
+    ok(/再往上没扫/.test(tOpen) && !/通天/.test(tOpen.replace('不代表通天', '')),
+      '🔴 没扫到上限之外 ⇒ 必须有"再往上没扫"的限定（不能装作看见天了）')
+    ok(/头顶看 y=66\.\.105/.test(tOpen), '抬头也写清"头顶看到哪"')
+
+    /* ② 头顶第一格就封死 ⇒ 跳不起来（PATHFINDER 那个"垫了也上不去"的原因） */
+    const FLAT = shaft({ 66: 'jungle_planks' })
+    ok(FLAT.above.ceiling?.y === 66 && FLAT.above.headroom === 0, '头顶那一格实心 ⇒ headroom=0')
+    ok(FLAT.above.truncated === false, '碰到实心 ⇒ truncated=false（看见了，不是猜的）')
+    const tFlat = columnText(FLAT)
+    ok(/头顶那一格（y=66）就是 \*\*jungle_planks\*\*/.test(tFlat) && /跳不起来/.test(tFlat),
+      '🔴 头顶封死 ⇒ 说"跳不起来"')
+    ok(/别在原地试垫脚/.test(tFlat) && !/能跳/.test(tFlat),
+      '🔴 还要说"别在原地试垫脚" —— 跳不起来时垫脚是件不可能的事')
+
+    /* ③ 头顶空几格再封顶 ⇒ 能跳，但上面封住了 */
+    const ROOM = shaft({ 70: 'stone' })
+    ok(ROOM.above.headroom === 4 && ROOM.above.ceiling?.y === 70,
+      '头顶空 4 格（66..69），y=70 封顶', JSON.stringify(ROOM.above.ceiling))
+    const tRoom = columnText(ROOM)
+    ok(/头顶连续 4 格没有实心（y=66\.\.69）/.test(tRoom) && /y=70 是 \*\*stone\*\*/.test(tRoom),
+      '🔴 报"空几格 + 第几格封的、封的是什么"')
+    ok(/能跳/.test(tRoom) && /想上去得挖开或垫脚/.test(tRoom), '🔴 能跳，但要告诉它上面得挖开才上得去')
+
+    /* ④ up 参数：看几格是能调的，且**传小就只看到那儿** */
+    const SHORT = shaft({ 80: 'stone' }, 3)
+    ok(SHORT.above.to === 68 && SHORT.above.layers.length === 3, 'up=3 ⇒ 只看 y=66..68')
+    ok(SHORT.above.ceiling === null, 'up=3 看不到 y=80 ⇒ 不能凭空报出天花板')
+    ok(/头顶 3 格（y=66\.\.68）/.test(columnText(SHORT)), 'up=3 ⇒ 文案也只说 3 格')
+    ok(shaft({}, 0).above.layers.length === 1, '🔴 up=0 ⇒ 至少看 1 格（不是"一格都不看"这种空报告）')
+    ok(shaft({}, 999).above.layers.length === 96, 'up 超过 96 ⇒ 夹到 96（跟往下扫同一个上限）')
+
+    /* ⑤ 未加载 = 不知道，不能说成"空"、也不能说成"能跳" */
+    const UNL = shaft({ 66: null, 67: null, 68: null })
+    ok(UNL.above.head?.kind === 'unloaded' && UNL.above.headroom === 0,
+      '头顶第一格没加载 ⇒ headroom=0（停下，不替世界下结论）')
+    ok(/头顶那一格（y=66）\*\*没加载\*\*/.test(columnText(UNL)) && !/能跳/.test(columnText(UNL)),
+      '🔴 头顶没加载 ⇒ 说"没加载"，不许说"空"、更不许说"能跳"')
+    const UNL2 = shaft({ 68: null }, 10)
+    ok(UNL2.above.unloaded === 1 && UNL2.above.headroom === 2,
+      '半路没加载 ⇒ unloaded 记 1、headroom 停在它前面（2 格）')
+    ok(/其中有 1 格没加载/.test(columnText(UNL2)), '🔴 半路没加载 ⇒ 文案点名"其中有几格没加载"')
+
+    /* ⑥ 头顶的水 / 岩浆：和"空腔"不是一回事 —— 从上面浇下来比往下掉更难救 */
+    const WAT = shaft({ 66: 'water', 67: 'water', 70: 'stone' }, 10)
+    ok(WAT.above.hazards.water.length === 1 && WAT.above.hazards.water[0].y === 66
+      && WAT.above.hazards.water[0].to === 67 && WAT.above.hazards.lava.length === 0,
+      'above.hazards.water 记了 y/到哪/几格', JSON.stringify(WAT.above.hazards))
+    const tWat = columnText(WAT)
+    ok(/🌊 头顶上方有\*\*水\*\*（y=66\.\.67，2 格）/.test(tWat), '🔴 头顶有水 ⇒ 单独一行点名')
+    ok(/能跳/.test(tWat), '水不挡路 ⇒ 仍然"能跳"（别把水说成天花板）')
+    const LAV = shaft({ 68: 'lava' }, 10)
+    const tLav = columnText(LAV)
+    ok(/🔥 头顶上方是\*\*岩浆\*\*（y=68，1 格）/.test(tLav) && /别往上挖/.test(tLav),
+      '🔴 头顶是岩浆 ⇒ 最重的措辞"别往上挖"')
+    ok(columnText(shaft({ 66: 'water' }, 4)).match(/🌊/) && !/头顶上方是\*\*岩浆\*\*/.test(columnText(shaft({ 66: 'water' }, 4))),
+      '水不会被说成岩浆')
+
+    /* ⑦ 结构不打架：上面那段和下面那段互不重叠 */
+    const MIX = shaft({ 66: 'air', 67: 'stone' }, 4)
+    ok(MIX.above.layers.every((l) => l.y >= 66) && MIX.layers.every((l) => l.y <= 63),
+      '🔴 头顶（≥66）与脚底往下（≤63）两段不重叠 —— 自己那两格（64 脚 / 65 头）哪边都不算')
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   section('⑤ 静态接线（core.mjs / index.js）')
 
   const core = readFileSync(new URL('../src/core.mjs', import.meta.url), 'utf8')
@@ -598,16 +685,23 @@ try {
     'index：mc_map 默认 floor，但 auto/surface/cave/column 老模式一个没丢（老参数兼容）')
   /* ⑩ 竖列图的接线（2026-10-15） */
   ok(/if \(mode === 'column'\) \{/.test(strip(idx)), 'index：mc_map 有 mode:"column" 分支')
-  ok(/columnOf\(sess\.bot\.requireBot\(\), \{ x: p\?\.x \?\? null, z: p\?\.z \?\? null, yBottom: args\.yBottom \}\)/.test(strip(idx)),
-    'index：column 分支直接调 map-render 的 columnOf（不经过 core 薄包装）')
-  ok(/parseXZ\(args\.target\)/.test(strip(idx)), 'index：column 用 target 定 x/z（复用老参数，不加新参数 —— token 预算只剩几十字符）')
+  ok(/columnOf\(sess\.bot\.requireBot\(\), \{\s*x: p\?\.x \?\? null, z: p\?\.z \?\? null, yBottom: args\.yBottom, up: args\.up,/.test(strip(idx)),
+    'index：column 分支直接调 map-render 的 columnOf（不经过 core 薄包装），并透传 `up`')
+  ok(/parseXZ\(args\.target\)/.test(strip(idx)), 'index：column 用 target 定 x/z')
   ok(/text: columnText\(col\)/.test(strip(idx)), 'index：column 的 text 走 columnText()')
   ok(/here: col\.here/.test(strip(idx)), 'index：column 分支把 here（你自己站的那一格）透传出去')
   ok(/const hereName = b\?\.blockAt\?\.\(new Vec3\(fx, fy, fz\)\)\?\.name \?\? null/.test(strip(mapSrc)),
     'map-render：columnOf 真的去读机器人自己那一格（here 不是编的）')
   ok(/"column"（竖列/.test(idx), 'index：mc_map 描述里写了 column 模式')
-  ok(/export function columnOf \(b, \{ x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX \} = \{\}\) \{/.test(mapSrc),
-    'map-render：columnOf(b, {x,z,yTop,yBottom,maxDepth})')
+  /* ⑪ 头顶的接线（2026-10-18） */
+  ok(/up: \{ type: 'number'/.test(strip(idx)), 'index：mc_map 有 `up` 参数（头顶看几格）')
+  ok(/above: col\.above/.test(strip(idx)), 'index：column 分支把 above（头顶扫描）透传出去')
+  ok(/头顶什么封着/.test(idx), 'index：mc_map 描述里写了"头顶什么封着/跳不跳得起来"')
+  ok(/export const COLUMN_UP_DEFAULT = 40/.test(mapSrc), 'map-render：COLUMN_UP_DEFAULT = 40（和 isUnderground 的 40 格同一个数）')
+  ok(/export function columnOf \(b, \{ x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX, up = null \} = \{\}\) \{/.test(mapSrc),
+    'map-render：columnOf(b, {x,z,yTop,yBottom,maxDepth,up})')
+  ok(/const headFrom = fy \+ 2/.test(strip(mapSrc)),
+    '🔴 map-render：头顶从 `fy + 2` 起算 —— `fy` 是脚、`fy + 1` 是脑袋，从 fy+1 起算就自己的头算成方块了')
   ok(/export function columnText \(col\) \{/.test(mapSrc), 'map-render：columnText(col)')
   ok(/const given = \(v\) => v !== null && v !== undefined && v !== '' && Number\.isFinite\(Number\(v\)\)/.test(mapSrc),
     '🔴 map-render：columnOf 里判"传没传"必须用 `given()` 先挡 null —— `Number(null) === 0` 会让"没传"变成"传了 0"')

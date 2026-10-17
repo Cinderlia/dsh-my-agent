@@ -2738,7 +2738,7 @@ export function apply(ctx, rawConfig) {
       + '· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载。'
       + 'mode="floor"（默认）/ "auto"（地下自动切洞穴层：# 墙 · 能站 ↓ 低一格 v 会掉 * 矿石）'
       + '/ "surface"（地表：@ 我 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田）/ "cave"'
-      + '/ "column"（竖列：只看你脚下这一格，往下几格实心、哪里开始是空的）；slab = 洞穴层上下各看几格（默认 2）。'
+      + '/ "column"（竖列：只看你脚下这一格，往下几格实心、哪里开始是空的、头顶什么封着、跳不跳得起来）；slab = 洞穴层上下各看几格（默认 2）。'
       + 'format="image" 出**俯视图像**（有视觉的模型能直接看，并落盘）。'
       + '🔴 想让 用户 看到图：见 out 参数。'
       + '字符图省 token 且坐标精确；形状/外观问题用图像。',
@@ -2747,6 +2747,7 @@ export function apply(ctx, rawConfig) {
       mode: { type: 'string', description: 'floor（默认，脚下方块那一层）/ auto（地下自动切洞穴层）/ surface / cave / column（竖列）' },
       purpose: { type: 'string', description: 'overview（默认）/ navigation（加目标方位）/ hazards（先列危险格）' },
       target: { type: 'string', description: '（可选）目标坐标 "x,y,z"（mc_scan 给的）；竖列图用它定 x/z' },
+      up: { type: 'number', description: '竖列图头顶看几格（默认 40）' },
       layer: { type: 'number', description: 'floor 层的 y（默认 feetY-1）' },
       depth: { type: 'number', description: 'floor 层往下探几格找地面（默认 4，0–8）' },
       slab: { type: 'number', description: '洞穴层上下各看几格（默认 2，范围 1–8；5 = 上下各 5 格）' },
@@ -2786,11 +2787,15 @@ export function apply(ctx, rawConfig) {
        *    不给就用机器人自己站的那一格；`yBottom`（默认 -24）就是往下看多深；`format` 忽略，恒出字符。 */
       if (mode === 'column') {
         const p = parseXZ(args.target)
-        const col = columnOf(sess.bot.requireBot(), { x: p?.x ?? null, z: p?.z ?? null, yBottom: args.yBottom })
+        const col = columnOf(sess.bot.requireBot(), {
+          x: p?.x ?? null, z: p?.z ?? null, yBottom: args.yBottom, up: args.up,
+        })
         return {
           mode: 'column', x: col.x, z: col.z, feetY: col.feetY, from: col.from, to: col.to,
           solidRun: col.solidRun, firstGap: col.firstGap, gaps: col.gaps, hazards: col.hazards,
           here: col.here,
+          /* 头顶：跳不跳得起来 / 封着什么 / 上面是不是水或岩浆（2026-10-18 用户需求） */
+          above: col.above,
           unloaded: col.unloaded, complete: col.complete, runs: col.runs, layers: col.layers,
           text: columnText(col),
         }
