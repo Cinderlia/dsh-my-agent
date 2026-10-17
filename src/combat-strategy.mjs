@@ -29,6 +29,66 @@ export const MELEE_RANGE = 3.5
 export const REACH_RANGE = 4.5
 /** 远程威胁：这个距离内的远程怪算"它够得着我" */
 export const RANGED_THREAT_RANGE = 12
+/**
+ * **威胁分**：同档怪之间谁先打（用户 2026-10-18 转来游戏里 AI 的原话：
+ * 「不会按威胁排优先级 —— 凋灵骷髅（挂凋零、10 秒掉 5 血）应该优先于僵尸，但它不会」）。
+ *
+ * 🔴 分只用于**已经决定要打**的候选之间排序（`attack.mjs` 里 rank 0 敌对那一档）：
+ *    · 凋零 / 爆炸 / 强制伤害型排最前（放着不管会把你按死）；
+ *    · 远程（骷髅/烈焰人/女巫）次之（它们会边退边打，越拖越亏）；
+ *    · 近战僵尸系最便宜（追得上、打得动）。
+ *    名字用注册名；`threatScoreOf` 有兜底，别在表外漏掉就崩。
+ */
+export const THREAT_SCORE = {
+  wither: 130,
+  ender_dragon: 140,
+  warden: 120,
+  wither_skeleton: 100,
+  creeper: 96,
+  blaze: 92,
+  evoker: 90,
+  witch: 88,
+  ravager: 86,
+  elder_guardian: 85,
+  enderman: 84,
+  ghast: 80,
+  skeleton: 80,
+  stray: 80,
+  bogged: 80,
+  zoglin: 78,
+  piglin_brute: 76,
+  vex: 75,
+  hoglin: 74,
+  vindicator: 72,
+  pillager: 70,
+  phantom: 70,
+  shulker: 70,
+  drowned: 66,
+  guardian: 65,
+  spider: 60,
+  cave_spider: 58,
+  silverfish: 55,
+  endermite: 55,
+  zombie: 50,
+  husk: 50,
+  zombie_villager: 40,
+  magma_cube: 35,
+  slime: 30,
+}
+
+/** 名字 ⇒ 威胁分（表外给兜底分，不认识也照样能排） */
+export function threatScoreOf (name) {
+  const n = String(name ?? '').trim().toLowerCase()
+  if (THREAT_SCORE[n] != null) return THREAT_SCORE[n]
+  /* 带后缀的变体（`zombie_horse`、`skeleton_horse`、模组怪 `xx_zombie`）按关键词兜底 */
+  if (/wither/.test(n)) return 100
+  if (/creeper/.test(n)) return 96
+  if (/skeleton/.test(n)) return 80
+  if (/zombie|husk/.test(n)) return 50
+  if (/spider/.test(n)) return 60
+  if (/slime/.test(n)) return 30
+  return 45
+}
 /** 视野里敌对数量到这个数 ⇒ 算"被围" */
 export const CROWD_THRESHOLD = 3
 /**
@@ -61,8 +121,12 @@ export const REPOSITION_MAX = 2
  *    如果一个阶段就把 `budget` 吃光，那"重新观察"永远不会发生 ——
  *    `reposition` / `equip` 这些分支写了也走不到（第一版就是这样：`check-core-attack`
  *    的"够不着"用例当场发现它从来不重新找位，因为第一次进攻就把预算用完了）。
+ *
+ * 🔴 2026-10-18 从 3 秒压到 1.2 秒（用户转来游戏里 AI 的原话：「**一次 3 秒不能中断**，
+ *    打一半想跑跑不掉」）：现在每 1.2 秒就重新看一次血/目标/旁边的怪，掉头、换目标、
+ *    提前收手都只差一个阶段，不再"闷头挥满 3 秒"。
  */
-export const COMBAT_PHASE_MS = 3_000
+export const COMBAT_PHASE_MS = 1_200
 /** 两次换武器之间至少隔多久（换装本身要花时间） */
 export const EQUIP_COOLDOWN_MS = 1_500
 /** 撤退时往反方向走多远 */

@@ -58,7 +58,7 @@ import { dropHint, entityHealth } from './world-observer.mjs'
 import { durabilityOf, EQUIP_SLOTS } from './inventory.mjs'
 import {
   assessCombat, chooseStrategy, combatOutcomeOf, combatOutcomeText, combatPlanText,
-  approachPointOf, isShield, COMBAT_PHASE_MS, HEALTH_LOW,
+  approachPointOf, isShield, COMBAT_PHASE_MS, HEALTH_LOW, threatScoreOf,
 } from './combat-strategy.mjs'
 import { Vec3 } from 'vec3'
 import { BRIDGE_FATAL } from './bridge.mjs'
@@ -146,17 +146,20 @@ function kiteSpotOf (b, target, { distance = KITE_DISTANCE } = {}) {
   return null
 }
 
-export async function attack (b, { who = null, budget = 20_000, kite = false } = {}, ctx = {}) {
+export async function attack (b, { who = null, budget = 20_000, kite = false, priority = 'threat' } = {}, ctx = {}) {
   const needle = who ? String(who).trim().toLowerCase() : null
   const alias = needle ? NAME_ALIAS[needle] : null
   const hasPvp = Boolean(ctx.hasPvp) && typeof b.pvp?.attack === 'function'
   /* 🔴 位置要**每次现读**（`b.entity.position` 是活的）——
    *    旧写法在函数开头 `const me = b.entity.position` 抓一次，走位之后就过期了。 */
   const distOf = (e) => { try { return e.position.distanceTo(b.entity.position) } catch { return Infinity } }
-  const all = Object.values(b.entities ?? {})
+  /* 🔴 2026-10-18：快照改成**可刷新**的（目标跑了要能换下一只 —— 用户转来游戏里 AI 的原话
+   *    「目标跑了也不换目标，这一轮就废了」）。原来 `all/list/pick/target` 在开头算一次就再也不变。 */
+  const snapshotAll = () => Object.values(b.entities ?? {})
     .filter((e) => e && e !== b.entity && e.position)
-    .map((e) => ({ e, d: distOf(e), nm: entityNameOf(e) }))
+    .map((e) => ({ e, d: distOf(e), nm: entityNameOf(e), hp: entityHealth(b, e) }))
     .filter((x) => x.d <= 24)
+  let all = snapshotAll()
   /* 🔴 2026-10-17（用户实机："怪物好像不显示中立"）：立场判定统一走 `hostilityOf()`。
    *    原来这里把 `HOSTILE_RE` 命中就算敌对，而那份名单里有 `enderman` / `piglin` ——
    *    于是不带名字的 `mc_act{attack}` 会**主动去揍末影人**（本不会打你、能瞬移、40 血），
@@ -178,15 +181,31 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
     if (fields.some((v) => v.includes(needle))) return true
     return Boolean(alias) && fields.some((v) => v.includes(alias))
   }
+  /* 🔴 2026-10-18（用户转来游戏里 AI 的原话：「**不会按威胁排优先级** —— 凋灵骷髅（挂凋零、
+   *    10 秒掉 5 血）应该优先于僵尸，但它不会」）：同一档（敌对/玩家/中立/动物）之间，
+   *    按 **威胁分 + 距离 + 是否正在打我** 排。分表在 `combat-strategy.mjs` 的 `threatScoreOf`。
+   *    `priority` 只决定"同一档里怎么排"：threat（默认，威胁最大）/ nearest（最近）/ weakest（血最少）。 */
+  const priorityMode = ['nearest', 'weakest'].includes(String(priority)) ? String(priority) : 'threat'
+  const scoreOf = (x) => threatScoreOf(x.nm) + Math.max(0, 12 - x.d) + (x.e?.target === b.entity ? 25 : 0)
+  const sortCands = (a, c) => {
+    const rank = rankOf(a) - rankOf(c)
+    if (rank) return rank
+    if (priorityMode === 'nearest') return a.d - c.d
+    if (priorityMode === 'weakest') return (a.hp ?? 999) - (c.hp ?? 999) || a.d - c.d
+    return scoreOf(c) - scoreOf(a) || a.d - c.d
+  }
+  const candsOf = (snap) => (needle
+    ? snap
+    : snap.filter((x) => rankOf(x) === 0 || (x.d <= 4.5 && rankOf(x) === 3)))
+    .filter(hit).sort(sortCands)
   // 🔴 不给 who 时**只追怪**（24 格内的敌对也追），动物/玩家仍只在 4.5 格内 ——
   //    否则"打最近的"会跑过去揍玩家 6 格外的马（2026-10-08 探针实测附近就有 horse 6.8 格）。
   /* 🔴 中立怪（末影人 / 猪灵 / 狼 / 蜜蜂 / 铁傀儡…）**不带名字就绝不去打**。
    *    它们本不会主动打你，但惹了会 —— 末影人 40 血 + 能瞬移，是最不该"顺手打一只"的。
    *    动物仍然只在 4.5 格内才算（打猎），玩家也改成必须点名。 */
-  const inReach = needle ? all : all.filter((x) => rankOf(x) === 0 || (x.d <= 4.5 && rankOf(x) === 3))
-  const list = inReach.filter(hit).sort((a, c) => (rankOf(a) - rankOf(c)) || (a.d - c.d))
-  const near = all.slice().sort((a, c) => a.d - c.d).slice(0, 6)
+  const nearOf = (snap) => snap.slice().sort((a, c) => a.d - c.d).slice(0, 6)
     .map((x) => `${x.nm} ${x.d.toFixed(1)} 格`).join('、')
+  let near = nearOf(all)
   /* 打完这一只，**附近还有哪些怪** —— 顺手报一句（用户 2026-10-16："用完 mc_attack 后自动调用
    * 获取实体的功能，防止周围有其他怪物"）。
    * 🔴 为什么非报不可：`extensions/mc_auto.mjs:1119` 的反射层在 `s.inFlight > 0` 时
@@ -213,12 +232,12 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
         + foes.map((f) => `${f.name} ${f.distance} 格${f.health == null ? '' : `（血 ${f.health}）`}`).join('、'),
     }
   }
-  const pick = list[0]
+  let pick = candsOf(all)[0]
   // 半径内只剩掉落物（且不在手边）就别动手：打到一个 item 是白费一轮
   /* 🔴 2026-10-15 审计：点名点到掉落物时，旧文案是"附近找不到 X（24 格内实际有：X）"——
    *    同一句话里自相矛盾（找不到却列出来了）。这里单独说清"它是掉落物、而且够不着"。 */
   const dropOutOfReach = Boolean(pick && rankOf(pick) === 4 && pick.d > 4.5)
-  const target = pick && !dropOutOfReach ? pick.e : null
+  let target = pick && !dropOutOfReach ? pick.e : null
   if (!target) {
     if (needle && dropOutOfReach) {
       throw new Error(`"${who}" 是**掉落物**，而且离我 ${pick.d.toFixed(1)} 格（超过 4.5 格）—— 我不打掉落物。`
@@ -248,9 +267,32 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
       + ' —— 掉落物 / 经验球不算，动物与玩家要贴到 4.5 格内；'
       + '要打远处的怪就先 `mc_move` 过去（或 `mc_act {mode:"attack", who:"zombie"}`，那个会追 24 格）。')
   }
-  const label = entityNameOf(target)
-  const d = Number(distOf(target).toFixed(1))
-  const hpBefore = entityHealth(b, target)
+  let label = entityNameOf(target)
+  let d = Number(distOf(target).toFixed(1))
+  let hpBefore = entityHealth(b, target)
+
+  /* ── 换目标（P1，用户 2026-10-18「目标跑了也不换目标，这一轮就废了」）───────────────
+   * 目标还活着就不换（打到一半换目标 = 这一轮白费，也违背"我说打谁就打谁"）；
+   * 只有确认它没了 / 跑出 24 格，才按同一个 `priority` 重新挑下一只。 */
+  let retargets = 0
+  const alive = () => Boolean(target && b.entities?.[target.id] && target.isValid !== false)
+  const trackable = () => { try { return alive() && distOf(target) <= 24 } catch { return false } }
+  const accept = (x) => {
+    pick = x; target = x.e; label = x.nm
+    d = Number(x.d.toFixed(1))
+    hpBefore = x.hp == null ? entityHealth(b, x.e) : x.hp
+    mem.lastInRange = null
+  }
+  const select = ({ reselect = false } = {}) => {
+    if (!reselect && trackable()) return true
+    all = snapshotAll()
+    near = nearOf(all)
+    const best = candsOf(all)[0]
+    const drop = Boolean(best && rankOf(best) === 4 && best.d > 4.5)
+    if (!best || drop) { pick = best ?? null; target = null; return false }
+    accept(best)
+    return true
+  }
 
   /* ═══════════ ① 进攻阶段（原来的实现原样搬进来，只改"谁来叫它"） ═══════════ */
 
@@ -260,8 +302,9 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
    *  放风筝时再压到 1.3 秒：节奏是"打一两下 → 退一步"，不是"顶 3 秒 → 退一次"。 */
   const phaseMs = () => callBudget(Math.min(budgetLeft(), kite ? Math.min(COMBAT_PHASE_MS, KITE_STEP_MS + 100) : COMBAT_PHASE_MS), 4_000)
 
-  /** 有 pvp：交给插件追+打，自己等到"目标没了 / 这一轮用完" */
-  const engagePvp = async () => {
+  /** 有 pvp：交给插件追+打，自己等到"目标没了 / 这一轮用完"
+   *  `opts.shield`：这一轮值得举盾吗（副手有盾 + 目标近战贴脸 / 远程在射我 / 被围） */
+  const engagePvp = async (opts = {}) => {
     /* 🔴 `bot.pvp.attack(target)` **立刻** resolve（它只做三件事：设 target、`GoalFollow` 追过去、
      *    发 `startedAttacking` 事件），真正挥拳的是 `physicTick` 上的后台循环 ⇒
      *    旧写法 `await withTimeout(b.pvp.attack(...))` 一毫秒就返回，紧接着 `finally` 里
@@ -277,6 +320,15 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
      *    当成"我打死了它" ⇒ 后面还会据此报掉落物。只有**消失前读到过血量下降**才算打死。 */
     let sawDamage = false
     let lastHp = hpBefore
+    /* 2026-10-18（用户：「一次 3 秒不能中断，打一半想跑跑不掉」「骷髅边跑边射追不上」）：
+     * 这一轮里也盯着三件事 —— 血掉太猛、目标越跑越远、什么时候该举盾。 */
+    let shields = 0
+    let ticks = 0
+    let hardHurt = false
+    let chaseGiveUp = false
+    let grewSince = 0
+    let lastDist = distOf(target)
+    const hpStart = Number(b.health)
     try {
       await b.pvp.attack(target)
       while (Date.now() - t0 < bd) {
@@ -286,6 +338,26 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
         if (hp != null) {
           if (lastHp != null && hp < lastHp) sawDamage = true
           lastHp = hp
+        }
+        /* ① 血掉太猛 ⇒ 这一轮提前收手（别等阶段走完） */
+        if (Number.isFinite(hpStart) && Number.isFinite(Number(b.health)) && hpStart - Number(b.health) >= 4) {
+          hardHurt = true
+          break
+        }
+        /* ② 远程目标越跑越远（持续 2.5 秒距离都在变大、且已经 >6 格）⇒ 别把预算花在追屁股上 */
+        const dd = distOf(target)
+        if (dd <= lastDist - 0.15) grewSince = 0
+        else if (dd >= lastDist + 0.15 && !grewSince) grewSince = Date.now()
+        lastDist = dd
+        if (grewSince && Date.now() - grewSince >= 900 && dd > 6 && RANGED_RE.test(label)) {
+          chaseGiveUp = true
+          break
+        }
+        /* ③ 举盾：只在"等它打过来"的窗口举 0.3 秒，挡完立刻放（举着不能攻击，会拖慢输出） */
+        if (opts.shield && (++ticks % 8) === 0) {
+          try { b.activateItem(true); shields++ } catch { /* 没有副手盾 / 插件不支持就跳过 */ }
+          await sleep(320)
+          try { b.deactivateItem() } catch { /* 放不下也不影响下一轮 */ }
         }
         await sleep(120)
       }
@@ -305,10 +377,17 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
     if (gone && !killed && !pvpErr) {
       note = `目标不见了，但**没读到过它掉血** —— 说不清是我打死的还是它走远/区块卸载了（别当成打死了）`
     }
+    if (hardHurt) {
+      note = `这一轮挨了 ${(hpStart - Number(b.health)).toFixed(0)} 点伤害 —— 血掉太快，提前收手（先撤或找掩体，别硬顶）`
+    }
+    if (chaseGiveUp) {
+      note = `目标越跑越远（现在 ${distOf(target).toFixed(1)} 格）—— 远程怪边跑边射，追不上；先找掩体/绕侧，或换目标`
+    }
     /* 打死了 ⇒ 掉落物就掉在原地。用户 2026-10-08 原话："打完动物以后老是忘记走过去拾取" ——
      * 只**点一句**，不替它走过去（先捡哪个、走多远是决策，而且这一轮的预算基本已经花完了）。 */
     const pickup = killed ? dropHint(b) : null
-    if (!gone && !pvpErr) {
+    /* 已经给出更具体的原因（血掉太猛 / 追不上）就别用"没打死"把它盖掉 */
+    if (!gone && !pvpErr && !hardHurt && !chaseGiveUp) {
       note = inRange
         ? `打了 ${(waitedMs / 1000).toFixed(1)} 秒还没打死（这一轮的时间到了）—— 再叫一次 mc_act{attack} 接着打`
         : `追了 ${(waitedMs / 1000).toFixed(1)} 秒还没进到攻击距离（3.5 格）—— 走不过去 / 被方块挡住 / 目标跑太快；`
@@ -320,18 +399,22 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
       ...(note ? { note } : {}),
       ...(pickup ? { pickup } : {}),
       ...(pvpErr ? { error: pvpErr } : {}),
+      ...(shields ? { shieldBlocks: shields } : {}),
       /* 内部字段（下划线开头，不进最终返回值）：给策略层判断用 */
       _sawDamage: sawDamage, _inRange: inRange, _gone: gone, _killed: killed,
+      _shields: shields, _hardHurt: hardHurt, _chaseGiveUp: chaseGiveUp,
     }
   }
 
   /** 没有 pvp 插件：退化成原地挥（上游原版就是一次 `b.attack`，这里按预算多挥几下） */
   const engageSwing = async () => {
+    const hpStart = Number(b.health)
     const t0 = Date.now()
     const leftMs2 = ctx.callLeft() - 400
     const bd = leftMs2 <= 100 ? 0 : Math.max(0, Math.min(phaseMs(), leftMs2))
     let swings = 0
     let sawDamage2 = false
+    let hardHurt = false
     let lastHp2 = hpBefore
     const sample = () => {
       const hp = entityHealth(b, target)
@@ -347,6 +430,10 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
       swings++
       await sleep(620)
       sample()
+      if (Number.isFinite(hpStart) && Number.isFinite(Number(b.health)) && hpStart - Number(b.health) >= 4) {
+        hardHurt = true
+        break
+      }
     }
     // 没有 pvp 时至少挥一下（bd=0 说明这一轮已经用完了，那就别再拖）
     if (swings === 0 && b.entities?.[target.id] && target.isValid !== false && distOf(target) <= 4.5 && !ctx.abortSignal?.aborted) {
@@ -363,7 +450,8 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
       attacked: label, distance: d, swings, killed, gone, health: b.health,
       ...(gone && !killed ? { note: '目标不见了，但**没读到过它掉血** —— 说不清是我打死的还是它走远/区块卸载了（别当成打死了）' } : {}),
       ...(pickup ? { pickup } : {}),
-      _sawDamage: sawDamage2, _inRange: inRange, _gone: gone, _killed: killed,
+      ...(hardHurt ? { note: `这一轮挨了 ${(hpStart - Number(b.health)).toFixed(0)} 点伤害 —— 血掉太快，提前收手` } : {}),
+      _sawDamage: sawDamage2, _inRange: inRange, _gone: gone, _killed: killed, _hardHurt: hardHurt,
     }
   }
 
@@ -376,6 +464,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
   const actions = []
   const hurt = []
   let sawDamageAny = false
+  let shieldsAny = 0
   let last = null
   /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高"）：策略层想撤 / 想拉开距离时，
    *    这里只记**建议**，不执行 —— 见下面 `chooseStrategy` 的解构。 */
@@ -411,6 +500,21 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
      *   ② `callLeft()`（这一轮**工具调用**还剩多少）—— 预算没超但宿主的时间快到了，也得收手。 */
     if (Date.now() - t00 >= budget - 100) { timedOut = true; break }
     if (ctx.callLeft() <= 500) { timedOut = true; break }
+
+    /* ── 目标没了 / 跑出 24 格 ⇒ 换下一只（用户 2026-10-18：「目标跑了也不换目标，这一轮就废了」）──
+     *    只换"同一批候选"里（点名就只在同名候选里挑），不擅自改成另一类目标。 */
+    if (!trackable()) {
+      const lost = label
+      if (!select({ reselect: true })) {
+        unreachable = true
+        moveErr = `「${lost}」不见了，24 格内也没有能接手的${needle ? `「${who}」` : '怪'}（附近：${near || '什么都没有'}）`
+        break
+      }
+      retargets++
+      actions.push('retarget')
+    }
+    /* 每轮刷新视野（威胁分要按当前局面算，不能拿几秒前的快照） */
+    all = snapshotAll()
 
     const now = Date.now()
     if (Number.isFinite(Number(b.health))) hurt.push({ at: now, health: Number(b.health) })
@@ -535,11 +639,25 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
       continue
     }
 
-    /* ── 进攻（一个阶段） ── */
-    last = hasPvp ? await engagePvp() : await engageSwing()
+    /* ── 进攻（一个阶段） ──
+     * 举盾只在"确实有东西要挡"时：目标自己是远程 / 它正在打我 / 被围 / 有别的远程在射我。 */
+    const shieldWanted = Boolean(snap.hasShield
+      && (snap.target?.ranged || snap.target?.attackingMe || snap.surrounded || snap.rangedThreat))
+    last = hasPvp ? await engagePvp({ shield: shieldWanted }) : await engageSwing()
     sawDamageAny = sawDamageAny || last._sawDamage === true
+    shieldsAny += Number(last._shields) || 0
     mem.lastInRange = last._inRange === true
-    if (last._killed === true || last._gone === true) break
+    if (last._killed === true) break
+    /* 血掉太猛 -> 这一轮就收（不再试下一个阶段） */
+    if (last._hardHurt === true) break
+    if (last._chaseGiveUp === true) { unreachable = true; moveErr = String(last.note ?? '远程怪在后退，追不上'); break }
+    if (last._gone === true) {
+      const lost = label
+      if (select({ reselect: true })) { retargets++; actions.push('retarget'); continue }
+      unreachable = true
+      moveErr = `「${lost}」不见了，24 格内也没有能接手的${needle ? `「${who}」` : '怪'}（附近：${near || '什么都没有'}）`
+      break
+    }
     if (last.error) break
     if (ctx.callLeft() <= 500) { timedOut = true; break }
 
@@ -595,7 +713,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
   const base = last ?? {
     attacked: label, distance: d, killed: false, gone: false, health: b.health,
   }
-  const { _sawDamage, _inRange, _gone, _killed, ...clean } = base
+  const { _sawDamage, _inRange, _gone, _killed, _shields, _hardHurt, _chaseGiveUp, ...clean } = base
   /* 够不着/超时/被中止时，旧 `note` 那句"再叫一次接着打"是误导 ⇒ 换成策略层的话 */
   const strategyNote = (unreachable || aborted || timedOut) && !last?.note
     ? `${combatPlanText(lastStep)}${moveErr ? `（${moveErr}）` : ''}`
@@ -623,6 +741,10 @@ export async function attack (b, { who = null, budget = 20_000, kite = false } =
             : `放风筝：这一轮没退${mem.kiteWhy ? `（${mem.kiteWhy}）` : '（没被打到 / 不是近战怪 / 被围 / 血太少 / 时间不够）'}`,
         }
       : {}),
+    /* 这次用的是哪种目标优先权（threat / nearest / weakest）+ 换过几次目标（用户 2026-10-18 的抱怨 ①③） */
+    priority: priorityMode,
+    ...(retargets ? { retargets } : {}),
+    ...(shieldsAny ? { shieldBlocks: shieldsAny } : {}),
     ...(strategyNote ? { note: strategyNote } : {}),
     /* 策略层的建议（没有执行）：AI 要撤 / 要拉开距离，自己叫 `mc_move`。
      * 单独给一个字段，别混进 `note`（那样会和"这一轮的攻击结果"抢同一句话）。 */

@@ -480,8 +480,9 @@ section('⑤ 静态接线')
   const connNo = strip(readFileSync(new URL('../src/connection.mjs', import.meta.url), 'utf8'))
   const auNo = strip(readFileSync(new URL('../src/async-util.mjs', import.meta.url), 'utf8'))
   has(atkNo, '24 格内实际有：', 'attack.mjs：找不到时列出半径内实际有谁')
-  has(atkNo, 'const inReach = needle ? all : all.filter((x) => rankOf(x) === 0 || (x.d <= 4.5 && rankOf(x) === 3))',
-    'attack.mjs：不给 who 时只追敌对（动物限 4.5 格，中立怪必须点名）')
+  has(atkNo, 'const candsOf = (snap) =>', 'attack.mjs：候选名单抽成函数（换目标要能重选）')
+  has(atkNo, "if (priorityMode === 'nearest') return a.d - c.d", 'attack.mjs：不给 who 时按 priority 排（默认 threat）')
+  has(atkNo, 'const select = ({ reselect = false } = {})', 'attack.mjs：select 能重新挑（目标跑了不直接收工）')
   /* 🔴 2026-10-16（用户 m11195 采纳的 ①）：`mc_act{mode:"attack"}` 打完目标后**顺带报附近还有谁** ——
    *    以前只报"打死了 / 打了多少血"，AI 得再单独调一次 `mc_entities` 才知道旁边还站着两只。
    *    数据本来就在手（`all` 已列了 24 格内全部实体），零额外遍历；没怪时返回 `{}`（常态零结果 token）。 */
@@ -532,7 +533,7 @@ section('⑤ 静态接线')
   has(atkNo, 'Promise.resolve(b.pvp.stop()).catch(() => {})',
     'attack.mjs：pvp.stop() 不 await（它最多等 5 秒 path_stop，会把预算吃光）')
   has(woNo, 'export function entityHealth (b, e)', 'world-observer：血量助手 entityHealth（第十刀搬过去的）')
-  has(atkNo, 'const hpBefore = entityHealth(b, target)', 'attack.mjs：动手前先记目标血量')
+  has(atkNo, 'let hpBefore = entityHealth(b, target)', 'attack.mjs：动手前先记目标血量（换目标要重记）')
   /* 🔴 2026-10-17 实机：`entityHealth()` 在真服上**永远回 null** ⇒ "打死必须有掉血证据"永远不成立
    *    （拳头打死僵尸，报的却是 combat:"unknown" + "没读到过它掉血"，掉落提示也从不出现）。
    *    根因：`@nxg-org/mineflayer-util-plugin` 的 `getHealth()` 算
@@ -1088,9 +1089,11 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     has(atkNo, '...(lastSnap?.weaponWarn ? { weaponWarn: lastSnap.weaponWarn } : {}),',
       '🔴 attack.mjs：武器快坏了要把话带出去（不然 AI 只看到"在打"）')
     /* 用户方案："没有盾牌或无法防御 ⇒ 不进入依赖盾牌的策略"。
-     * 我们**根本不举盾** —— 那就要钉死"不许凭空调用防御 API"。 */
-    ok(!/activateItem|useItem\(|raiseShield|blockWithShield/.test(atkNo),
-      '🔴 attack.mjs 里没有任何"举盾/使用物品"的调用（没有盾牌就不进依赖盾牌的策略）')
+    /* 用户 m01086 抱怨 4："副手有盾也不用"。现在只在**副手真握着盾**时举（hasShield 来自真实背包/装备）。
+     * 所以断言改成两头：举盾入口只能走副手，且必须被 hasShield 和"有敌人"两道门夹住。 */
+    has(atkNo, 'const shieldWanted = Boolean(snap.hasShield', '🔴 attack.mjs：举盾只看真实持有的盾 + 有没有东西要挡')
+    has(atkNo, 'if (opts.shield && (++ticks % 8) === 0)', '🔴 attack.mjs：只在交战的窗口里举（不是一直举着）')
+    has(atkNo, 'b.deactivateItem()', '🔴 attack.mjs：交完手放下盾（不能一直举着）')
   }
 }
 
@@ -1186,6 +1189,117 @@ section('⑨ 放风筝 —— 只对近战怪、退到安全落脚点、没退�
 }
 
 // ── 收尾 ──────────────────────────────────────────────────────────────────────
+/* ─────────── ⑩ 威胁优先 / 换目标 / 举盾 / 早收手（用户 m01086 的 6 条实机抱怨） ───────────
+ * 这里钉的是"打谁、换不换、怎么保护自己"：
+ *   · 默认按**威胁**挑（挂凋零的骷髅排在僵尸前面），另外还有 nearest / weakest
+ *   · 目标消失 ⇒ 当轮重新挑，不再"这一轮就废"
+ *   · 副手有盾 ⇒ 交战期间举起来（只举副手、只举一会儿）
+ *   · 一轮掉 8 点血 ⇒ 当场收手（用户："打一半想跑跑不掉"）
+ *   · 远程怪越跑越远 ⇒ 4 秒内认输，不烧满预算 */
+section('⑩ 威胁优先 / 换目标 / 举盾 / 血掉太快早收手 / 远程追不上就认（用户 m01086）')
+{
+  const has = (s, t, label) => ok(String(s).includes(t), label, t)
+  const mob = (id, name, x, z, extra = {}) => ent({ id, name, type: 'hostile', kind: 'Hostile mobs', pos: { x, y: 64, z }, ...extra })
+  const hunt = async (entities, { args = {}, budget = 400, hook = null } = {}) => {
+    const f = mkFightBot(entities)
+    if (hook) hook(f.bot, f.calls)
+    const mc = mkMc(f)
+    const r = await mc.attack({ budget, ...args })
+    return { r, f }
+  }
+
+  /* ① 威胁优先：僵尸贴脸、骷髅 6 格 —— 默认应该先打骷髅（挂凋零/远程/会退） */
+  {
+    const { r, f } = await hunt([mob('z1', 'zombie', 0, 2), mob('s1', 'skeleton', 0, 6)])
+    ok(f.calls.attack[0]?.name === 'skeleton', '🔴 默认 threat：僵尸 2 格、骷髅 6 格 ⇒ 先打骷髅', f.calls.attack[0]?.name)
+    ok(r.priority === 'threat', '结果里如实报这次用的优先权', String(r.priority))
+  }
+  /* ①-b nearest：还是先打贴脸的僵尸 */
+  {
+    const { f } = await hunt([mob('z1', 'zombie', 0, 2), mob('s1', 'skeleton', 0, 6)], { args: { priority: 'nearest' } })
+    ok(f.calls.attack[0]?.name === 'zombie', 'priority:"nearest" ⇒ 先打最近的僵尸', f.calls.attack[0]?.name)
+  }
+  /* ①-c weakest：两只僵尸，血少的那只优先 */
+  {
+    const { f } = await hunt([mob('z1', 'zombie', 0, 6, { health: 20 }), mob('z2', 'zombie', 0, 4, { health: 6 })], { args: { priority: 'weakest' } })
+    ok(f.calls.attack[0]?.id === 'z2', 'priority:"weakest" ⇒ 先打血少的那只（6 血）', f.calls.attack[0]?.name)
+  }
+  /* ② 目标跑了 ⇒ 换下一只，不再"这一轮就废" */
+  {
+    const { r, f } = await hunt([mob('z1', 'zombie', 0, 4), mob('z2', 'zombie', 0, 6)], {
+      budget: 900,
+      hook: (bot, calls) => {
+        bot.pvp.attack = (t) => { calls.attack.push(t); delete bot.entities[t.id]; return Promise.resolve() }
+      },
+    })
+    ok(f.calls.attack.length >= 2, '第一个目标消失后真的接着打了下一只', f.calls.attack.map((x) => x.name).join(' → '))
+    ok(r.retargets === 1, '结果里报换了几次目标（retargets）', String(r.retargets))
+  }
+  /* ③ 举盾：副手有盾 + 目标是骷髅（远程）⇒ 交战期间举起又放下 */
+  {
+    const rec = { up: 0, down: 0 }
+    const { r } = await hunt([mob('s1', 'skeleton', 0, 3)], {
+      budget: 2500,
+      hook: (bot) => {
+        bot.inventory = { items: () => [], slots: [] }
+        bot.inventory.slots[45] = { name: 'shield' }
+        bot.activateItem = (off) => { if (off) rec.up++ }
+        bot.deactivateItem = () => { rec.down++ }
+      },
+    })
+    ok(rec.up >= 1 && rec.down >= 1, '🔴 副手盾真的举起来又放下了（activateItem(true)/deactivateItem）', JSON.stringify(rec))
+    ok(Number(r.shieldBlocks) >= 1, '结果里报举了几次盾', String(r.shieldBlocks))
+  }
+  /* ④ 血掉太快 ⇒ 提前收手（不等阶段走完） */
+  {
+    const { r } = await hunt([mob('z1', 'zombie', 0, 2)], {
+      budget: 1500,
+      hook: (bot, calls) => {
+        bot.health = 20
+        bot.pvp.attack = (t) => { calls.attack.push(t); bot.health = 11; return Promise.resolve() }
+      },
+    })
+    ok(/血掉太快/.test(String(r.note ?? '')), '🔴 一轮掉 9 点血 ⇒ 当场收手并说明', String(r.note ?? '').slice(0, 60))
+  }
+  /* ⑤ 远程怪越跑越远 ⇒ 认输（不再烧满整个预算） */
+  {
+    const t0 = Date.now()
+    const { r } = await hunt([mob('s1', 'skeleton', 0, 4)], {
+      budget: 5000,
+      hook: (bot, calls) => {
+        bot.pvp.attack = (t) => {
+          calls.attack.push(t)
+          if (!bot._iv) {
+            bot._iv = setInterval(() => { t.position.z += 0.4 }, 100)
+            setTimeout(() => clearInterval(bot._iv), 8000)
+          }
+          return Promise.resolve()
+        }
+      },
+    })
+    ok(r.unreachable === true, '目标越跑越远 ⇒ 如实报"追不上"', JSON.stringify({ unreachable: r.unreachable }))
+    ok(/追不上|越跑越远/.test(String(r.note ?? '')), '并说清是它一直在后退（不是打死了）', String(r.note ?? '').slice(0, 60))
+    ok(Date.now() - t0 < 4200, '4.2 秒内就收手（不再烧满整个预算）', String(Date.now() - t0))
+  }
+  /* ⑥ 阶段 1.2 秒（用户："一次 3 秒不能中断"） */
+  {
+    const stratRaw = readFileSync(new URL('../src/combat-strategy.mjs', import.meta.url), 'utf8')
+    has(stratRaw, 'export const COMBAT_PHASE_MS = 1_200', '战斗阶段压到 1.2 秒（每轮重新观察，掉头只差一个阶段）')
+  }
+  /* ⑦ 静态接线 */
+  {
+    const atkRaw = readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8')
+    has(atkRaw, 'threatScoreOf', 'attack.mjs：威胁分来自策略层唯一出处')
+    has(atkRaw, 'priorityMode', 'attack.mjs：priority 有三种排法')
+    has(atkRaw, 'select({ reselect: true })', 'attack.mjs：目标没了会重新选（不是直接收工）')
+    has(atkRaw, '_shields', 'attack.mjs：举盾次数进结果')
+    const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    ok(/priority: \{ type: 'string'/.test(idx), 'mc_act 参数里有 priority')
+    ok(/aroundOf/.test(idx), 'mc_move 走完带 around（周围实体）')
+    ok(/around: out\.slice\(0, 6\)/.test(idx), 'mc_move 结果里真有 around 字段')
+  }
+}
+
 for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 console.log(`\ncheck-core-attack：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

@@ -2936,6 +2936,27 @@ export function apply(ctx, rawConfig) {
 
   /* ── 行动 ── */
 
+  /* 周围实体快照（用户 m01114：走完一步要能看见"身边有谁"，不用再单独叫 mc_entities）。
+   * 只列 12 格内、最多 6 个；附近没人就返回 {}（常态零额外 token）。 */
+  const aroundOf = (sess, radius = 12) => {
+    const b = sess?.bot?.bot
+    const me = b?.entity?.position
+    if (!me) return {}
+    const out = []
+    for (const e of Object.values(b.entities ?? {})) {
+      if (!e || !e.position || e.id === b.entity?.id) continue
+      const name = e.username || e.name || e.displayName
+      if (!name) continue
+      let d = Infinity
+      try { d = me.distanceTo(e.position) } catch { continue }
+      if (!(d <= radius)) continue
+      out.push({ name, d: Number(d.toFixed(1)), ...(Number.isFinite(Number(e.health)) ? { hp: e.health } : {}) })
+    }
+    if (!out.length) return {}
+    out.sort((a, c) => a.d - c.d)
+    return { around: out.slice(0, 6) }
+  }
+
   ctx.tools.register(asTool({
     name: 'mc_move',
     description: '移动。mode="walk" 走过去（自动避障；**在水里会自动改成"直接游"**，实测 2 格/秒）；mode="fly" 创造模式直飞（最稳，创造模式默认用它）；'
@@ -2959,13 +2980,13 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const sess = getSession(exec)
       const mode = String(args.mode ?? '')
-      if (mode === 'jump') return sess.bot.jump()
+      if (mode === 'jump') return { ...(await sess.bot.jump()), ...aroundOf(sess) }
       if (mode === 'swim') {
         // 给了坐标 = 游过去（walkTo 在水里会自动走"直接游"那条）；没给 = 只上浮换气
         if (args.x !== undefined && args.y !== undefined && args.z !== undefined) {
-          return withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs) }), { expect: 'moved' })
+          return { ...withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
         }
-        return withOutcome(await sess.bot.swimUp({ hold: args.budgetMs }), { expect: 'moved' })
+        return { ...withOutcome(await sess.bot.swimUp({ hold: args.budgetMs }), { expect: 'moved' }), ...aroundOf(sess) }
       }
       if (args.x === undefined || args.y === undefined || args.z === undefined) {
         throw new Error('walk/fly 需要 x/y/z；只想跳一下请给 mode:"jump"，在水里上浮请给 mode:"swim"')
@@ -2974,9 +2995,9 @@ export function apply(ctx, rawConfig) {
       const creative = sess.bot.bot?.game?.gameMode === 'creative'
       const use = mode || (creative ? 'fly' : 'walk')
       // 🔴 2026-10-08 审计⑤：fly 以前不传 budgetMs —— 写 budgetMs:2000 也照样跑满 10 秒
-      if (use === 'fly') return withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' })
+      if (use === 'fly') return { ...withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
       if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / fly / jump / swim）`)
-      return withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs) }), { expect: 'moved' })
+      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
     },
   }))
 
@@ -2985,23 +3006,24 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register(asTool({
     name: 'mc_act',
     description: '与游戏世界互动（**优先用它，别用服务器指令**）。mode：\n'
-      + '· look   看向坐标(x,y,z)或玩家(who)："看向我" = look + who\n'
+      + '· look 看向坐标或玩家(who)：look+who\n'
       + '· toward 看向并走近某个玩家(who)\n'
       + '· place  放方块到 (x,y,z)；悬空先垫脚（=搭高）\n'
       + '· bridge 搭路：朝 (x,y,z) 一格格铺（铺在脚下一层），每块等服务端确认才走；有坠落/岩浆风险就停\n'
       + '· break  破坏 (x,y,z)：先自动换对的工具；换不上就拒绝\n'
       + '· use    使用方块或实体(who)：开门、按钮、拉杆、喂动物；都不给=用手上的东西\n'
-      + '· useitem 用手上的东西：扔眼睛/雪球、拉弓、喝药水\n'
-      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。会看血/被围给建议（不替你撤退；要撤叫 mc_move）；kite 放风筝（只对近战怪，打一下退一步）。约 10 秒\n'
-      + '· equip  装备(name)：护甲自动穿到对应格（盾→副手），其余拿到手上；to 指定格子\n'
-      + '· enchant 附魔台：自动开窗放料；option:0-2 真附魔，不给只报选项\n'
-      + '· anvil   铁砧：action:combine(默认) / rename；item + name\n'
-      + '· smithing 锻造台：item 底座、name 附加、template 模板\n'
-      + '· toss   丢弃物品(name, count)',
+      + '· useitem 用手上的东西：扔眼睛/雪球/拉弓\n'
+      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就按 priority 挑（默认 threat 威胁最大 / nearest 最近 / weakest 血最少）。会换剑、举盾、给建议（不替你撤退）；kite 放风筝。约 10 秒\n'
+      + '· equip 装备(name)：护甲自动穿（盾→副手），其余拿到手上；to 指定格子\n'
+      + '· enchant 附魔台：option 0-2；不给只报选项\n'
+      + '· anvil 铁砧：combine(默认)/rename；item+name\n'
+      + '· smithing 锻造台：item/name/template\n'
+      + '· toss 丢弃(name,count)',
     parameters: {
       mode: { type: 'string', description: '见上面各 mode（默认 look）' },
       who: { type: 'string', description: '玩家或实体名（look/toward/use/attack）' },
       kite: { type: 'boolean', description: 'attack 放风筝：近战怪打一下退一步' },
+      priority: { type: 'string', description: 'attack 选目标：threat(默认)/nearest/weakest(血最少)' },
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       name: { type: 'string', description: '方块或物品名（place/equip/toss/anvil/smithing 用）' },
       to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand/hand；只给 = 脱掉' },
