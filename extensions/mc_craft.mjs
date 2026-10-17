@@ -9,7 +9,7 @@
  *   `bot.craft(recipe, count, craftingTable)` / `bot.recipesFor(...)` / `bot.recipesAll(...)`。
  * 本文件把它们包成工具 `mc_craft`，并补上 mineflayer 没做的事：
  *   ① **递归规划**：原料不够但能再合成（原木→木板→木棍）就自动排好顺序一起做，
- *      不再需要 AI 自己一步步算（它算错过，也会因此反问 Master）。
+ *      不再需要 AI 自己一步步算（它算错过，也会因此反问 用户）。
  *   ② **自动用/放工作台**：附近没有工作台、但背包里有，就自己放到脚边再用（mineflayer 只会抛错）。
  *   ③ **缺料报告**：缺什么、缺几个、现有几个，并给出下一步该调哪个工具。
  *   ④ 名字解析（`planks` → `oak_planks` 这种）、`list` 看配方、`dryRun` 只出计划。

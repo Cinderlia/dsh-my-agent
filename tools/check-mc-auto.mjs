@@ -1081,7 +1081,7 @@ section('9. 自主决策（长期目标 / 别问直接做 / 催促的边界）')
   ok('文案开头是"自主行动轮"而不是"自主时间"', t.includes('【自主行动轮｜'))
   ok('文案带三条硬规矩（不许反问 / 不许 waitSec 干等 / 观察不算行动）',
     t.includes('不要问他') && t.includes('要我做什么') && t.includes('mc_events waitSec') && t.includes('不算行动'))
-  ok('文案告诉它 Master 改主意时先改长期目标', t.includes('Master 刚发话给了新指令') && t.includes('先 `mc_auto set {"standing"'))
+  ok('文案告诉它对方改主意时先改长期目标', t.includes('他刚发话给了新指令') && t.includes('先 `mc_auto set {"standing"'))
   ok('整段文案不以问句结尾（不会诱导反问）', !/[？?]\s*$/.test(t.trim()))
 
   // idleWake:false → 既不叫醒也不催促

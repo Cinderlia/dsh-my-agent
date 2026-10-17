@@ -2649,7 +2649,12 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')
 
-  console.log(`  ${/dsh-mc-agent 行事准则/.test(DEFAULT_AGENTS_MD) && /DeepSeek/.test(DEFAULT_AGENTS_MD) && /Master/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则像样（标题 / 称呼都在）`)
+  /* 🔴 2026-10-17（用户要求）：称呼改成"一起生存的伙伴" —— 不再叫 Master，
+   *    默认**直接叫对方的游戏名**。这里钉三件事：标题在、称呼段在、以及
+   *    "用游戏名 + 别叫 Master" 这两句规矩在（后半句那个 Master 是**禁令**，不是称呼）。 */
+  console.log(`  ${/dsh-mc-agent 行事准则/.test(DEFAULT_AGENTS_MD) && /DeepSeek/.test(DEFAULT_AGENTS_MD) && /## 称呼/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则像样（标题 / 称呼都在）`)
+  console.log(`  ${/直接叫他的游戏名/.test(DEFAULT_AGENTS_MD) && /别叫 Master/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 称呼是"一起生存的伙伴"：用游戏名，别叫 Master`)
+  console.log(`  ${!/默认叫用户 \*\*Master\*\*/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 不再把 Master 当默认称呼`)
   console.log(`  ${/mc_accounts/.test(DEFAULT_AGENTS_MD) && /mc_capabilities/.test(DEFAULT_AGENTS_MD) && /mc_watch/.test(DEFAULT_AGENTS_MD) && /README\.md/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 默认准则里的关键工具/索引名都在`)
   console.log(`  ${!/xxx/.test(DEFAULT_AGENTS_MD) ? '✅' : '❌'} 草稿里的 "xxx" 占位符已全部替换`)
   // 🔴 凭据边界：默认准则**不得**再指路到明文凭据文件、也不得出现已删除的连接参数

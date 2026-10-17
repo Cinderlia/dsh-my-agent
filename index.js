@@ -68,7 +68,7 @@ import { waitForEvents } from './src/wait.mjs'
 export const name = 'dsh-mc-agent'
 export const inject = ['webServer', 'tools']
 
-/** 插件版本（`mc_capabilities` 会报给 Master；读不到就 unknown） */
+/** 插件版本（`mc_capabilities` 会报给他；读不到就 unknown） */
 const PLUGIN_VERSION = (() => {
   try { return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? 'unknown' } catch { return 'unknown' }
 })()
@@ -590,7 +590,7 @@ export function apply(ctx, rawConfig) {
     try { return ctx.get('agents')?.get?.(String(sessionId)) ?? null } catch { return null }
   }
   /* 🔴 2026-10-06（本机补丁）：原来这里写死"记忆 <会话工作区>/.dsh-mc-agent"，
-   *    可 Master 一设 `config.memoryDir`（本机就把记忆挪到了 $DSH_HOME/dsh-mc-agent/memory），
+   *    可 用户 一设 `config.memoryDir`（本机就把记忆挪到了 $DSH_HOME/dsh-mc-agent/memory），
    *    这行日志就会骗人。改成打印**真实生效的记忆根**。 */
   /* 🔴 2026-10-06（日志优化）：加**版本号**与日志级别 —— 以前日志里没有任何版本标记，
    *    今天修的行和几天前的旧行混在一起根本分不出是哪份代码打出来的。 */
@@ -2568,7 +2568,7 @@ export function apply(ctx, rawConfig) {
     name: 'mc_capabilities',
     description: '【边界信息】这个插件能做什么、边界在哪：**支持的 MC 版本范围**（testedVersions）、底层 mineflayer 版本、'
       + '支持的登录方式、工具命名空间、各种上限（序列步数/记忆大小/事件队列）以及当前配置要点。\n'
-      + '**进服前不确定版本能不能连时先看它**；确实不支持就如实告诉 Master，别硬试。',
+      + '**进服前不确定版本能不能连时先看它**；确实不支持就如实跟他说一声，别硬试。',
     parameters: {},
     output: text(),
     async execute(args, exec) {
@@ -2740,7 +2740,7 @@ export function apply(ctx, rawConfig) {
       + '/ "surface"（地表：@ 我 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田）/ "cave"'
       + '/ "column"（竖列：只看你脚下这一格，往下几格实心、哪里开始是空的）；slab = 洞穴层上下各看几格（默认 2）。'
       + 'format="image" 出**俯视图像**（有视觉的模型能直接看，并落盘）。'
-      + '🔴 想让 Master 看到图：见 out 参数。'
+      + '🔴 想让 用户 看到图：见 out 参数。'
       + '字符图省 token 且坐标精确；形状/外观问题用图像。',
     parameters: {
       radius: { type: 'number', description: '半径（默认 32，上限 96）' },
@@ -2756,7 +2756,7 @@ export function apply(ctx, rawConfig) {
       format: { type: 'string', description: 'chars（默认）/ image / both' },
       scale: { type: 'number', description: '图像每格放大倍数（默认 4，1–16）' },
       out: { type: 'string', description: `落盘路径（工作区相对；默认 .dsh-mc-agent/${OUT_DIR}/mc-map-<时间>.png 不对外）。`
-        + `想让 Master 看到就写到 .dsh-mc-agent/${EXPRESS_DIR}/<子目录>/x.png（发布区），再用 mc_kit_express 取那一行` },
+        + `想让 用户 看到就写到 .dsh-mc-agent/${EXPRESS_DIR}/<子目录>/x.png（发布区），再用 mc_kit_express 取那一行` },
     },
     output: {
       schema: { type: 'object', properties: {}, additionalProperties: true },
@@ -2850,11 +2850,11 @@ export function apply(ctx, rawConfig) {
         }
         // ② 顺手落盘：默认 **`.dsh-mc-agent/.out/`**（不对外）。给了 `out`（例如
         //    `.dsh-mc-agent/.express/world1/map.png`）就写那儿 —— 落在发布区时结果里会带上
-        //    现成的 `express.url` 与 `express.markdown`（`![](url)`），原样粘进回复 Master 就能看到。
+        //    现成的 `express.url` 与 `express.markdown`（`![](url)`），原样粘进回复 用户 就能看到。
         try {
           const { writeFileSync, mkdirSync } = await import('node:fs')
           const wsRoot = workspaceRootFor(exec?.agent)
-          /* 🔴 2026-10-06（本机补丁）：记忆根可能已被 Master 挪出工作区（`config.memoryDir`）。
+          /* 🔴 2026-10-06（本机补丁）：记忆根可能已被 用户 挪出工作区（`config.memoryDir`）。
            *    默认输出必须落在**记忆根**的 `.out/`，否则每调一次 mc_map 就会在工作区里
            *    重新长出一个 `.dsh-mc-agent/`。规则与 mc_observe 扩展一致：
            *      · `.dsh-mc-agent/...` 前缀 = 记忆根相对（老写法，兼容）
@@ -3902,7 +3902,7 @@ export function apply(ctx, rawConfig) {
         text: rulesPointerText({
           abs: cur.path,
           fileName: 'RULES.md',
-          what: `行事准则（${cur.source === 'custom' ? 'Master 自定义版' : '默认版'}，长期有效）`,
+          what: `行事准则（${cur.source === 'custom' ? '用户 自定义版' : '默认版'}，长期有效）`,
         }),
       })
     }
@@ -4730,7 +4730,7 @@ export function apply(ctx, rawConfig) {
 
   /* 🔴 2026-09-16：这里原来有一段"麦块模式专属指导"（通过系统提示注入）。
    * 用户要求**删掉显式注入**，而且它的内容（单对话 / 记忆 / 看门狗 / 指令是最后手段 / 别乱挖乱建）
-   * 已经全部写在 `.dsh-mc-agent/AGENTS.md`（Master 亲自给的那版）里 —— 留着就是重复。 */
+   * 已经全部写在 `.dsh-mc-agent/AGENTS.md`（用户 亲自给的那版）里 —— 留着就是重复。 */
 
   /**
    * 这个 agent 当前套用的**工具曝光策略**（'mc' / 'mc-plus' / 'other'；没套过 = 不存在）。

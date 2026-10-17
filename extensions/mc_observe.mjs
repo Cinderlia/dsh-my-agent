@@ -120,7 +120,7 @@ export async function apply (api) {
 
   /** 可选调参文件 `<记忆根>/view.json`（默认 `<工作区>/.dsh-mc-agent/view.json`）：
    *  {"gate":true,"maxActions":6,"maxAgeMs":120000} —— 有就覆盖环境变量/默认值（放宽、收紧、gate:false 关掉都行），
-   *  这样 Master 或 AI 自己写个文件就能改尺度，**不用重启 DSH、也不用环境变量**。 */
+   *  这样 用户 或 AI 自己写个文件就能改尺度，**不用重启 DSH、也不用环境变量**。 */
   const gateFileCfg = (agent) => {
     try {
       const root = memRootFor(agent)
@@ -168,7 +168,7 @@ export async function apply (api) {
         ? ''
         : '（想变回强制模式：写 `.dsh-mc-agent/view.json` 的 {"gate":true}。）\n')
       + '图里：暗紫色块=区块没加载。\n'
-      + `🔴 要让 **Master** 看到：\`out:"\\.dsh-mc-agent/${EXPRESS_DIR}/<子目录>/view.png"\` 写进发布区，`
+      + `🔴 要让他看到：\`out:"\\.dsh-mc-agent/${EXPRESS_DIR}/<子目录>/view.png"\` 写进发布区，`
       + '再用 `mc_kit_express` 取；默认落 `.dsh-mc-agent/' + OUT_DIR + '/`（不对外）。',
     parameters: {
       width: { type: 'number', description: '宽（默认 192，32–480；越大越慢越费 token）' },
@@ -402,7 +402,7 @@ export async function apply (api) {
           out.image.fileError = '拿不到工作区路径（agent.session.header.cwd 为空）'
         } else {
           const rel = args.out ? String(args.out) : `.dsh-mc-agent/${OUT_DIR}/mc-observe-${Date.now()}.png`
-          // `.dsh-mc-agent/...` 是"记忆根相对"的老写法：记忆根可能已经被 Master 挪出工作区
+          // `.dsh-mc-agent/...` 是"记忆根相对"的老写法：记忆根可能已经被 用户 挪出工作区
           // （`config.memoryDir`），所以剥掉前缀挂到记忆根上；其余相对路径仍按工作区解析，
           // 绝对路径原样用。这样默认出图会跟着记忆根走，express 发布区（`<记忆根>/.express/`）才对得上。
           const memPrefix = /^\.dsh-mc-agent[\\/]/i
@@ -693,7 +693,7 @@ export async function apply (api) {
       let ma = maxActions
       let mg = maxAgeMs
       // 可选的调参文件：每次判定都读（文件很小、判定的都是动作类工具，代价可忽略），
-      // 这样 Master / AI 写个文件就能开关和改尺度 —— 改完立即生效。
+      // 这样 用户 / AI 写个文件就能开关和改尺度 —— 改完立即生效。
       const cfg = gateFileCfg(agent)
       if (cfg) {
         if (cfg.gate === true || cfg.gate === 'on') on = true

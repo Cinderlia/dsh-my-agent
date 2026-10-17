@@ -301,7 +301,7 @@ const FAIL_TTL_MS = 30_000
 
 /**
  * 皮肤仓库：按玩家名 + url 缓存，落盘到**记忆根**下的 `skins/`
- * （默认 `<工作区>/.dsh-mc-agent/skins/`；Master 设了 `config.memoryDir` 就跟着挪）。
+ * （默认 `<工作区>/.dsh-mc-agent/skins/`；用户 设了 `config.memoryDir` 就跟着挪）。
  * 拿不到就返回 null（调用方回退到纯色），绝不抛。
  * @param {Function} [o.memRootOf] 工作区路径 → 记忆根绝对路径
  */
