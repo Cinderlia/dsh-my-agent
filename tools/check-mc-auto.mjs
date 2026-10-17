@@ -151,7 +151,7 @@ const mkReg = (list) => ({
 
 /**
  * 时间类断言用的基线间隔。
- * 产品默认值改成了 5s（用户 m02357），但"180s 才叫醒""61s 不叫"这类断言要的是**能分辨的刻度**，
+ * 产品默认值先是 5s（用户 m02357），2026-10-18 审计后改成 10s；但"180s 才叫醒""61s 不叫"这类断言要的是**能分辨的刻度**，
  * 所以除了第 1 节（专门断言默认值）以外，其它小节都用这套基线，跟默认值解耦。
  */
 const TIMING_BASE = { idleWakeSec: 180, idleWakeNearPlayerSec: 60, minIdleGapSec: 10 }
@@ -185,7 +185,7 @@ section('1. 配置（默认值 / 夹取 / 未知键 / 落盘回读）')
   const ws = mkdtempSync(join(tmpdir(), 'mc-auto-'))
   const h = setup({ workspaceOf: () => ws, timing: false })
   const d = h.cfg()
-  ok('默认开启且待机 5s 就叫醒', d.enabled === true && d.idleWake === true && d.idleWakeSec === 5, JSON.stringify({ e: d.enabled, i: d.idleWake, s: d.idleWakeSec }))
+  ok('默认开启且待机 10s 就叫醒', d.enabled === true && d.idleWake === true && d.idleWakeSec === 10, JSON.stringify({ e: d.enabled, i: d.idleWake, s: d.idleWakeSec }))
   ok('默认间隔/最小间隔/有人时都是 5s', d.minIdleGapSec === 5 && d.idleWakeNearPlayerSec === 5, JSON.stringify({ g: d.minIdleGapSec, n: d.idleWakeNearPlayerSec }))
   ok('默认每小时上限给了余量（120）', d.idleWakeMaxPerHour === 120, String(d.idleWakeMaxPerHour))
   ok('默认反射项全开（小动作/游荡已删）', d.lookAround && d.autoEat && d.pickup && d.avoid
@@ -320,11 +320,18 @@ section('3. 自保（踩到岩浆后退 / 有怪只叫醒 AI、不自己跑）')
 
   /* 🔴 名单统一（mc_map 第二轮）：反射层原来自己写了一份正则，**漏了灵魂火 / 灵魂营火**。
    *    现在和搭路共用 `src/bridge.mjs` 的 `BRIDGE_FATAL_NAMES`，这几个都该被认出来。 */
-  for (const bad of ['soul_fire', 'soul_campfire', 'cactus', 'powder_snow', 'sweet_berry_bush']) {
+  for (const bad of ['soul_fire', 'soul_campfire', 'cactus', 'powder_snow']) {
     const w = setup({ world: { overrides: { '10,63,20': bad } }, patch: { lookAround: false } })
     w.tick(w.at(1000))
     ok(`脚下方块是 ${bad} → 后退（反射层和搭路共用同一份危险名单）`,
       w.w.calls.controls.some(([k, v]) => k === 'back' && v === true))
+  }
+  /* 2026-10-18 审计：甜浆果丛只减速，踩上去能走过去 ⇒ 不能当岩浆一样后退，否则来回震荡。 */
+  {
+    const w = setup({ world: { overrides: { '10,63,20': 'sweet_berry_bush' } }, patch: { lookAround: false } })
+    w.tick(w.at(1000))
+    ok('脚下方块是 sweet_berry_bush → 不后退（只减速，别来回震荡）',
+      !w.w.calls.controls.some(([k, v]) => k === 'back' && v === true))
   }
   const stone = setup({ world: { overrides: { '10,63,20': 'stone' } }, patch: { lookAround: false } })
   stone.tick(stone.at(1000))
@@ -1251,28 +1258,28 @@ section('9. 自主决策（长期目标 / 别问直接做 / 催促的边界）')
 
 /* ───────────────────────── 10. 待机 5 秒触发 ───────────────────────── */
 
-section('10. 待机 5 秒触发（默认值真的生效 / 退避仍然管用）')
+section('10. 待机 10 秒触发（默认值真的生效 / 退避仍然管用）')
 {
   const textOf = (m) => m?.content?.[0]?.text ?? ''
   const h = setup({ timing: false, patch: { enabled: false, avoid: false } })
   const c = h.cfg()
-  ok('默认 idleWakeSec = 5', c.idleWakeSec === 5, String(c.idleWakeSec))
+  ok('默认 idleWakeSec = 10（审计后从 5s 改宽）', c.idleWakeSec === 10, String(c.idleWakeSec))
   ok('默认 minIdleGapSec = 5', c.minIdleGapSec === 5, String(c.minIdleGapSec))
   ok('默认 idleWakeNearPlayerSec = 5', c.idleWakeNearPlayerSec === 5, String(c.idleWakeNearPlayerSec))
 
-  h.tick(h.at(4_000))
-  ok('待机 4s 还不叫', h.agent.steers.length === 0, String(h.agent.steers.length))
-  h.tick(h.at(5_000))
-  ok('待机 5s 就叫醒（这就是"5 秒触发"）', h.agent.steers.length === 1, String(h.agent.steers.length))
   h.tick(h.at(9_000))
-  ok('叫完要等一个间隔（9s 还没到第二次）', h.agent.steers.length === 1, String(h.agent.steers.length))
+  ok('待机 9s 还不叫', h.agent.steers.length === 0, String(h.agent.steers.length))
   h.tick(h.at(10_000))
-  ok('间隔 5s → 第二次叫醒', h.agent.steers.length === 2, String(h.agent.steers.length))
-  ok('第二轮文案提示"连着 1 轮只是说话/站着"', textOf(h.agent.steers[1]).includes('连着 1 轮'))
+  ok('待机 10s 就叫醒（默认值）', h.agent.steers.length === 1, String(h.agent.steers.length))
   h.tick(h.at(19_000))
-  ok('没动作 → 退避翻倍（19s 还不叫）', h.agent.steers.length === 2, String(h.agent.steers.length))
+  ok('第一次叫醒后还没动作 → 19s 还不叫第二次', h.agent.steers.length === 1, String(h.agent.steers.length))
   h.tick(h.at(20_000))
-  ok('退避后 10s 叫第三次', h.agent.steers.length === 3, String(h.agent.steers.length))
+  ok('到 10s 间隔叫第二次', h.agent.steers.length === 2, String(h.agent.steers.length))
+  ok('第二轮文案提示"连着 1 轮只是说话/站着"', textOf(h.agent.steers[1]).includes('连着 1 轮'))
+  h.tick(h.at(39_000))
+  ok('第二轮也没动作 → 退避翻倍（39s 还不叫）', h.agent.steers.length === 2, String(h.agent.steers.length))
+  h.tick(h.at(40_000))
+  ok('翻倍后的 20s 叫第三次', h.agent.steers.length === 3, String(h.agent.steers.length))
 
   // 旁边有人时用的也是 5s（min(idleWakeNearPlayerSec, idleWakeSec)）
   const near = setup({ timing: false, world: { players: [{ name: 'Steve', position: [13.0, 64, 20.5], yaw: 0 }] }, patch: { enabled: false, avoid: false } })
@@ -1281,10 +1288,10 @@ section('10. 待机 5 秒触发（默认值真的生效 / 退避仍然管用）'
 
   // 说明文案别再说"3 分钟"
   const spec = h.auto.toolSpec()
-  ok('工具 description 写的是 5 秒、不再写"3 分钟"',
-    spec.description.includes('5 秒') && !spec.description.includes('3 分钟'), spec.description.slice(0, 200))
+  ok('工具 description 写的是 10 秒、不再写"3 分钟"',
+    spec.description.includes('10 秒') && !spec.description.includes('3 分钟'), spec.description.slice(0, 200))
   const st = await h.auto.toolSpec().execute({ action: 'status' }, { agent: h.agent })
-  ok('status 里显示"空闲 5s 叫醒"', st.text.includes('空闲 5s 叫醒'), st.text.slice(0, 200))
+  ok('status 里显示"空闲 10s 叫醒"', st.text.includes('空闲 10s 叫醒'), st.text.slice(0, 200))
 }
 
 section('11. 叫醒文案省 token：完整版每 10 分钟一次，其余短版（2026-10-18 审计）')

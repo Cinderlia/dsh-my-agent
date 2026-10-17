@@ -32,7 +32,7 @@
  * 形状：只认 `b.entities` / `b.entity` / `b.health` 三样（与 `world-scan.mjs` 同一套路数），
  * 不 import 游戏库、不 import `core.mjs`。
  */
-import { HOSTILE_RE } from './entity-names.mjs'
+import { HOSTILE_RE, hostilityOf } from './entity-names.mjs'
 
 /** 敌对怪贴到这个距离内 ⇒ 紧急（3 格：僵尸再走一步就够到了） */
 export const DANGER_HOSTILE_R = 3
@@ -61,7 +61,12 @@ export function nearestHostile (b, radius = DANGER_HOSTILE_R) {
   for (const e of Object.values(b?.entities ?? {})) {
     if (!e || e === b.entity || !e.position) continue
     const nm = String(e.name ?? e.username ?? '')
-    if (!(HOSTILE_RE.test(nm) || e.kind === 'Hostile mobs')) continue
+    /* 🔴 2026-10-18 审计：末影人/猪灵在 `HOSTILE_RE` 里，但**默认中立** ——
+     *    走过去一只末影人就把正在跑的 12 步序列砍断（"有怪贴脸"），可它根本不打人。
+     *    中立怪只有**正在打我**（它的 target 是我）才算威胁。 */
+    const stance = hostilityOf(nm, e.kind)
+    const targetingMe = e.target === b.entity || (e.target != null && e.target.id != null && e.target.id === b.entity?.id)
+    if (stance !== 'hostile' && !(stance === 'neutral' && targetingMe)) continue
     const d = e.position.distanceTo(me)
     if (!Number.isFinite(d) || d > radius) continue
     if (!best || d < best.distance) {

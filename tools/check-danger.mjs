@@ -91,6 +91,22 @@ section('② nearestHostile：只认近处的敌对怪')
   ok(nearestHostile(null, 3) === null, '没有 bot ⇒ null')
 }
 
+section('②′ 中立怪：不主动打我 = 不是威胁（2026-10-18 审计）')
+{
+  /* 末影人 / 猪灵 / 狼 / 铁傀儡 在 `HOSTILE_RE` 里，但**默认中立**。
+   * 以前它们一走到 3 格内就 `nearestHostile` 非 null ⇒ 长循环被砍断、任务被暂停，
+   * 而 `mc_act{attack}` 又不打它们（`hostilityOf` 口径相反）。现在只在**它正打我**时才算。 */
+  const calm = fakeBot({ mobs: [{ name: 'enderman', at: [1, 64, 0] }] })
+  calm.entities[1].target = null
+  ok(nearestHostile(calm, 3) === null, '末影人站着不动 ⇒ 不算威胁')
+  const angry = fakeBot({ mobs: [{ name: 'enderman', at: [1, 64, 0] }] })
+  angry.entities[1].target = angry.entity
+  ok(nearestHostile(angry, 3)?.name === 'enderman', '末影人正盯着我打 ⇒ 算威胁')
+  const zombie = fakeBot({ mobs: [{ name: 'zombie', at: [1, 64, 0] }] })
+  zombie.entities[1].target = null
+  ok(nearestHostile(zombie, 3)?.name === 'zombie', '僵尸天然敌对 ⇒ 不管它盯不盯我都算')
+}
+
 section('③ dangerNow：掉血最硬，其次才是怪贴脸')
 {
   const b = fakeBot({ health: 17, mobs: [{ name: 'zombie', at: [1, 64, 0] }] })

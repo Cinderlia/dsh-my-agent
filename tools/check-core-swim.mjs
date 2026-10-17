@@ -311,7 +311,10 @@ section('⑦ 在水里走路 —— 绕开 pathfinder 直接游（实机 2.05~2.
     const ms = Date.now() - t0
     ok(ms < 1500, '到点就返回（不硬耗到 10 秒）', `${ms}ms`)
     ok(r.arrived === false && r.reason === 'swim-budget', 'reason=swim-budget', String(r.reason))
-    ok(r.stuck === true && r.remaining > 0, '如实报 stuck + remaining', JSON.stringify({ stuck: r.stuck, remaining: r.remaining }))
+    /* 🔴 2026-10-18 审计：预算用完不再等于 stuck（只是"这次没游到"）——
+     *    以前 `stuck: !outOfWater` 让正常游泳也被交去自救。 */
+    ok(r.stuck === false && r.remaining > 0, '预算用完不算 stuck（只是这次没游到）+ remaining',
+      JSON.stringify({ stuck: r.stuck, remaining: r.remaining }))
     ok(/再叫一次 mc_move/.test(String(r.hint ?? '')), 'hint 教它"再叫一次 mc_move 接着游"')
     ok(!heldAt(calls, 'forward') && !heldAt(calls, 'jump'), '超时也松开控制位')
   }
@@ -401,8 +404,8 @@ section('⑧ 静态接线：core / index 都在')
   ok(/mode === 'swim'/.test(index), 'index.js 的 mc_move 认 swim')
   ok(/sess\.bot\.swimUp\(\{ hold: args\.budgetMs \}\)/.test(index), 'swim 不给坐标时把 budgetMs 当上浮时间')
   /* 2026-10-15：walkTo 的返回值现在过 `withOutcome(..., { expect: 'moved' })`（结果台账要判得动）。 */
-  ok(/sess\.bot\.walkTo\(\{ x: Number\(args\.x\), y: Number\(args\.y\), z: Number\(args\.z\) \}, \{ budget: callBudget\(args\.budgetMs\) \}\)/.test(index),
-    'swim 给了坐标就游过去（walkTo 会自动走"直接游"）')
+  ok(/sess\.bot\.walkTo\(\{ x: Number\(args\.x\), y: Number\(args\.y\), z: Number\(args\.z\) \}, \{ budget: callBudget\(args\.budgetMs\), noTower: args\.allowTower !== true \}\)/.test(index),
+    'swim 给了坐标就游过去（walkTo 会自动走"直接游"；默认不许垫柱）')
   ok(/在水里会自动改成"直接游"/.test(index), 'mc_move 描述里写明"在水里自动直接游"')
   ok(/在水里（氧气/.test(index), 'mc_status 瘦身视图里带氧气')
   ok(/头在水下/.test(index), 'mc_status 读不到氧气时也说清"头在水下"')

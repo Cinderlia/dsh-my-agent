@@ -418,7 +418,7 @@ section('⑨ avoidBlockIds：把"要命方块"交给寻路器绕开')
   BRIDGE_FATAL_NAMES.forEach((n, i) => { reg.blocksByName[n] = { id: 100 + i } })
   const ids = avoidBlockIds({ registry: reg })
   ok(ids.length === BRIDGE_FATAL_NAMES.length, '名单里的每个方块都换成了 id', `${ids.length}/${BRIDGE_FATAL_NAMES.length}`)
-  ok(ids.includes(100) && ids.includes(108), 'lava(100) 和 sweet_berry_bush(108) 都在', JSON.stringify(ids))
+  ok(ids.includes(100) && ids.includes(106), 'lava(100) 和 cactus(106) 都在', JSON.stringify(ids))
   ok(ids.every((n) => typeof n === 'number'), '全是数字 id（`blocksToAvoid` 收的就是 id）')
 
   // 认不出来的方块跳过，不硬凑
@@ -427,7 +427,8 @@ section('⑨ avoidBlockIds：把"要命方块"交给寻路器绕开')
   ok(avoidBlockIds({}).length === 0, '没 registry ⇒ 空数组（不炸）')
   ok(avoidBlockIds(null).length === 0, 'null ⇒ 空数组')
   ok(avoidBlockIds({ registry: { blocksByName: { get lava () { throw new Error('boom') } } } }).length === 0, 'registry 抛错 ⇒ 空数组')
-  ok(BRIDGE_FATAL.test('lava') && BRIDGE_FATAL.test('sweet_berry_bush') && !BRIDGE_FATAL.test('stone'), '正则仍由那份名单生成（唯一出处）')
+  ok(BRIDGE_FATAL.test('lava') && BRIDGE_FATAL.test('cactus') && !BRIDGE_FATAL.test('stone')
+    && !BRIDGE_FATAL.test('sweet_berry_bush'), '正则仍由那份名单生成（唯一出处）；甜浆果丛只减速、不算致命')
 
   const plugins = read('../src/plugins.mjs')
   ok(/import \{ avoidBlockIds \} from '\.\/bridge\.mjs'/.test(plugins), 'plugins.mjs 引了 avoidBlockIds')

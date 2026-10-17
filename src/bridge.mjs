@@ -41,7 +41,11 @@ export const BRIDGE_CONFIRM_MS = 150
 export const BRIDGE_STEP_MS = 3500
 export const BRIDGE_STEP_ARRIVE = 0.9
 /** 会**要命**的方块：落在上面/旁边都不该继续（这份名单是唯一出处，下面的正则和寻路黑名单都由它生成） */
-export const BRIDGE_FATAL_NAMES = ['lava', 'fire', 'soul_fire', 'magma_block', 'campfire', 'soul_campfire', 'cactus', 'powder_snow', 'sweet_berry_bush']
+/* 🔴 2026-10-18 审计：`sweet_berry_bush` 从**致命**名单里拿掉 —— 它只减速、每秒 1 点血，
+ *    而且**踩在丛上就能走过去**。留在名单里的后果是 `mc_auto.avoid()` 把它当岩浆：
+ *    站上去就按后退、下一拍又走上去 ⇒ 来回震荡、永远过不去，还会一直叫醒 AI。
+ *    真正致命的（岩浆/火/营火/仙人掌/细雪/岩浆块）仍然全在。 */
+export const BRIDGE_FATAL_NAMES = ['lava', 'fire', 'soul_fire', 'magma_block', 'campfire', 'soul_campfire', 'cactus', 'powder_snow']
 export const BRIDGE_FATAL = new RegExp(`^(${BRIDGE_FATAL_NAMES.join('|')})$`)
 /** 掉进去不致命、但要如实说的 */
 export const BRIDGE_WET = /^(water|bubble_column)$/

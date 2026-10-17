@@ -39,10 +39,18 @@ export const TIMEOUTS = {
  */
 export const CALL_MS = 11_000         // 硬上限：一次工具调用最多占这么久
 export const CALL_BUDGET_MS = 10_000  // 动作自己的预算（留 1 秒收尾 / 序列化 / 回传）
-/** 把预算收进 [200, cap]；没给（或不是正数）就用 def */
+/**
+ * 把预算收进 [200, cap]。
+ *
+ * 🔴 2026-10-18 审计：**显式传 0 跟"没传"不是一回事**。
+ *    以前 `v <= 0` 一律回退 `def`（10 秒）—— 模型说"只走一步/立刻收手"传 0，
+ *    结果拿到整整 10 秒预算，跟它的意图正好相反。
+ *    现在：0 ⇒ **下限 200ms**（手放开就走这么多）；负数/非数字才算"没给"。
+ */
 export const callBudget = (v, def = CALL_BUDGET_MS, cap = CALL_BUDGET_MS) => {
   const n = Number(v)
-  if (!Number.isFinite(n) || n <= 0) return def
+  if (!Number.isFinite(n)) return def
+  if (n < 0) return def
   return Math.min(Math.max(Math.round(n), 200), cap)
 }
 /** 这一轮调用的截止时刻（ms）—— 循环里用它早停，别把整次调用挂死 */

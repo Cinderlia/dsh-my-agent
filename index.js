@@ -1970,6 +1970,33 @@ export function apply(ctx, rawConfig) {
     render: (args, value2) => [{ type: 'text', text: render ? render(args, value2) : String(value2?.text ?? JSON.stringify(value2, null, 2)) }],
   })
 
+  /**
+   * 紧凑 JSON（2026-10-18 审计）：把 `null` / `undefined` / 空对象 / 空数组先剔掉，
+   * 再 `JSON.stringify` 成**一行**。
+   *
+   * 以前 `text()` 兜底 `JSON.stringify(v, null, 2)` —— `mc_act` / `mc_move` 成功时
+   * 也是一整片缩进换行（几十个字段里一半是 `/` 与 `"),`），模型要读的只是其中几项。
+   * 单行 + 去空字段能省掉 30~50% 的字符，形状和键名都不变。
+   */
+  const compactJson = (v) => {
+    const strip = (x) => {
+      if (Array.isArray(x)) return x.map(strip).filter((y) => y !== undefined && y !== null)
+      if (x && typeof x === 'object' && !(x instanceof Date)) {
+        const o = {}
+        for (const [k, v2] of Object.entries(x)) {
+          if (v2 === undefined || v2 === null) continue
+          const sv = strip(v2)
+          if (Array.isArray(sv) && sv.length === 0) continue
+          if (sv && typeof sv === 'object' && !Array.isArray(sv) && Object.keys(sv).length === 0) continue
+          o[k] = sv
+        }
+        return o
+      }
+      return x
+    }
+    try { return JSON.stringify(strip(v)) } catch { return JSON.stringify(v) }
+  }
+
   /** 保留两位小数（省 token：`-3.366740127096657` → `-3.37`；不是数字就原样返回） */
   const round2 = (n) => (Number.isFinite(Number(n)) ? Math.round(Number(n) * 100) / 100 : n)
 
@@ -2724,11 +2751,26 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const sess = getSession(exec)
       await sess.bot.waitForChunks()
-      return sess.bot.scan({
+      const r = await sess.bot.scan({
         radius: args.radius, height: args.height,
         name: args.name ? String(args.name) : null,
         limit: args.limit,
       })
+      /* 🔴 2026-10-18 审计（token）：不点名时以前把整个 `{center,radius,height,counts}` 用
+       *    `JSON.stringify(…, null, 2)` 打印（半径 40 时约 970 字），一半是缩进和键名。
+       *    计数模式改**一行式**（有 `text` 就走它），结构化字段仍然留在返回值里给程序用。 */
+      if (r && !args.name && Array.isArray(r.counts)) {
+        const list = r.counts.slice(0, 14).map((c) => `${c.name}×${c.count}`).join('、')
+        const more = r.counts.length > 14 ? ` 等 ${r.counts.length} 种` : ''
+        const total = r.counts.reduce((a, c) => a + c.count, 0)
+        return {
+          ...r,
+          text: `⛏ 周围 ${r.radius} 格（上下 ${r.height}）约 ${total} 个方块：${list || '（空的）'}${more}`
+            + `${r.unloaded ? `；另有 ${r.unloaded} 格未加载（不算空）` : ''}`
+            + ' — 要坐标就给 name 点名',
+        }
+      }
+      return r
     },
   }))
 
@@ -2968,14 +3010,15 @@ export function apply(ctx, rawConfig) {
       + '🔴 **在水里**（`mc_status` 里 `在水里`）寻路基本不动（A* 不把水当节点，实机"4 秒只挪 1 格"）：'
       + '`mc_move` 会自动直接游（按住 forward+jump 浮在水面，实测 2 格/秒），上了岸再交回寻路。'
       + '**快淹死了就 `mode:"swim"` 不给坐标**（只上浮换气）：水挖不掉，别去 `mc_dig` 水。\n'
-      + '🔴 **路上自己垫方块上去**（`pillared`）会报 `pillaredWith`/`held`——**手上会变成垫脚那种方块**，别以为还攥着镐'
-      + '（要挖就 `mc_act{mode:"break"}`，它会自己换）。',
+      + '🔴 **默认不原地垫 1×1 柱**（`allowTower:true` 才允许）—— 垫柱被服务端拒会直接摔下去，实机摔死过；'
+      + '要上高处请走斜台阶。默认只在路上垫台阶（`pillared` 会报 `pillaredWith`/`held`）。',
     parameters: {
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       mode: { type: 'string', description: 'walk / fly / jump / swim（创造模式缺省 fly；jump 不需要坐标；swim 不给坐标就只上浮换气）' },
       budgetMs: { type: 'number', description: 'walk/swim 的最长时间（默认 10000，上限 10000）；swim 不给坐标时的上浮时间（默认 3000，上限 3000）' },
+      allowTower: { type: 'boolean', description: '允许寻路时原地垫 1×1 柱往上爬（默认不许，容易摔死）' },
     },
-    output: text(),
+    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
@@ -2984,7 +3027,7 @@ export function apply(ctx, rawConfig) {
       if (mode === 'swim') {
         // 给了坐标 = 游过去（walkTo 在水里会自动走"直接游"那条）；没给 = 只上浮换气
         if (args.x !== undefined && args.y !== undefined && args.z !== undefined) {
-          return { ...withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
+          return { ...withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true }), { expect: 'moved' }), ...aroundOf(sess) }
         }
         return { ...withOutcome(await sess.bot.swimUp({ hold: args.budgetMs }), { expect: 'moved' }), ...aroundOf(sess) }
       }
@@ -2997,7 +3040,7 @@ export function apply(ctx, rawConfig) {
       // 🔴 2026-10-08 审计⑤：fly 以前不传 budgetMs —— 写 budgetMs:2000 也照样跑满 10 秒
       if (use === 'fly') return { ...withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
       if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / fly / jump / swim）`)
-      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
+      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true }), { expect: 'moved' }), ...aroundOf(sess) }
     },
   }))
 
@@ -3025,6 +3068,7 @@ export function apply(ctx, rawConfig) {
       kite: { type: 'boolean', description: 'attack 放风筝：近战怪打一下退一步' },
       priority: { type: 'string', description: 'attack 选目标：threat(默认)/nearest/weakest(血最少)' },
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+      allowDangerous: { type: 'boolean', description: 'break：允许挖自己脚下的支撑（默认拦）' },
       name: { type: 'string', description: '方块或物品名（place/equip/toss/anvil/smithing 用）' },
       to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand/hand；只给 = 脱掉' },
       count: { type: 'number', description: 'toss 丢几个（默认 1）' },
@@ -3036,7 +3080,7 @@ export function apply(ctx, rawConfig) {
       action: { type: 'string', description: 'anvil：combine（默认）/ rename' },
       template: { type: 'string', description: 'smithing 的模板（默认自己挑）' },
     },
-    output: text(),
+    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
@@ -3148,6 +3192,7 @@ export function apply(ctx, rawConfig) {
       name: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       maxDistance: { type: 'number', description: '搜索半径（默认 16；树/矿脉远的话给大一点，上限看场景）' },
       count: { type: 'number', description: '挖几个（默认 1，上限 16；一次挖不完就再叫一次）' },
+      allowDangerous: { type: 'boolean', description: '允许挖自己脚下的支撑（默认拦，下面没落脚点就掉下去）' },
     },
     output: text(),
     timeoutMs: CALL_MS + 1_000,

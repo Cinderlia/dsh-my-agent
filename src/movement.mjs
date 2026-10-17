@@ -369,7 +369,13 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
     remaining: left,
     moved,
     via: 'swim',
-    stuck: stuckWhy != null || !outOfWater,
+    /* 🔴 2026-10-18 审计：以前 `stuck: stuckWhy != null || !outOfWater` ——
+     *    只要这一趟结束时人还在水里就报 stuck，哪怕它是**笔直往前游、一直在靠近目标**。
+     *    上层（`walkTo`）看到 stuck 就把整趟交给 `recoverFromWater`（找出口那套），
+     *    于是"正常游过去"被当成"游不动"、白烧一轮自救预算。
+     *    现在只有**真的没进展**（`swim-stuck`）才算 stuck；上岸了报 `swim-shore`，
+     *    时间用完报 `swim-budget`，都如实写在 `reason` 里。 */
+    stuck: stuckWhy != null,
     reason,
     outOfWater,
     ...(fixups ? { fixups } : {}),

@@ -21,7 +21,7 @@ import vec3pkg from 'vec3'
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 
 import { sleep, DESYNC_HINT } from './async-util.mjs'
-import { isAir, isLiquid } from './block-names.mjs'
+import { isAir, isLiquid, isSolidBlock } from './block-names.mjs'
 import { heldText, canHarvestNow, toolKinds, countOf, durWarnText } from './inventory.mjs'
 import { digMsFor } from './dig-speed.mjs'
 import { blockReachOf, slowDigWhy, stateNameOf, dropHint } from './world-observer.mjs'
@@ -83,7 +83,50 @@ export function veinHint (b, minedName) {
     + '回头补料比多挖几块贵得多。'
 }
 
-export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
+/**
+ * 「挖脚下方块」的安全检查 —— 2026-10-18 审计（P1-5）。
+ *
+ * 现象：`mc_dig` / `mc_act {mode:"break"}` 挖**自己站着的那一格**（或它脚下）时没有任何检查，
+ * 下面若是岩浆 / 悬空 / 水就直接掉下去 —— 实机摔死过（y=68 → 47）。
+ *
+ * 判据刻意保守，只拦「**这一格就是我的支撑**」这一种：
+ *   · 方块在**脚下**（同一列、`pos.y === 脚下方块的 y`），或
+ *   · 方块**和我脚同层**（同一列、`pos.y === 脚 y`，挖掉后脚下可能是空的）
+ * 并且往下 3 格量一遍：第一格不是实心（悬空）或第一格/第二格是液体 ⇒ 有风险。
+ *
+ * 返回 `{ bad, why, below }`，`bad=false` 表示照挖。**不检查远处的方块** —— 那是寻路和搭路的事。
+ */
+function underfootRiskOf (b, pos) {
+  const p = b.entity?.position
+  if (!p) return null
+  const feet = p.floored()
+  const sameColumn = pos.x === feet.x && pos.z === feet.z
+  /* 只有"脚底下**垫着**的那一格"才算拆支撑 —— 站的那一格本身（`feet.y`）永远是空气，
+   * 挖同层的方块不会让人掉下去（水平相邻的方块另算，那是寻路的事）。 */
+  const mineSupport = pos.y === feet.y - 1
+  if (!sameColumn || !mineSupport) return null
+  const below = []
+  for (let dy = 1; dy <= 3; dy++) {
+    const c = b.blockAt(new Vec3(pos.x, pos.y - dy, pos.z))
+    below.push(c ? c.name : null)
+  }
+  const first = below[0]
+  const second = below[1]
+  const liquid = (n) => n != null && isLiquid(n)
+  /* 🔴 `null` = 那一格没加载（"不知道"），**不当成"空"** —— 否则在测试/新区块里
+   *    每次挖脚下方块都会被拦，而在真世界里脚下总是加载好的。
+   *    只有**读到了**"不是实心"或"是液体"才判危险。 */
+  const bad = (first != null && !isSolidBlock(first)) || liquid(first) || liquid(second)
+  return {
+    bad,
+    why: bad
+      ? `正下方只有 ${below.map((n) => n ?? '未加载').join(' / ')} —— 挖掉这一格就掉下去了`
+      : null,
+    below,
+  }
+}
+
+export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}, ctx = {}) {
   const b = self.requireBot()
   const pos = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z))
   const blk = b.blockAt(pos)
@@ -97,6 +140,17 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
     }
   }
   const name = blk.name
+  /* ①′ 挖自己脚下 = 拆自己的支撑（2026-10-18 审计 P1-5）：下面若是岩浆/悬空/水，
+   *    挖下去人就跟着掉。**默认拦住**，要拆就说 `allowDangerous:true`。 */
+  const risk = allowDangerous ? null : underfootRiskOf(b, pos)
+  if (risk?.bad) {
+    return {
+      broken: false, at: { x: pos.x, y: pos.y, z: pos.z }, now: name,
+      dangerous: true,
+      note: `挖这一格会把自己脚下的支撑拆掉：${risk.why}`
+        + ' —— **我没开始挖**。真要走的话先横着挪一格（`mc_move`），或确实想拆就带上 `allowDangerous:true`。',
+    }
+  }
   /* 🔴 2026-10-08 第五份审计报告 ② + 实机定论：`breakBlock` 以前**完全没有"够不着"检查**（dig 有）。
    *    上游 `digging.js` 的 `canDigBlock` 要求**眼睛到方块中心** ≤ 5.1，服务端生存 reach 是 4.5；
    *    对够不着的方块动手 = 服务端静默忽略 + 报告 ① 的客户端预测 ⇒ **静默假成功**。
@@ -247,7 +301,7 @@ export async function breakBlock (self, { x, y, z } = {}, ctx = {}) {
  * 判据：模块不 import `core.mjs`、不 import 游戏库（只认 `b.blockAt` / `b.dig` / `b.findBlocks` / `b.game`）。
  * ──────────────────────────────────────────────────────────────────────────── */
 
-export async function dig (self, { name = null, pos = null, maxDistance = 6, count = 1 } = {}, ctx = {}) {
+export async function dig (self, { name = null, pos = null, maxDistance = 6, count = 1, allowDangerous = false } = {}, ctx = {}) {
   const b = self.requireBot()
   const out = []
   const held0 = heldText(b)
@@ -443,6 +497,13 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
             + '先 `mc_move` 到它旁边（或换个近一点的目标）再叫我挖：站远了挖服务端不认，方块会"复原"')
           continue
         }
+      }
+      /* 挖自己脚下（2026-10-18 审计 P1-5）：跟 `breakBlock` 同一条判据。 */
+      const risk = allowDangerous ? null : underfootRiskOf(b, p)
+      if (risk?.bad) {
+        out.push(`⚠️ ${nm} @ ${p} 是你脚下的支撑：${risk.why} —— **这一格没挖**。`
+          + '先横着挪一格（`mc_move`）再挖，或确实要拆就带 `allowDangerous:true`')
+        continue
       }
       {
         const watch = ctx.watchServerBreak(b, p)

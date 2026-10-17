@@ -352,6 +352,57 @@ section('⑥ 够得着就原地挖 —— 复核过才算挖掉，掉落物要�
 }
 
 /* ─────────── ⑦ 采集任务卡死：cancelTask 等不到事件 ⇒ 必须清空僵尸队列 ─────────── */
+/* ─────────── ⑥′ 挖自己脚下：下面没落脚点/是岩浆 ⇒ 拦（2026-10-18 审计 P1-5） ─────────── */
+section('⑥′ 挖自己脚下的支撑：下面没落脚点就别挖（除非 allowDangerous）')
+{
+  const mkWorld = (map) => (p) => {
+    const k = `${p.x},${p.y},${p.z}`
+    return k in map ? map[k] : null
+  }
+  const fake = mkBot({ bx: 0, by: 63, bz: 0 })
+  const b = fake.bot
+  b.entity.position = new Vec3(0.5, 64, 0.5)   // 脚 y=64 ⇒ 支撑格是 (0,63,0)
+  b.entity.onGround = true
+  b.blockAt = mkWorld({
+    '0,63,0': { name: 'dirt', type: 3, boundingBox: 'block' },
+    '0,62,0': { name: 'air', type: 0, boundingBox: 'empty' },
+    '0,61,0': { name: 'air', type: 0, boundingBox: 'empty' },
+  })
+  b.dig = () => { fake.state.dug = true; return Promise.resolve() }
+  const mc = mkMc(fake)
+  const r = await mc.breakBlock({ x: 0, y: 63, z: 0 })
+  ok(r.broken === false && r.dangerous === true, '踩着的方块下面是空的 ⇒ 拒绝挖（dangerous:true）',
+    JSON.stringify(r).slice(0, 120))
+  ok(/脚下的支撑/.test(String(r.note)) && /allowDangerous/.test(String(r.note)),
+    '说清"这是脚下的支撑"并指出 allowDangerous', String(r.note).slice(0, 90))
+  ok(fake.state.dug === false, '一块都没挖')
+
+  const mc2 = mkMc(mkBot({ bx: 0, by: 63, bz: 0 }))
+  const b2 = mc2.bot
+  b2.entity.position = new Vec3(0.5, 64, 0.5)
+  b2.entity.onGround = true
+  b2.blockAt = mkWorld({
+    '0,63,0': { name: 'dirt', type: 3, boundingBox: 'block' },
+    '0,62,0': { name: 'lava', type: 4, boundingBox: 'empty' },
+  })
+  b2.dig = () => Promise.resolve()
+  const r2 = await mc2.breakBlock({ x: 0, y: 63, z: 0, allowDangerous: true })
+  ok(r2.dangerous !== true, 'allowDangerous:true ⇒ 照挖（不再拦）', JSON.stringify(r2).slice(0, 100))
+
+  /* 挖脚下的**侧面**（同层相邻方块）不管 —— 那是寻路的事；只有当方块就在自己列上才算拆支撑。 */
+  const mc3 = mkMc(mkBot({ bx: 1, by: 63, bz: 0 }))
+  const b3 = mc3.bot
+  b3.entity.position = new Vec3(0.5, 64, 0.5)
+  b3.entity.onGround = true
+  b3.blockAt = mkWorld({
+    '1,63,0': { name: 'dirt', type: 3, boundingBox: 'block' },
+    '1,62,0': { name: 'air', type: 0, boundingBox: 'empty' },
+  })
+  b3.dig = () => Promise.resolve()
+  const r3 = await mc3.breakBlock({ x: 1, y: 63, z: 0 })
+  ok(r3.dangerous !== true, '旁边那一列的同层方块 ⇒ 不拦（不是我的支撑）', JSON.stringify(r3).slice(0, 100))
+}
+
 section('⑦ 采集任务卡死（cancelTask 永远等不到 collectBlock_finished）—— 清空僵尸队列')
 {
   /* 背景（2026-10-08 实机日志 02:38–02:43 连打 20 次"上次的采集任务还在后台跑"）：

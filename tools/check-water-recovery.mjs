@@ -384,7 +384,12 @@ section('⑧ 接线：移动层自动接管、反射层通知 AI、都不另起�
   ok(/const recovering = startWaterRecover\(s, sess, cfg, t, \{/.test(au),
     '只在**憋气**那条分支里启动自救（挨打那条照旧只叫醒、不自己动）')
   /* 自救这一路自己不许按键盘（按 jump 抬一下是**原有**的濒死保命动作，不在这条里） */
-  const recFn = au.slice(au.indexOf('const startWaterRecover ='), au.indexOf('const avoid = (s, sess, cfg, t)'))
+  /* 2026-10-18：`startWaterRecover` 与 `avoid` 之间现在还有苦力怕应急（会按控制位），
+   * 所以切到**下一个函数**为止，别把它算进"自救"这一段。 */
+  const recFrom = au.indexOf('const startWaterRecover =')
+  const recTo = [au.indexOf('const creeperFlee ='), au.indexOf('const avoid = (s, sess, cfg, t)')]
+    .filter((i) => i > recFrom).sort((a, c) => a - c)[0] ?? au.length
+  const recFn = au.slice(recFrom, recTo)
   ok(recFn.length > 200 && !/setControlState/.test(recFn), '自救这一路一行 setControlState 都没有')
 
   /* ── P0-1 场景二：自救要进调度器，不能"绕过表直接驱动 bot" ── */

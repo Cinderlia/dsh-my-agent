@@ -4,7 +4,8 @@
  * 用户诉求（2026-10-05 m01304）："现在机器人等指令的时候很少动，能不能让它像正常玩家一样，有自主决策"
  * 用户补充（m01412）："没事做的时候，看看玩家在干什么，可以询问，观察，理解并帮助玩家"
  * 用户选择（m01305）：① 两层都要，**默认只做无害动作**；② 空闲就叫醒 AI 一次。
- * 用户改（m02357）："待机时间改成5秒触发" ⇒ idleWakeSec / minIdleGapSec / idleWakeNearPlayerSec 默认 5s。
+ * 用户改（m02357）："待机时间改成5秒触发"；2026-10-18 审计后空闲叫醒默认改成 **10s**
+ * （危险叫醒另有配额，见 `dangerWakeMaxPerHour`）。
  *
  * 两层：
  *   ① **反射层**（不花 token，常开）：
@@ -14,7 +15,7 @@
  *      · **走路类**（跟随/捡东西）额外要求 `agent.status !== 'running'`
  *        —— AI 这一轮还没跑完（可能在思考/等事件）时不许挪窝，免得它按旧画面行动；
  *      · 定时器回调里**绝不抛错**（setInterval 回调抛错 = uncaughtException = 整个宿主进程死）。
- *   ② **空闲决策层**（花 token）：闲着 idleWakeSec（默认 **5s**；旁边有人时 idleWakeNearPlayerSec，默认 5s）后，
+ *   ② **空闲决策层**（花 token）：闲着 idleWakeSec（默认 **10s**；旁边有人时 idleWakeNearPlayerSec，默认 5s）后，
  *      用 `agent.steer(plugin notice)` 把 AI 叫醒（宿主语义："空闲起一轮、运行中下一步插话"）。
  *      叫醒文案**先给观察结果**（附近玩家：距离/在动还是站着/手持什么/面向哪边/y、最近聊天、自己的位置血量饥饿），
  *      再要求它"按长期目标 standing 自己动手做 2~4 个动作 → 简短汇报"（**不许反问 用户**），
@@ -41,7 +42,8 @@
 import { userMessage } from '../src/user-message.mjs'
 import { clamp } from './mc_util.mjs'
 import { BRIDGE_FATAL } from '../src/bridge.mjs'
-import { isSolidBlock, SOFT_ROOF } from '../src/block-names.mjs'
+import { isSolidBlock, isPassable, SOFT_ROOF } from '../src/block-names.mjs'
+import { hostilityOf } from '../src/entity-names.mjs'
 import { floorMapOf, hazardCellsOf } from '../src/map-render.mjs'
 import { recoverFromWater, waterReportText } from '../src/water-recovery.mjs'
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
@@ -66,11 +68,17 @@ export const DEFAULT_STANDING = '和正常玩家一样发展，最后击败末�
 export const AUTO_DEFAULTS = {
   /** 反射层总开关（关掉=只有空闲决策层还会叫醒 AI） */
   enabled: true,
-  /** 空闲决策层：闲着这么久就叫醒 AI（秒）。用户要求：待机 5 秒就触发 */
+  /** 空闲决策层：闲着这么久就叫醒 AI（秒）。用户 2026-10-18 审计后改成 10 秒（原 5 秒） */
   idleWake: true,
-  idleWakeSec: 5,
-  /** 每小时最多叫醒几次（硬上限，防刷屏烧 token）。5s 间隔下自然节奏约 1 次/分钟 ⇒ 给足余量 */
+  idleWakeSec: 10,
+  /** 空闲叫醒每小时上限（只管"没事找事"这条线；危险叫醒有自己的配额，见下） */
   idleWakeMaxPerHour: 120,
+  /**
+   * 🔴 2026-10-18 审计：**危险叫醒和空闲叫醒各用各的配额**。
+   *    以前共用 `wakeTimes` —— 空闲空转把 120 次烧光后，**真有怪贴脸时反而不叫了**。
+   *    危险叫醒才是保命的那条线，它不该被"自己找事做"挤掉。
+   */
+  dangerWakeMaxPerHour: 40,
   /** 两次叫醒之间至少隔多久（秒） */
   minIdleGapSec: 5,
   /** 叫醒后 AI 没动作 → 间隔翻倍退避（封顶 30 分钟） */
@@ -101,7 +109,14 @@ export const AUTO_DEFAULTS = {
   quietAfterToolMs: 6000,
 
   /**
-   * 自保叫醒时**先停下手里的事**（默认开）。用户 2026-10-14 任务驱动第三步：
+   * 🔴 2026-10-18 审计（用户拍板）：**苦力怕贴到 4 格内先自己退一步**，再叫醒 AI。
+   *    苦力怕引信 1.5 秒、爆炸中心伤害不衰减 —— 等模型回话（几秒）人已经炸死了。
+   *    这是**唯一**一种反射层会主动挪位置的自保（别的怪仍然只叫醒、不动位置）。
+   *    关掉它 = 回到"只叫醒、哪都不去"。
+   */
+  creeperFlee: true,
+
+  /** 自保叫醒时**先停下手里的事**（默认开）。用户 2026-10-14 任务驱动第三步：
    * "先停止采集，再由 AI 决定逃跑、战斗还是继续任务"。
    *
    * 🔴 只"停手"，**不跑、不还手** —— 那是用户 2026-10-06 定的（自保层不替 AI 做决策）。
@@ -114,6 +129,7 @@ export const AUTO_DEFAULTS = {
 const RANGES = {
   idleWakeSec: [5, 3600],
   idleWakeMaxPerHour: [1, 720],
+  dangerWakeMaxPerHour: [1, 720],
   minIdleGapSec: [5, 3600],
   idleWakeNearPlayerSec: [5, 3600],
   playerNearRadius: [4, 64],
@@ -143,6 +159,12 @@ const WALK_BUDGET = 2600
 const DANGER_WAKE_GAP_MS = 15_000
 /** 怪贴到几格内算"急事"（AI 正在动手也要抢控制权先跑） */
 const URGENT_RADIUS = 4
+/** 苦力怕进到这个距离就自己退（爆发半径 3 格、引信 1.5 秒，等模型回话已经晚了） */
+const CREEPER_FLEE_R = 4
+/** 后退多久（毫秒）：0.7 秒 ≈ 2~3 格，够出爆发中心，又不至于把 AI 的任务意图带偏 */
+const CREEPER_FLEE_MS = 700
+/** 两次苦力怕后退之间至少隔多久（毫秒） */
+const CREEPER_FLEE_GAP_MS = 8_000
 /** 憋气叫醒的最短间隔（毫秒）：氧气见底后每秒都在掉血，等 15 秒太久，所以比 DANGER_WAKE_GAP_MS 短 */
 const DROWN_WAKE_GAP_MS = 6_000
 /** 氧气低于这个值就该出声（20 = 满；掉到 0 之后开始掉血） */
@@ -319,8 +341,12 @@ const hostilesNear = (b, radius) => {
   for (const e of Object.values(b?.entities ?? {})) {
     if (e === b.entity || !e?.position) continue
     const nm = String(e.name ?? e.username ?? '')
-    const hostile = HOSTILE.test(nm) || e.kind === 'Hostile mobs'
-    if (!hostile) continue
+    /* 🔴 2026-10-18 审计：末影人/猪灵在 `HOSTILE` 里，但它们**默认中立** ——
+     *    走过去时被当成"怪贴脸"，4 格内抢控制权、停任务、每步中断，可 `attack` 又不打它们。
+     *    现在中立怪只有**真的在打我**（它的 target 是我）才算威胁。 */
+    const stance = hostilityOf(nm, e.kind)
+    const targetingMe = e.target === b.entity || (e.target != null && e.target.id != null && e.target.id === b.entity?.id)
+    if (stance !== 'hostile' && !(stance === 'neutral' && targetingMe)) continue
     const d = e.position.distanceTo(me)
     if (d <= radius) out.push({ entity: e, distance: d, name: nm || String(e.type ?? '?') })
   }
@@ -887,8 +913,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       drown = false, air = null, submerged = false, subSec = 0, gap = DANGER_WAKE_GAP_MS,
       waterRecover = false, fell = null, fellFrom = null, suffocate = null } = info ?? {}
     if (t - num(s.lastDangerWakeAt, 0) < gap) return 'throttled'
-    s.wakeTimes = s.wakeTimes.filter((x) => t - x < 3_600_000)
-    if (s.wakeTimes.length >= cfg.idleWakeMaxPerHour) { s.stats.denied++; return 'throttled' }
+    /* 🔴 危险叫醒用**自己的**配额（2026-10-18 审计）：和空闲叫醒共用一份时，
+     *    空闲空转能把 120 次烧光，真有怪时反而不叫。 */
+    s.dangerWakeTimes = (s.dangerWakeTimes ?? []).filter((x) => t - x < 3_600_000)
+    if (s.dangerWakeTimes.length >= cfg.dangerWakeMaxPerHour) { s.stats.denied++; return 'throttled' }
     const b = sess?.bot?.bot
     const me = b?.entity?.position
     const held = String(b?.heldItem?.name ?? '空手')
@@ -997,6 +1025,11 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         L.push('· 远程怪**要看得见你才打得到你**：`mc_build` 在它和你之间垒两格方块挡视线，或钻到墙后/树后/坑里；'
           + '血够（≥16）也可以贴上去打（贴近了它反而不好射）。')
       }
+      if (/creeper/i.test(threat?.name ?? '')) {
+        L.push(creeperFled
+          ? '· 苦力怕贴脸：**我已经先往后挪了一步**（不过它没退远）。**别在原地打** —— 走到 8 格外，或者隔着墙 / 垫两格方块。'
+          : '· ⚠️ 苦力怕贴脸（**没找到安全的落脚点，我没退**）：**别在原地打** —— 它会炸；先走到 8 格外，或隔着墙 / 垫方块。')
+      }
       L.push(`· 还手：\`mc_act {"mode":"attack","who":"${threat?.name ?? '怪名'}"}\``
         + '（血 < 14、苦力怕/女巫/烈焰人、两只以上 → 别打，接着撤）')
       L.push('· 继续撤：`mc_move` 到更远的安全点；旁边有玩家就跑过去（`mc_act {"mode":"toward","who":"玩家名"}`）')
@@ -1021,7 +1054,8 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       s.lastDangerWakeAt = t
       s.lastWakeAt = t
       s.nudgedAt = 0
-      s.wakeTimes.push(t)
+      s.dangerWakeTimes = (s.dangerWakeTimes ?? []).filter((x) => t - x < 3_600_000)
+      s.dangerWakeTimes.push(t)
       s.stats.dangerWakes++
       logLine(suffocate
         ? `mc_auto：头卡在方块里（${suffocate.name} @ ${suffocate.x}, ${suffocate.y}, ${suffocate.z}，氧气 ${air ?? '?'}/20）→ 已叫醒 AI`
@@ -1131,6 +1165,63 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
   /** 危险回避：踩到岩浆/火/仙人掌 → 后退（这个还是要动的，站里面会死）；
    *  有怪/挨打 → **只叫醒 AI**（报怪的位置、血量、距离），反射层不自己跑、不抢控制权。
    *  用户 2026-10-06："既然选择可以获取怪物位置，把受到攻击自动跑离开去掉。" */
+  /**
+   * 苦力怕贴到 4 格内：**先自己退一步**，再叫醒 AI（2026-10-18 审计，用户拍板）。
+   *
+   * 为什么别的怪都不动、只有它动：
+   *   · 苦力怕引信 1.5 秒、爆炸中心伤害不衰减 —— 等模型回话（几秒）人已经炸没了；
+   *   · 它贴上来时**退一步就有效**（离开爆发中心），不像骷髅你退它追；
+   *   · 仍然不是"替 AI 打架"：只按 0.7 秒后退，然后照常叫醒、把决定权交回去。
+   *
+   * @returns {boolean} 这次真退了没有（叫醒文案里要如实写）
+   */
+  const creeperFlee = (s, sess, cfg, t, foe) => {
+    if (cfg.creeperFlee === false) return false
+    const b = sess?.bot?.bot
+    const me = b?.entity?.position
+    const cp = foe?.entity?.position
+    if (!me || !cp) return false
+    if (t - num(s.lastCreeperFleeAt, 0) < CREEPER_FLEE_GAP_MS) return false
+    /* 方向：背离苦力怕 2.5 格；正后方不行就左右各 52° 再试（别退进墙/岩浆/悬空）。 */
+    let dx = me.x - cp.x
+    let dz = me.z - cp.z
+    const len = Math.hypot(dx, dz) || 1
+    dx = (dx / len) * 2.5
+    dz = (dz / len) * 2.5
+    let spot = null
+    for (const a of [0, 0.9, -0.9, 1.8, -1.8]) {
+      const ca = Math.cos(a)
+      const sa = Math.sin(a)
+      const cand = me.offset(dx * ca - dz * sa, 0, dx * sa + dz * ca)
+      const feet = blockNameAt(b, cand)
+      const head = blockNameAt(b, cand.offset(0, 1, 0))
+      const floor = blockNameAt(b, cand.offset(0, -1, 0))
+      if (!feet || !head || !floor) continue
+      if (!isPassable(feet) || !isPassable(head)) continue
+      if (!isSolidBlock(floor)) continue
+      if (BRIDGE_FATAL.test(feet) || BRIDGE_FATAL.test(head) || BRIDGE_FATAL.test(floor)) continue
+      spot = cand
+      break
+    }
+    if (!spot) return false
+    let shield = false
+    try {
+      const off = b?.inventory?.slots?.[45]?.name
+      if (off === 'shield' && typeof b.activateItem === 'function') {
+        b.activateItem(true)
+        shield = true
+        s.shieldOffAt = t + CREEPER_FLEE_MS
+      }
+    } catch { /* 举盾失败不影响跑 */ }
+    try { b.lookAt(spot) } catch { /* 只是朝向 */ }
+    holdCtl(sess, 'forward', CREEPER_FLEE_MS, () => { try { b.setControlState('forward', false) } catch { /* 忽略 */ } })
+    s.lastCreeperFleeAt = t
+    s.stats.creeperFlees = num(s.stats.creeperFlees, 0) + 1
+    s.lastAction = '躲苦力怕'
+    logLine(`mc_auto：苦力怕 ${foe.distance.toFixed(1)} 格 → 先退 ${CREEPER_FLEE_MS}ms（${shield ? '举盾 + ' : ''}再叫醒 AI）`)
+    return true
+  }
+
   const avoid = (s, sess, cfg, t) => {
     /* 🔴 2026-10-08 审计：以前这里是 `if (s.busy) return` —— `busy` 由 `pickup`（最长 8 秒）与
      *   `follow`（最长 3.4 秒）置位，那 8 秒里岩浆/挨打/憋气**全都不检测**，AI 一边挨打一边走 6 格
@@ -1138,6 +1229,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
      *   所以现在只把**动作**（按 back/jump）关掉，检测与 `wakeForDanger` 照跑。 */
     const busy = Boolean(s.busy)
     const b = sess?.bot?.bot
+    if (s.shieldOffAt && t >= s.shieldOffAt) {
+      s.shieldOffAt = 0
+      try { b?.deactivateItem?.() } catch { /* 忽略 */ }
+    }
     const e = b?.entity
     if (!e?.position) return
     const p = e.position
@@ -1311,6 +1406,11 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     }
 
     const ranged = RANGED.test(threat.name)
+    /* 🔴 苦力怕：**先退，再说**（放在 inFlight 闸之前 —— AI 正在挖矿时它贴上来，也得先退）。 */
+    const creepers = foes.filter((f) => /creeper/i.test(f.name) && f.distance <= CREEPER_FLEE_R
+      && !losBlocked(b, eyeOf(f.entity.position), eyeOf(e.position)))
+    let creeperFled = false
+    for (const c of creepers) if (creeperFlee(s, sess, cfg, t, c)) creeperFled = true
     // AI 正在动手、怪也没贴上来（没挨打）→ 不打扰它，等它这一轮跑完
     if (s.inFlight > 0 && !(hurtRecently || threat.distance <= URGENT_RADIUS)) return
 
@@ -1329,7 +1429,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     //    原来这里还有一段"叫不醒 AI 就自己上"的兜底（judgeFight → wearArmor → holdWeapon →
     //    sess.bot.attack），连判断函数一起删掉了。没人值守时（没有 steer 通道）就只记档 ——
     //    AI 不在，自己动手更容易白送，而且它下次上线能看到 mc_observe "程序检测到"里的怪。
-    wakeForDanger(s, sess, cfg, t, { threat, foes, health, ranged, hurt: hurtRecently })
+    wakeForDanger(s, sess, cfg, t, { threat, foes, health, ranged, hurt: hurtRecently, creeperFled })
   }
 
   /** 跟随指定玩家（反射层里优先级最高的"移动"） */
@@ -1345,7 +1445,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     /* 🔴 同 `startWaterRecover`：反射层自己发起的走路要先开预算，否则空闲 tick 里一步不走。 */
     grantMoveBudget(sess.bot, WALK_BUDGET + 800)
     withTimeout(sess.bot.walkTo({ x: target.position.x, y: target.position.y, z: target.position.z },
-      { arrive: cfg.followDistance, budget: WALK_BUDGET }), WALK_BUDGET + 800, '跟随')
+      { arrive: cfg.followDistance, budget: WALK_BUDGET, noTower: true }), WALK_BUDGET + 800, '跟随')
       .then(() => { s.stats.follows++; s.lastAction = `跟上 ${target.username}` })
       .catch((err) => { s.lastError = `跟随失败：${err?.message ?? err}` })
       .finally(() => { s.busy = false })
