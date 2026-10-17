@@ -304,7 +304,21 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
 
   /** 有 pvp：交给插件追+打，自己等到"目标没了 / 这一轮用完"
    *  `opts.shield`：这一轮值得举盾吗（副手有盾 + 目标近战贴脸 / 远程在射我 / 被围） */
+  /* 🔴 审计（2026-10-18）：战斗期间**关掉自动吃**。mineflayer-auto-eat 会在低血时自作主张
+   *    换手吃、按右键，战斗那几秒里等于把剑收起来。只在真正开打的这段关，打完立刻还原。 */
+  const eatOff = () => {
+    const ae = b?.autoEat
+    if (!ae || typeof ae.disableAuto !== 'function' || ae.enabled === false) return null
+    try { ae.disableAuto() } catch { return null }
+    return ae
+  }
+  const eatBack = (ae) => {
+    if (!ae || typeof ae.enableAuto !== 'function') return
+    try { ae.enableAuto() } catch { /* 还不了也无害：自主层下一拍会按配置重新开 */ }
+  }
+
   const engagePvp = async (opts = {}) => {
+    const ae = eatOff()
     /* 🔴 `bot.pvp.attack(target)` **立刻** resolve（它只做三件事：设 target、`GoalFollow` 追过去、
      *    发 `startedAttacking` 事件），真正挥拳的是 `physicTick` 上的后台循环 ⇒
      *    旧写法 `await withTimeout(b.pvp.attack(...))` 一毫秒就返回，紧接着 `finally` 里
@@ -368,6 +382,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
       /* 🔴 这里**不能 await**：`pvp.stop()` 里 `onceWithTimeout('path_stop', 5000)` 最多等 5 秒，
        *    会把这一轮的预算整段吃光（而且 pathfinder 的 stop 在它第一行就已经做了）。 */
       try { Promise.resolve(b.pvp.stop()).catch(() => {}) } catch { /* 停不掉也不影响 */ }
+      eatBack(ae)
     }
     const gone = !b.entities?.[target.id] || target.isValid === false
     const killed = gone && sawDamage
@@ -408,6 +423,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
 
   /** 没有 pvp 插件：退化成原地挥（上游原版就是一次 `b.attack`，这里按预算多挥几下） */
   const engageSwing = async () => {
+    const ae = eatOff()
     const hpStart = Number(b.health)
     const t0 = Date.now()
     const leftMs2 = ctx.callLeft() - 400
@@ -446,6 +462,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     const killed = gone && sawDamage2
     const pickup = killed ? dropHint(b) : null
     const inRange = distOf(target) <= 4.5
+    eatBack(ae)
     return {
       attacked: label, distance: d, swings, killed, gone, health: b.health,
       ...(gone && !killed ? { note: '目标不见了，但**没读到过它掉血** —— 说不清是我打死的还是它走远/区块卸载了（别当成打死了）' } : {}),

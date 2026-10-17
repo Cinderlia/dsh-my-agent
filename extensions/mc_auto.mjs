@@ -41,6 +41,7 @@
 import { userMessage } from '../src/user-message.mjs'
 import { clamp } from './mc_util.mjs'
 import { BRIDGE_FATAL } from '../src/bridge.mjs'
+import { isSolidBlock, SOFT_ROOF } from '../src/block-names.mjs'
 import { floorMapOf, hazardCellsOf } from '../src/map-render.mjs'
 import { recoverFromWater, waterReportText } from '../src/water-recovery.mjs'
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
@@ -122,6 +123,16 @@ const RANGES = {
 
 /** 退避封顶（毫秒） */
 const MAX_BACKOFF_MS = 30 * 60_000
+/**
+ * 叫醒文案的"完整版"最短间隔（毫秒）。
+ *
+ * 🔴 2026-10-18 审计：完整叫醒文案里有 **2375 个静态汉字**，加上动态部分约 2.5~2.7K 字；
+ *    默认待机 5 秒就能触发、每小时上限 120 次 ⇒ 最坏一小时灌 30 万字（≈8 万 token），
+ *    而内容几乎每次一样（路线/三条规矩/默认约束/长期目标），模型上一条还没忘。
+ *    现在：**每 10 分钟才发一次完整版**，中间发"现状 + 玩家 + 脚下一层 + 台账 + 一句目标"的
+ *    短版（约 600~900 字，省 2/3）；上下文被压缩/丢掉了也会在 10 分钟内自然补回完整版。
+ */
+const BRIEF_EVERY_MS = 10 * 60_000
 /** 叫醒间隔的硬下限（秒）：用户要求待机 5 秒就能触发，所以下限也是 5 */
 const MIN_IDLE_SEC = 5
 /** 叫醒后多久还没动手就补一条催促（毫秒） */
@@ -143,6 +154,8 @@ const DROWN_SUBMERGE_MS = 10_000
 const DROWN_SUBMERGE_GAP_MS = 20_000
 /** 🔴 水下自动救援的最短间隔（毫秒）：一次"搜出口 + 走一条路线"最多 12 秒，别叠着跑 */
 const WATER_RECOVER_GAP_MS = 15_000
+/** 窒息：快死了才喊，8 秒一次（默认 15 秒的"怪贴脸"间隔对窒息太慢） */
+const SUFFOCATE_GAP_MS = 8_000
 /** 🔴 水下自动救援一次的墙钟上限（毫秒）：超了就放弃这一轮（`recoverFromWater` 自己也有 12 秒预算） */
 const WATER_RECOVER_MAX_MS = 15_000
 /** 交给 `recoverFromWater` 的**内层**预算（毫秒）：比墙钟上限短一截，
@@ -872,7 +885,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     if (!agent || typeof agent.steer !== 'function') return 'none'
     const { threat = null, foes = [], health = 20, ranged = false, hurt = false, blind = false,
       drown = false, air = null, submerged = false, subSec = 0, gap = DANGER_WAKE_GAP_MS,
-      waterRecover = false, fell = null, fellFrom = null } = info ?? {}
+      waterRecover = false, fell = null, fellFrom = null, suffocate = null } = info ?? {}
     if (t - num(s.lastDangerWakeAt, 0) < gap) return 'throttled'
     s.wakeTimes = s.wakeTimes.filter((x) => t - x < 3_600_000)
     if (s.wakeTimes.length >= cfg.idleWakeMaxPerHour) { s.stats.denied++; return 'throttled' }
@@ -918,6 +931,25 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       L.push('· 水/岩浆是**流体，挖不掉** —— 别 `mc_dig` 水（白花一次调用）')
       L.push('· 血少（< 8）就先浮上来换气、再吃/躲；别在水下跟怪纠缠')
       L.push('选一个**直接做**，不用问我。')
+    } else if (suffocate) {
+      /* 🔴 2026-10-18 审计：**头被方块封住 = 窒息**（沙/砂砾砸下来、被挤进墙里、贴墙放方块）。
+       *    每秒掉 1 点血，而且"既不像被打、也不像溺水"（不进水、附近没怪）—— 不点名就查不出来。 */
+      const where = ['x', 'y', 'z'].every((k) => Number.isFinite(Number(suffocate[k])))
+        ? `(${suffocate.x}, ${suffocate.y}, ${suffocate.z})`
+        : '（坐标没读到）'
+      L.push(`【自保：我头卡在方块里，正在窒息｜血 ${Math.round(health)}/20】`)
+      L.push('')
+      L.push(`**这不是被打，也不是溺水** —— 我**头那一格**是 \`${suffocate.name}\` ${where}，`
+        + '人被方块封在里面：每秒掉 1 点血，不挪开就一直掉。多半是**沙子/砂砾砸下来**，或者被挤进墙/自己垫方块垫进头里。')
+      L.push(`我：血 ${Math.round(health)}/20，手上 ${held}，在 ${me ? `(${Math.round(me.x)}, ${Math.round(me.y)}, ${Math.round(me.z)})` : '?'}`)
+      L.push('')
+      const bx = Math.floor(Number(suffocate.x))
+      const by = Math.floor(Number(suffocate.y))
+      const bz = Math.floor(Number(suffocate.z))
+      L.push(`· 先挖掉**头那一格**：\`mc_act {"mode":"break","x":${bx},"y":${by},"z":${bz}}\`（就是上面那个坐标，别挖脚）`)
+      L.push('· 挖不了（徒手挖不动/有水/有岩浆）就先**横着挪一格**：`mc_move` 到旁边两格；别往上跳，越跳越卡')
+      L.push('· 出来之后 `mc_observe {"distance":8}` 看一眼头/脚那格（`mc_status` 不报方块），确认能喘气了再继续')
+      L.push('选一个**直接做**，不用问我。')
     } else if (fallOnly) {
       /* P0-B：摔伤。**别说成"被打"** —— 那会让 AI 去找一个不存在的敌人（实机就是这么掉的第二次）。 */
       L.push(`【自保：我刚摔下来了｜血 ${Math.round(health)}/20】`)
@@ -927,10 +959,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         + '掉落伤害和"被远程怪射"在插件里长得一模一样（血掉了、附近没怪），这次是按**垂直位移**判成摔伤的。')
       L.push(`我：血 ${Math.round(health)}/20，手上 ${held}，在 ${me ? `${Math.round(me.x)} ${Math.round(me.y)} ${Math.round(me.z)}` : '?'}`)
       L.push('')
-      L.push('· 先看脚下和四周：`mc_status`（脚下那格是什么、有没有水/岩浆/虚空，血多少）')
+      L.push('· 先看脚下和四周：`mc_observe {"distance":8}` 或 `mc_map {"mode":"column"}`（脚下/头顶是什么、有没有水/岩浆/虚空）')
       L.push('· 血少先吃/回血、躲开怪，**别急着继续往上爬**；要上去就走**斜台阶**（`mc_act {"mode":"break"}` 一格一格挖上去），'
         + '别反复垫柱子 —— 垫柱子要往自己脚下放方块，被服务端一拒人就在半空了')
-      L.push('· 垫柱子失败最常见的原因是**目标格被占 / 离得太远 / 手上有别的**：放之前先 `mc_status` 看手上和脚下')
+      L.push('· 垫柱子失败最常见的原因是**目标格被占 / 离得太远 / 手上有别的**：放之前先 `mc_inventory` 看手上、`mc_observe` 看脚下')
       L.push('选一个**直接做**，不用问我。')
     } else {
       L.push(hurt
@@ -977,9 +1009,11 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         content: [{ type: 'text', text: L.join('\n') }],
         source: {
           kind: 'plugin:dsh-mc-agent', form: 'notice',
-          summary: drown
-            ? `MC 自保：快淹死了（${air == null ? '头在水下' : `氧气 ${air}/20`}）`
-            : fallOnly
+          summary: suffocate
+            ? `MC 自保：头卡在方块里（${suffocate.name}）`
+            : drown
+              ? `MC 自保：快淹死了（${air == null ? '头在水下' : `氧气 ${air}/20`}）`
+              : fallOnly
               ? `MC 自保：摔伤（掉了 ${fell} 格，不是被打）`
               : `MC 自保：${blind ? '被远程打' : threat?.name ?? '有怪'}`,
         },
@@ -989,7 +1023,9 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       s.nudgedAt = 0
       s.wakeTimes.push(t)
       s.stats.dangerWakes++
-      logLine(drown
+      logLine(suffocate
+        ? `mc_auto：头卡在方块里（${suffocate.name} @ ${suffocate.x}, ${suffocate.y}, ${suffocate.z}，氧气 ${air ?? '?'}/20）→ 已叫醒 AI`
+        : drown
         ? `mc_auto：在水里憋气（${air == null ? `头在水下 ${subSec || '?'} 秒` : `氧气 ${air}/20`}，血 ${Math.round(health)}/20）→ 已叫醒 AI 上浮`
         : fallOnly
           ? `mc_auto：挨了打但看不到怪 → 判成**摔伤**（净下落 ${fell} 格，血 ${Math.round(health)}/20）→ 已叫醒 AI`
@@ -1152,8 +1188,44 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
      *    undefined ⇒ 整个憋气分支（下面那条 `if (inWater && …)`）直接不执行，AI 淹死都不出声。
      *    现在 `inWater` 以"头在水下"为主判据，`isInWater` 只当补充。 */
     const submerged = submergedIn(b, e)
-    const inWater = submerged || Boolean(e?.isInWater)
     const air = Number.isFinite(b?.oxygenLevel) ? b.oxygenLevel : null
+    /* 🔴 2026-10-18 审计：**头那一格是实心方块 = 正在窒息**（沙/砂砾砸下来、被挤进墙里）。
+     *    `here` 在最上面已经读过：`here[0]` 脚、`here[1]` 头、`here[2]` 脚下一格。
+     *    判据刻意收窄成三条一起看，否则**任何 1 格高的矿道/地洞里都会误报**：
+     *      ① 头那格是实心（树叶/原木/雪这类 `SOFT_ROOF` 不算 —— 实体在树叶里不窒息）；
+     *      ② **刚从"头是空的"变成"头是实心"**（沙子/砂砾砸下来、被挤进墙），或**正在掉血**；
+     *      ③ 不在水下、也不是刚摔下来（那两件各有自己的文案，别抢）。
+     *    **不能用氧气读数当判据**：窒息（沙埋/卡墙）走的是另一套伤害，服务端只在水下发
+     *    `air_supply`；地面/刚出生时是 null，埋进去也不变。用 `air <= 19` 会把功能整个关死，
+     *    而假世界能随便造 air，测试还全绿 —— 2026-10-18 审计抓到的就是这条。
+     *    窒息既不算"被打"也不算"溺水"：不点名的话 AI 会以为闲下来了，然后每秒掉 1 点血安静地死。 */
+    const headName = here[1]
+    const headSolidNow = Boolean(headName && isSolidBlock(headName) && !SOFT_ROOF.test(headName))
+    /* 🔴 判据只看"头被盖住"这件事本身，**不能靠氧气读数**：窒息（沙埋/卡墙）走的是另一套伤害，
+     *    服务端只在水下才发 `air_supply` —— 地面/刚出生时 `oxygenLevel` 是 null，被沙埋也不会变，
+     *    原来那条 `air <= 19` 会把功能整个关死（2026-10-18 审计抓到的 P0，测试用假 air 所以没暴露）。
+     *    两个触发口：① **刚从"头是空的"变成"头是实心"**（沙子/砂砾砸下来、被挤进墙）——
+     *    这里要求上一拍**明确读到过空**（`=== false`），会话第一条不触发，免得把"出生就站在
+     *    1 格高洞里"当成埋人；② 头一直实心、但**正在掉血**（掉血 = 已经在窒息了）。 */
+    const headChanged = headSolidNow && s.lastHeadSolid === false
+    s.lastHeadSolid = headSolidNow
+    const suffocant = !submerged && !fellRecently && headSolidNow && (headChanged || hurtRecently) ? headName : null
+    if (suffocant && t - num(s.lastSuffocateAt, 0) > SUFFOCATE_GAP_MS) {
+      const r = wakeForDanger(s, sess, cfg, t, {
+        health,
+        hurt: hurtRecently,
+        gap: SUFFOCATE_GAP_MS,
+        suffocate: { name: suffocant, x: e?.position?.x, y: (e?.position?.y ?? 0) + 1, z: e?.position?.z },
+      })
+      /* 只有**真喊出去**才记时间：被限流/没人值守时记了，下一次窗口会被自己挡住。 */
+      if (r !== 'throttled' && r !== 'none') {
+        s.lastSuffocateAt = t
+        s.stats.alerts++
+        s.lastAction = '窒息提醒'
+        return
+      }
+    }
+    const inWater = submerged || Boolean(e?.isInWater)
     if (submerged) { if (!s.submergedSince) s.submergedSince = t } else s.submergedSince = 0
     const subMs = s.submergedSince ? t - s.submergedSince : 0
     const subSec = Math.round(subMs / 1000)
@@ -1287,7 +1359,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const sec = s.nearPlayers > 0 ? Math.min(cfg.idleWakeNearPlayerSec, cfg.idleWakeSec) : cfg.idleWakeSec
     const base = Math.max(MIN_IDLE_SEC, sec) * 1000
     if (!cfg.idleWakeBackoff) return base
-    return Math.min(base * 2 ** Math.min(s.noActionStreak, 5), MAX_BACKOFF_MS)
+    /* 🔴 审计 F6（2026-10-18）：以前指数夹在 5 —— 5s 基础只翻到 160s 就停，
+     *    `MAX_BACKOFF_MS`（30 分钟）**永远到不了**，文档/日志却都说"封顶 30 分钟"。
+     *    夹到 9 才让封顶真的生效（5s×2^9 = 2560s > 1800s；180s 基础两轮就到）。 */
+    return Math.min(base * 2 ** Math.min(s.noActionStreak, 9), MAX_BACKOFF_MS)
   }
 
   /**
@@ -1412,6 +1487,22 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       taskBlock = `⚠️ 台账这次读不出来（${e?.message ?? e}）—— **别当成"没有任务"**：`
         + '先 `mc_task {action:"list"}` 自己看一眼再决定。\n'
     }
+    /* 🔴 2026-10-18 审计：完整版每 10 分钟一次，其余发短版。
+     * 短版**只保留"这一轮必须知道"的动态信息**（现状/玩家/脚下一层/聊天/台账/一句目标/催促），
+     * 路线、三条规矩、默认约束不重复 —— 它们上一条完整版刚说过（模型上下文里还在）。 */
+    const briefFull = !s.lastBriefAt || t - s.lastBriefAt >= BRIEF_EVERY_MS
+    if (briefFull) s.lastBriefAt = t
+    if (!briefFull) {
+      return `【自主行动轮｜我已经 ${idleSec}s 没被安排了】他没在派活，继续做你手上的事。\n`
+        + parts.join('\n') + '\n\n'
+        + (taskBlock ? `${taskBlock}\n` : '')
+        + `🎯 长期目标（以最新的为准）：${goal}\n`
+        + (s.noActionStreak
+          ? `⚠️ 你已经连着 ${s.noActionStreak} 轮只说话/站着 —— 这一轮**先动手再说话**（挖/走/建/打都算），别汇报、别问。\n`
+          : '')
+        + (hasPlayer ? '👥 旁边有人：直接上手帮他（他挖你搬、他盖你递料、他被怪打你上），只有动他东西才问一句。\n' : '')
+        + '路线、三条硬规矩、默认约束都照上一条；**这一轮真的做一个改世界的动作**（有台账就 `mc_task {action:"run"}` 推一步），干完一句话说结果。'
+    }
     return `【自主行动轮｜我已经 ${idleSec}s 没被安排了】他没在派活，这段时间归你自己安排。\n`
       + parts.join('\n') + '\n\n'
       + (taskBlock ? `${taskBlock}\n` : '')
@@ -1473,7 +1564,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       s.wakeTimes.push(t)
       s.stats.wakes++
       logLine(`mc_auto：空闲 ${Math.round((t - s.lastToolAt) / 1000)}s → 已叫醒 AI（本小时第 ${s.wakeTimes.length} 次`
-        + `${s.noActionStreak ? `，上次没动作，间隔已翻 ${2 ** s.noActionStreak} 倍` : ''}）`)
+        + `${s.noActionStreak ? `，上次没动作，间隔拉到 ${Math.round(effectiveIdleMs(s, cfg) / 1000)}s` : ''}）`)
     } catch (e) {
       s.stats.denied++
       s.lastError = `空闲叫醒失败：${e?.message ?? e}`
@@ -1667,29 +1758,17 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
 
   const toolSpec = () => ({
     name: 'mc_auto',
-    description: '🤖 **自主行为层**（"让它像正常玩家一样"）：不传参数 = 看状态。\n'
-      + '两层：① **反射层**（不花 token、常开）：AI 没调工具时我自己环顾、饿了吃、'
-      + '捡掉落物、躲岩浆火仙人掌、跟随玩家。'
-      + '**被怪打 / 有怪贴上来 → 立刻叫醒 AI 定策略**（还手/撤/垒方块都由 AI 决定）；'
-      + '**我自己不跑、不还手**，只把手里那件活先停下（`dangerStopWork` 可关；叫醒文案带怪名/坐标/距离/血量）；**没人值守就只记档**。'
-      + '远程怪（骷髅/掠夺者/女巫…）22 格内**且看得见我**才算威胁；挨打却看不到怪会报上次看到它在哪。'
-      + '**在水里憋气（头在水下）也会叫醒 AI 上浮**：掉血或超过 10 秒；真要憋死了我只按住 jump 抬一下，不横向跑。'
-      + '**附近有玩家时我一直看着他**（不动位置、不碰东西）；'
-      + '任何工具调用后静默 6s；走路类只在 AI 这一轮跑完时才动。\n'
-      + `② **空闲决策层**（花 token）：AI 停下来（默认 ${AUTO_DEFAULTS.idleWakeSec} 秒没事干）且这一轮结束时，我用插件提示叫醒它，`
-      + '文案带"玩家在干什么"（距离/在动/手持/面向/最近聊天）+ **长期目标** + **没做完的任务**，'
-      + '让它**按长期目标自己开工**（**看图不强制**；默认目标"像正常玩家一样发展、最后打末影龙"，路线木头/石具→铁→钻石→下界→末地；旁边有人一起干）。'
-      + '**不许反问他"要我做什么"**（不回话 = 让它自己决定）；'
-      + '只有要动他的箱子/建筑时才 mc_say 问一句、问完不等。'
-      + '叫醒 45s 后还没动手，我会再补一条"别问，直接做"的催促（每次叫醒最多一条，也占额度）。\n'
-      + `每小时最多 ${AUTO_DEFAULTS.idleWakeMaxPerHour} 次；**叫醒后 AI 没做任何事就自动翻倍拉长间隔**`
-      + '（封顶 30 分钟），做了事就复位。\n'
-      + '用法：`action:"status"`（默认）｜`"off"` 关掉反射层（🔴 **不是"全停"**：空闲叫醒还开着，'
-      + '要用 `set {"idleWake":false}` 才全静音；自保 `avoid` 也是独立开关，要一起关得 `set {"avoid":false}`）｜`"on"` 全开｜`"stay"` 站定（停跟随）｜'
-      + '`"follow"` + `who:"玩家名"` 跟着谁走｜`"wake"` 立刻叫醒一次（不等间隔）｜'
-      + '`"set"` + `patch:{"standing":"先盖个小屋再挖矿","idleWakeSec":600}` 改参数（落 `.dsh-mc-agent/auto.json`）。\n'
+    description: '🤖 **自主层**（让它像正常玩家）：不传参数 = 看状态。\n'
+      + '① **反射层**（不花 token，常开）：AI 没调工具时环顾/吃/捡/躲岩浆火仙人掌/跟随；'
+      + '**被怪打、怪贴脸、头卡方块窒息、水里憋气 → 立刻叫醒 AI 定策略**'
+      + '（我自己只停手，不跑、不还手；`dangerStopWork` 可关）；附近有玩家就看着他；工具调用后静默 6s。\n'
+      + `② **空闲决策层**（花 token）：AI 闲 ${AUTO_DEFAULTS.idleWakeSec} 秒就叫醒它，带上玩家动态/长期目标/没做完的台账，`
+      + '让它自己开工（**不许反问"要我做什么"**；只有动别人箱子建筑才 mc_say 问、问完不等）；45s 没动手补一条"别问，直接做"。\n'
+      + `每小时最多 ${AUTO_DEFAULTS.idleWakeMaxPerHour} 次；叫醒后没做事 ⇒ 间隔翻倍（封顶 30 分钟），做了事复位。\n`
+      + '用法：`status`（默认）｜`off` 关反射层（🔴 **不是全停**：空闲叫醒还开，要 `set {"idleWake":false}`；`avoid` 独立开关）｜`on` 全开｜'
+      + '`stay` 站定｜`follow`+who 跟随｜`wake` 立刻叫醒一次｜`set`+patch 改参数（落 `.dsh-mc-agent/auto.json`）。\n'
       + '**他在对话里改了主意 → 立刻用 `set` 把 `standing` 写成他那句新的**；他没发话就别自己改。\n'
-      + '🔴 默认只做**无害动作**：不会自己拆别人建筑、动别人箱子、乱丢东西、跑太远。',
+      + '🔴 默认只做无害动作：不拆别人建筑、不动别人箱子、不乱丢东西、不跑太远。',
     parameters: {
       action: { type: 'string', description: 'status（默认）/ on / off / stay / follow / wake / set' },
       who: { type: 'string', description: 'follow 用：要跟随的玩家名（留空=取消跟随）' },

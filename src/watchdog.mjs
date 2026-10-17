@@ -486,9 +486,24 @@ export class Watchdog {
       } catch { /* 忽略 */ }
       this.#fire(['damage'], { kind: 'damage', text: `血量降到 ${e.health}${wet}` })
     })
-    on('death', () => {
+    on('death', (e) => {
       if (!this.config.wakeOn.death) return this.#suppress('death')
-      this.#fire(['death'], { kind: 'death', text: '我死了' })
+      /* 🔴 2026-10-18 审计：以前只报「我死了」三个字 —— 而 `core.mjs` 发这个事件时
+       * **带着死亡坐标**（`{ position }`），这里丢掉就再也找不回来：AI 没法回去捡东西
+       * （掉落物 5 分钟就会消失），也不知道是不是死在自己的床上/重生点。
+       * 现在把坐标、掉落提醒、"别马上去送"一起说清楚。 */
+      let at = ''
+      try {
+        const p = e?.position
+        if (p && ['x', 'y', 'z'].every((k) => Number.isFinite(Number(p[k])))) {
+          at = ` @ (${Number(p.x)}, ${Number(p.y)}, ${Number(p.z)})`
+        }
+      } catch { /* 拿不到坐标就不写 */ }
+      this.#fire(['death'], {
+        kind: 'death',
+        text: `我死了${at}：身上的东西全掉在那了（**5 分钟内**还在，先去捡；背包多半也空了）。`
+          + '先看清死因（怪/岩浆/摔/憋气）再回去 —— 装备没补好别硬闯同一个地方。',
+      })
     })
     on('teleport', (e) => {
       if (!this.config.wakeOn.teleport) return this.#suppress('teleport')

@@ -509,11 +509,11 @@ section('3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不抢控�
   }
   {
     // 只掉 2 格（下台阶）⇒ 还得按"被远程打"报：摔伤判据不能太宽，否则真挨打时被当成摔伤
-    const small = setup({ world: { health: 20, mobs: [], pos: [10.5, 64, 20.5] }, patch: { lookAround: false } })
+    const small = setup({ world: { health: 20, mobs: [], pos: [10.5, 65, 20.5] }, patch: { lookAround: false } })
     small.tick(small.at(1000))
     await flush()
     small.w.setHealth(3)
-    small.w.raw.entity.position = mkP(10.5, 62, 20.5)
+    small.w.raw.entity.position = mkP(10.5, 63, 20.5)
     small.w.fire('entityHurt', small.w.raw.entity)
     small.setT(small.now() + 100)
     small.tick(small.at(0))
@@ -795,6 +795,77 @@ section('3.7 busy 期间照样检测并叫醒（先停手，但不抢控制位�
   // ⑤ 加载日志的默认值从 AUTO_DEFAULTS 现算，不再写死 180s/60s
   ok('加载日志不再写死"空闲 180s、旁边有人 60s"',
     !/空闲 180s/.test(src) && /AUTO_DEFAULTS\.idleWakeSec/.test(src))
+}
+
+section('3.8 头卡在方块里（窒息）→ 叫醒 AI（2026-10-18 审计）')
+{
+  const steered = (h) => h.agent.steers.map((m) => (m?.content ?? []).map((c) => c?.text ?? '').join('\n')).join('\n')
+  const strip = (s) => String(s).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  /* 假世界：地面 y=63 是石头，y≥64 是空气。窒息 = 头那格（y+1）刚被盖住，或者头被盖住且正在掉血。
+   * 🔴 不能用 `world:{air:5}` 造假 —— 现实里窒息（沙埋/卡墙）**不消耗气泡条**，地面 oxygenLevel 是 null；
+   *    假 air 会让"需要氧气读数"这种错判据照样全绿（这是审计抓到的 P0）。 */
+  const buried = (over = {}) => setup({ world: { overrides: { '10,65,20': 'stone', ...over } }, patch: { lookAround: false } })
+
+  // ① 沙子刚砸在头上（上一拍头还是空的）：叫醒，且不需要 oxygenLevel
+  const h = buried({ '10,65,20': 'sand' })
+  h.state().lastHeadSolid = false
+  h.tick(h.at(1000))
+  await flush()
+  ok('头刚从空变实心 ⇒ 叫醒（氧气读数是 null 也照样报）', h.agent.steers.length === 1, steered(h).slice(0, 80))
+  const t = steered(h)
+  ok('文案点名窒息、报出方块与头那格坐标', /窒息/.test(t) && /sand/.test(t) && /10\.5,\s*65,\s*20\.5/.test(t), t.slice(0, 260))
+  ok('标题是窒息，不是溺水、也不是"挨了打看不到怪"',
+    /【自保：.*窒息/.test(t) && !/正在溺水|溺水｜/.test(t) && !/看不到怪/.test(t), t.slice(0, 200))
+  ok('break 给的是 x/y/z（mc_act 不认 pos）', /"x":10/.test(t) && /"y":65/.test(t) && /"z":20/.test(t) && !/\\"pos\\"/.test(t), t.slice(0, 300))
+  ok('让 AI 用 mc_observe 看头格（mc_status 不报方块）', /mc_observe/.test(t) && !/mc_status`?（血、氧气/.test(t), t.slice(0, 300))
+  ok('计入自保统计（alerts）', h.state().stats.alerts >= 1, JSON.stringify(h.state().stats))
+
+  // ② 8 秒内不重复；还在掉血 ⇒ 过了窗口再喊
+  h.w.setHealth(19)
+  h.tick(h.at(2_000))
+  await flush()
+  ok('8 秒内不重复喊窒息', h.agent.steers.length === 1, String(h.agent.steers.length))
+  h.w.setHealth(18)
+  h.tick(h.at(11_000))
+  await flush()
+  h.tick(h.at(12_000))
+  await flush()
+  ok('头一直实心但还在掉血 ⇒ 过了窗口再喊一次', h.agent.steers.length === 2, String(h.agent.steers.length))
+
+  // ③ 一直实心、没掉血、也不是刚变化 ⇒ 不喊（站在 1 格高的洞里那种正常情况）
+  const top = setup({ world: { overrides: { '10,65,20': 'stone' } }, patch: { lookAround: false } })
+  top.state().lastHeadSolid = true
+  top.tick(top.at(1000))
+  await flush()
+  ok('头一直实心但没掉血 ⇒ 不喊（避免 1 格高矿道误报）', top.agent.steers.length === 0, steered(top).slice(0, 80))
+
+  // ④ 连脚那格也被沙填了（埋死/挤进墙）：照样喊，别沉默
+  const inside = buried({ '10,65,20': 'sand', '10,64,20': 'sand' })
+  inside.state().lastHeadSolid = false
+  inside.tick(inside.at(1000))
+  await flush()
+  ok('脚也被填住 ⇒ 照样喊（不是沉默）', inside.agent.steers.length === 1, steered(inside).slice(0, 80))
+  ok('文案给"横着挪 / 别往上跳"的出路', /横着挪|别往上跳/.test(steered(inside)), steered(inside).slice(0, 300))
+
+  // ⑤ 树叶/原木里不窒息（SOFT_ROOF）
+  const leaf = buried({ '10,65,20': 'oak_leaves' })
+  leaf.state().lastHeadSolid = false
+  leaf.tick(leaf.at(1000))
+  await flush()
+  ok('头在树叶里（SOFT_ROOF）⇒ 不按窒息报', leaf.agent.steers.length === 0, steered(leaf).slice(0, 80))
+
+  // ⑥ 头是空气（正常站着）⇒ 当然不报
+  const clean = setup({ patch: { lookAround: false } })
+  clean.tick(clean.at(1000))
+  await flush()
+  ok('头那格是空气 ⇒ 不报窒息', clean.agent.steers.length === 0, steered(clean).slice(0, 80))
+
+  // ⑦ 静态：判据不再依赖氧气，且"刚变化"必须上一拍明确读到空
+  const src = strip(readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8'))
+  ok('不再拿氧气读数当窒息门槛', !/air != null && air <= 19/.test(src))
+  ok('判据 = 头实心 +（上一拍是空 / 正在掉血）',
+    /const headChanged = headSolidNow && s\.lastHeadSolid === false/.test(src) && /suffocant = !submerged && !fellRecently && headSolidNow/.test(src))
+  ok('SOFT_ROOF 不按窒息算', /SOFT_ROOF/.test(src))
 }
 
 /* ───────────────────────── 4. 吃 / 捡 ───────────────────────── */
@@ -1214,6 +1285,52 @@ section('10. 待机 5 秒触发（默认值真的生效 / 退避仍然管用）'
     spec.description.includes('5 秒') && !spec.description.includes('3 分钟'), spec.description.slice(0, 200))
   const st = await h.auto.toolSpec().execute({ action: 'status' }, { agent: h.agent })
   ok('status 里显示"空闲 5s 叫醒"', st.text.includes('空闲 5s 叫醒'), st.text.slice(0, 200))
+}
+
+section('11. 叫醒文案省 token：完整版每 10 分钟一次，其余短版（2026-10-18 审计）')
+{
+  const textOf = (m) => (m?.content ?? []).map((c) => c?.text ?? '').join('\n')
+  const wakes = (h) => h.agent.steers.filter((m) => /自主行动轮/.test(textOf(m)))
+  const h = setup({ patch: { lookAround: false, idleWakeSec: 5, minIdleGapSec: 5, idleWakeNearPlayerSec: 5 } })
+  h.tick(h.at(6_000))
+  await flush()
+  const first = textOf(wakes(h)[0] ?? {})
+  ok('第一次叫醒是完整版（带发育路线）', /发育路线|末影龙/.test(first), first.slice(0, 120))
+  ok('第一次叫醒带三条硬规矩', /三条硬规矩/.test(first), first.slice(0, 120))
+  const longLen = first.length
+
+  // 10 分钟内第二次叫醒 ⇒ 短版：不带路线/规矩/默认约束，但该带的都在
+  const s1 = h.state()
+  s1.lastWakeAt = 0
+  s1.noActionStreak = 0
+  s1.wakeTimes = []
+  h.setT(h.at(12_000))
+  h.tick(h.now())
+  await flush()
+  const second = textOf(wakes(h)[1] ?? {})
+  ok('10 分钟内的第二次叫醒是短版', !/发育路线/.test(second) && first.length > 0, second.slice(0, 120))
+  ok('短版确实更短（省 token）', second.length > 0 && second.length < longLen * 0.75,
+    JSON.stringify({ long: longLen, short: second.length }))
+  ok('短版保留：现状 / 长期目标 / 要动手，但不复述规矩条文',
+    /长期目标/.test(second) && /改世界的动作/.test(second) && !/不要问他"要我做什么"/.test(second), second.slice(0, 200))
+  ok('短版明确说"路线、规矩照上一条"（不丢约束）', /照上一条/.test(second), second.slice(0, 200))
+
+  // 过了 10 分钟 ⇒ 又发完整版
+  const s2 = h.state()
+  s2.lastBriefAt = h.now() - 11 * 60_000
+  s2.lastWakeAt = 0
+  s2.wakeTimes = []
+  h.setT(h.at(20_000))
+  h.tick(h.now())
+  await flush()
+  const third = textOf(wakes(h)[2] ?? {})
+  ok('过了 10 分钟再发完整版', /三条硬规矩/.test(third) && /发育路线/.test(third), third.slice(0, 120))
+
+  // 静态：常量与分支都在
+  const strip = (x) => String(x).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const src = strip(readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8'))
+  ok('常量 BRIEF_EVERY_MS = 10 分钟', /BRIEF_EVERY_MS = 10 \* 60_000/.test(src))
+  ok('短版分支只看"这一轮必须知道的"', /if \(!briefFull\) \{/.test(src))
 }
 
 /* ───────────────────────── 汇总 ───────────────────────── */

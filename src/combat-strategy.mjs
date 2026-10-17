@@ -514,8 +514,11 @@ export function combatOutcomeOf (r = {}) {
   if (r.aborted === true) return 'aborted'
   if (r.retreated === true) return 'retreated'
   if (r.unreachable === true) return 'unreachable'
-  if (r.sawDamage === true) return 'damaged'
+  /* 🔴 审计 F5：`timedOut` 必须排在 `sawDamage` 前面。攻击循环结束那一刻常同时带着
+   *    「打中过」和「时间到了」；以前先判 damaged ⇒ 报"打到了"、被判成功，
+   *    实际是**打到一半被预算掐断**，怪还活着。 */
   if (r.timedOut === true) return 'timeout'
+  if (r.sawDamage === true) return 'damaged'
   if (r.gone === true) return 'unknown'
   return 'unknown'
 }

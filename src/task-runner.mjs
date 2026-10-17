@@ -302,7 +302,14 @@ export function outcomeOf (res, { expect = null } = {}) {
   const r = res ?? {}
   const s = (x) => String(x ?? '')
   const num = (x) => (Number.isFinite(Number(x)) ? Number(x) : null)
-  const blob = `${s(r.error)} ${s(r.reason)} ${s(r.note)} ${s(r.why)} ${s(r.hint)}`
+  /* 🔴 审计 F3（2026-10-18）：以前**只看 error/reason/note/why/hint**，把工具真正写给人看的
+   *    `text` 和 `result` 整片漏掉。而 `mc_chest`（9 个出口）/`mc_craft`/按坐标的 `mc_dig`
+   *    只回 `{ text }` 或 `{ result: [...] }` —— 成功证据全在文本里 ⇒ 一律判成 unknown，
+   *    任务执行器连试 3 次就永久 blocked。判据必须读工具自己报的话。 */
+  const resultText = Array.isArray(r.result)
+    ? r.result.map((x) => (typeof x === 'string' ? x : (x?.text ?? ''))).join(' ')
+    : s(r.result)
+  const blob = `${s(r.error)} ${s(r.reason)} ${s(r.note)} ${s(r.why)} ${s(r.hint)} ${s(r.text)} ${resultText}`
 
   /* 🔴 代次过期（2026-10-15，用户点名的异步方案 ⑤）：这一步的结果属于**上一代**。
    *    它既不是成功、也不是失败，更不是"结果未知、服务器可能已经做了" ——
@@ -320,9 +327,12 @@ export function outcomeOf (res, { expect = null } = {}) {
    *    "够不着 / NoPath"的文本正则误判成失败（撤退时 note 里常常带"走不过去"）。 */
   if (r.combat != null) {
     const c = s(r.combat)
-    if (c === 'killed' || c === 'damaged' || c === 'retreated') return 'confirmed'
+    /* 🔴 审计 F5：`damaged` 只是"打中了一下"，不是"打死了"。它以前被翻成 confirmed ⇒
+     *    任务执行器把这一步记成 done，AI 以为怪没了、背身走开被咬死。
+     *    `retreated` 例外：撤退是**主动做到了想做的事**。 */
+    if (c === 'killed' || c === 'retreated') return 'confirmed'
     if (c === 'unreachable') return 'failed'
-    return 'unknown'   // aborted / timeout / unknown：可能已经打中了，别当失败
+    return 'unknown'   // damaged / aborted / timeout / unknown：可能已经打中了，但没打完
   }
 
   // ① 明确失败：被拒 / 够不着 / 服务端复原 / 路不通
@@ -336,6 +346,14 @@ export function outcomeOf (res, { expect = null } = {}) {
    *    原来顺序反了 ⇒ `mc_move` 带着 `{mcTimeout:true}` 回来时，只要 note 里出现"够不着"
    *    之类字样就先被判成 'failed'，"结果未知"那条永远走不到。 */
   if (r.mcTimeout === true || r.cutByCall === true || r.preempted === true) return 'unknown'
+  /* 🔴 审计 F4：显式 `ok:false` 是**工具自己说没做成**（例如搭桥因血低安全停：
+   *    `{ok:false, stopped:true, placed:3, why:'血量只有5'}`），以前它落在成功侧被忽略 ⇒
+   *    `placed:3` 把"安全停"判成"已确认成功"，AI 以为搭完了继续往前走。 */
+  if (r.ok === false) {
+    /* 中止/超时是"没做完"，不是"做不成" —— 它们各自有独立语义，留给 unknown */
+    if (/aborted|timeout|preempted|中断|超时/i.test(s(r.reason))) return 'unknown'
+    return 'failed'
+  }
   if (/复原|够不着|没有能挖|不在线|NoPath|unreachable|refused|拒绝|缺少|先 mc_craft|没挖成|没挖掉/i.test(blob)) return 'failed'
 
   // ② 明确成功：有证据

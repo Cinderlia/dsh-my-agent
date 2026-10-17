@@ -1045,8 +1045,9 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
   }
   {   /* 🔴 战斗结局**不许占用** `outcome`（跨工具的统一结局）—— 两个字段都要在，且各说各的 */
     const { outcomeOf } = await import(new URL('../src/task-runner.mjs', import.meta.url))
+    const { combatOutcomeOf } = await import(new URL('../src/combat-strategy.mjs', import.meta.url))
     const map = {
-      killed: 'confirmed', damaged: 'confirmed', retreated: 'confirmed',
+      killed: 'confirmed', damaged: 'unknown', retreated: 'confirmed',
       unreachable: 'failed', aborted: 'unknown', timeout: 'unknown', unknown: 'unknown',
     }
     for (const [c, want] of Object.entries(map)) {
@@ -1058,6 +1059,18 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
       '🔴 撤退带"够不着"字样的 note，也仍然是"做到了"（文本正则不许抢先）')
     /* 没给 combat 时，统一结局照旧按证据判（战斗层不许污染别的工具） */
     ok(outcomeOf({ arrived: true }) === 'confirmed', '别的工具不带 combat 时判据完全不受影响')
+    /* 🔴 审计（2026-10-18）：返回值语义与判定器脱节的三处，逐条钉住 */
+    ok(outcomeOf({ text: '✅ 从箱子取出 oak_log ×32（服务端已确认）' }) === 'confirmed',
+      '只看 text 的工具（mc_chest/mc_craft/按坐标 mc_dig）也要能判成功')
+    ok(outcomeOf({ result: ['✅ 挖掉 stone (1,2,3)（服务端已确认）'], text: 'ok' }) === 'confirmed',
+      '只看 result 数组的工具也要能判成功')
+    ok(outcomeOf({ ok: false, stopped: true, placed: 3, why: '血量只有5' }) === 'failed',
+      '🔴 安全停（ok:false）不许因为 placed:3 被判成功')
+    ok(outcomeOf({ ok: false, reason: 'aborted' }) === 'unknown', '中止是"没做完"，不是"做不成"')
+    ok(combatOutcomeOf({ killed: false, sawDamage: true, timedOut: true }) === 'timeout',
+      '🔴 打中过但时间到了 ⇒ timeout（不是 damaged）')
+    ok(outcomeOf({ combat: combatOutcomeOf({ sawDamage: true, timedOut: true }) }) === 'unknown',
+      '打中一下+超时 ⇒ 结果未知，不许当打死')
   }
   {   /* 静态接线：core.mjs 必须把能力回调传下去（不然策略层永远是瘸的） */
     const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
