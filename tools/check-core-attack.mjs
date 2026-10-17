@@ -755,6 +755,53 @@ section('⑦ 战斗策略层 —— 威胁排序 / 换武器 / 状态机 / 结�
     }))
     ok(side.action === 'defend', '战况：旁边有远程正在射我（不是目标）⇒ 仍然先拉开距离', JSON.stringify(side))
   }
+  /* 🔴 2026-10-18（用户："用attack的时候能不能自动切剑" ⇒ 选"开打第一件事就换"）：
+   *    换武器必须排在"冲上去 / 拉开距离"**前面** —— 那两个分支在 `attack.mjs` 里被降级成
+   *    "照打"（`hold-line`）。排在它们后面 = 只要被围 / 被远程射 / 目标本身是远程，
+   *    换武器那条分支**永远走不到**，实机就是"被骷髅射着、手里攥着镐一路拿镐捶"。 */
+  {
+    const held = 'stone_pickaxe'
+    const bag = ['iron_sword']
+    const zip = (o) => assessCombat({ ...base, held, items: bag, ...o })
+
+    const shoot = zip({ foes: [{ name: 'skeleton', distance: 8, hostile: true, ranged: true, attackingMe: true }] })
+    ok(shoot.inDanger === false,
+      '🔴 被远程射着**不再算**"换武器危险区"（否则正是最该换的时候偏偏不换）', `inDanger=${shoot.inDanger}`)
+    const shootStep = chooseStrategy(shoot)
+    ok(shootStep.action === 'equip' && shootStep.name === 'iron_sword',
+      '🔴 被骷髅射着 + 手里镐 + 包里有剑 ⇒ 先换剑（以前是 defend，被降级成拿镐照打）', JSON.stringify(shootStep))
+
+    const crowd3 = zip({
+      foes: [
+        { name: 'zombie', distance: 3, hostile: true },
+        { name: 'zombie', distance: 4, hostile: true },
+        { name: 'zombie', distance: 5, hostile: true },
+      ],
+    })
+    const crowdStep = chooseStrategy(crowd3)
+    ok(crowdStep.action === 'equip',
+      '🔴 被三只怪围着 + 包里有剑 ⇒ 也先换剑（换完下一轮照旧给"拉开距离"的建议）', JSON.stringify(crowdStep))
+
+    const rangedTarget = zip({ target: { name: 'skeleton', distance: 10, hostile: true, ranged: true, type: 'hostile' } })
+    const rangedStep = chooseStrategy(rangedTarget)
+    ok(rangedStep.action === 'equip',
+      '🔴 目标是骷髅 + 手里镐 + 包里有剑 ⇒ 先换剑再冲（以前 close-in 抢在前面）', JSON.stringify(rangedStep))
+
+    const low = zip({ health: 10 })
+    ok(low.inDanger === true && low.weapon === null,
+      '🔴 血 10（已经该考虑撤了）⇒ 仍不换装（别在快死时花几百毫秒翻背包）',
+      JSON.stringify({ inDanger: low.inDanger, weapon: low.weapon }))
+    ok(chooseStrategy(low).action !== 'equip', '🔴 血 10 ⇒ 状态机不返回 equip', JSON.stringify(chooseStrategy(low)))
+
+    const healthy = zip({ health: 20 })
+    ok(chooseStrategy(healthy).action === 'equip', '血 20 ⇒ 照换（新口径没有把正常情况弄丢）')
+
+    /* 次数/冷却上限：一轮战斗最多换 2 次、两次之间至少 1.5 秒 */
+    ok(chooseStrategy(healthy, { equips: 2 }).action !== 'equip',
+      '换武器次数用光（2 次）⇒ 不再换', JSON.stringify(chooseStrategy(healthy, { equips: 2 })))
+    ok(chooseStrategy(healthy, { equips: 0, lastEquipAt: 500 }).action !== 'equip',
+      '冷却未到（500ms < 1500ms）⇒ 不再换')
+  }
   /* 🔴 2026-10-17：被围只数**贴到 8 格内**的怪 —— `foes` 是 24 格内的全部敌对，
    *    原来 `crowd = foes.length` ⇒ 20 格外的三只怪也让战斗层一直判"被围、退"。 */
   {
@@ -919,6 +966,19 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
     ok(calls.equip.length === 1 && calls.equip[0] === 'diamond_sword', '🔴 空手 + 背包有剑 ⇒ 换一次（且只换一次）', JSON.stringify(calls.equip))
     ok(r.actions.includes('equip'), 'actions 里能看到换过武器', JSON.stringify(r.actions))
+  }
+  {   /* 🔴 2026-10-18：被围 / 被远程射时以前先走 defend（被降级成照打）⇒ 换武器永远不发生。
+   *    现在"开打第一件事就是换武器"，被围也一样。 */
+    const f = mkFightBot([zombieAt('z1', 3), zombieAt('z2', 4), zombieAt('z3', 5)])
+    f.bot.heldItem = { name: 'stone_pickaxe' }
+    f.bot.inventory = { items: () => [{ name: 'diamond_sword' }] }
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(calls.equip.length === 1 && calls.equip[0] === 'diamond_sword',
+      '🔴 被三只怪围着 + 手里是镐 + 包里有剑 ⇒ 先换剑（以前换武器分支被 defend 挡住、永远走不到）',
+      JSON.stringify(calls.equip))
+    ok(r.actions.includes('equip'), 'actions 里能看到"先换了武器"', JSON.stringify(r.actions))
+    ok(r.strategy === 'engage', '换完这一轮照样照打（不自己退）', String(r.strategy))
   }
   {   /* 停止命令：abortSignal 一置位就收手 */
     const f = mkFightBot([zombieAt('z1', 2)])

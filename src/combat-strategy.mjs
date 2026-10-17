@@ -164,8 +164,14 @@ export function weaponChoiceOf ({ held = null, items = [], targetDistance = null
     return { name: null, warn: `手里 ${held} 只剩 ${left}%，背包里没有备用的` }
   }
   if (!best || best.s <= now) return null
-  /* 🔴 危险中不换武器：换装要花几百毫秒，那几百毫秒里手是无防备的。
-   *    用户方案原话："武器耐久很低 ⇒ **在安全条件下**更换备用武器"。 */
+  /* 危险中不换武器：换装要花几百毫秒，那几百毫秒里手是无防备的。
+   *
+   * 🔴 2026-10-18（用户："用attack的时候能不能自动切剑" ⇒ 选"开打第一件事就换"）：
+   *    `inDanger` 的含义**收窄**了 —— 调用方（`assessCombat`）现在只在"已经该考虑撤"时
+   *    才传 true（血少 / 掉血快到撑不住）。**被围、被远程射不再算"危险"**：
+   *    那些局面恰恰最需要换剑，而且 `attack.mjs` 把 retreat/defend 全降级成"照打"
+   *    （hold-line），拦下换装就等于"被骷髅射着、手里攥着镐一直拿镐打"。
+   *    函数这一层的守卫保留：别的调用方仍可以显式传 true 来禁换。 */
   if (inDanger) return null
   const why = now === 0
     ? `空手打不动，背包里有 ${best.n}`
@@ -291,8 +297,9 @@ export function assessCombat (o = {}) {
   const targetInRange = Number.isFinite(d) && d <= MELEE_RANGE
   const targetReachable = target?.canReach !== false
 
-  /* 换武器：危险中不换（见 weaponChoiceOf 的注释） */
-  const inDanger = threat === 'high' || health <= HEALTH_LOW
+  /* 换武器：**只有"已经该考虑撤"时不换**（见下面 `inDanger` 的新口径）。
+   * 被围 / 被远程射 / 目标是远程都不拦 —— 那几种局面正是最需要把镐换成剑的时候。 */
+  const inDanger = health <= HEALTH_LOW || hurtDps >= HURT_RETREAT_DPS
   const weapon = weaponChoiceOf({
     held: o.held, items: o.items, targetDistance: Number.isFinite(d) ? d : null,
     arrowCount: o.arrowCount, inDanger, heldPct: o.heldPct, pctOf: o.pctOf,
@@ -362,20 +369,36 @@ export function chooseStrategy (s, mem = {}) {
     return m('retreat', 'retreat', 'low-health', { why })
   }
 
-  /* ③ 目标**自己就是远程** ⇒ 冲上去打，不是站着挨。
+  /* ③ 手里的家伙不如背包里的 ⇒ **先换把趁手的**（2026-10-18 提到这里，见下）。
+   *
+   * 🔴 为什么必须排在"冲上去 / 拉开距离"前面：`attack.mjs` 把 retreat/defend 一律降级成
+   *    **照打**（`hold-line`，AI 叫的打就是命令）—— 所以以前把换武器放在它们后面，
+   *    等于"只要被围、被远程射、或目标本身是远程，换武器那条分支就永远走不到"。
+   *    实机后果：被骷髅射着、手里攥着镐，一路拿镐把骷髅捶死（或者被捶死）。
+   *    现在**开打第一件事就是换武器**，只有"该撤了"（② 血少/掉血快）和"打死了"（①）在前。
+   *
+   * 🔴 `lastEquipAt === 0` 要当成"从来没换过"，不能拿它去比冷却 ——
+   *    否则"刚开局、`now` 又是个小数字"时冷却恒不满足，换武器这条分支永远走不到
+   *    （`check-core-attack` 的纯函数用例就是这么逮到它的：`now = 1000` ⇒ `1000 - 0 < 1500`）。 */
+  const equipReady = lastEquipAt === 0 || (s.now - lastEquipAt) >= EQUIP_COOLDOWN_MS
+  if (s.weapon && equipReady && equips < 2) {
+    return m('assess', 'equip', 'better-weapon', { name: s.weapon.name, why: s.weapon.why })
+  }
+
+  /* ④ 目标**自己就是远程** ⇒ 冲上去打，不是站着挨。
    *
    * 🔴 2026-10-17（用户实机，游戏里那个 AI 的原话）：「只要目标被它判成远程（骷髅/女巫/烈焰人
    *    全算），它就只挡不还手 … 所以骷髅打我我永远打不到它，只能挨。」
    *    原因就在这里：远程威胁一律走 `defend` = 往反方向退 8 格然后收工 —— 可骷髅的箭比腿快，
    *    退只会一边挨射一边把距离拉开，下一轮还得再走回来。远程怪的优势**只在拉开距离时**成立，
    *    贴到近战距离它们反而最弱（骷髅 20 血、烈焰人 20 血、女巫 26 血且没有近战）。
-   *    真正的远程威胁是**别的怪在射我**（下面 ④），不是我要打的那只恰好是远程。 */
+   *    真正的远程威胁是**别的怪在射我**（下面 ⑤），不是我要打的那只恰好是远程。 */
   if (s.targetRanged && s.targetReachable !== false) {
     return m('engage', 'engage', 'close-in',
       { why: `目标是远程（${s.target?.name ?? '?'}，${s.target?.distance ?? '?'} 格）—— 站在外面只会挨打，冲上去近战` })
   }
 
-  /* ④ 被围 / **别的**远程在射我 ⇒ 拉开距离（用户方案：没有盾牌手段时退化为拉开距离）。
+  /* ⑤ 被围 / **别的**远程在射我 ⇒ 拉开距离（用户方案：没有盾牌手段时退化为拉开距离）。
    *
    * 🔴 必须有次数上限：同一个实机会话里另一个症状是退了还退 —— 每轮重新观察都还能看到
    *    远程威胁，于是一路退到没地方退、血还是掉。退够 `RETREAT_TRIES` 次就换成边打边找机会。 */
@@ -393,18 +416,9 @@ export function chooseStrategy (s, mem = {}) {
     return m('defend', 'defend', s.surrounded ? 'surrounded' : 'ranged-threat', { why: `${why}（${how}）`, shield: s.hasShield })
   }
 
-  /* ⑤ 血不多了 ⇒ 停止冒进（还能打，但不主动往上顶） */
+  /* ⑥ 血不多了 ⇒ 停止冒进（还能打，但不主动往上顶） */
   if (s.shouldStopAdvancing && !s.targetInRange) {
     return m('retreat', 'retreat', 'low-health-stop', { why: `血 ${s.health}，先拉开距离` })
-  }
-
-  /* ⑥ 手里的家伙不如背包里的 ⇒ 换一把（危险中不换，`weaponChoiceOf` 已经挡了） */
-  /* 🔴 `lastEquipAt === 0` 要当成"从来没换过"，不能拿它去比冷却 ——
-   *    否则"刚开局、`now` 又是个小数字"时冷却恒不满足，换武器这条分支永远走不到
-   *    （`check-core-attack` 的纯函数用例就是这么逮到它的：`now = 1000` ⇒ `1000 - 0 < 1500`）。 */
-  const equipReady = lastEquipAt === 0 || (s.now - lastEquipAt) >= EQUIP_COOLDOWN_MS
-  if (s.weapon && equipReady && equips < 2) {
-    return m('assess', 'equip', 'better-weapon', { name: s.weapon.name, why: s.weapon.why })
   }
 
   /* ⑦ 够不着 ⇒ 换个位置再来（有限次；试完就说"够不着"，不无限试） */

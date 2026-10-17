@@ -37,6 +37,12 @@
  *   · **不在 `mc_attack` 内部再调一个新工具**去换武器或吃东西（会嵌套调度、
  *     重复占资源、甚至等自己释放资源而死锁）—— 换武器走 `ctx.equipTo` 这个**能力回调**。
  *
+ * 2026-10-18（用户："用attack的时候能不能自动切剑"）：换武器在 `chooseStrategy` 里的位置
+ * 提到**最前**（仅次于"目标没了"和"该撤了"），被围 / 被远程射 / 目标是远程**不再拦它**
+ * （见 `src\combat-strategy.mjs` 里 `inDanger` 的新口径）。以前那三种局面先返回
+ * `defend` / `engage(close-in)`，而这两个分支在下面被降级成"照打"（`hold-line`）⇒
+ * 换武器那条分支根本走不到 —— 实机表现就是"被骷髅射着、手里攥着镐，一直拿镐捶"。
+ *
  * 🔴 战斗结局叫 **`combat`**，不叫 `outcome` —— `outcome` 是**跨工具**的"三种结局"
  *    （`confirmed`/`failed`/`unknown`/`stale`，见 `src\task-runner.mjs` 的 `outcomeOf()`），
  *    所有工具共用同一个含义。第一版战斗结局直接占了 `outcome`，结果 `withOutcome()`
