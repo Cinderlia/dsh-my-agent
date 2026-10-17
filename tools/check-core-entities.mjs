@@ -344,6 +344,66 @@ section('⑨ 静态检查（实体工具已并进 mc_observe 感知块、不看�
     'world-scan 支持 kind:"neutral" 过滤')
 }
 
+/* ─────────── ⑩ 作物成熟度（用户 2026-10-18："现在ai看不到作物的成熟等级"）─────────── */
+section('⑩ 作物成熟度 —— mc_scan{name} 带出 age / maxAge / ripe（各作物上限不同）')
+{
+  const { scanAround } = await import(new URL('../src/world-scan.mjs', import.meta.url))
+  const { cropStageOf, CROP_MAX_AGE } = await import(new URL('../src/block-names.mjs', import.meta.url))
+  /** 只放指定的方块 + 我站在 (0,64,0)：`blocks` 是 `${x},${y},${z}` → { name, props } */
+  const mkScanBot = (blocks = {}) => ({
+    entity: { position: new Vec3(0, 64, 0) },
+    blockAt: (p) => {
+      const key = `${p.x},${p.y},${p.z}`
+      const hit = blocks[key]
+      if (!hit) return { name: 'air' }
+      return { name: hit.name, getProperties: () => ({ ...(hit.props ?? {}) }) }
+    },
+  })
+
+  {   /* 主线：三株小麦，age 4 / 7 / 1 —— 只说"熟没熟"，还要说"几/几" */
+    const bot = mkScanBot({
+      '1,64,0': { name: 'wheat', props: { age: 4 } },
+      '0,64,1': { name: 'wheat', props: { age: 7 } },
+      '0,64,2': { name: 'wheat', props: { age: 1 } },
+    })
+    const r = scanAround(bot, { name: 'wheat', radius: 4, height: 2 })
+    ok(r.found.length === 3, '找到三株小麦（坐标照旧给）', JSON.stringify(r.found))
+    ok(Array.isArray(r.blocks) && r.blocks.length === 3, '新字段 blocks 一处一条（坐标 + 状态）', JSON.stringify(r.blocks))
+    const ripe = r.blocks.filter((x) => x.ripe === true).length
+    ok(ripe === 1, '🔴 只有 age 7 那株算成熟（4 和 1 都不算）', JSON.stringify(r.blocks.map((x) => [x.age, x.ripe])))
+    ok(r.blocks.every((x) => x.maxAge === 7), '把上限一起给出来（不用 AI 自己背"小麦 7 才熟"）', JSON.stringify(r.blocks.map((x) => x.maxAge)))
+    ok(r.blocks.some((x) => x.state?.age === 7), '原始状态也留着（state.age）', JSON.stringify(r.blocks.find((x) => x.pos === '0,64,1')))
+    ok(/1\/3 已成熟/.test(String(r.cropSummary ?? '')), '还给一句结论（"1/3 已成熟"），不用 AI 自己数', String(r.cropSummary ?? ''))
+  }
+  {   /* 不同作物上限不同：甜菜根 0~3，age 3 就熟（别一律按 7 判） */
+    const bot = mkScanBot({ '2,64,0': { name: 'beetroots', props: { age: 3 } } })
+    const r = scanAround(bot, { name: 'beetroots', radius: 4, height: 2 })
+    ok(r.blocks[0]?.ripe === true && r.blocks[0]?.maxAge === 3, '🔴 甜菜根 age 3/3 就算熟（上限 3，不是 7）', JSON.stringify(r.blocks[0]))
+  }
+  {   /* 读不到 age ⇒ 不许编成 0（"不知道"≠"刚种下"） */
+    const bot = mkScanBot({ '3,64,0': { name: 'wheat', props: {} } })
+    const r = scanAround(bot, { name: 'wheat', radius: 4, height: 2 })
+    ok(r.blocks[0] && r.blocks[0].age === undefined && r.blocks[0].ripe === undefined,
+      '🔴 方块状态里没有 age ⇒ 不给 age/ripe（不拿 0 冒充"刚种下"）', JSON.stringify(r.blocks[0]))
+  }
+  {   /* 非作物也有状态（楼梯朝向 / 活板门开关），但**不许**冒出 age/ripe */
+    const bot = mkScanBot({ '4,64,0': { name: 'oak_stairs', props: { facing: 'east', half: 'bottom' } } })
+    const r = scanAround(bot, { name: 'oak_stairs', radius: 4, height: 2 })
+    ok(r.blocks[0]?.state?.facing === 'east' && r.blocks[0].age === undefined,
+      '非作物只给 state（楼梯朝向照样能看），不硬塞 age', JSON.stringify(r.blocks[0]))
+  }
+  {   /* 纯函数本身 */
+    ok(cropStageOf('wheat', { age: '7' })?.ripe === true, 'cropStageOf 认字符串 age（协议里可能是字符串）')
+    ok(cropStageOf('stone', { age: 1 }) === null, '非作物 ⇒ null')
+    ok(cropStageOf('wheat', null) === null, '没状态 ⇒ null（不是 0）')
+    ok(CROP_MAX_AGE.carrots === 7 && CROP_MAX_AGE.cocoa === 2, '上限表：胡萝卜 7、可可豆 2')
+  }
+  {   /* use 的结果也带结论（用户实机是靠 changed 里的 "age: 0 → 3" 猜出来的） */
+    const useSrc = readFileSync(new URL('../src/world-use.mjs', import.meta.url), 'utf8')
+    ok(useSrc.includes('cropStageOf(blk.name, props2)'), 'mc_act{use} 的结果里也读作物成熟度（用骨粉后直接看结论）')
+  }
+}
+
 // ── 收尾 ────────────────────────────────────────────────────────────────────
 for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 console.log(`\ncheck-core-entities：pass=${pass} fail=${fail}`)

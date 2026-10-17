@@ -17,7 +17,7 @@
  */
 
 import { Vec3 } from 'vec3'
-import { isAir } from './block-names.mjs'
+import { isAir, cropStageOf } from './block-names.mjs'
 import { entityNameOf, HOSTILE_RE, RANGED_RE, hostilityOf } from './entity-names.mjs'
 
 export function scanAround (b, { radius = 16, height = 4, name = null, limit = 10 } = {}) {
@@ -43,7 +43,16 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
              *    （半径 24 时能差 30 多格）。AI 于是跑去够不着的地方挖，或据此判"附近没有"。
              *    现在带距离一起记，最后**按到我的距离升序**取前 N 个。 */
             const d = Math.hypot(pos.x + 0.5 - b.entity.position.x, pos.y + 0.5 - b.entity.position.y, pos.z + 0.5 - b.entity.position.z)
-            found.push({ pos: `${pos.x},${pos.y},${pos.z}`, d: Math.round(d * 10) / 10 })
+            /* 方块**状态**（`getProperties()`）：作物 age、楼梯朝向、活板门开关…
+             * 🔴 2026-10-18 用户实机：AI 种完小麦说"成熟度看不到——工具只告诉我那格是 wheat"，
+             *    于是它只能靠 `mc_act {use}` 碰巧带出的 `age: 0 → 3` 去猜。名字之外的状态必须一起给。
+             *    读不到（或没有状态）就是 null，不编。 */
+            let state = null
+            try {
+              const p = blk.getProperties?.()
+              if (p && Object.keys(p).length) state = p
+            } catch { state = null }
+            found.push({ pos: `${pos.x},${pos.y},${pos.z}`, d: Math.round(d * 10) / 10, state })
           }
         } else counts.set(blk.name, (counts.get(blk.name) ?? 0) + 1)
       }
@@ -53,7 +62,29 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
     found.sort((a, b2) => a.d - b2.d)
     /* 🔴 2026-10-15 审计：`found` 是 `string[]`，而 `nearest` 以前塞的是内部的 `{pos,d}` 对象
      *    ⇒ 两套形状，谁把它当字符串用就会拿到 `[object Object]`。统一成字符串坐标。 */
-    return { found: found.slice(0, limit).map((f) => f.pos), total: found.length, unloaded, nearest: found.length ? found[0].pos : null }
+    const top = found.slice(0, limit)
+    const crops = top.map((f) => cropStageOf(name, f.state)).filter(Boolean)
+    return {
+      found: top.map((f) => f.pos),
+      total: found.length, unloaded,
+      nearest: found.length ? found[0].pos : null,
+      /* 一句话结论（作物才有）：让 AI 一眼看到"能收几株"，不用自己数 blocks[] */
+      ...(crops.length
+        ? { cropSummary: `🌾 ${name}：${crops.filter((c) => c.ripe).length}/${crops.length} 已成熟（ripe=true 就能收，其余再等等；age/maxAge 见每一条）` }
+        : {}),
+      /* 每一处的方块状态（作物成熟度就从这里看）：
+       * `age/maxAge/ripe` 是给作物的现成结论（各作物上限不同，别让 AI 背"7 就是熟"），
+       * `state` 是原始属性（楼梯 facing、活板门 open、水田 moisture…）。 */
+      blocks: top.map((f) => {
+        const crop = cropStageOf(name, f.state)
+        return {
+          pos: f.pos,
+          distance: f.d,
+          ...(crop ? { age: crop.age, maxAge: crop.maxAge, ripe: crop.ripe } : {}),
+          ...(f.state ? { state: f.state } : {}),
+        }
+      }),
+    }
   }
   return {
     center: { x: c.x, y: c.y, z: c.z }, radius: R, height: H, unloaded,

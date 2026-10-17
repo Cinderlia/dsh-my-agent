@@ -2988,11 +2988,11 @@ export function apply(ctx, rawConfig) {
       + '· look   看向坐标(x,y,z)或玩家(who)："看向我" = look + who\n'
       + '· toward 看向并走近某个玩家(who)\n'
       + '· place  放方块到 (x,y,z)；悬空先垫脚（=搭高）\n'
-      + '· bridge 搭路：朝 (x,y,z) 一格格铺（铺在脚下一层），**每块等服务端确认了才走**；有坠落/岩浆风险就停\n'
-      + '· break  破坏 (x,y,z)：**先自动换对的工具**；换不上就拒绝\n'
+      + '· bridge 搭路：朝 (x,y,z) 一格格铺（铺在脚下一层），每块等服务端确认才走；有坠落/岩浆风险就停\n'
+      + '· break  破坏 (x,y,z)：先自动换对的工具；换不上就拒绝\n'
       + '· use    使用方块或实体(who)：开门、按钮、拉杆、喂动物；都不给=用手上的东西\n'
       + '· useitem 用手上的东西：扔眼睛/雪球、拉弓、喝药水\n'
-      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。会看血/被围给建议（**不替你撤退**，要撤自己叫 mc_move），结果看 outcome。约 10 秒\n'
+      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就打 4.5 格内最近的（怪优先）。会看血/被围给建议（不替你撤退；要撤叫 mc_move）；kite 放风筝（只对近战怪，打一下退一步）。约 10 秒\n'
       + '· equip  装备(name)：护甲自动穿到对应格（盾→副手），其余拿到手上；to 指定格子\n'
       + '· enchant 附魔台：自动开窗放料；option:0-2 真附魔，不给只报选项\n'
       + '· anvil   铁砧：action:combine(默认) / rename；item + name\n'
@@ -3001,6 +3001,7 @@ export function apply(ctx, rawConfig) {
     parameters: {
       mode: { type: 'string', description: '见上面各 mode（默认 look）' },
       who: { type: 'string', description: '玩家或实体名（look/toward/use/attack）' },
+      kite: { type: 'boolean', description: 'attack 放风筝：近战怪打一下退一步' },
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       name: { type: 'string', description: '方块或物品名（place/equip/toss/anvil/smithing 用）' },
       to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand/hand；只给 = 脱掉' },

@@ -27,7 +27,7 @@ import { sleep, waitUntil } from './async-util.mjs'
  *    拆分时（第二十/二十七刀）漏掉的。 */
 import { callBudget } from './budget.mjs'
 import { aimAt } from './camera.mjs'
-import { CONTAINER_RE, TOGGLE_RE } from './block-names.mjs'
+import { CONTAINER_RE, TOGGLE_RE, cropStageOf } from './block-names.mjs'
 import { entityNameOf, pickEntity } from './entity-names.mjs'
 import { heldText, equipDestOf } from './inventory.mjs'
 
@@ -123,8 +123,13 @@ export async function useBlock (b, { x, y, z, who = null } = {}, ctx = {}) {
   const after2 = b.blockAt(pos)
   const props2 = { ...(after2?.getProperties?.() ?? {}) }
   const changed2 = Object.keys(props2).filter((k) => props0[k] !== props2[k])
+  /* 作物（小麦/胡萝卜/甜菜根…）：用骨粉/等生长之后 `age` 就是成熟度。
+   * 2026-10-18 用户实机里 AI 正是靠 `changed:["age: 0 → 3"]` 才发现这条路的 ——
+   * 那就把结论直接写出来（age 上限各作物不同，ripe 才有意义）。 */
+  const stage2 = cropStageOf(blk.name, props2)
   return {
     usedBlock: blk.name, at,
+    ...(stage2 ? { age: stage2.age, maxAge: stage2.maxAge, ripe: stage2.ripe } : {}),
     ...(changed2.length ? { changed: changed2.map((k) => `${k}: ${props0[k]} → ${props2[k]}`) } : {}),
     note: '交互包已经发出去了 —— 服务端**不会回执**，我没法确认生效（`activateBlock` 内部只瞄一下再发包）。'
       + '如果没反应：确认 4.5 格内、看得见、没被挡住',

@@ -58,8 +58,11 @@ import { dropHint, entityHealth } from './world-observer.mjs'
 import { durabilityOf, EQUIP_SLOTS } from './inventory.mjs'
 import {
   assessCombat, chooseStrategy, combatOutcomeOf, combatOutcomeText, combatPlanText,
-  approachPointOf, isShield, COMBAT_PHASE_MS,
+  approachPointOf, isShield, COMBAT_PHASE_MS, HEALTH_LOW,
 } from './combat-strategy.mjs'
+import { Vec3 } from 'vec3'
+import { BRIDGE_FATAL } from './bridge.mjs'
+import { isLiquid, isPassable, isSolidBlock } from './block-names.mjs'
 
 /**
  * 挨打记录：`bot → { at, health }` 上一次看到的样子。
@@ -75,7 +78,75 @@ const LAST_SEEN = new WeakMap()
  *  真正的抖动防线是 `repositions` / `equips` 各自的次数上限；这个数字只是最后一道保险。 */
 const MAX_ROUNDS = 8
 
-export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {}) {
+/* ── 放风筝（2026-10-18 用户："attack加个放风筝模式用来打近战怪，打一下往安全的地方退一点"）──
+ *
+ * 效果：打一下 → 往**背离目标**的安全落脚点退一步（约 3 格）→ 下一轮再靠近打。
+ * 近战怪的手长是 3 格，退到 3.5 格它就得继续追、这 1~2 秒它打不到你 ⇒ 用它自己的冷却换你的冷却。
+ *
+ * 🔴 只对**近战**怪：远程怪（骷髅/女巫/恶魂…）退开等于把自己送到它的射程里。
+ * 🔴 只退到**验过的落脚点**：脚/头能站、脚下是实心、脚下和身下都不是岩浆/火/仙人掌/水；
+ *    周围找不到就**不退**（原地打完这一轮），绝不为了放风筝往危险里走。
+ * 🔴 退路仍是 `ctx.moveTo`（现成 walkTo）—— 本文件不碰 `setControlState`，不建第二套移动控制。
+ */
+const KITE_DISTANCE = 3.4
+/** 一次调用最多退几步（再多就是"跑路"了，那是 AI 叫 mc_move 的事） */
+const KITE_MAX = 3
+/** 目标贴到这么近才值得退（本来就够不着 ⇒ 退什么） */
+const KITE_TRIGGER = 4.2
+/** 退一步自己的时间预算（毫秒）：只走 3 格，给太多会挤掉下一次挥拳 */
+const KITE_STEP_MS = 1_200
+
+/**
+ * 算"往哪退"：朝背离目标的方向找一格能站住、且不碰危险的地方。
+ *
+ * 方向优先正后方，被挡就试斜后方（±31°/±60°）—— 直线退路在树林/洞穴里经常是一堵墙。
+ * 竖直方向按「脚下的层 → 上一层 → 下一层 → 下两层」找（应付台阶与矮一格的地面）。
+ *
+ * @returns {{x:number,y:number,z:number}|null} 站上去的中心坐标；找不到安全的落脚点就是 null
+ */
+function kiteSpotOf (b, target, { distance = KITE_DISTANCE } = {}) {
+  const mp = b.entity?.position
+  const tp = target?.position
+  if (!mp || !tp) return null
+  let ax = Number(mp.x) - Number(tp.x)
+  let az = Number(mp.z) - Number(tp.z)
+  const len = Math.hypot(ax, az)
+  if (!(len > 0.05)) return null /* 重叠 ⇒ 算不出"反方向" */
+  ax /= len; az /= len
+  const blockAt = (x, y, z) => {
+    try { return b.blockAt?.(new Vec3(x, y, z)) ?? null } catch { return null }
+  }
+  const nameAt = (x, y, z) => blockAt(x, y, z)?.name ?? null
+  const risky = (n) => Boolean(n) && (BRIDGE_FATAL.test(n) || isLiquid(n))
+  const baseY = Math.floor(mp.y)
+  const levels = [baseY, baseY + 1, baseY - 1, baseY - 2]
+  for (const a of [0, 0.55, -0.55, 1.05, -1.05]) {
+    const ca = Math.cos(a); const sa = Math.sin(a)
+    const ux = ax * ca - az * sa
+    const uz = ax * sa + az * ca
+    for (const d of [distance, 2.6]) {
+      const gx = Math.floor(mp.x + ux * d)
+      const gz = Math.floor(mp.z + uz * d)
+      /* 别在原地或更靠近目标的地方"退"：水平距离得真的拉开 */
+      if (Math.hypot(gx + 0.5 - tp.x, gz + 0.5 - tp.z) < Math.max(2.4, distance - 0.4)) continue
+      for (const gy of levels) {
+        const feet = nameAt(gx, gy, gz)
+        const head = nameAt(gx, gy + 1, gz)
+        const floor = nameAt(gx, gy - 1, gz)
+        const under = nameAt(gx, gy - 2, gz)
+        if (feet == null || head == null || floor == null || under == null) continue
+        if (!isPassable(feet) || !isPassable(head)) continue          /* 脚/头得能站 */
+        if (!isSolidBlock(floor) || risky(floor) || risky(under)) continue /* 脚下得踩实、别踩进岩浆/水 */
+        /* 落脚点本身也不许挨着危险方块（退到岩浆边上=换一种死法） */
+        if (risky(feet) || risky(head)) continue
+        return { x: gx + 0.5, y: gy, z: gz + 0.5 }
+      }
+    }
+  }
+  return null
+}
+
+export async function attack (b, { who = null, budget = 20_000, kite = false } = {}, ctx = {}) {
   const needle = who ? String(who).trim().toLowerCase() : null
   const alias = needle ? NAME_ALIAS[needle] : null
   const hasPvp = Boolean(ctx.hasPvp) && typeof b.pvp?.attack === 'function'
@@ -185,8 +256,9 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
 
   /** 这次调用还剩多少总预算（每一轮进攻都从这里面扣，不能每轮各拿一份满预算） */
   const budgetLeft = () => Math.max(0, budget - (Date.now() - t00))
-  /** 这一个进攻阶段的时间上限：**比总预算短**，否则"重新观察"永远不会发生（见 COMBAT_PHASE_MS 注释） */
-  const phaseMs = () => callBudget(Math.min(budgetLeft(), COMBAT_PHASE_MS), 4_000)
+  /** 这一个进攻阶段的时间上限：**比总预算短**，否则"重新观察"永远不会发生（见 COMBAT_PHASE_MS 注释）。
+   *  放风筝时再压到 1.3 秒：节奏是"打一两下 → 退一步"，不是"顶 3 秒 → 退一次"。 */
+  const phaseMs = () => callBudget(Math.min(budgetLeft(), kite ? Math.min(COMBAT_PHASE_MS, KITE_STEP_MS + 100) : COMBAT_PHASE_MS), 4_000)
 
   /** 有 pvp：交给插件追+打，自己等到"目标没了 / 这一轮用完" */
   const engagePvp = async () => {
@@ -300,7 +372,7 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
   const canMove = typeof ctx.moveTo === 'function'
   const canEquip = typeof ctx.equipTo === 'function'
   const t00 = Date.now()
-  const mem = { repositions: 0, equips: 0, lastEquipAt: 0, lastInRange: null }
+  const mem = { repositions: 0, equips: 0, lastEquipAt: 0, lastInRange: null, kites: 0, kiteBlocked: 0, kiteWhy: null }
   const actions = []
   const hurt = []
   let sawDamageAny = false
@@ -470,6 +542,39 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     if (last._killed === true || last._gone === true) break
     if (last.error) break
     if (ctx.callLeft() <= 500) { timedOut = true; break }
+
+    /* ── 放风筝：打一下，往安全的地方退一步（用户 2026-10-18，只给近战怪）──
+     * 条件里每一条都是"退这一步确实有意义/不会帮倒忙"：
+     *   · 没被围（多只怪各自有手长，退一步躲不开第二只，反而脱出战圈吃背刺）
+     *   · 目标是近战（远程怪退开 = 送给它射）
+     *   · 真打到/够得着（本来够不着还退 = 越追越远）
+     *   · 策略层没在建议撤/拉开距离（那说明该拉开 8 格，不是退 3 格，决策权在 AI）
+     *   · 血还够（`HEALTH_LOW` 以下别再浪）
+     *   · 这一步的预算够（不够就先打，别"退到一半时间没了"） */
+    if (kite && canMove && mem.kites < KITE_MAX &&
+        !RANGED_RE.test(label) &&
+        !(Number(b.health) <= HEALTH_LOW) &&
+        foes.filter((f) => f.id !== target.id).length === 0 &&
+        !advisory &&
+        (last._inRange === true || last._sawDamage === true || distOf(target) <= 3) &&
+        (stillThere ? distOf(target) <= KITE_TRIGGER : false) &&
+        Math.min(budgetLeft(), ctx.callLeft()) > KITE_STEP_MS + 500) {
+      const spot = kiteSpotOf(b, target)
+      if (!spot) {
+        mem.kiteBlocked++
+        mem.kiteWhy = '周围没有安全的落脚点（岩浆 / 火 / 悬空）'
+      } else {
+        try {
+          await ctx.moveTo(spot, { arrive: 0.7, budget: KITE_STEP_MS })
+          mem.kites++
+          actions.push('kite')
+          mem.lastInRange = null /* 换位了：下一轮重新靠近，别让策略层以为还贴着 */
+        } catch (e) {
+          mem.kiteBlocked++
+          mem.kiteWhy = `退的路上被挡住了（${String(e?.message ?? e).slice(0, 60)}）`
+        }
+      }
+    }
     /* 目标还在、时间还有 ⇒ 再评估一轮（MAX_ROUNDS 兜底，防止抖动磨光预算） */
   }
 
@@ -505,6 +610,19 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
      * 和 `note`/`adviceText` 那种给人看的中文分开：一个给下游判分支，一个给 AI 读。 */
     reason: lastStep?.reason ?? null,
     actions,
+    /* 放风筝的账（用户要"打一下退一点"，就得说清退了几次 / 为什么没退） */
+    ...(kite
+      ? {
+          kite: {
+            retreats: mem.kites,
+            ...(mem.kiteBlocked ? { blocked: mem.kiteBlocked } : {}),
+            ...(mem.kiteWhy ? { why: mem.kiteWhy } : {}),
+          },
+          kiteText: mem.kites
+            ? `放风筝：打了 ${mem.kites} 下、退了 ${mem.kites} 步（往安全落脚点退，约 3 格）`
+            : `放风筝：这一轮没退${mem.kiteWhy ? `（${mem.kiteWhy}）` : '（没被打到 / 不是近战怪 / 被围 / 血太少 / 时间不够）'}`,
+        }
+      : {}),
     ...(strategyNote ? { note: strategyNote } : {}),
     /* 策略层的建议（没有执行）：AI 要撤 / 要拉开距离，自己叫 `mc_move`。
      * 单独给一个字段，别混进 `note`（那样会和"这一轮的攻击结果"抢同一句话）。 */

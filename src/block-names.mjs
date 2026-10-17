@@ -139,3 +139,32 @@ export const canPlaceInto = (blk) => {
   if (blk.boundingBox === 'empty') return true
   return isAir(blk.name) || isLiquid(blk.name)     // 兜底：个别版本 boundingBox 可能不准
 }
+
+/* ── 作物成熟度（2026-10-18 用户实机："现在ai看不到作物的成熟等级"）────────────────
+ *
+ * 方块名只告诉你"这格是 wheat"，**不告诉你熟没熟** —— `age` 在方块状态里（`getProperties()`）。
+ * 以前 `mc_scan {name:"wheat"}` 只回坐标，AI 只能"收一次看掉的是小麦还是种子"来猜，
+ * 或者靠 `mc_act {use}` 的 `changed` 里碰巧带出 `age: 0 → 3`。
+ *
+ * `age` 的取值范围**按作物不同**（小麦/胡萝卜/马铃薯 0~7，甜菜根/地狱疣 0~3，可可 0~2），
+ * 所以"7 就是熟"只对一部分作物成立 —— 这里把上限一起给出来，别再让 AI 自己背这张表。
+ * 拿不到 age 时返回 null：**"不知道"不许当成"刚种下"**。
+ */
+export const CROP_MAX_AGE = {
+  wheat: 7, carrots: 7, potatoes: 7, beetroots: 3,
+  nether_wart: 3, cocoa: 2,
+  melon_stem: 7, pumpkin_stem: 7,
+  sweet_berry_bush: 3, torchflower_crop: 3, pitcher_crop: 4,
+}
+
+/**
+ * 读作物生长阶段。`name` 是方块 id（`carrots` 这种复数要照实写），`props` 是 `block.getProperties()`。
+ * @returns {{age:number,maxAge:number,ripe:boolean}|null} 不是作物 / 读不到 age ⇒ null
+ */
+export function cropStageOf (name, props) {
+  const maxAge = CROP_MAX_AGE[String(name ?? '')]
+  if (!maxAge || !props) return null
+  const age = Number(props.age)
+  if (!Number.isFinite(age)) return null
+  return { age, maxAge, ripe: age >= maxAge }
+}

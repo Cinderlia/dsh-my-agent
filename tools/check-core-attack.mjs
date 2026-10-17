@@ -1072,8 +1072,14 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     ok(!/self\.(dig|placeBlock|useItem)\(/.test(atkNo), 'attack.mjs 不自己调别的动作能力（只走 ctx 回调）')
     has(atkNo, "from './combat-strategy.mjs'", 'attack.mjs 真的 import 了策略层')
     has(atkNo, 'if (Date.now() - t00 >= budget - 100)', '🔴 attack.mjs：循环有总预算闸门（不然一轮轮各吃满预算）')
-    has(atkNo, 'const phaseMs = () => callBudget(Math.min(budgetLeft(), COMBAT_PHASE_MS), 4_000)',
-      '🔴 attack.mjs：一个战斗阶段比总预算短（否则"重新观察"永远不发生）')
+    has(atkNo, 'kite ? Math.min(COMBAT_PHASE_MS, KITE_STEP_MS + 100) : COMBAT_PHASE_MS',
+      '🔴 attack.mjs：一个战斗阶段比总预算短（否则"重新观察"永远不发生）；放风筝时再压到 ~1.3 秒（打一两下就退）')
+    has(atkNo, 'kite = false', '🔴 attack.mjs：放风筝是**显式开关**（默认关，老行为一字不变）')
+    has(atkNo, 'KITE_MAX = 3', 'attack.mjs：一次调用最多退 3 步（再多就是"跑路"，那是 AI 叫 mc_move 的事）')
+    has(atkNo, 'function kiteSpotOf', 'attack.mjs：退路先算"安全落脚点"再走（不是闷头后退）')
+    has(atkNo, "import { BRIDGE_FATAL } from './bridge.mjs'",
+      '🔴 attack.mjs：危险名单复用 bridge 的唯一出处（不自己再写一份岩浆/火/仙人掌）')
+    has(atkNo, 'actions.push(\'kite\')', 'attack.mjs：退了一步就记进 actions（AI 能看到这一轮步法）')
     has(atkNo, 'foes: foes.map((f) => ({ ...f, isTarget: f.id === target.id }))',
       '🔴 attack.mjs：把当前目标按**身份**标出来（按名字标会把同类怪一起剔光，"被围"就数不出来）')
     has(atkNo, 'heldPct: pctOfItem(heldItem),', '🔴 attack.mjs：把手里武器的剩余耐久喂给策略层')
@@ -1085,6 +1091,97 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
      * 我们**根本不举盾** —— 那就要钉死"不许凭空调用防御 API"。 */
     ok(!/activateItem|useItem\(|raiseShield|blockWithShield/.test(atkNo),
       '🔴 attack.mjs 里没有任何"举盾/使用物品"的调用（没有盾牌就不进依赖盾牌的策略）')
+  }
+}
+
+/* ─────────── ⑨ 放风筝（用户 2026-10-18："attack加个放风筝模式用来打近战怪，打一下往安全的地方退一点"） ───────────
+ * 这里钉的是"退这一步确实有意义、且不会把 AI 送进危险里"：
+ *   · 单只近战怪贴脸 ⇒ 打一下、往**背离它**的方向退到一个验过的落脚点
+ *   · 远程怪 / 被围 / 血少 / 四周是岩浆 / 没开开关 ⇒ 不退（每种都给个明确的理由） */
+section('⑨ 放风筝 —— 只对近战怪、退到安全落脚点、没退路就不退（端到端，假能力回调）')
+{
+  const { attack } = await import(new URL('../src/attack.mjs', import.meta.url))
+  const mkCtx = (o = {}) => {
+    const calls = { move: [], equip: [] }
+    const ctx = {
+      t: (p) => p,
+      callLeft: () => 60_000,
+      abortSignal: o.abort ?? null,
+      hasPvp: true,
+      ...(o.noMove ? {} : { moveTo: async (pos, opts) => { calls.move.push({ pos, opts }) } }),
+      equipTo: async (n) => { calls.equip.push(n) },
+    }
+    return { ctx, calls }
+  }
+  /** 平地：y<64 石头、y>=64 空气；`over` 可以覆盖特定格子（造岩浆/墙） */
+  const mkFlat = (entities, { over = new Map(), health = 20, me = [0, 64, 0] } = {}) => {
+    const f = mkFightBot(entities, { me })
+    f.bot.health = health
+    f.bot.pvp.wasInRange = true
+    f.bot.blockAt = (p) => {
+      const k = `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`
+      if (over.has(k)) return { name: over.get(k) }
+      return { name: p.y < 64 ? 'stone' : 'air' }
+    }
+    return f
+  }
+  const zed = (id, z, extra = {}) => ent({ id, name: 'zombie', type: 'hostile', kind: 'Hostile mobs', pos: { x: 0, y: 64, z }, ...extra })
+  const skel = (id, z) => ent({ id, name: 'skeleton', type: 'hostile', kind: 'Hostile mobs', pos: { x: 0, y: 64, z } })
+
+  {   /* 主线：近战怪贴到 3 格 ⇒ 打一下，往背离它的方向退一步 */
+    const f = mkFlat([zed('z1', 3)])
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 3500, kite: true }, ctx)
+    ok(f.calls.attack.length >= 1, '放风筝也要真的打（先打、后退）', `attack=${f.calls.attack.length}`)
+    ok(calls.move.length >= 1, 'kite:true + 近战怪贴脸 ⇒ 真的退了一步', JSON.stringify(calls.move.map((m) => m.pos)))
+    const first = calls.move[0]?.pos
+    ok(Boolean(first) && first.z < 0 && Math.abs(first.z) >= 2.4,
+      '往**背离目标**的方向退（怪在 +z ⇒ 我往 -z，拉开 ≥2 格）', JSON.stringify(first))
+    ok(Boolean(first) && Math.abs(Number(first.y) - 64) <= 1, '落脚点在我这一层附近（不是往天上/地下走）', JSON.stringify(first))
+    ok(r.actions.includes('kite'), 'actions 里能看到"退了一步"', JSON.stringify(r.actions))
+    ok(r.kite && r.kite.retreats >= 1 && /放风筝/.test(String(r.kiteText ?? '')),
+      '结果里有放风筝的账（退了几步 + 一句人话）', JSON.stringify(r.kite))
+    ok(calls.move[0]?.opts?.budget === 1200, '退这一步只给 1.2 秒预算（不能把整轮时间吃光）', JSON.stringify(calls.move[0]?.opts))
+  }
+  {   /* 远程怪 ⇒ 不退（退开只是把自己送进它的射程） */
+    const f = mkFlat([skel('s1', 3)])
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'skeleton', budget: 2000, kite: true }, ctx)
+    ok(calls.move.length === 0, '骷髅（远程）⇒ 不退（退开只会让它更好射）', String(calls.move.length))
+    ok(r.kite?.retreats === 0, '结果里如实说没退', JSON.stringify(r.kite))
+  }
+  {   /* 被围 ⇒ 不退（退一步躲不开第二只，反而脱出战圈） */
+    const f = mkFlat([zed('z1', 3), zed('z2', -3)])
+    const { ctx, calls } = mkCtx()
+    await attack(f.bot, { who: 'zombie', budget: 2000, kite: true }, ctx)
+    ok(calls.move.length === 0, '两只怪夹着 ⇒ 不退（退一步躲不开第二只）', String(calls.move.length))
+  }
+  {   /* 血少 ⇒ 不退（策略层已经在建议撤了，那是 AI 的事） */
+    const f = mkFlat([zed('z1', 3)], { health: 8 })
+    const { ctx, calls } = mkCtx()
+    await attack(f.bot, { who: 'zombie', budget: 2000, kite: true }, ctx)
+    ok(calls.move.length === 0, '血 8 ⇒ 不退（血少先别浪）', String(calls.move.length))
+  }
+  {   /* 🔴 没退路：背离方向全是岩浆 ⇒ 宁可原地打，也不往危险里退 */
+    const over = new Map()
+    for (let x = -5; x <= 5; x++) for (let z = -7; z <= -1; z++) over.set(`${x},64,${z}`, 'lava')
+    const f = mkFlat([zed('z1', 3)], { over })
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 3500, kite: true }, ctx)
+    ok(calls.move.length === 0, '🔴 退路上全是岩浆 ⇒ 原地打，绝不为了放风筝往危险里走', String(calls.move.length))
+    ok(r.kite?.blocked >= 1 && /落脚点/.test(String(r.kite?.why ?? '')), '如实报"周围没有安全的落脚点"', JSON.stringify(r.kite))
+  }
+  {   /* 没开开关 ⇒ 完全老行为（不退、结果里连 kite 字段都没有） */
+    const f = mkFlat([zed('z1', 3)])
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 1200 }, ctx)
+    ok(calls.move.length === 0 && r.kite === undefined && r.kiteText === undefined,
+      '不给 kite ⇒ 老行为一字不变（不退、也没有 kite 字段）', JSON.stringify({ moves: calls.move.length, kite: r.kite }))
+  }
+  {   /* 静态接线：index.js 得真有这个参数、描述里得提一句（不然模型永远不知道有它） */
+    const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    ok(/kite: \{ type: 'boolean'/.test(idx), 'mc_act 参数里有 kite（boolean）')
+    ok(/kite 放风筝/.test(idx), 'mc_act 描述里写了 kite 放风筝（模型才知道有这个模式）')
   }
 }
 
