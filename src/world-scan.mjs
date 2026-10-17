@@ -18,7 +18,7 @@
 
 import { Vec3 } from 'vec3'
 import { isAir } from './block-names.mjs'
-import { entityNameOf, HOSTILE_RE, RANGED_RE } from './entity-names.mjs'
+import { entityNameOf, HOSTILE_RE, RANGED_RE, hostilityOf } from './entity-names.mjs'
 
 export function scanAround (b, { radius = 16, height = 4, name = null, limit = 10 } = {}) {
   /* 半径默认 16 = **1 区块**（2026-10-13 用户要求，先定 32 后改回 16）：一次扫 33×33 格，
@@ -104,16 +104,22 @@ export function entitiesNear (b, radius = 24, { kind = 'all', limit = 40 } = {})
     if (!e || e === b.entity || !e.position) continue
     const nm = entityNameOf(e)
     const isPlayer = Boolean(e.username) || e.type === 'player'
-    const hostile = HOSTILE_RE.test(nm) || e.kind === 'Hostile mobs'
-    const group = isPlayer ? 'player' : (hostile ? 'hostile' : 'other')
+    /* 🔴 2026-10-17（用户实机："怪物好像不显示中立"）：原来只有 `player / hostile / other` 三档，
+     *    末影人、猪灵这类**中立**怪被算成 hostile ⇒ AI 以为它们要打自己；狼、蜜蜂、铁傀儡
+     *    被塞进 `other` ⇒ 又完全看不出它们是"惹了才打你"。现在四档，且判定只有 `hostilityOf()` 一处。 */
+    const stance = isPlayer ? 'player' : hostilityOf(nm, e.kind)
+    const hostile = stance === 'hostile'
+    const neutral = stance === 'neutral'
+    const group = stance === 'passive' ? 'other' : stance
     if (want === 'hostile' && group !== 'hostile') continue
+    if (want === 'neutral' && group !== 'neutral') continue
     if (want === 'player' && group !== 'player') continue
     if (want === 'mob' && group === 'player') continue
     const d = distOf(e)
     if (d > R) continue
     const hp = healthOf(e)
     list.push({
-      name: nm, kind: group, hostile, ranged: RANGED_RE.test(nm),
+      name: nm, kind: group, hostile, neutral, ranged: RANGED_RE.test(nm),
       distance: Math.round(d * 100) / 100,
       position: { x: Math.floor(e.position.x), y: Math.floor(e.position.y), z: Math.floor(e.position.z) },
       dy: Math.round((e.position.y - me.y) * 10) / 10,
@@ -122,7 +128,7 @@ export function entitiesNear (b, radius = 24, { kind = 'all', limit = 40 } = {})
     })
   }
   list.sort((a, c) => a.distance - c.distance)
-  const counts = { hostile: 0, player: 0, other: 0 }
+  const counts = { hostile: 0, neutral: 0, player: 0, other: 0 }
   for (const x of list) counts[x.kind]++
   return {
     me: { x: Math.floor(me.x), y: Math.floor(me.y), z: Math.floor(me.z) },

@@ -47,7 +47,7 @@
  */
 import { sleep } from './async-util.mjs'
 import { callBudget } from './budget.mjs'
-import { HOSTILE_RE, RANGED_RE, JUNK_RE, NAME_ALIAS, entityNameOf, nameFieldsOf } from './entity-names.mjs'
+import { HOSTILE_RE, RANGED_RE, JUNK_RE, NAME_ALIAS, entityNameOf, nameFieldsOf, hostilityOf } from './entity-names.mjs'
 import { dropHint, entityHealth } from './world-observer.mjs'
 import { durabilityOf, EQUIP_SLOTS } from './inventory.mjs'
 import {
@@ -80,11 +80,20 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     .filter((e) => e && e !== b.entity && e.position)
     .map((e) => ({ e, d: distOf(e), nm: entityNameOf(e) }))
     .filter((x) => x.d <= 24)
+  /* 🔴 2026-10-17（用户实机："怪物好像不显示中立"）：立场判定统一走 `hostilityOf()`。
+   *    原来这里把 `HOSTILE_RE` 命中就算敌对，而那份名单里有 `enderman` / `piglin` ——
+   *    于是不带名字的 `mc_act{attack}` 会**主动去揍末影人**（本不会打你、能瞬移、40 血），
+   *    而狼 / 蜜蜂 / 铁傀儡（真惹了会打你）被归进"其它"，连"被围"都不算。 */
+  const stanceOf = (x) => (x.e.username || x.e.type === 'player')
+    ? 'player'
+    : hostilityOf(x.nm, x.e.kind)
   const rankOf = (x) => {
-    if (JUNK_RE.test(x.nm)) return 3                                  // 掉落物 / 经验球 / 箭
-    if (HOSTILE_RE.test(x.nm) || x.e.kind === 'Hostile mobs') return 0
-    if (x.e.username || x.e.type === 'player') return 1
-    return 2                                                          // 动物之类
+    if (JUNK_RE.test(x.nm)) return 4                                  // 掉落物 / 经验球 / 箭
+    const st = stanceOf(x)
+    if (st === 'hostile') return 0
+    if (st === 'player') return 1
+    if (st === 'neutral') return 2                                    // 中立：只有点名才打
+    return 3                                                          // 动物之类
   }
   const hit = (x) => {
     if (!needle) return true
@@ -94,7 +103,10 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
   }
   // 🔴 不给 who 时**只追怪**（24 格内的敌对也追），动物/玩家仍只在 4.5 格内 ——
   //    否则"打最近的"会跑过去揍玩家 6 格外的马（2026-10-08 探针实测附近就有 horse 6.8 格）。
-  const inReach = needle ? all : all.filter((x) => x.d <= 4.5 || rankOf(x) === 0)
+  /* 🔴 中立怪（末影人 / 猪灵 / 狼 / 蜜蜂 / 铁傀儡…）**不带名字就绝不去打**。
+   *    它们本不会主动打你，但惹了会 —— 末影人 40 血 + 能瞬移，是最不该"顺手打一只"的。
+   *    动物仍然只在 4.5 格内才算（打猎），玩家也改成必须点名。 */
+  const inReach = needle ? all : all.filter((x) => rankOf(x) === 0 || (x.d <= 4.5 && rankOf(x) === 3))
   const list = inReach.filter(hit).sort((a, c) => (rankOf(a) - rankOf(c)) || (a.d - c.d))
   const near = all.slice().sort((a, c) => a.d - c.d).slice(0, 6)
     .map((x) => `${x.nm} ${x.d.toFixed(1)} 格`).join('、')
@@ -110,7 +122,7 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
     const foes = Object.values(b.entities ?? {})
       .filter((e) => e && e !== b.entity && e !== exclude && e.position)
       .map((e) => ({ e, d: distOf(e), nm: entityNameOf(e) }))
-      .filter((x) => x.d <= NEARBY_R && (HOSTILE_RE.test(x.nm) || x.e.kind === 'Hostile mobs'))
+      .filter((x) => x.d <= NEARBY_R && stanceOf(x) === 'hostile')
       .sort((a, c) => a.d - c.d)
       .slice(0, 5)
       .map((x) => {
@@ -128,7 +140,7 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
   // 半径内只剩掉落物（且不在手边）就别动手：打到一个 item 是白费一轮
   /* 🔴 2026-10-15 审计：点名点到掉落物时，旧文案是"附近找不到 X（24 格内实际有：X）"——
    *    同一句话里自相矛盾（找不到却列出来了）。这里单独说清"它是掉落物、而且够不着"。 */
-  const dropOutOfReach = Boolean(pick && rankOf(pick) === 3 && pick.d > 4.5)
+  const dropOutOfReach = Boolean(pick && rankOf(pick) === 4 && pick.d > 4.5)
   const target = pick && !dropOutOfReach ? pick.e : null
   if (!target) {
     if (needle && dropOutOfReach) {
@@ -298,7 +310,7 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
 
   /** 视野里的敌对（`all` 已经是 24 格内、带名字和距离的快照） */
   const foesOf = (radius = NEARBY_R) => all
-    .filter((x) => x.d <= radius && (HOSTILE_RE.test(x.nm) || x.e.kind === 'Hostile mobs'))
+    .filter((x) => x.d <= radius && stanceOf(x) === 'hostile')
     .map((x) => ({
       /* 🔴 带 `id` 是为了把"正在打的那只"从威胁里**按身份**剔掉 ——
        *    第一版按**名字**剔（`f.name !== label`），于是三只僵尸会被一起剔光，
@@ -369,7 +381,7 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
         name: label,
         distance: stillThere ? distOf(target) : null,
         health: stillThere ? entityHealth(b, target) : null,
-        hostile: HOSTILE_RE.test(label) || target.kind === 'Hostile mobs',
+        hostile: hostilityOf(label, target.kind) === 'hostile',
         ranged: RANGED_RE.test(label),
         attackingMe: stillThere && (target.target === b.entity || distOf(target) <= 3),
         canReach: mem.lastInRange === null ? undefined : mem.lastInRange,
@@ -417,6 +429,11 @@ export async function attack (b, { who = null, budget = 20_000 } = {}, ctx = {})
         }
         retreated = true
         retreatWhy = step.why
+        /* 🔴 只有 defend（被围 / 被远程射）计入退次数，`retreat`（血快没了）**不计** ——
+         *    保命没有上限，但"退了还退"必须有：`chooseStrategy` 用 `mem.retreats`
+         *    在退够 `RETREAT_TRIES` 次之后改成边打边找机会（用户实机 2026-10-17：
+         *    AI 反复调用、每轮都判"还有远程"，于是一路退到没地方退）。 */
+        if (step.action === 'defend') mem.retreats = (Number(mem.retreats) || 0) + 1
         break
       }
     }

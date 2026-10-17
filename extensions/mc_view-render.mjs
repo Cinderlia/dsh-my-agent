@@ -656,6 +656,15 @@ const CLOTHES = [
   [72, 186, 190], [222, 116, 176], [140, 140, 152],
 ]
 const HOSTILE = /(zombie|skeleton|spider|creeper|witch|enderman|endermite|blaze|ghast|slime|magma_cube|piglin|hoglin|zoglin|wither|guardian|shulker|phantom|drowned|husk|stray|pillager|vindicator|evoker|ravager|silverfish|vex|warden|breeze|bogged|illager|giant|illusioner|ender_dragon)/
+/**
+ * 中立怪：**你不惹它，它不惹你**（2026-10-17 用户实机："怪物好像不显示中立"）。
+ * 画成和敌对一样的四足/方块生物，但配色单独一档（橙），文字也写"中立" —— 不然图和摘要里
+ * 末影人 / 猪灵 / 狼 / 铁傀儡 要么被当成红名敌人、要么被当成黄名动物，两头都不对。
+ * 顺序提醒：这张表在 `HOSTILE` **之前**判，所以 `enderman` / `piglin` 落到这里；
+ * 而 `piglin_brute` / `zoglin` / `hoglin` 仍是敌对，这里用 `BRUTE` 单独挑回来。
+ */
+const NEUTRAL = /(enderman|piglin|wolf|bee|polar_bear|panda|iron_golem|llama|goat|dolphin|snow_golem)/
+const BRUTE = /(piglin_brute|zoglin|hoglin)/
 const PASSIVE = /(cow|pig|sheep|chicken|horse|donkey|mule|rabbit|wolf|cat|ocelot|fox|parrot|llama|goat|frog|tadpole|axolotl|bee|turtle|panda|polar_bear|camel|sniffer|armadillo|allay|villager|wandering_trader|golem|mooshroom|strider|squid|dolphin|bat|nautilus|fish|cod|salmon|pufferfish|tropical_fish)/
 const SKIN = [228, 178, 148]
 
@@ -674,6 +683,7 @@ export function entityStyle (ent) {
     return { shape: 'player', label: uname || '玩家', color: cloth, pants: scaleC(cloth, 0.42), skin: SKIN }
   }
   if (type === 'mob') {
+    if (NEUTRAL.test(nm) && !BRUTE.test(nm)) return { shape: 'mob', label: ent?.name ?? '中立怪', color: [232, 154, 74], hostile: false, neutral: true, skin: [226, 184, 150] }
     if (HOSTILE.test(nm)) return { shape: 'mob', label: ent?.name ?? '怪物', color: [214, 74, 74], hostile: true, skin: [188, 96, 82] }
     if (PASSIVE.test(nm)) return { shape: 'mob', label: ent?.name ?? '动物', color: [226, 202, 108], hostile: false, skin: [236, 226, 210] }
     return { shape: 'mob', label: ent?.name ?? '生物', color: [176, 146, 206], hostile: false, skin: [210, 200, 220] }

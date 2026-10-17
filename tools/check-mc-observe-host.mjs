@@ -63,16 +63,16 @@ const mineflayerBot = {
  *  就踩了这个：`bot.entities(...)` 在真服永远报 `is not a function`，所以这里必须提供这一层。 */
 const mkEntities = (radius = 24, { kind = 'all', limit = 40 } = {}) => {
   const rows = [
-    { e: STEVE, kind: 'player', hostile: false, player: true, health: 20, distance: 3 },
-    { e: ZOMBIE, kind: 'hostile', hostile: true, player: false, health: 20, distance: 4 },
+    { e: STEVE, kind: 'player', hostile: false, neutral: false, player: true, health: 20, distance: 3 },
+    { e: ZOMBIE, kind: 'hostile', hostile: true, neutral: false, player: false, health: 20, distance: 4 },
   ].map((r) => ({
-    name: r.e.username ?? r.e.name, kind: r.kind, hostile: r.hostile, ranged: false,
+    name: r.e.username ?? r.e.name, kind: r.kind, hostile: r.hostile, neutral: r.neutral, ranged: false,
     distance: r.distance, position: { x: r.e.position.x, y: r.e.position.y, z: r.e.position.z }, dy: 0,
     health: r.health, ...(r.player ? { player: true } : {}),
   }))
   return {
     me: { x: 0.5, y: 1, z: 0.5 }, radius, kind,
-    counts: { hostile: 1, player: 1, other: 0 }, total: rows.length,
+    counts: { hostile: 1, neutral: 0, player: 1, other: 0 }, total: rows.length,
     list: rows.slice(0, limit),
   }
 }
@@ -317,7 +317,9 @@ console.log('— ④ execute 输出（含真实渲染 + 附件 + 落盘）—')
     JSON.stringify((out.percept.sensed.entities ?? []).map((x) => x.name)))
   ok(out.percept.sensed.counts?.hostile === 1 && out.percept.sensed.counts?.player === 1,
     'sensed.counts 有敌对/玩家计数', JSON.stringify(out.percept.sensed.counts))
-  ok(out.text.includes('格内实体：敌对 1 ｜ 玩家 1 ｜ 其它 0'), 'text 给了"半径内实体：敌对 x ｜ 玩家 y ｜ 其它 z"')
+  ok(out.text.includes('格内实体：敌对 1 ｜ 中立 0 ｜ 玩家 1 ｜ 其它 0'), 'text 给了"半径内实体：敌对 x ｜ 中立 y ｜ 玩家 z ｜ 其它 w"（2026-10-17 加中立档）')
+  ok(out.percept.sensed.counts?.neutral === 0, 'sensed.counts 里也带 neutral（没中立怪就是 0，不是 undefined）',
+    JSON.stringify(out.percept.sensed.counts))
   ok(out.percept.sensed.ray && out.percept.sensed.ray.error,
     '假 world 没有 raycast ⇒ 程序射线如实记成 { error }，不炸', JSON.stringify(out.percept.sensed.ray))
   ok(out.percept.uncertain.some((t) => /程序射线没跑出来/.test(t)), '不确定清单里点出"程序射线没跑出来"')

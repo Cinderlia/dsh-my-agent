@@ -31,6 +31,14 @@ export const REACH_RANGE = 4.5
 export const RANGED_THREAT_RANGE = 12
 /** 视野里敌对数量到这个数 ⇒ 算"被围" */
 export const CROWD_THRESHOLD = 3
+/**
+ * "被围"只数**贴到这么近**的怪。
+ *
+ * 🔴 2026-10-17（用户实机：骷髅射我，它只会退）：`foes` 是 24 格内的全部敌对，原来
+ *    `crowd = foes.length` ⇒ 20 格外的两只僵尸 + 一只骷髅就让"被围"成立，战斗层
+ *    一直判"退"，AI 反复调用也只能反复退。真正该退的是**贴脸围上来**，不是"视野里有三只"。
+ */
+export const CROWD_RANGE = 8
 /** 掉血速度的观察窗口 */
 export const HURT_WINDOW_MS = 4_000
 /**
@@ -253,7 +261,9 @@ export function assessCombat (o = {}) {
   const d = Number(target?.distance)
   const notes = []
 
-  const crowd = foes.length
+  /* 贴到 `CROWD_RANGE` 以内的才算"被围"（`crowdAll` 仍然给 24 格内的总数，供 AI 判断局势） */
+  const crowdNear = foes.filter((f) => (Number(f?.distance) ?? Infinity) <= CROWD_RANGE)
+  const crowd = crowdNear.length
   /* 🔴 "被围"要**连正在打的那只一起数**（三只怪围着你是三只，不是两只）——
    *    但"远程威胁"和"正在挨打"要把它剔掉：我正在打一只僵尸，它贴着我，
    *    那是**正常交战**，不是"被围"也不是"有人拿弓射我"。
@@ -299,7 +309,8 @@ export function assessCombat (o = {}) {
   return {
     health, food: o.food ?? null, air: o.air ?? null, submerged: o.submerged === true,
     now, hurtDps, hurtWindowMs: HURT_WINDOW_MS,
-    threat, crowd, rangedFoes, rangedOnMe, rangedThreat, nearestFoe: Number.isFinite(nearestFoe) ? Math.round(nearestFoe * 10) / 10 : null,
+    threat, crowd, crowdAll: foes.length, rangedFoes, rangedOnMe, rangedThreat, nearestFoe: Number.isFinite(nearestFoe) ? Math.round(nearestFoe * 10) / 10 : null,
+    targetRanged: target?.ranged === true,
     target, targetGone, sawDamage, targetInRange, targetReachable,
     held: o.held ?? null, hasShield: o.hasShield === true, armorPoints: o.armorPoints ?? null,
     weapon, inDanger, notes, weaponWarn,
@@ -327,6 +338,8 @@ export function chooseStrategy (s, mem = {}) {
   const repositions = Number(mem.repositions) || 0
   const equips = Number(mem.equips) || 0
   const lastEquipAt = Number(mem.lastEquipAt) || 0
+  /* 已经退过几次（`attack.mjs` 每执行一次 defend 就 +1）—— 用来给退了还退设上限 */
+  const retreats = Number(mem.retreats) || 0
   const m = (state, action, reason, extra = {}) => ({ state, action, reason, ...extra })
 
   /* ① 目标没了 —— 先分清"打死了"和"走远了"（这是既有的、必须保住的口径）。
@@ -349,23 +362,43 @@ export function chooseStrategy (s, mem = {}) {
     return m('retreat', 'retreat', 'low-health', { why })
   }
 
-  /* ③ 被围 / 有真的远程威胁 ⇒ 先拉开距离（用户方案：没有盾牌手段时"退化为拉开距离"） */
+  /* ③ 目标**自己就是远程** ⇒ 冲上去打，不是站着挨。
+   *
+   * 🔴 2026-10-17（用户实机，游戏里那个 AI 的原话）：「只要目标被它判成远程（骷髅/女巫/烈焰人
+   *    全算），它就只挡不还手 … 所以骷髅打我我永远打不到它，只能挨。」
+   *    原因就在这里：远程威胁一律走 `defend` = 往反方向退 8 格然后收工 —— 可骷髅的箭比腿快，
+   *    退只会一边挨射一边把距离拉开，下一轮还得再走回来。远程怪的优势**只在拉开距离时**成立，
+   *    贴到近战距离它们反而最弱（骷髅 20 血、烈焰人 20 血、女巫 26 血且没有近战）。
+   *    真正的远程威胁是**别的怪在射我**（下面 ④），不是我要打的那只恰好是远程。 */
+  if (s.targetRanged && s.targetReachable !== false) {
+    return m('engage', 'engage', 'close-in',
+      { why: `目标是远程（${s.target?.name ?? '?'}，${s.target?.distance ?? '?'} 格）—— 站在外面只会挨打，冲上去近战` })
+  }
+
+  /* ④ 被围 / **别的**远程在射我 ⇒ 拉开距离（用户方案：没有盾牌手段时退化为拉开距离）。
+   *
+   * 🔴 必须有次数上限：同一个实机会话里另一个症状是退了还退 —— 每轮重新观察都还能看到
+   *    远程威胁，于是一路退到没地方退、血还是掉。退够 `RETREAT_TRIES` 次就换成边打边找机会。 */
   if (s.surrounded || s.rangedThreat) {
     const why = s.surrounded
-      ? `视野里有 ${s.crowd} 只怪`
+      ? `贴到 ${CROWD_RANGE} 格内的有 ${s.crowd} 只怪（视野里共 ${s.crowdAll ?? s.crowd} 只）`
       : `有 ${s.rangedFoes} 个远程在 ${s.nearestFoe} 格`
-    /* 没有盾牌就**明说**是"拉开距离"，别让 AI 以为我们在举盾 ——
-     * 用户方案："没有盾牌或无法防御 ⇒ 不进入依赖盾牌的策略"。 */
+    if (retreats >= RETREAT_TRIES) {
+      return m('engage', 'engage', 'retreat-exhausted',
+        { why: `${why}；已经退过 ${retreats} 次还是甩不掉 —— 再退也是白退，改成边打边找机会` })
+    }
+    /* 没有盾牌就**明说**是拉开距离，别让 AI 以为我们在举盾 ——
+     * 用户方案：没有盾牌或无法防御 ⇒ 不进入依赖盾牌的策略。 */
     const how = s.hasShield ? '有盾，边挡边退' : '没有盾牌，只能拉开距离'
     return m('defend', 'defend', s.surrounded ? 'surrounded' : 'ranged-threat', { why: `${why}（${how}）`, shield: s.hasShield })
   }
 
-  /* ④ 血不多了 ⇒ 停止冒进（还能打，但不主动往上顶） */
+  /* ⑤ 血不多了 ⇒ 停止冒进（还能打，但不主动往上顶） */
   if (s.shouldStopAdvancing && !s.targetInRange) {
     return m('retreat', 'retreat', 'low-health-stop', { why: `血 ${s.health}，先拉开距离` })
   }
 
-  /* ⑤ 手里的家伙不如背包里的 ⇒ 换一把（危险中不换，`weaponChoiceOf` 已经挡了） */
+  /* ⑥ 手里的家伙不如背包里的 ⇒ 换一把（危险中不换，`weaponChoiceOf` 已经挡了） */
   /* 🔴 `lastEquipAt === 0` 要当成"从来没换过"，不能拿它去比冷却 ——
    *    否则"刚开局、`now` 又是个小数字"时冷却恒不满足，换武器这条分支永远走不到
    *    （`check-core-attack` 的纯函数用例就是这么逮到它的：`now = 1000` ⇒ `1000 - 0 < 1500`）。 */
@@ -374,7 +407,7 @@ export function chooseStrategy (s, mem = {}) {
     return m('assess', 'equip', 'better-weapon', { name: s.weapon.name, why: s.weapon.why })
   }
 
-  /* ⑥ 够不着 ⇒ 换个位置再来（有限次；试完就说"够不着"，不无限试） */
+  /* ⑦ 够不着 ⇒ 换个位置再来（有限次；试完就说"够不着"，不无限试） */
   if (s.targetReachable === false || mem.lastInRange === false) {
     if (repositions < REPOSITION_MAX) {
       return m('reposition', 'reposition', 'out-of-reach',
@@ -384,7 +417,7 @@ export function chooseStrategy (s, mem = {}) {
       { why: `试了 ${REPOSITION_MAX} 次还是够不着 —— 别在原地耗，换个目标或先 mc_move 过去` })
   }
 
-  /* ⑦ 其余情况：进攻 */
+  /* ⑧ 其余情况：进攻 */
   return m('engage', 'engage', 'engage', { why: `打 ${s.target?.name ?? '目标'}` })
 }
 

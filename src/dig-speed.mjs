@@ -32,22 +32,35 @@ export function enchantsOfItem (it) {
   } catch { return [] }
 }
 
-/** 🔴 2026-10-15 审计：`fixDigMs` 重算的是**没有附魔**的原版公式。
- *
- *  **效率（Efficiency）是手持物附魔，不进 `b.entity.effects`** —— 原来只查药水效果，
- *  拿效率镐时 `fixDigMs` 照样返回那个"没算效率"的偏快值，`digMsFor` 的 `Math.min(...cands)`
- *  又让偏快值胜出 ⇒ `patchDigTime` 喂给 `bot.digTime` ⇒ mineflayer 按偏快时长 STOP ⇒
- *  服务端判进度不够、把方块发回来 = 用户看到的"挖完又复原"。
- *  ⇒ 只要这件工具（或头盔）带附魔，`fixDigMs` 就一律不修，退回上游那个把附魔算进去的值。 */
-function enchantedFor (b, itemType) {
+/** 这件物品本身（优先手上那件，其次背包里同类型的第一件）。找不到返回 null。 */
+function itemOf (b, itemType) {
   try {
-    if (itemType == null) return false
     const held = b?.heldItem ?? null
-    if (held && held.type === itemType && enchantsOfItem(held).length) return true
-    const items = b?.inventory?.items?.() ?? []
-    for (const it of items) if (it?.type === itemType && enchantsOfItem(it).length) return true
+    if (held && held.type === itemType) return held
+    for (const it of b?.inventory?.items?.() ?? []) if (it?.type === itemType) return it
   } catch {}
-  return false
+  return null
+}
+
+/** "效率（Efficiency）"附魔给的速度加成：原版是 `+ level² + 1`（I 级 +2，V 级 +26）。
+ *
+ *  🔴 2026-10-17（用户实机：「挖钻石矿一块要 6.75 秒，正常应该 0.85 秒」）：
+ *  原来的判据是 `enchantedFor` —— **只要这件工具有任何附魔就一律不修**。
+ *  可无限耐久 / 耐久 / 幸运 / 精准采集**根本不改挖掘速度**，只有效率才改。
+ *  于是带耐久 III 的钻石镐挖 `deepslate_diamond_ore`（material 被写坏成
+ *  `incorrect_for_wooden_tool` 的那 108 个方块之一）永远退回上游那个"空手速度"的
+ *  **6750ms**，而同样硬度 4.5 的正常方块（`deepslate`）只要 600ms —— 用户看到的就是"慢 8 倍"。
+ *  现在只把**效率**这一项算进来，其它附魔照旧不影响。 */
+function efficiencyBonusOf (b, itemType) {
+  const it = itemOf(b, itemType)
+  if (!it) return 0
+  for (const e of enchantsOfItem(it)) {
+    if (e.name === 'efficiency') {
+      const lvl = Number(e.lvl) || 0
+      return lvl > 0 ? lvl * lvl + 1 : 0
+    }
+  }
+  return 0
 }
 
 /** 这把工具的"品级速度"：从 registry 里**所有** material 表里取它的最大倍率
@@ -87,11 +100,6 @@ export function fixDigMs (b, blk, itemType) {
     if (b?.game?.gameMode === 'creative') return null
     const hardness = Number(blk?.hardness)
     if (!(hardness > 0)) return null
-    // 有药水效果 / 附魔时不算（Haste、效率、水下速掘都会改速度，宁可退回上游那个保守值）
-    const eff = b?.entity?.effects
-    if (eff && typeof eff === 'object' && Object.keys(eff).length > 0) return null
-    // 🔴 效率是**手持物附魔**，不在 entity.effects 里（见 enchantedFor 的注释）
-    if (enchantedFor(b, itemType)) return null
     const have = reg.materials[blk?.material]?.[itemType]
     if (Number.isFinite(have) && have > 1) return null        // 数据没问题，上游算得对
     const heldKind = digToolKindOf(reg.items?.[itemType]?.name)
@@ -110,16 +118,24 @@ export function fixDigMs (b, blk, itemType) {
     let can = false
     try { can = Boolean(blk.canHarvest?.(itemType)) } catch {}
     if (!can) return null                                      // 品级不够 ⇒ 上游那个慢值是对的
-    const speed = digToolSpeedOf(reg, itemType)
+    const speed = digToolSpeedOf(reg, itemType) + efficiencyBonusOf(b, itemType)
     if (!(speed > 1)) return null
-    const inWater = inWaterNow(b)
-    const aqua = Number(b?.inventory?.slots?.[5]?.enchants?.find?.((x) => x?.name === 'aqua_affinity')?.lvl ?? 0)
-    let sp = speed
-    if (inWater && !aqua) sp /= 5
-    if (fallingNow(b)) sp /= 5
-    const delta = sp / hardness / 30
-    if (!(delta > 0)) return null
-    return Math.ceil(1 / delta) * 50
+    /* 🔴 2026-10-17：不再自己套"水下 / 悬空 / 药水效果"的乘数 —— 改成**按比例缩**
+     *  上游算出来的那个"空手速度"值。
+     *
+     *  上游在 material 查不到时按 `blockBreakingSpeed = 1` 算，但**效果（急速 / 挖掘疲劳）、
+     *  水下、悬空这些乘数它照常会乘进去**。时间 ∝ 1/速度，所以
+     *  `真值 = 上游空手值 / 真速度`，效果部分自动约掉 —— 既不用复刻原版公式，
+     *  也不可能和服务端算得不一样（复刻才容易漏）。
+     *
+     *  `enchants` 只传头盔（海之眷顾 Aqua Affinity）：手持物的效率已经被
+     *  `efficiencyBonusOf` 折进 speed 了，再传一遍会重复计算（上游在数据坏的方块上本来也不认效率）。 */
+    const helmet = (() => { try { return b?.inventory?.slots?.[5] ?? null } catch { return null } })()
+    const hand = Number(blk.digTime(itemType, false, inWaterNow(b), fallingNow(b), enchantsOfItem(helmet), b?.entity?.effects ?? {}))
+    if (!(Number.isFinite(hand) && hand > 0)) return null
+    // 上游那个值是按 50ms 一档取整过的，直接 ceil 会把它那点取整误差也放大一档；
+    // 这里 round 回最近一档（`patchDigTime` 还有 8% + 60ms 余量兜底，不会挖早）
+    return Math.round(hand / speed / 50) * 50
   } catch { return null }
 }
 

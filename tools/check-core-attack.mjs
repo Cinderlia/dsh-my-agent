@@ -480,8 +480,8 @@ section('⑤ 静态接线')
   const connNo = strip(readFileSync(new URL('../src/connection.mjs', import.meta.url), 'utf8'))
   const auNo = strip(readFileSync(new URL('../src/async-util.mjs', import.meta.url), 'utf8'))
   has(atkNo, '24 格内实际有：', 'attack.mjs：找不到时列出半径内实际有谁')
-  has(atkNo, 'const inReach = needle ? all : all.filter((x) => x.d <= 4.5 || rankOf(x) === 0)',
-    'attack.mjs：不给 who 时只追怪（动物/玩家限 4.5 格）')
+  has(atkNo, 'const inReach = needle ? all : all.filter((x) => rankOf(x) === 0 || (x.d <= 4.5 && rankOf(x) === 3))',
+    'attack.mjs：不给 who 时只追敌对（动物限 4.5 格，中立怪必须点名）')
   /* 🔴 2026-10-16（用户 m11195 采纳的 ①）：`mc_act{mode:"attack"}` 打完目标后**顺带报附近还有谁** ——
    *    以前只报"打死了 / 打了多少血"，AI 得再单独调一次 `mc_entities` 才知道旁边还站着两只。
    *    数据本来就在手（`all` 已列了 24 格内全部实体），零额外遍历；没怪时返回 `{}`（常态零结果 token）。 */
@@ -733,6 +733,73 @@ section('⑦ 战斗策略层 —— 威胁排序 / 换武器 / 状态机 / 结�
     const acute = assessCombat({ ...base, hurt: [{ at: 0, health: 20 }, { at: 1000, health: 16 }] })
     ok(chooseStrategy(acute).action === 'retreat', '🔴 4/秒 ⇒ retreat（20 血撑不过 5 秒，来不及脱身）', JSON.stringify(chooseStrategy(acute)))
     ok(S.HURT_RETREAT_DPS >= 3, '🔴 急症阈值不许被调回 1.5（那会让 attack 对落单怪也逃跑）', String(S.HURT_RETREAT_DPS))
+  }
+  /* 🔴 2026-10-17（用户实机，游戏里那个 AI 的原话：「骷髅打我我永远打不到它，只能挨」）：
+   *    目标是**远程**时策略层原来一律走 `defend`（往反方向退 8 格再收工）。可远程怪的
+   *    优势只在拉开距离时成立 —— 退的结果是一边挨箭一边把距离拉大，下一轮还得走回来。
+   *    正确解法是**冲上去近战**，但保命（血快没了）依然优先。 */
+  {
+    const rangedTarget = { name: 'skeleton', distance: 10, hostile: true, ranged: true }
+    const st = chooseStrategy(assessCombat({ ...base, target: rangedTarget }))
+    ok(st.action === 'engage' && st.reason === 'close-in',
+      '🔴 状态机：目标是远程（骷髅 10 格）⇒ 冲上去打，不许掉头就跑', JSON.stringify(st))
+    const low = chooseStrategy(assessCombat({ ...base, health: 4, target: rangedTarget }))
+    ok(low.action === 'retreat' && low.reason === 'low-health',
+      '🔴 状态机：血 4 时目标是远程也要先撤（保命排在进攻前面）', JSON.stringify(low))
+    const worn = chooseStrategy(assessCombat({ ...base, health: 10, target: rangedTarget }))
+    ok(worn.action === 'engage', '状态机：血 10 + 目标是远程 ⇒ 仍然冲上去', JSON.stringify(worn))
+    /* 反向：远程**不是**目标（它在旁边射我）时，仍然按"远程威胁"处理 */
+    const side = chooseStrategy(assessCombat({
+      ...base,
+      foes: [{ name: 'skeleton', distance: 8, hostile: true, ranged: true, attackingMe: true }],
+    }))
+    ok(side.action === 'defend', '战况：旁边有远程正在射我（不是目标）⇒ 仍然先拉开距离', JSON.stringify(side))
+  }
+  /* 🔴 2026-10-17：被围只数**贴到 8 格内**的怪 —— `foes` 是 24 格内的全部敌对，
+   *    原来 `crowd = foes.length` ⇒ 20 格外的三只怪也让战斗层一直判"被围、退"。 */
+  {
+    const far3 = assessCombat({
+      health: 20, now: 1000, foes: [
+        { name: 'zombie', distance: 20, hostile: true },
+        { name: 'zombie', distance: 22, hostile: true },
+        { name: 'zombie', distance: 24, hostile: true },
+      ],
+    })
+    ok(far3.crowd === 0 && far3.crowdAll === 3 && far3.surrounded === false,
+      '🔴 战况：20 格外的三只怪不算被围（crowd 只数 8 格内，crowdAll 才是总数）',
+      `crowd=${far3.crowd} crowdAll=${far3.crowdAll}`)
+    const near3 = assessCombat({
+      health: 20, now: 1000, foes: [
+        { name: 'zombie', distance: 3, hostile: true },
+        { name: 'zombie', distance: 5, hostile: true },
+        { name: 'zombie', distance: 7, hostile: true },
+      ],
+    })
+    ok(near3.surrounded === true && near3.crowd === 3, '战况：8 格内三只 ⇒ 才算被围', `crowd=${near3.crowd}`)
+    ok(S.CROWD_RANGE > 0 && S.CROWD_RANGE <= 12, 'CROWD_RANGE 是具名常量且在合理区间', String(S.CROWD_RANGE))
+  }
+  /* 🔴 2026-10-17：退了还退 —— 退够 `RETREAT_TRIES` 次还是甩不掉就改成边打边找机会 */
+  {
+    const surrounded = assessCombat({
+      ...base,
+      foes: [
+        { name: 'zombie', distance: 3, hostile: true },
+        { name: 'zombie', distance: 4, hostile: true },
+        { name: 'zombie', distance: 5, hostile: true },
+      ],
+    })
+    const first = chooseStrategy(surrounded, { retreats: 0 })
+    ok(first.action === 'defend', '状态机：被围第一次 ⇒ defend（边挡边退 / 没盾就拉开距离）', JSON.stringify(first))
+    const capped = chooseStrategy(surrounded, { retreats: S.RETREAT_TRIES })
+    ok(capped.action === 'engage' && capped.reason === 'retreat-exhausted',
+      '🔴 状态机：退够次数还是被围 ⇒ 不再退，改成边打边找机会（否则会一路退到没地方退）',
+      JSON.stringify(capped))
+    const atkSrc = readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8')
+    ok(/if \(step\.action === 'defend'\) mem\.retreats = /.test(atkSrc),
+      '🔴 attack.mjs：执行 defend 时给策略层记一次退次数（否则 RETREAT_TRIES 形同虚设）')
+    const stratSrc = readFileSync(new URL('../src/combat-strategy.mjs', import.meta.url), 'utf8')
+    ok(/if \(retreats >= RETREAT_TRIES\)/.test(stratSrc),
+      '🔴 策略层：退次数上限真的被用在分支里')
   }
   {
     const st = chooseStrategy(assessCombat({

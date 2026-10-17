@@ -69,11 +69,11 @@ const mkMc = (bot) => {
   return mc
 }
 /** 假 bot：真 registry + 真 prismarine-block，`digTime` 复刻 mineflayer 的实现（`block.digTime(heldItem.type)`） */
-const mkBot = ({ held = null, effects = {}, onGround = true } = {}) => {
+const mkBot = ({ held = null, effects = {}, onGround = true, enchants = [] } = {}) => {
   const bot = {
     registry,
     game: { gameMode: 'survival' },
-    heldItem: held == null ? null : { type: itemId(held), name: held },
+    heldItem: held == null ? null : { type: itemId(held), name: held, enchants },
     entity: { position: new Vec3(0, 64, 0), onGround, velocity: new Vec3(0, 0, 0), isInWater: false, effects },
     inventory: { slots: [] },
     _getBlockAtEyeLevel: () => ({ name: 'air' }),
@@ -106,12 +106,13 @@ section('① 上游原值（证明坑存在：material 是品级门标签，速�
 section('② 修之后：`bot.digTime` 按原版真值（含 8% + 60ms 余量）')
 {
   const cases = [
-    ['stone_pickaxe', 1150], ['iron_pickaxe', 750], ['diamond_pickaxe', 600], ['netherite_pickaxe', 500],
+    ['stone_pickaxe', 1150], ['iron_pickaxe', 750], ['diamond_pickaxe', 550], ['netherite_pickaxe', 500],
   ]
   for (const [tool, truth] of cases) {
     const { got, want } = patched('iron_ore', tool, truth)
-    ok(got === want, `铁矿 + ${tool} ⇒ ${got}ms（真值 ${truth} + 余量 ⇒ ${want}）`, '上游原来是 4550ms')
+    ok(got === want, `铁矿 + ${tool} ⇒ ${got}ms（取到 ${truth} 一档 + 余量 ⇒ ${want}）`, '上游原来是 4550ms')
   }
+  ok(withMargin(550) > 600, '钻石镐那一档 550ms 仍高于真值 600ms（×1.08+60 = 654），不会挖早', String(withMargin(550)))
   // 金镐：minecraft-data 的 `iron_ore.harvestTools` **不含金镐** ⇒ canHarvest 假 ⇒ 按"挖不动"处理（不修）
   const gold = patched('iron_ore', 'golden_pickaxe', 15000)
   ok(gold.got === gold.want, '铁矿 + 金镐 ⇒ 按"挖不动"保守处理（数据里 harvestTools 不含金镐）', String(gold.got))
@@ -147,14 +148,44 @@ section('③ 不许估快（估快 ⇒ 服务端判"进度不够" ⇒ 方块"复
   ok(wet.digTime(blockOf('iron_ore')) === withMargin(3750), '在水里挖铁矿 ⇒ 真值 750 × 5 = 3750ms + 余量（原来 4550ms）', String(wet.digTime(blockOf('iron_ore'))))
 }
 
-// ── ④ 有药水效果时不插手（Haste / 挖掘疲劳都会改速度，宁可退回上游那个值）──────────────────
-section('④ 有效果时不插手')
+// ── ④ 药水效果 / 附魔：不再"整段不插手"，而是按比例折算（2026-10-17 用户实测 6.75 秒）───────
+section('④ 药水效果：按上游空手值 ÷ 真速度折算（原来一见效果就整段退回上游）')
 {
-  // 注意：prismarine-block 按 **id** 查效果 ⇒ id 3 就是 MiningFatigue（上游 base 因此变成 50000ms）
+  // id 3 = MiningFatigue（上游把效果乘进去了：空手 50000ms）
   const bot = mkBot({ held: 'iron_pickaxe', effects: { 3: { id: 3, amplifier: 1, duration: 100 } } })
   mkMc(bot).patchDigTime(bot)
   const got = bot.digTime(blockOf('iron_ore'))
-  ok(got === withMargin(50000), '有药水效果 ⇒ 不插手，用上游算出来的值（+余量）', String(got))
+  ok(got === withMargin(8350), '挖掘疲劳 II + 铁镐挖铁矿 ⇒ 50000 ÷ 6 = 8350ms', String(got))
+}
+
+// ── ⑤ 附魔：**只有效率改速度**，耐久/幸运/精准采集都不改 ─────────────────────────────────
+//   用户 2026-10-17 原话：「挖钻石矿一块要 6.75 秒（正常应该 0.85 秒）」——
+//   真凶是 `enchantedFor` 把"任何附魔"都当成"会影响速度"，于是带耐久/幸运的钻石镐
+//   在 material 被写坏的方块上永远退回上游那个 6750ms 的**空手速度**。
+section('⑤ 附魔：只有效率改速度（带耐久的钻石镐必须照样给 850ms）')
+{
+  const plain = mkBot({ held: 'diamond_pickaxe' })
+  mkMc(plain).patchDigTime(plain)
+  const base = plain.digTime(blockOf('deepslate_diamond_ore'))
+  ok(base === withMargin(850), '钻石镐挖深板岩钻石矿 ⇒ 850ms（上游 6750ms = 空手速度）', String(base))
+
+  const unb = mkBot({ held: 'diamond_pickaxe', enchants: [{ name: 'unbreaking', lvl: 3 }, { name: 'fortune', lvl: 3 }] })
+  mkMc(unb).patchDigTime(unb)
+  ok(unb.digTime(blockOf('deepslate_diamond_ore')) === base, '耐久 III + 幸运 III（不改速度）⇒ 和没附魔一样', String(unb.digTime(blockOf('deepslate_diamond_ore'))))
+
+  const eff1 = mkBot({ held: 'diamond_pickaxe', enchants: [{ name: 'efficiency', lvl: 1 }] })
+  mkMc(eff1).patchDigTime(eff1)
+  ok(eff1.digTime(blockOf('deepslate_diamond_ore')) === withMargin(700), '效率 I ⇒ 速度 8+2 ⇒ 700ms', String(eff1.digTime(blockOf('deepslate_diamond_ore'))))
+
+  const eff5 = mkBot({ held: 'diamond_pickaxe', enchants: [{ name: 'efficiency', lvl: 5 }] })
+  mkMc(eff5).patchDigTime(eff5)
+  ok(eff5.digTime(blockOf('deepslate_diamond_ore')) === withMargin(200), '效率 V ⇒ 速度 8+26 ⇒ 200ms', String(eff5.digTime(blockOf('deepslate_diamond_ore'))))
+
+  // 同一种附魔在"数据正常"的方块上仍然交给上游（上游会算效率，别重复算）
+  const oakEff = mkBot({ held: 'iron_axe', enchants: [{ name: 'efficiency', lvl: 5 }] })
+  mkMc(oakEff).patchDigTime(oakEff)
+  const upstream = blockOf('oak_log').digTime(itemId('iron_axe'), false, false, false, [{ name: 'efficiency', lvl: 5 }], {})
+  ok(oakEff.digTime(blockOf('oak_log')) === withMargin(upstream), '数据正常 + 效率 V（橡木+铁斧）⇒ 用上游算好的值，不重复加速', String(oakEff.digTime(blockOf('oak_log'))))
 }
 
 // ── ⑤ 边界：挖不动的方块（Infinity）要原样传下去，不能变成 0 / 不许递归 ────────────────────

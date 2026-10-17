@@ -484,11 +484,12 @@ export async function apply (api) {
         if (prog?.error) {
           entLines.push(`（读不到实体列表：${prog.error}）`)
         } else if (prog) {
-          const label = { hostile: '敌对', player: '玩家', other: '生物' }
+          const label = { hostile: '敌对', neutral: '中立', player: '玩家', other: '生物' }
           const one = (x) => {
             const bits = [`${label[x.kind] ?? x.kind} **${x.name}**`, `(${x.position.x}, ${x.position.y}, ${x.position.z})`, `${x.distance} 格`]
             if (x.dy) bits.push(`上下 ${x.dy > 0 ? '+' : ''}${x.dy}`)
             if (x.health != null) bits.push(`血 ${x.health}`)
+            if (x.neutral) bits.push('中立（惹了才打）')
             if (x.ranged) bits.push('远程')
             return bits.join(' · ')
           }
@@ -561,7 +562,7 @@ export async function apply (api) {
             ? `   · 实体：${entLines.join(' ｜ ')}`
             : prog === null
               ? '   · 这次没收集实体（`entities:false`）'
-              : `   · ${distance} 格内实体：敌对 ${prog?.counts?.hostile ?? 0} ｜ 玩家 ${prog?.counts?.player ?? 0} ｜ 其它 ${prog?.counts?.other ?? 0}`
+              : `   · ${distance} 格内实体：敌对 ${prog?.counts?.hostile ?? 0} ｜ 中立 ${prog?.counts?.neutral ?? 0} ｜ 玩家 ${prog?.counts?.player ?? 0} ｜ 其它 ${prog?.counts?.other ?? 0}`
                 + (entLines.length ? ` —— ${entLines.join(' ｜ ')}` : '（一只都没有）')
                 + (prog && prog.total > prog.list.length ? `（还有 ${prog.total - prog.list.length} 个没列出来）` : ''),
           `   · 生命 ${out.health ?? '?'} · 饥饿 ${out.food ?? '?'}`

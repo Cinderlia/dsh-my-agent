@@ -317,6 +317,33 @@ section('⑨ 静态检查（实体工具已并进 mc_observe 感知块、不看�
     renderOnly.join(' / '))
 }
 
+// ── ⑩ 立场四档：hostile / neutral / passive / player ───────────────────────
+{
+  section('⑩ 立场四档 —— 中立怪不再被当成敌对')
+  const EN = await import(new URL('../src/entity-names.mjs', import.meta.url))
+  const st = (nm, kind) => EN.hostilityOf(nm, kind)
+  ok(st('enderman') === 'neutral', '末影人是中立（不看眼睛不打人）', st('enderman'))
+  ok(st('piglin') === 'neutral', '猪灵是中立（穿着金装不打人）', st('piglin'))
+  ok(st('zombified_piglin') === 'neutral', '僵尸猪灵是中立', st('zombified_piglin'))
+  ok(st('piglin_brute') === 'hostile',
+    '🔴 猪灵蛮兵是敌对（名字里有 piglin，所以"永远敌对"必须排在"中立"前面判）', st('piglin_brute'))
+  ok(st('zoglin') === 'hostile' && st('hoglin') === 'hostile', '僵尸猪兽 / 猪兽仍然是敌对',
+    `${st('zoglin')} / ${st('hoglin')}`)
+  ok(st('zombie') === 'hostile' && st('skeleton') === 'hostile', '普通的僵尸 / 骷髅是敌对')
+  ok(st('cow') === 'passive' && st('sheep') === 'passive', '牛 / 羊是被动（打猎目标）', `${st('cow')} / ${st('sheep')}`)
+  ok(st('something_unknown', 'Hostile mobs') === 'hostile',
+    '🔴 名字不在任何名单里、但 mcdata 说是敌对 ⇒ 仍然算敌对（不能只认名字）')
+  ok(st('enderman', 'Hostile mobs') === 'neutral',
+    '🔴 名字说了中立就听名字（mcdata 的 kind 会把末影人标成 Hostile mobs，但它是中立的）')
+  const scanNo = readFileSync(new URL('../src/world-scan.mjs', import.meta.url), 'utf8')
+  ok(scanNo.includes('hostilityOf(nm, e.kind)'), 'world-scan 用 hostilityOf 判立场（不是自己写正则）')
+  ok(scanNo.includes('const neutral = stance === \'neutral\''), 'world-scan 输出里有 neutral 标记')
+  ok(scanNo.includes('counts = { hostile: 0, neutral: 0, player: 0, other: 0 }'),
+    'world-scan 的计数里有 neutral 一档')
+  ok(scanNo.includes("if (want === 'neutral' && group !== 'neutral') continue"),
+    'world-scan 支持 kind:"neutral" 过滤')
+}
+
 // ── 收尾 ────────────────────────────────────────────────────────────────────
 for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 console.log(`\ncheck-core-entities：pass=${pass} fail=${fail}`)

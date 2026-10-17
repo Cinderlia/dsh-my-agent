@@ -26,6 +26,40 @@ export const HOSTILE_RE = /zombie|skeleton|creeper|spider|witch|enderman|slime|p
 export const RANGED_RE = /skeleton|stray|bogged|pillager|vindicator|witch|blaze|ghast|guardian|shulker|llama|illusioner|evoker|breeze|wither|drowned/i
 
 /**
+ * **中立**怪 —— 你不惹它，它不惹你（用户 2026-10-17 实机："怪物好像不显示中立"）。
+ *
+ * 🔴 为什么必须单独一档：`HOSTILE_RE` 里有 `enderman` 和 `piglin`，可这两只**默认是中立的**
+ *    （末影人不看眼睛不打人；猪灵穿着金装不打人）。原来只有"敌对 / 其它"两档，于是
+ *    末影人被当成敌对 ⇒ 不带名字的 `mc_act{attack}` 会**主动去揍一只本不会打我、而且能瞬移、
+ *    血 40** 的怪；反过来狼/蜜蜂/铁傀儡被归进 `other` ⇒ 打它们时既不算"被围"也不报警。
+ *
+ * 名单口径（vanilla 1.21）：末影人、猪灵、僵尸猪灵、狼、蜜蜂、北极熊、熊猫、铁傀儡、
+ * 羊驼 / 行商羊驼、山羊、海豚、雪傀儡。**猪灵蛮兵 / 僵尸猪灵以外的下界猪类仍是敌对**，
+ * 所以 `ALWAYS_HOSTILE_RE` 先判一次（`piglin` 是 `piglin_brute` 的子串，顺序反了就把蛮兵当中立）。
+ */
+export const NEUTRAL_RE = /enderman|piglin|zombified_piglin|wolf|bee|polar_bear|panda|iron_golem|llama|goat|dolphin|snow_golem/i
+/** 名字里带中立词、但其实**永远敌对**的那几个（必须排在 `NEUTRAL_RE` 之前判） */
+export const ALWAYS_HOSTILE_RE = /piglin_brute|zoglin|hoglin/i
+
+/**
+ * 一只实体到底是什么立场 —— `'hostile' | 'neutral' | 'passive' | 'player'`。
+ *
+ * 这是**唯一**的判定处（`world-scan` 的分组、`attack` 的选目标、`danger` 的警报都调它）。
+ * 以前每个调用方自己写 `HOSTILE_RE.test(nm) || e.kind === 'Hostile mobs'`，
+ * 于是"中立"这个概念在四个地方各丢一次。
+ *
+ * @param {string} nm 实体名字（`entityNameOf()` 的结果）
+ * @param {string} [kind] minecraft-data 的 `e.kind`（`'Hostile mobs'` 之类）
+ */
+export function hostilityOf (nm, kind) {
+  const n = String(nm ?? '')
+  if (ALWAYS_HOSTILE_RE.test(n)) return 'hostile'
+  if (NEUTRAL_RE.test(n)) return 'neutral'
+  if (HOSTILE_RE.test(n) || kind === 'Hostile mobs') return 'hostile'
+  return 'passive'
+}
+
+/**
  * 掉落物 / 投掷物 —— 也算实体，也能"攻击"，但**不该抢走打怪/打猎的机会**。
  * 2026-10-08 实机：不带 `who` 的 `mc_act{attack}` 会先打到脚边的 `item`（自己刚挖掉的方块），
  * AI 自己都发现了（"it attacked an item entity. Not useful."）。
