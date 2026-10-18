@@ -29,7 +29,6 @@ import { createRequire } from 'node:module'
 import { resolve, sep, join, isAbsolute, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
-import { scheduleShutdown, cancelShutdown, shutdownStatus } from './src/pc-power.mjs'
 import { defineTool, toolDefKind } from './src/tool-def.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
@@ -3607,7 +3606,7 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register(asTool({
     name: 'mc_kit_memory',
     description: '长期记忆（跨会话、重启后还在），放在 `.dsh-mc-agent/` 里，按服务器建子文件夹（`_global/` 放通用的）。\n'
-      + '**索引由你自己维护**：`README.md`（每轮把内容 + 自动目录树注入上下文；改了记忆顺手更新）。\n'
+      + '**索引由你自己维护**：`README.md`（插件每轮把它的内容 + 自动目录树注入上下文，忘了更新也不失真，但改了记忆就顺手更新它）。\n'
       + 'action：\n'
       + '· index（默认）看总览：有哪些文件夹/文件、各多少条、README 现状\n'
       + '· kinds   四类记忆的说明 + 各类各有几个文件\n'
@@ -5215,30 +5214,6 @@ export function apply(ctx, rawConfig) {
   }, 'dsh-mc-agent: mc-mode policy')
 
   /* ── 管理工具：只有**非 MC 模式**会话能用（MC 模式看不见 + 调了被 guard 拒）── */
-  /* ── 本机电源：给"把电脑关了"一件明确、能撤销的动作（2026-10-18 用户要求）──
-   * 只在 Windows 本机执行、只走系统自带的 shutdown 命令；触发交给 Windows 自己的定时器
-   * （宿主进程退出也照样关）。见 src/pc-power.mjs。 */
-  ctx.tools.register(asTool({
-    name: 'mc_pc',
-    description: '【本机】定时关这台 Windows 电脑（用户明确要求才用）。'
-      + 'action：schedule（afterSec / at "HH:MM"，≥60 秒）/ cancel / status。'
-      + '系统定时器，宿主退出照样关；反悔 cancel。',
-    parameters: {
-      action: { type: 'string', description: 'schedule / cancel / status（默认）' },
-      afterSec: { type: 'number', description: '多少秒后关（≥60）' },
-      at: { type: 'string', description: '几点关（"HH:MM"）' },
-      label: { type: 'string', description: '备注（为什么关）' },
-    },
-    output: text(),
-    async execute (args) {
-      const action = String(args.action ?? 'status').toLowerCase()
-      if (action === 'schedule') return await scheduleShutdown(args)
-      if (action === 'cancel') return await cancelShutdown()
-      if (action === 'status') return shutdownStatus()
-      throw new Error(`未知 action："${action}"（可用 schedule/cancel/status）`)
-    },
-  }))
-
 
   ctx.tools.register(asTool({
     name: 'mc_admin_config',
