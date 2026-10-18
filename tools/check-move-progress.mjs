@@ -450,10 +450,12 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
     '🔴 walkPathfinder 把采样器的 promise 和 goto 一起竞速')
   ok(!/await raceAbort\(withTimeout\(work, budget, '寻路'\), self\.abortSignal, '寻路'\)/.test(src),
     '🔴 不再是"一次 goto 到底"的老写法')
-  ok(/for \(let attempt = 0; ; attempt\+\+\)/.test(src), '有重试循环')
+  ok(/let attempt = 0\s*\n\s*for \(;;\)/.test(src), '有重试循环（attempt 手动推进：挖台阶补救不算一级脱困）')
   ok(/const step = escapeStepOf\(attempt - 1\)/.test(src), '每轮按阶梯取脱困动作')
   ok(/err\.mcStuck = true[\s\S]{0,120}?err\.mcExhausted = true/.test(src), '阶梯用完抛的是带 mcStuck 的错误')
-  ok(/if \(e\?\.mcStuck\) continue/.test(src), '采样器判卡 ⇒ 进下一轮脱困')
+  ok(/if \(e\?\.mcStuck\)[\s\S]{0,1400}?attempt\+\+[\s\S]{0,200}?continue/.test(src), '采样器判卡 ⇒ 补救没戏就进下一轮脱困')
+  ok(/await carveStepAhead\(b, target\)/.test(src) && /carveTries < MOVE_CARVE_TRIES/.test(src),
+    '🔴 阶梯之前先试"挖开挡路的台阶"（贴着目标时，2026-10-18）')
   ok(/const exhausted = Boolean\(e\?\.mcStuck\)/.test(src), 'catch 里认出 mcStuck')
   ok(/: exhausted \? 'unreachable'/.test(src), '🔴 reason 里有 unreachable 这一档')
   ok(/const moveInfo = \(opts = \{\}\) => \(\{/.test(src), 'moveInfo 是个多字段的汇总（地形 + 脱困 + 路径失效）')
@@ -513,13 +515,13 @@ section('⑨ noTower（逃跑时关掉"原地垫高"）')
   const ctx = { ...mkCtx(self, clock), movements: () => mv }
   await walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, ctx)
   clock.stopPump()
-  ok(!Object.hasOwn(mv, 'allow1by1towers'), '不传 noTower ⇒ 不碰这个开关（赶路时照旧吃 vendor 默认）')
+  ok(mv.allow1by1towers === false, '🔴 不传 noTower ⇒ **默认也不垫柱**（2026-10-18：实机"拿圆石垫脚乱搭"）', String(mv.allow1by1towers))
 }
 {
   const src = read('../src/movement.mjs')
   ok(/if \(noTower\) mv\.allow1by1towers = false/.test(src), '🔴 关的是 allow1by1towers 这一个开关')
   ok(!/mv\.scafoldingBlocks = \[\]/.test(src), '🔴 绝不清空 scafoldingBlocks（那会把 1×1 柱子的 move 一起剪掉，掉坑里出不来）')
-  ok(/noTower = false \} = \{\}, ctx = \{\}\)/.test(src), 'walkTo 也接 noTower（上层能一路传到 walkPathfinder）')
+  ok(/noTower = true \} = \{\}, ctx = \{\}\)/.test(src), 'walkTo 也接 noTower，且**默认 true**（不垫柱 —— 2026-10-18 实机：垫柱放错就摔死）')
   /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高"）：战斗层**不再自己撤退**，
    *    所以"撤退要关掉垫脚"这条已经没有对象了 —— 反过来要守住"不许再出现撤退执行"。 */
   const atk = read('../src/attack.mjs')
@@ -595,6 +597,107 @@ function realCtx (self) {
     '每个出口都带 fellInfo（arrived / preempted / 站错层 / 没路 / 时间到 / 异常）')
   ok(/const fellNote = \(p\) => \{/.test(src), 'hint 用同一份措辞（掉多少格 + 别反复爬）')
   ok(/d >= 3 \? Number\(d\.toFixed\(1\)\) : null/.test(src), '阈值 3 格：下台阶不算掉下去')
+}
+
+/* ═══════════════ ⑧ 窄隧道/台阶的手工补救（carveStepAhead）═══════════════ */
+section('⑧ 贴着目标却卡住 ⇒ 挖开挡在脚上/头顶的那一格（2026-10-18 实机）')
+
+function mkCarveBot (cells = {}, at = [0, 64, 0]) {
+  const map = new Map(Object.entries(cells))
+  const b = {
+    entity: { position: new Vec3(...at) },
+    dug: [], equipped: [],
+    blockAt (v) {
+      const n = map.get(`${v.x},${v.y},${v.z}`)
+      return n ? { name: n, position: v } : { name: 'air', position: v }
+    },
+    async equip (item, dest) { b.equipped.push([item?.name ?? item, dest]) },
+    async dig (blk) { b.dug.push(`${blk.position.x},${blk.position.y},${blk.position.z}`) },
+    pathfinder: { bestHarvestTool: () => ({ name: 'iron_pickaxe' }) },
+  }
+  return b
+}
+const carve = mod.carveStepAhead
+
+{
+  /* 1×2 窄道 + 1 格台阶：脚那格是石头、头顶空，底下有支撑 ⇒ 挖脚那格 */
+  const b = mkCarveBot({ '1,64,0': 'stone', '1,63,0': 'stone' })
+  const n = await carve(b, { x: 1, y: 64, z: 0 })
+  ok(n === 1 && b.dug.includes('1,64,0'), '台阶挡在脚上 ⇒ 挖掉脚那格', JSON.stringify({ n, dug: b.dug }))
+  ok(b.equipped.length >= 1, '动手前先换合适的工具（bestHarvestTool）', JSON.stringify(b.equipped))
+  ok(!b.dug.some((k) => k === '0,64,0'), '🔴 永不挖自己站的那一格', JSON.stringify(b.dug))
+}
+{
+  /* 天花板低：脚那格空、头顶那格石头 ⇒ 挖头那格（"挖脚+挖头"里的第二下） */
+  const b = mkCarveBot({ '1,65,0': 'stone', '1,63,0': 'stone' })
+  const n = await carve(b, { x: 1, y: 64, z: 0 })
+  ok(n === 1 && b.dug.includes('1,65,0'), '天花板挡着头 ⇒ 挖头那格', JSON.stringify(b.dug))
+}
+{
+  /* 底下是空的 ⇒ 那不是台阶是坑：不许挖（挖开就是往坑里走） */
+  const b = mkCarveBot({ '1,64,0': 'stone' })
+  const n = await carve(b, { x: 1, y: 64, z: 0 })
+  ok(n === 0 && b.dug.length === 0, '前面是坑（底下没支撑）⇒ 不挖', JSON.stringify({ n, dug: b.dug }))
+}
+{
+  /* 底下是岩浆 ⇒ 更不许挖 */
+  const b = mkCarveBot({ '1,64,0': 'stone', '1,63,0': 'lava' })
+  const n = await carve(b, { x: 1, y: 64, z: 0 })
+  ok(n === 0 && b.dug.length === 0, '底下是岩浆 ⇒ 不挖', JSON.stringify({ n, dug: b.dug }))
+}
+{
+  /* 挡路的本身就是岩浆/基岩 ⇒ 不碰 */
+  const lava = mkCarveBot({ '1,64,0': 'lava', '1,63,0': 'stone' })
+  ok(await carve(lava, { x: 1, y: 64, z: 0 }) === 0 && lava.dug.length === 0, '挡路的是岩浆 ⇒ 不挖')
+  const bed = mkCarveBot({ '1,64,0': 'bedrock', '1,63,0': 'stone' })
+  ok(await carve(bed, { x: 1, y: 64, z: 0 }) === 0 && bed.dug.length === 0, '挡路的是基岩 ⇒ 不挖（白费时间）')
+}
+{
+  /* 离得远 ⇒ 不挖（远处卡住多半是别的原因，乱挖会把路改坏） */
+  const b = mkCarveBot({ '1,64,0': 'stone', '1,63,0': 'stone' })
+  const n = await carve(b, { x: 20, y: 64, z: 0 })
+  ok(n === 0 && b.dug.length === 0, '离目标太远（> 4.5 格）⇒ 不挖', String(n))
+}
+{
+  /* 台阶在第二格（第一格是通的）—— cells=2 要能看到它 */
+  const b = mkCarveBot({ '1,63,0': 'stone', '2,64,0': 'stone', '2,63,0': 'stone' })
+  const n = await carve(b, { x: 2, y: 64, z: 0 })
+  ok(n === 1 && b.dug.includes('2,64,0'), '台阶在第二格也能看到（cells=2）', JSON.stringify(b.dug))
+}
+{
+  /* 整条链路：贴着目标还 mcStuck ⇒ 先挖开，再重跑同一个 goto（**不**白吃一级脱困） */
+  const b = mkCarveBot({ '1,64,0': 'stone', '1,63,0': 'stone' })
+  b.on = () => {}
+  b.removeListener = () => {}
+  b.setControlState = () => {}
+  Object.assign(b, {
+    controls: [],
+    calls: { goto: 0, setGoal: [] },
+    pathfinder: {
+      isMining: () => false,
+      isBuilding: () => false,
+      setMovements: () => {},
+      bestHarvestTool: () => ({ name: 'iron_pickaxe' }),
+      setGoal (g) { b.calls.setGoal.push(g) },
+      goto () {
+        b.calls.goto++
+        if (b.calls.goto === 1) {
+          return new Promise((resolve, reject) => {
+            setTimeout(() => { const e = new Error('stuck'); e.mcStuck = true; reject(e) }, 10)
+          })
+        }
+        b.entity.position = new Vec3(1, 64, 0)      // 挖开之后走到了
+        return Promise.resolve()
+      },
+    },
+  })
+  const self = mkSelf(b)
+  const r = await walkPathfinder(self, { x: 1, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, mkCtx(self, autoClock()))
+  ok(r.arrived === true, '挖开台阶后再试一次就到位了', JSON.stringify({ arrived: r.arrived, reason: r.reason }))
+  ok(r.carved >= 1, '结果里报 carved（挖开了几格）', String(r.carved))
+  ok(b.calls.goto === 2 && r.repathCount === undefined, '🔴 补救只重跑同一个 goto，**不**算一级脱困（repathCount 不出现）',
+    JSON.stringify({ goto: b.calls.goto, repathCount: r.repathCount }))
+  ok(self.logs.some((m) => /挖开了.*格挡路的方块/.test(m)), '日志写清"挖开了几格"', JSON.stringify(self.logs.slice(0, 2)))
 }
 
 console.log(`\n${'─'.repeat(50)}`)

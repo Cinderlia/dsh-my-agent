@@ -20,7 +20,8 @@ const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 import { callBudget, callSecText, budgetSecText, CALL_BUDGET_MS } from './budget.mjs'
 import { inWaterNow } from './world-observer.mjs'
 import { heldText, invSnap, invUsed } from './inventory.mjs'
-import { isAir, isLiquid, isPassable } from './block-names.mjs'
+import { isAir, isLiquid, isPassable, isSolidBlock } from './block-names.mjs'
+import { BRIDGE_FATAL } from './bridge.mjs'
 import { classifyTerrainCached } from './terrain.mjs'
 import { recoverFromWater } from './water-recovery.mjs'
 /* 🔴 2026-10-16 审计（P1，四类耗时）：`goto` 这一段的墙钟**几乎全是"等寻路"** ——
@@ -392,7 +393,7 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
  * 这是唯一的移动实现：不再保留手写的按键、盲跳、挖方块或垫脚兜底。
  * ⚠️ 唯一的例外：**在水里**先交给 `#walkSwim`（A* 不把水当节点，见它的注释）。
  */
-export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = false } = {}, ctx = {}) {
+export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true } = {}, ctx = {}) {
   const b = self.requireBot()
   // 🔴 在水里：A* 不把水当节点（见 #walkSwim 的注释），实机表现是"4 秒挪 1 格"。
   //    先直接游；上了岸、还有时间，再把剩下的路交给 pathfinder 走完。
@@ -580,6 +581,17 @@ export const MOVE_BACK_MS = 420         // 后退脱困按住 back 多久
 export const MOVE_RESET_LIMIT = 4
 /** 脱困阶梯（第 1 级 = `MOVE_ESCAPES[0]`）。走完还没进展 ⇒ 报 `unreachable`。 */
 export const MOVE_ESCAPES = ['repath', 'jump', 'backoff']
+/* 🔴 2026-10-18（实机，AI 原话：「窄隧道和 1 格台阶上它基本走不动，10 秒原地蹭 0.8 格」）：
+ *    在 1×2 高的**窄隧道**里遇到 1 格台阶时，A* 上不去 —— 站上台阶要 3 格净高，而这里只有 2 格；
+ *    vendor 的 `JumpUp` 只查"头顶有没有空"，**不会计划去挖那个天花板**。于是 `goto` 找不出路：
+ *    表现就是 `stuck` + `moved:0` + `remaining:0.8`（人就在目标旁边，却一步不动），
+ *    模型只能手工 `break 脚 + break 头 + move` 一段段爬（实机 15:09–15:12 就是这么干的）。
+ *    这里把那套手工动作**收进走路层**：卡住且离目标 ≤ `MOVE_CARVE_RADIUS` 时，朝目标方向
+ *    挖开"挡在脚上/头顶"的那一格（只挖实心、非危险、底下有支撑的），然后重试同一个 `goto`。
+ *    不改脱困阶梯的顺序（那是用户 2026-10-15 定的），只在阶梯**之前**补这一次。 */
+export const MOVE_CARVE_RADIUS = 4.5    // 离目标这么近还卡住，才值得动镐子
+export const MOVE_CARVE_CELLS = 2       // 一次最多往前看几格
+export const MOVE_CARVE_TRIES = 2       // 一次 walkPathfinder 里最多补挖几次
 
 /** 第 `n` 级脱困动作（0 起）；超出阶梯返回 `null`（= 该认输了）。 */
 export function escapeStepOf (n) { return MOVE_ESCAPES[n] ?? null }
@@ -590,6 +602,72 @@ export function escapeTextOf (step) {
     : step === 'jump' ? '跳跃脱困'
       : step === 'backoff' ? '后退再寻路'
         : '放弃'
+}
+
+/**
+ * 窄隧道/台阶的"手工补救"：朝目标方向挖掉挡在**脚上**或**头顶**的那一格实心方块。
+ *
+ * 背景见 `MOVE_CARVE_RADIUS` 的注释（实机：1×2 窄道里的 1 格台阶，A* 上不去）。
+ * 只做**最保守**的那一件：
+ *   - 只朝目标方向（主轴优先，再看另一条轴）看 `MOVE_CARVE_CELLS` 格；
+ *   - 只挖"脚下这一层或头顶那一层"的实心块，且要求**底下（y-1）有支撑**（不然挖完是往坑里走）；
+ *   - 岩浆/火/水/细雪/仙人掌/黑曜石/基岩/命令方块**一概不碰**；
+ *   - 永不挖自己站的那一格。
+ *
+ * 返回挖了几格（0 = 没得挖 / 不该挖）。**只挖不改走路** —— 挖完由调用方重跑同一个 `goto`。
+ */
+export async function carveStepAhead (b, target, { cells = MOVE_CARVE_CELLS, radius = MOVE_CARVE_RADIUS } = {}) {
+  const me = b?.entity?.position
+  if (!me || !target) return 0
+  const fx = Math.floor(me.x), fy = Math.floor(me.y), fz = Math.floor(me.z)
+  const dx = Number(target.x) - me.x, dz = Number(target.z) - me.z
+  if (!Number.isFinite(dx) || !Number.isFinite(dz)) return 0
+  if (Math.hypot(dx, dz) > radius) return 0
+  const at = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z)) } catch { return null } }
+  const nameOf = (blk) => { try { return blk?.name ?? null } catch { return null } }
+  const solid = (blk) => { const n = nameOf(blk); return Boolean(n) && isSolidBlock(n) }
+  /* 能挖：实心 + 不是危险方块 + 不是"挖了会出事/挖不动"的那些。名单和搭路共用 BRIDGE_FATAL。 */
+  const diggable = (blk) => {
+    const n = nameOf(blk)
+    if (!n || !isSolidBlock(n)) return false
+    if (BRIDGE_FATAL.test(n) || isLiquid(n)) return false
+    return !/^(bedrock|barrier|command_block|chain_command_block|repeating_command_block|obsidian|end_portal_frame)$/.test(n)
+  }
+  /* 方向：先主轴（离得远的那个轴），再另一条轴 —— 斜着走楼梯时两条都要看。 */
+  const sx = Math.sign(dx), sz = Math.sign(dz)
+  const dirs = []
+  if (Math.abs(dx) >= Math.abs(dz)) { if (sx) dirs.push([sx, 0]); if (sz) dirs.push([0, sz]) }
+  else { if (sz) dirs.push([0, sz]); if (sx) dirs.push([sx, 0]) }
+  const digOne = async (blk) => {
+    try {
+      const tool = typeof b.pathfinder?.bestHarvestTool === 'function' ? b.pathfinder.bestHarvestTool(blk) : null
+      if (tool && typeof b.equip === 'function') await b.equip(tool, 'hand')
+      await b.dig(blk, true)
+      return true
+    } catch { return false }
+  }
+  let dug = 0
+  for (const [ddx, ddz] of dirs) {
+    for (let d = 1; d <= cells; d++) {
+      const x = fx + ddx * d, z = fz + ddz * d
+      if (x === fx && z === fz) continue
+      const feet = at(x, fy, z)
+      const head = at(x, fy + 1, z)
+      const floor = at(x, fy - 1, z)
+      const feetHard = solid(feet), headHard = solid(head)
+      if (!feetHard && !headHard) continue            // 这一格本来就过得去
+      /* 🔴 底下没有支撑就别挖：那说明前面是坑/悬空，挖开只会多一个掉下去的口子。 */
+      const floorName = nameOf(floor)
+      if (!floorName || !isSolidBlock(floorName) || BRIDGE_FATAL.test(floorName) || isLiquid(floorName)) continue
+      const picks = []
+      if (feetHard && diggable(feet)) picks.push(feet)
+      if (headHard && diggable(head)) picks.push(head)
+      if (!picks.length) continue
+      for (const blk of picks) { if (await digOne(blk)) dug++ }
+      if (dug > 0) return dug       // 先挖第一处，挖完让 goto 重算（别一口气把路改了）
+    }
+  }
+  return dug
 }
 
 /**
@@ -717,7 +795,7 @@ export async function escapeMove (b, goal, step, ctx = {}) {
  * 返回值保持 `arrived / moved / remaining / stuck / hint` 结构；
  * 上层 `mc_move` 和自主层直接使用；额外带 `via:"pathfinder"` 便于排查。
  */
-export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null, noTower = false } = {}, ctx = {}) {
+export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null, noTower = true } = {}, ctx = {}) {
   const b = self.bot
   const { goals, Movements } = self._pf
   const t0 = Date.now()
@@ -826,6 +904,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   /* P1：其中有多少次是**因为路径被反复失效**而进阶梯的（不是"没进展"）—— 分开报，
    * 因为给模型的下一步不同：一个该换目标点，一个该先看看世界在变什么。 */
   let pathThrash = 0
+  /* 2026-10-18：窄隧道/台阶的"手工补救"（见 `carveStepAhead` 注释）。 */
+  let carveTries = 0
+  let carved = 0
   let watch = null
   /** 脱困次数（P0-1）与路径失效次数（P1）：>0 才报 —— 模型据此知道"这次走得磕磕绊绊"。
    *  外加地形分类（P2）：只有不是平地时才报（平地是默认，报了纯占地方）。
@@ -835,6 +916,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     ...(terrain.kind === 'flat' || terrain.kind === 'unknown' ? {}
       : { [opts.arrived ? 'terrainAtStart' : 'terrain']: terrain.kind }),
     ...(repathCount ? { repathCount } : {}),
+    ...(carved ? { carved } : {}),
     ...(pathThrash ? { pathThrash } : {}),
     ...(pathResetsTotal >= 2 ? { pathResets: pathResetsTotal, pathResetReasons: { ...resetReasons } } : {}),
   })
@@ -846,7 +928,10 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     return { arrivedTerrain: now.kind, ...(now.note ? { arrivedNote: now.note } : {}) }
   }
   try {
-    for (let attempt = 0; ; attempt++) {
+    /* `attempt` 手动推进（不在 for 头里自增）："挖开挡路的台阶"是**同一次尝试内的重试**，
+     * 不该白吃一级脱困阶梯 —— 2026-10-18 实机加的，见 `carveStepAhead`。 */
+    let attempt = 0
+    for (;;) {
       if (attempt > 0) {
         const step = escapeStepOf(attempt - 1)
         if (!step) {
@@ -880,7 +965,28 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       } catch (e) {
         watch.stop(); watch = null
         if (e?.mcPathThrash) pathThrash++          // P1：这次是被"路径反复失效"逼进阶梯的
-        if (e?.mcStuck) continue                   // 卡住 ⇒ 下一轮走脱困阶梯
+        if (e?.mcStuck) {
+          /* 2026-10-18：**阶梯之前**先试一次"挖开挡路的台阶/天花板"（见 `carveStepAhead`）。
+           * 只在人已经贴着目标（≤ MOVE_CARVE_RADIUS）时做 —— 远处卡住多半是别的原因，
+           * 乱挖会白吃时间、还可能把路挖坏。挖到了就重跑同一个 `goto`（不算一级脱困）。 */
+          if (carveTries < MOVE_CARVE_TRIES) {
+            const end = b.entity.position
+            const dNow = Math.hypot(end.x - target.x, end.z - target.z)
+            if (dNow <= MOVE_CARVE_RADIUS) {
+              carveTries++
+              try { ctx.stopPathing?.(b) } catch {}
+              await sleep(60)
+              const n = await carveStepAhead(b, target)
+              if (n > 0) {
+                carved += n
+                self.log(`⛏ 离目标 ${dNow.toFixed(1)} 格走不动 —— 挖开了 ${n} 格挡路的方块，再试一次`)
+                continue
+              }
+            }
+          }
+          attempt++                                // 卡住 ⇒ 下一轮走脱困阶梯
+          continue
+        }
         throw e
       } finally {
         /* 这一轮 `goto` 的墙钟（含脱困动作之前的等待）—— 见文件头 import 处的说明。
@@ -1066,7 +1172,14 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
                  + `（${Object.entries(resetReasons).map(([k, v]) => `${REASON_TEXT[k] ?? k}×${v}`).join('、')}）：`
                  + '说明**路一直在被世界变化打断**（别人放的方块 / 走过来的实体 / 岩浆流 / 方块更新），'
                  + '不是"找不到路"——光重算没用，所以停了。**换个走法**：'
-               : '') + `—— **别原地重试了**（已经替你换过 ${repathCount} 次策略都没用）：把长路**拆成几段**，`
+               : '')
+               /* 2026-10-18 实机：1×2 窄道里的 1 格台阶，人贴在目标 0.8 格处一步不动。
+                * 自动补救（carveStepAhead）已经试过两次；还不行就把"手工挖台阶"的办法交给模型。 */
+               + (!preempted && remaining <= 2.5 && (carved || carveTries)
+                 ? `—— 你离目标只剩 ${remaining.toFixed(1)} 格，多半是**窄道/台阶**：脚下或头顶有一格挡着。`
+                   + '照实机的办法来：先 `mc_act {mode:"break",x:…,y:…,z:…}` 挖掉**脚前那一格**，再用同样方式挖掉它**头顶那一格**，然后叫 `mc_move` 走一步。'
+                 : '')
+               + `—— **别原地重试了**（已经替你换过 ${repathCount} 次策略都没用）：把长路**拆成几段**，`
                + '先走到中间一个能站住的点、再走下一段；或者用 `mc_scan` 看挡在中间的是什么（墙 / 水 / 栅栏 / 半砖）。'
                + '　要是"脚下明明没东西却还是走不动"，可能是我这边的世界和服务端对不上（客户端预测的方块缓存）——'
                + '走远 32 格再回来让区块重发。'
