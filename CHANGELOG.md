@@ -11,6 +11,22 @@
 
 ## [未发布]
 
+### 💥 修复（第二次闪退：一次"没人接的寻路中止"就能把宿主带走，2026-10-18）
+
+实机现场：又弹「**应用无法启动或已意外停止**」，崩溃栈和上一版不是同一处：
+
+```
+dsh: fatal unhandled rejection: Error: PathStopped: Path was stopped before it could be completed!
+    at Bot.stop (…/mineflayer-pathfinder/index.js:130:24)
+    at Bot.setGoal → resetPath …
+```
+
+根因：`goto()` 返回的 promise 在"被后来的一次 `setGoal` 停下"时会 reject。它本来由 `walkPathfinder` 用 `await` 接着；但只要这一次**已经先超时返回 / 被上层撤掉**，就没有人再 `await` 它 —— 于是变成 `unhandledRejection`，宿主 fail-loud 直接把进程收掉。
+
+修法（`src/plugins.mjs` 的 `guardPathfinderRejections`）：给 `bot.pathfinder.goto` 包一层，对返回的 promise 挂一个**空 catch 当作"已处理"标记** —— 不改变返回值，调用方自己 `.catch` / `await` 照常收到 reject，只是"没人接"的那一种不会再炸宿主。
+
+回归：`check-move-progress` 232/0（新增：没人 catch 的 `PathStopped` 不再变成 unhandledRejection、重复包装不会套两层）；`check-all --fast` 42/42。
+
 ### 💥 修复（寻路插件的一拍错误会把整个 DSH 带崩，2026-10-18）
 
 实机现场：玩着玩着应用直接弹「**应用无法启动或已意外停止**」，不是掉线、不是工具报错，是整个宿主进程没了。崩溃栈：
@@ -45,12 +61,13 @@ dsh: fatal uncaught exception: TypeError: Cannot read properties of undefined (r
 - **已经开着的门会被再按一次**：vendor 的 `useOne` 是无条件 `activateBlock`。我们自己的定时器刚把门按开，它走到门口又按一下，等于**把门关回去** —— 现象就是"开了、但不走"。
 
 修法：
-1. 规划层给 `Movements` 打补丁（`patchDoorMoves`）：木门/栅栏门/活板门**不许进 `toBreak`**；门**已经开着**就删掉"再按一下"那一步。铁门按不开，不在这条规则里。
+1. 规划层给 `Movements` 打补丁（`patchDoorMoves`）：木门/栅栏门/活板门**不许进 `toBreak`**；门的 `useOne` **一律删掉**（不再把"开门"交给 vendor 那一步）。铁门按不开，不在这条规则里。
 2. 执行层给 `bot.activateBlock` 加守卫（`guardDoorActivate`）：12 秒内被我们按开过的门，vendor 的重复 `useOne` 直接忽略（只有确认门还开着才忽略；被谁关了照常按）。
-3. 门口那一格仍然由 `openNearbyDoor` 每 400ms 探一次、够得着就按开 —— 规划允许穿门、执行真的穿过去。
-4. **补上 vendor 漏收的门**（用户第三次反馈「它选了更便宜的墙」）：vendor 自己搭"能按开"的集合时只收名字带 `gate` 的方块，**木门根本不在里面** ⇒ 就算 `canOpenDoors` 开着，规划里门还是"实心、要挖"。现在把木门/木活板门也塞进这个集合；同时**把"挖门"的工钱从路径成本里退掉** —— 以前只删"要挖"不扣钱，A* 仍觉得挖门和走门一样贵，自然挑更短的墙。
+3. 门口那一格仍然由 `openNearbyDoor` 每 400ms 探一次、够得着就按开 —— 规划里"穿门"不额外花钱（挖门的工钱退掉）、执行时真的走过去。
+4. **把"挖门"的工钱从路径成本里退掉**（用户第三次反馈「它选了更便宜的墙」）：以前只删"要挖"不扣钱，A* 仍觉得挖门和走门一样贵，自然挑更短的墙。
+5. **（用户第四次反馈「卡在门口，寻路不认开着的门，三次原地不动」）别把门塞进 vendor 的"能按开"集合**：那条规划会给门安排一步 `useOne`，而 vendor 的状态机在"这一步就是最后一步"时会 `shift()` 出 `undefined`、`placing` 标志不复位 —— 下一拍读 `placingBlock.y` 直接 `TypeError`；被拦住后它停住寻路，表现就是站在门口原地打转。现在门不进那个集合，开门**只**由 `openNearbyDoor` 负责。
 
-回归：`check-move-progress` 203/0 → **221/0**（新增 18 条：门不进 `toBreak`、石头照挖、关着保留"按开"、开着删掉重按、铁门不管、重复按被忽略、别人关了照按、12 秒后不再拦、挖门成本退回、门的 id 收齐/铁门不收）；`check-all --fast` 42/42。
+回归：`check-move-progress` 203/0 → **232/0**（门：不进 `toBreak`、`useOne` 一律删、铁门不管、挖门成本退回、重复按被忽略、别人关了照按、12 秒后不再拦；`guardPathfinderRejections`：没人 catch 的 `PathStopped` 不再变成 unhandledRejection）；`check-all --fast` 42/42。
 
 ### 🧭 变更（走路开始"带意图"、耗时分开报、走不到先给竖井事实；门不再挖墙，2026-10-18）
 

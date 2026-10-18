@@ -970,15 +970,15 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
     const m = out[0]
     ok(m.toBreak.length === 1 && m.toBreak[0].x === 2, '🔴 门不进"要挖的方块"（stone 照旧可挖）', JSON.stringify(m.toBreak))
-    ok(m.toPlace.some((p) => p.useOne && p.x === 1), '门关着 ⇒ 保留"按开"那一步', JSON.stringify(m.toPlace))
+    ok(!m.toPlace.some((p) => p.useOne), '🔴 门的 useOne 一律删掉（vendor 在"只有 useOne"时会 crash：placingBlock 变 undefined）', JSON.stringify(m.toPlace))
   }
   {
-    // 门已经开着：不该再 activateBlock（那等于把它关回去）
+    // 门已经开着：同样不该再 activateBlock（那等于把它关回去）
     const mv = mkMv({ '1,64,0': blk('oak_door', true), '2,64,0': blk('stone', false) })
     patchDoorMoves(mv)
     const out = []
     mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
-    ok(out[0].toPlace.length === 0, '🔴 门已经开着 ⇒ 删掉"再按一下"那步', JSON.stringify(out[0].toPlace))
+    ok(out[0].toPlace.length === 0, '🔴 门已经开着 ⇒ 没有"再按一下"那步', JSON.stringify(out[0].toPlace))
   }
   {
     // 铁门按不开：保留原行为（别把唯一的路堵死）
@@ -986,7 +986,7 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     patchDoorMoves(mv)
     const out = []
     mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
-    ok(out[0].toBreak.length === 2 && out[0].toPlace.length === 1, '铁门不在这条规则里（按不开，仍允许挖）', JSON.stringify(out[0].toBreak))
+    ok(out[0].toBreak.length === 2, '铁门不在这条规则里（按不开，仍允许挖）', JSON.stringify(out[0].toBreak))
   }
   {
     // guardDoorActivate：我们按开的门，vendor 的 useOne 再按时直接忽略
@@ -1021,22 +1021,30 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     ok(m.toBreak.length === 1 && m.toBreak[0].x === 2, '…石头照旧可挖', JSON.stringify(m.toBreak))
   }
   {
-    // vendor 的 openable 集合里没有门 ⇒ 自己补；铁门不补
-    const { doorBlockIds } = await import(new URL('../src/plugins.mjs', import.meta.url))
-    const fake = { registry: { blocksArray: [
-      { name: 'oak_door', id: 190 }, { name: 'oak_fence_gate', id: 191 },
-      { name: 'iron_door', id: 192 }, { name: 'spruce_trapdoor', id: 193 }, { name: 'stone', id: 1 },
-    ] } }
-    const ids = doorBlockIds(fake)
-    ok(ids.length === 3 && ids.includes(190) && ids.includes(191) && ids.includes(193), '门 id 收齐（木门/栅栏门/活板门）', JSON.stringify(ids))
-    ok(!ids.includes(192), '铁门不收（按不开）', JSON.stringify(ids))
-    ok(doorBlockIds({}).length === 0, '没有 registry 时安全返回空')
+    // 🔴 goto 的拒绝必须有人接：PathStopped 是 unhandledRejection ⇒ 宿主 fail-loud 直接 exit(1)
+    const { guardPathfinderRejections } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    const unhandled = []
+    const onUnhandled = (e) => unhandled.push(e)
+    process.on('unhandledRejection', onUnhandled)
+    const fake = { pathfinder: { goto: () => Promise.reject(new Error('PathStopped: Path was stopped')) } }
+    ok(guardPathfinderRejections(fake) === true, '给 goto 挂上了"拒绝必有人接"')
+    ok(guardPathfinderRejections(fake) === false, '重复调用不会套两层')
+    fake.pathfinder.goto()   // 故意不 catch —— 模拟"超时先返回，goto 后 reject"
+    await new Promise((r) => setTimeout(r, 30))
+    process.removeListener('unhandledRejection', onUnhandled)
+    ok(unhandled.length === 0, '🔴 没人 catch 的 PathStopped 也不会变成 unhandledRejection（以前这一下 = 应用闪退）', String(unhandled.length))
+  }
+  {
+    // 🔴 反向验证：这版**故意不进 openable** —— 进去就会生成 useOne-only 的 move，
+    // vendor 的 monitorMovement 在那一刻会 shift() 出 undefined 并崩（踩坑 #172）。
+    const plug2 = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
+    ok(!/mv\.openable\.add/.test(plug2), '🔴 门不再进 openable（否则又会出现 useOne-only 的 move）')
+    ok(/openNearbyDoor/.test(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')), '开门改由 openNearbyDoor 定时器负责')
   }
   const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
   ok(/export function patchDoorMoves/.test(plug) && /patchDoorMoves\(mv\)/.test(plug), 'movements() 里真的挂了这个补丁')
-  ok(/for \(const id of doorBlockIds\(b\)\) mv\.openable\.add\(id\)/.test(plug), '🔴 门真的进了 openable（否则门在 A* 眼里还是实心）')
-  ok(/export function doorBlockIds/.test(plug), 'doorBlockIds 是导出的（可测）')
   ok(/guardDoorActivate\(b\)/.test(plug), 'setupPlugins 里装了"我们按开的门别被再按"')
+  ok(/guardPathfinderRejections\(b/.test(plug), '🔴 setupPathfinder 里给 goto 的拒绝挂了 catch（否则 PathStopped 会炸宿主）')
   ok(/__autoOpenedDoors instanceof Map/.test(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')),
     '定时器按开门时记账（供上面的守卫用）')
 }

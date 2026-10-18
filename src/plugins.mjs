@@ -211,6 +211,34 @@ export function guardPathfinderTicks (b, { log = null } = {}) {
   return fns.length
 }
 
+/**
+ * 给 `bot.pathfinder.goto` 加一层"拒绝一定有人接"的保险（2026-10-18 第二次闪退）。
+ *
+ * 崩溃现场：`goto` → `setGoal(null)` → `resetPath` → `stop()` → 发 `path_stop` →
+ * **上一次还没走完的 goto** 被 reject 成 `PathStopped`，而它已经没人 await 了
+ * （超时先返回、或 collectBlock/pvp 内部先撤）⇒ `unhandledRejection` ⇒
+ * 宿主 fail-loud 直接 `exit(1)`（应用闪退）。
+ *
+ * 做法：包一层 `goto`，对返回的 promise **挂一个空 catch**（只是标记"已处理"，
+ * 不改变返回值 —— 调用方自己 `.catch` / `await` 仍然照常收到 reject）。
+ */
+export function guardPathfinderRejections (b, { log = null } = {}) {
+  const pf = b?.pathfinder
+  if (!pf || typeof pf.goto !== 'function' || pf.__dshGuardedGoto) return false
+  const orig = pf.goto.bind(pf)
+  pf.goto = function (...args) {
+    const p = orig(...args)
+    try {
+      p?.catch?.(() => {})
+    } catch (e) {
+      try { log?.(`给 goto 的拒绝挂 catch 失败：${e?.message ?? e}`) } catch {}
+    }
+    return p
+  }
+  pf.__dshGuardedGoto = true
+  return true
+}
+
 export async function setupPathfinder (self, { spec = null } = {}) {
   const b = self.bot
   if (!b) return false
@@ -231,6 +259,7 @@ export async function setupPathfinder (self, { spec = null } = {}) {
      * ③ 抛错时只记日志并停住寻路，绝不让它冒到进程级。 */
     const guarded = guardPathfinderTicks(b, { log: (m) => self.log(m) })
     if (guarded) self.logDebug(`pathfinder tick 已接管（${guarded} 个监听）`)
+    guardPathfinderRejections(b, { log: (m) => self.log(m) })
     // 想路线的预算：服务器卡顿时别想太久；搜索半径别放到无限。
     // 🔴 4000 太短了 —— 2026-10-06 实机挖树时频繁 "Took to long to decide path to goal!"，
     //    collectBlock 因此整批失败（改成逐个喂之后至少不会再一坏全坏）。8000 让"目标在高处、
@@ -262,24 +291,6 @@ export const DOOR_BLOCK_RE = /_(door|trapdoor|fence_gate)$/
 const IRON_DOOR_RE = /^iron_(door|trapdoor)$/
 
 /**
- * 能"按开"的门的方块 id（木门 / 木栅栏门 / 木活板门；铁的不算）。
- *
- * 为什么自己算：vendor 只把名字里带 `gate` 的塞进 `mv.openable`
- * （`movements.js:97-101`），**door 根本不在里面** —— `getMoveForward` 里
- * `canOpenDoors && blockC.openable` 那个分支对门永远 false，门被当实心，
- * 走 `safeOrBreak(blockC)`（= 挖掉）。2026-10-18「它选了更便宜的墙」就是这里：
- * 挖墙和挖门的账一样，没理由走门。
- */
-export function doorBlockIds (b) {
-  const arr = b?.registry?.blocksArray
-  if (!Array.isArray(arr)) return []
-  return arr
-    .filter((x) => x && typeof x.name === 'string' && DOOR_BLOCK_RE.test(x.name) && !IRON_DOOR_RE.test(x.name))
-    .map((x) => x.id)
-    .filter((id) => Number.isFinite(id))
-}
-
-/**
  * 给 vendor 的 `Movements` 打两个补丁（**只影响规划出来的那条 move**，不改 A*）：
  *
  * ① **别把门算进 `toBreak`**：vendor 的 `getMoveForward` 先
@@ -296,7 +307,6 @@ export function patchDoorMoves (mv) {
     try { return mv.getBlock?.(node, p.x - node.x, p.y - node.y, p.z - node.z) ?? null } catch { return null }
   }
   const isDoor = (blk) => Boolean(blk?.name && DOOR_BLOCK_RE.test(blk.name) && !IRON_DOOR_RE.test(blk.name))
-  const isOpen = (blk) => { try { return blk?.getProperties?.()?.open === true } catch { return false } }
   /* 把"挖这扇门"的工钱退掉：vendor 的 safeOrBreak 已经把它算进 `m.cost` 了，
    * 只在 toBreak 里删位置而不扣钱，A* 仍然觉得"挖门"和"走门"一样贵 ⇒ 还是选墙。
    * 公式照 `movements.js:290-298`（laborCost = (1 + 3*digTime/1000) * digCost）。 */
@@ -331,11 +341,13 @@ export function patchDoorMoves (mv) {
           m.toBreak = kept
         }
         if (Array.isArray(m.toPlace) && m.toPlace.length) {
-          m.toPlace = m.toPlace.filter((p) => {
-            if (!p?.useOne) return true
-            const blk = doorAt(node, p)
-            return !(isDoor(blk) && isOpen(blk))
-          })
+          /* 🔴 门的 `useOne` **一律删掉**（不管门现在是开是关）。
+           * 2026-10-18 第三次闪退/卡门的根因就在这：vendor 的 `monitorMovement`
+           * 在 `useOne` 只有一步时 `placingBlock = nextPoint.toPlace.shift()` 会拿到 undefined，
+           * 而 `placing` 标志不复位 ⇒ 下一拍读 `placingBlock.y` 抛 TypeError
+           * （我们拦住后它停住寻路 ⇒ 表现成"卡在门口、原地不动"）。
+           * 门由 `openNearbyDoor`（400ms 探一次、够得着就按）负责开 —— 规划里不需要这一步。 */
+          m.toPlace = m.toPlace.filter((p) => !(p?.useOne && isDoor(doorAt(node, p))))
         }
       }
       return r
@@ -359,10 +371,14 @@ export function movements (self, { terrain = null } = {}) {
    * 配上 canDig=true ⇒ "挖墙"永远比"绕路"便宜。规划允许穿门，执行由
    * `src/movement.mjs` 的 `openNearbyDoor` 走到门边按一下。 */
   mv.canOpenDoors = true
-  /* 🔴 光把 canOpenDoors 打开**不够**：vendor 自己搭 `openable` 时只收名字带 `gate` 的
-   * （`movements.js:97-101`），木门根本不在集合里 ⇒ 门在规划里仍是"实心、要挖"。
-   * 2026-10-18「它选了更便宜的墙」= 这一条没补。 */
-  for (const id of doorBlockIds(b)) mv.openable.add(id)
+  /* ⚠️ 2026-10-18 晚：**不要把门塞进 `mv.openable`**。
+   * 试过（上一版）——规划里会给门加一步 `useOne`，而 vendor 的
+   * `monitorMovement` 在"`useOne` 是最后一步"时会 `shift()` 出 undefined、
+   * `placing` 不复位 ⇒ 下一拍读 `placingBlock.y` 抛 TypeError（我们拦住后它停住寻路，
+   * 表现就是「卡在门口、原地不动、试三次都不走」）。
+   * 现在门一律**不进 `openable`**：规划里门仍算"可挖"，但 `patchDoorMoves` 把它从
+   * `toBreak` 删掉并退回挖门的工钱（= 穿门不额外花钱），执行时由 400ms 的
+   * `openNearbyDoor` 走到跟前按开。挖墙 vs 走门：门更便宜。 */
   mv.canDig = self.cfg.walkCanDig !== false        // 挡路的方块可以挖穿（不然掉坑里出不来）
   mv.allowSprinting = true
   mv.dontMineUnderFallingBlock = true
