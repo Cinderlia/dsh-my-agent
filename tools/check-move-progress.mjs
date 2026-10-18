@@ -883,6 +883,31 @@ section('⑧‴ 失败结果"可操作"：眼前挡路的那格 + 泳也算三�
     const n = await openNearbyDoor(b)
     ok(n === 0 && seen.length === 0, '门已经开着 ⇒ 不再乱按')
   }
+  /* 🔴 实机第四次反馈「会卡在门外然后一直开门」：门有上下两格，按两格 = 开了又关；
+   * 再叠加 400ms 定时器，就是无限开关。这里钉住"一扇门一轮只按一次 + 有冷却"。 */
+  {
+    const { doorBaseKey, DOOR_PRESS_COOL_MS } = mod
+    const seen = []
+    const lowerPos = new Vec3(1, 64, 0)
+    const upperPos = new Vec3(1, 65, 0)
+    const b = {
+      entity: { position: new Vec3(0, 64, 0) },
+      blockAt (v) {
+        if (v.x === 1 && v.y === 64 && v.z === 0) return { name: 'oak_door', position: v, getProperties: () => ({ open: false, half: 'lower' }) }
+        if (v.x === 1 && v.y === 65 && v.z === 0) return { name: 'oak_door', position: v, getProperties: () => ({ open: false, half: 'upper' }) }
+        return { name: 'air', position: v }
+      },
+      async activateBlock (blk) { seen.push(`${blk.position.y}`) },
+    }
+    ok(doorBaseKey({ position: upperPos, getProperties: () => ({ half: 'upper' }) }) === '1,64,0'
+      && doorBaseKey({ position: lowerPos, getProperties: () => ({ half: 'lower' }) }) === '1,64,0',
+      '🔴 上下半格折算成同一个"门轴"（否则会按两次 ⇒ 开了又关）')
+    const n1 = await openNearbyDoor(b)
+    ok(n1 === 1 && seen.length === 1 && seen[0] === '64', '🔴 一扇门一轮只按一次（按下半格，不按上半格）', JSON.stringify(seen))
+    const n2 = await openNearbyDoor(b)
+    ok(n2 === 0 && seen.length === 1, `按过之后 ${DOOR_PRESS_COOL_MS}ms 内不再按（否则每次轮询都把门关回去）`, JSON.stringify({ n2, seen }))
+    ok(DOOR_PRESS_COOL_MS >= 1000, '按门冷却不能太短（门状态要时间同步回来）')
+  }
   ok(CARVE_PROTECTED.test('oak_door') && CARVE_PROTECTED.test('oak_fence_gate'),
     '🔴 卡住时的"挖开挡路的"绝不砸门（门进保护名单）')
   {
@@ -1059,13 +1084,30 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     b.__inPathTick = true
     await b.dig(closed)
     ok(activated === 1 && dug === 0, '🔴 寻路中遇到关着的木门 ⇒ 按开，不挖', `activated=${activated} dug=${dug}`)
-    await b.dig(openDoor)
-    ok(dug === 1 && activated === 1, '门本来就开着 ⇒ 不按（交给原 dig 判空）', `activated=${activated} dug=${dug}`)
-    await b.dig(iron)
-    ok(dug === 2 && activated === 1, '铁门按不开 ⇒ 照旧真的挖（能脱困）', `activated=${activated} dug=${dug}`)
-    b.__inPathTick = false
+    /* 同一个位置再来一次：1.5 秒冷却内不许再按（否则就是"开了又关"） */
     await b.dig(closed)
-    ok(dug === 3 && activated === 1, '🔴 AI 自己点名挖门（不在寻路 tick 里）⇒ 真的挖，不拦', `activated=${activated} dug=${dug}`)
+    ok(activated === 1 && dug === 0, '🔴 同一扇门按过之后立刻又要求挖 ⇒ 冷却内不再按（不关回去、也不挖）', `activated=${activated} dug=${dug}`)
+    /* 上半格：按到的是下半格那一格 */
+    const baseAt = { name: 'oak_door', position: { x: 5, y: 64, z: 0 }, getProperties: () => ({ open: false, half: 'lower' }) }
+    b.blockAt = () => baseAt
+    const upper = { name: 'oak_door', position: { x: 5, y: 65, z: 0 }, getProperties: () => ({ open: false, half: 'upper' }) }
+    const pressed = []
+    const origActivate = b.activateBlock
+    b.activateBlock = async (blk) => { pressed.push(`${blk.position.y}`); activated++; }
+    await b.dig(upper)
+    ok(activated === 2 && pressed[0] === '64', '🔴 上半格被要求挖时按的是下半格（同一个门轴只按一次）', JSON.stringify({ activated, pressed }))
+    b.activateBlock = origActivate
+    const actBefore = activated
+    const dugBefore = dug
+    await b.dig(openDoor)
+    ok(dug === dugBefore + 1 && activated === actBefore, '门本来就开着 ⇒ 不按（交给原 dig 判空）', `activated=${activated} dug=${dug}`)
+    const dugBefore2 = dug
+    await b.dig(iron)
+    ok(dug === dugBefore2 + 1 && activated === actBefore, '铁门按不开 ⇒ 照旧真的挖（能脱困）', `activated=${activated} dug=${dug}`)
+    b.__inPathTick = false
+    const dugBefore3 = dug
+    await b.dig(closed)
+    ok(dug === dugBefore3 + 1 && activated === actBefore, '🔴 AI 自己点名挖门（不在寻路 tick 里）⇒ 真的挖，不拦', `activated=${activated} dug=${dug}`)
   }
   const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
   ok(/guardDoorDig\(b/.test(plug), 'setupPlugins 里装了 door dig 守卫')

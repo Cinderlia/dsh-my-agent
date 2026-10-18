@@ -700,6 +700,23 @@ export const DOOR_RE = /(_door|_trapdoor|_fence_gate)$/
 export const DOOR_OPEN_R = 2.6
 
 /**
+ * 一扇门的"门轴坐标"：门有两格（下/上），按任意一格都能开关；**按两格 = 开了又关**。
+ * 这里把上半格折算到下半格，同一次扫描里只按一格。
+ */
+export function doorBaseKey (blk) {
+  const p = blk?.position
+  if (!p) return null
+  let y = Number(p.y)
+  try {
+    if (blk.getProperties?.().half === 'upper') y -= 1
+  } catch {}
+  return `${Math.floor(p.x)},${Math.floor(y)},${Math.floor(p.z)}`
+}
+
+/** 同一扇门两次按之间的冷却：门开了之后 **再按一下就关回去了**（实机"卡在门外一直开门"）。 */
+export const DOOR_PRESS_COOL_MS = 1_500
+
+/**
  * 把身边关着的门/栅栏门/活板门打开（只开、不管关；够不着就什么都不做）。
  * @returns {Promise<number>} 这一轮真的按开了几扇
  */
@@ -710,6 +727,9 @@ export async function openNearbyDoor (b, radius = DOOR_OPEN_R) {
     let opened = 0
     const r = Math.ceil(radius)
     const me = new Vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z))
+    const pressAt = b.__doorPressAt instanceof Map ? b.__doorPressAt : (b.__doorPressAt = new Map())
+    const now = Date.now()
+    const done = new Set()   // 这一轮已经按过的门轴（上下半格只按一次）
     for (let dx = -r; dx <= r; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
         for (let dz = -r; dz <= r; dz++) {
@@ -721,12 +741,22 @@ export async function openNearbyDoor (b, radius = DOOR_OPEN_R) {
           let isOpen = false
           try { isOpen = blk.getProperties?.().open === true } catch {}
           if (isOpen) continue
+          const key = doorBaseKey(blk) ?? `${pos.x},${pos.y},${pos.z}`
+          if (done.has(key)) continue
+          /* 🔴 冷却：门已经被我们按开、但客户端那一格还没刷新时，**不能再按**
+           * （再按就是关上；然后下一轮又开 —— 实机表现为"卡在门外一直开门"）。 */
+          if (now - Number(pressAt.get(key) ?? 0) < DOOR_PRESS_COOL_MS) continue
+          done.add(key)
           try {
             await b.activateBlock(blk)
             opened++
+            pressAt.set(key, now)
             /* 记一笔"这扇是我们按开的"：vendor 规划里的 `useOne` 走到门口还会再按一次，
              * 那一下会把门关回去（实机"开了但不走门"）。`guardDoorActivate` 据此忽略重复按。 */
-            if (b.__autoOpenedDoors instanceof Map) b.__autoOpenedDoors.set(`${pos.x},${pos.y},${pos.z}`, Date.now())
+            if (b.__autoOpenedDoors instanceof Map) {
+              b.__autoOpenedDoors.set(`${pos.x},${pos.y},${pos.z}`, now)
+              if (key !== `${pos.x},${pos.y},${pos.z}`) b.__autoOpenedDoors.set(key, now)
+            }
           } catch {}
         }
       }

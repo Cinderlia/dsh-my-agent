@@ -14,6 +14,7 @@
  *      所以另有"按 `$DSH_HOME\profiles\<profile>\vendor\mc-deps` 绝对路径找"那条兜底。
  */
 import { existsSync, readdirSync } from 'node:fs'
+import Vec3 from 'vec3'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { resolveHarnessHome } from './format.mjs'
@@ -238,20 +239,45 @@ export function guardDoorDig (b, { log = null } = {}) {
     lastLogAt = now
     try { log?.(m) } catch {}
   }
+  /* 门有上下两格：按任意一格都能开关，**按两格 = 开了又关**。
+   * 这里统一折算到"门轴那一格"，并按 1.5 秒冷却去重 —— 实机"卡在门外一直开门"就是
+   * 400ms 定时器 + 这里各按一次、上下半格再各按一次，来回把门打开又关上。 */
+  const DOOR_PRESS_COOL_MS = 1_500
+  const keyOf = (blk) => {
+    const p = blk?.position
+    if (!p) return null
+    let y = Number(p.y)
+    try { if (blk.getProperties?.().half === 'upper') y -= 1 } catch {}
+    return `${Math.floor(p.x)},${Math.floor(y)},${Math.floor(p.z)}`
+  }
   b.dig = function (block, ...rest) {
     const nm = block?.name
     const isDoor = typeof nm === 'string' && DOOR_BLOCK_RE.test(nm) && !IRON_DOOR_RE.test(nm)
     if (!isDoor || !b.__inPathTick) return orig(block, ...rest)
     return (async () => {
+      const key = keyOf(block) ?? `${block?.position?.x},${block?.position?.y},${block?.position?.z}`
+      const pressAt = b.__doorPressAt instanceof Map ? b.__doorPressAt : (b.__doorPressAt = new Map())
+      const now = Date.now()
+      /* 1.5 秒内按过这扇门 ⇒ 当这一步已经完成（别关回去，也别再挖） */
+      if (now - Number(pressAt.get(key) ?? 0) < DOOR_PRESS_COOL_MS) return
       try {
         const openNow = (() => { try { return block.getProperties?.().open === true } catch { return false } })()
         if (!openNow && typeof b.activateBlock === 'function') {
-          await b.activateBlock(block)
-          if (b.__autoOpenedDoors instanceof Map) {
-            b.__autoOpenedDoors.set(`${block.position?.x},${block.position?.y},${block.position?.z}`, Date.now())
-          }
+          /* 按"门轴那一格"（下半格）：上半格在客户端可能是另一个状态对象，
+           * 按两格就等于开了又关。 */
+          const p = block.position
+          let target = block
+          try {
+            if (block.getProperties?.().half === 'upper' && typeof b.blockAt === 'function') {
+              const base = b.blockAt(new Vec3(Math.floor(p.x), Math.floor(p.y) - 1, Math.floor(p.z)))
+              if (base?.name && DOOR_BLOCK_RE.test(base.name)) target = base
+            }
+          } catch {}
+          await b.activateBlock(target)
+          pressAt.set(key, Date.now())
+          if (b.__autoOpenedDoors instanceof Map) b.__autoOpenedDoors.set(key, Date.now())
           b.__doorOpens = (b.__doorOpens ?? 0) + 1
-          say(`🚪 寻路要挖 ${nm} —— 改成按开（${block.position?.x},${block.position?.y},${block.position?.z}）`)
+          say(`🚪 寻路要挖 ${nm} —— 改成按开（${key}）`)
           return
         }
       } catch (e) {
