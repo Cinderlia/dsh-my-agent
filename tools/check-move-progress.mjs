@@ -1192,7 +1192,51 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
       b.__inPathTick = false
     }
   }
+  {
+    /* 🔴 异步窗口：vendor 是 `bot.equip().then(() => bot.dig())`，那会儿 __inPathTick 已经复位。
+     * 只靠同步标记会把"挖门"放行 ⇒ 必须同时看 pathfinder.isMining()。 */
+    const { guardDoorDig } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    let dug = 0
+    let pressed = 0
+    const door = { name: 'oak_door', position: { x: 1, y: 64, z: 0 }, getProperties: () => ({ open: false, half: 'lower' }) }
+    const b = {
+      __inPathTick: false,
+      pathfinder: { isMining: () => true },
+      blockAt: () => door,
+      activateBlock: async () => { pressed++ },
+      dig: async () => { dug++ },
+    }
+    guardDoorDig(b)
+    await b.dig(door)
+    ok(dug === 0 && pressed === 1, '🔴 装备工具的异步窗口（tick 标记已复位、isMining 仍真）⇒ 仍然按开门、不挖', JSON.stringify({ dug, pressed }))
+    b.pathfinder.isMining = () => false
+    await b.dig(door)
+    ok(dug === 1, 'AI 自己挖（既不在 tick 里、也不在挖矿中）⇒ 照旧真的挖', JSON.stringify({ dug }))
+  }
+  {
+    /* 🔴 统一在 getNeighbors 上过滤：与"是哪个 getMove* 生成的"无关 */
+    const { patchDoorMoves } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    const doorBlk = { name: 'oak_door', getProperties: () => ({ open: false }), digTime: () => 500 }
+    const mv = {
+      digCost: 4,
+      getBlock (node, dx, dy, dz) {
+        const key = `${node.x + dx},${node.y + dy},${node.z + dz}`
+        return key === '1,64,0' ? doorBlk : { name: 'stone', getProperties: () => ({ open: false }) }
+      },
+      getNeighbors (node) {
+        const mk = (kind) => ({ kind, cost: 12, toBreak: [{ x: 1, y: 64, z: 0 }], toPlace: [] })
+        return [mk('walk'), mk('drop'), mk('down'), mk('up'), mk('parkour')]
+      },
+    }
+    patchDoorMoves(mv)
+    const moves = mv.getNeighbors({ x: 0, y: 64, z: 0 })
+    ok(moves.every((m) => m.toBreak.length === 0 && m.cost === 2),
+      '🔴 所有移动类型（walk/drop/down/up/parkour）都不再带"挖门"，且挖门工钱都退掉', JSON.stringify(moves))
+  }
   const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
+  ok(/mv\.getNeighbors = function \(node\)/.test(plug) && /__dshDoorPatched/.test(plug),
+    '🔴 门补丁挂在 getNeighbors 上（不再维护 getMove* 清单）')
+  ok(/pathfinder\?\.isMining\?\.\(\)/.test(plug), '🔴 来源判断包含 pathfinder.isMining()（覆盖装备工具的异步窗口）')
   ok(/guardDoorDig\(b/.test(plug), 'setupPlugins 里装了 door dig 守卫')
   ok(/const prev = b\.__inPathTick/.test(plug), '寻路 tick 里打了 `__inPathTick` 标记（只有这段里的挖才换成开门）')
   ok(/export function patchDoorMoves/.test(plug) && /patchDoorMoves\(mv\)/.test(plug), 'movements() 里真的挂了这个补丁')

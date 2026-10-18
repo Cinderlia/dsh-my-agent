@@ -11,6 +11,15 @@
 
 ## [未发布]
 
+### 🚪 修复（寻路挖门的"来源判断"要看 `isMining()`；门补丁统一挂在 `getNeighbors` 上，2026-10-18）
+
+两个漏洞（用户看图指出）：
+
+1. **异步窗口漏判**：vendor 的挖掘顺序是 `bot.equip(tool,'hand').then(() => bot.dig(...))` —— `equip` 一 await，`physicsTick` 包装早就退出、`__inPathTick` 已复位，真正调用 `dig` 时被当成"普通挖掘"放行 ⇒ 门还是会被挖掉。现在判据是 **`__inPathTick` 或 `pathfinder.isMining()`**（等装备这段时间它一直为 true）。
+2. **补丁只包了 3 个生成器**：vendor 有 7 个 `getMove*`（还有 DropDown / Down / Up / ParkourForward），漏掉的那几种移动仍会带着"挖门"。现在不再维护生成器清单，改为**在 `getNeighbors()` 返回值上统一过滤**：所有候选节点的 `toBreak` 里剔掉木门/活板门/栅栏门并退回工钱，`useOne` 也一律删；普通方块、铁门保持原样。
+
+回归（只跑移动相关）：`check-move-progress` 251/0 → **256/0**（新增：`isMining` 异步窗口仍按开门、不在挖矿中则照挖；`getNeighbors` 出来的 walk/drop/down/up/parkour 全都不带挖门且工钱全退；两条静态断言）；`check-core-swim` 126/126、`check-call-budget` 176/176、`check-mc-pathfinder` 26/0。
+
 ### 🚪 修复（寻路器再也不许挖门：开着 / 开成功 / 开失败 / 状态读不到，一律绕开而不是拆掉，2026-10-18）
 
 用户指出上一版的最后一处漏洞：`guardDoorDig` 走完"开门"分支后仍然 `return orig(block, ...rest)` —— 于是"门已经开着"和"开门报错"两种情况都会**挖掉门的下半格**，用毁门来掩盖失败。而且旧测试还把"门开着就让原 dig 执行"这个错误行为固化成了断言。

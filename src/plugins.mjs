@@ -247,10 +247,19 @@ export function guardDoorDig (b, { log = null } = {}) {
    * 这里统一折算到"门轴那一格"，并按 1.5 秒冷却去重 —— 实机"卡在门外一直开门"就是
    * 400ms 定时器 + 这里各按一次、上下半格再各按一次，来回把门打开又关上。
    * 与 `openNearbyDoor` 共享同一套 key / 冷却 / 在途锁（`b.__doorPressAt` / `b.__doorInFlight`）。 */
+  /* 来源判断不能只看同步标记（2026-10-18 用户指出）：
+   * vendor 的执行顺序是 `bot.equip(tool,'hand').then(() => bot.dig(block, true))` ——
+   * 真正调用 `dig` 时 `physicsTick` 包装早已退出、`__inPathTick` 已复位，
+   * 于是"寻路器要挖门"被当成"普通挖掘"放行。改判据：
+   * `__inPathTick` **或** `pathfinder.isMining()`（等装备的异步窗口里它仍为 true）。 */
+  const fromPathfinder = () => {
+    if (b.__inPathTick === true) return true
+    try { return b.pathfinder?.isMining?.() === true } catch { return false }
+  }
   b.dig = function (block, ...rest) {
     const nm = block?.name
     const isDoor = typeof nm === 'string' && DOOR_BLOCK_RE.test(nm) && !IRON_DOOR_RE.test(nm)
-    if (!isDoor || !b.__inPathTick) return orig(block, ...rest)
+    if (!isDoor || !fromPathfinder()) return orig(block, ...rest)
     return (async () => {
       const target = doorFaceOf(b, block) ?? block
       const key = doorBaseKey(target) ?? `${target?.position?.x},${target?.position?.y},${target?.position?.z}`
@@ -396,6 +405,46 @@ export function patchDoorMoves (mv) {
       return (1 + 3 * digTime / 1000) * mv.digCost
     } catch { return 0 }
   }
+  /* 统一在 `getNeighbors()` 的返回值上做后处理（2026-10-18 用户指出）：
+   * 逐个包 `getMoveForward`/`getMoveJumpUp`/… 是在维护一份"生成器清单"，
+   * vendor 一共 7 个生成器（还有 DropDown / Down / Up / ParkourForward），漏一个
+   * 那种移动就仍带着"挖门"。改为**所有候选 move 一律过一遍**，与来源无关。 */
+  const clean = (node, m) => {
+    if (!m) return
+    if (Array.isArray(m.toBreak) && m.toBreak.length) {
+      const kept = []
+      for (const p of m.toBreak) {
+        const blk = doorAt(node, p)
+        if (isDoor(blk)) {
+          m.cost = Math.max(0, (Number(m.cost) || 0) - laborOf(blk))
+          continue
+        }
+        kept.push(p)
+      }
+      m.toBreak = kept
+    }
+    if (Array.isArray(m.toPlace) && m.toPlace.length) {
+      /* 🔴 门的 `useOne` **一律删掉**（不管门现在是开是关）。
+       * 2026-10-18 第三次闪退/卡门的根因就在这：vendor 的 `monitorMovement`
+       * 在 `useOne` 只有一步时 `placingBlock = nextPoint.toPlace.shift()` 会拿到 undefined，
+       * 而 `placing` 标志不复位 ⇒ 下一拍读 `placingBlock.y` 抛 TypeError
+       * （我们拦住后它停住寻路 ⇒ 表现成"卡在门口、原地不动"）。
+       * 门由 `openNearbyDoor`（400ms 探一次、够得着就按）负责开 —— 规划里不需要这一步。 */
+      m.toPlace = m.toPlace.filter((p) => !(p?.useOne && isDoor(doorAt(node, p))))
+    }
+  }
+  const origNeighbors = mv.getNeighbors
+  if (typeof origNeighbors === 'function') {
+    mv.getNeighbors = function (node) {
+      const moves = origNeighbors.call(this, node)
+      if (!Array.isArray(moves)) return moves
+      for (const m of moves) clean(node, m)
+      return moves
+    }
+    mv.__dshDoorPatched = true
+    return mv
+  }
+  /* 回退：没有 `getNeighbors` 的假对象/旧版 Movements ⇒ 包住所有已知生成器 */
   const wrap = (name) => {
     const orig = mv[name]
     if (typeof orig !== 'function') return
@@ -403,37 +452,12 @@ export function patchDoorMoves (mv) {
       const before = Array.isArray(neighbors) ? neighbors.length : 0
       const r = orig.call(this, node, dir, neighbors)
       if (!Array.isArray(neighbors)) return r
-      for (let i = before; i < neighbors.length; i++) {
-        const m = neighbors[i]
-        if (!m) continue
-        if (Array.isArray(m.toBreak) && m.toBreak.length) {
-          const kept = []
-          for (const p of m.toBreak) {
-            const blk = doorAt(node, p)
-            if (isDoor(blk)) {
-              m.cost = Math.max(0, (Number(m.cost) || 0) - laborOf(blk))
-              continue
-            }
-            kept.push(p)
-          }
-          m.toBreak = kept
-        }
-        if (Array.isArray(m.toPlace) && m.toPlace.length) {
-          /* 🔴 门的 `useOne` **一律删掉**（不管门现在是开是关）。
-           * 2026-10-18 第三次闪退/卡门的根因就在这：vendor 的 `monitorMovement`
-           * 在 `useOne` 只有一步时 `placingBlock = nextPoint.toPlace.shift()` 会拿到 undefined，
-           * 而 `placing` 标志不复位 ⇒ 下一拍读 `placingBlock.y` 抛 TypeError
-           * （我们拦住后它停住寻路 ⇒ 表现成"卡在门口、原地不动"）。
-           * 门由 `openNearbyDoor`（400ms 探一次、够得着就按）负责开 —— 规划里不需要这一步。 */
-          m.toPlace = m.toPlace.filter((p) => !(p?.useOne && isDoor(doorAt(node, p))))
-        }
-      }
+      for (let i = before; i < neighbors.length; i++) clean(node, neighbors[i])
       return r
     }
   }
-  wrap('getMoveForward')
-  wrap('getMoveJumpUp')
-  wrap('getMoveDiagonal')
+  for (const name of ['getMoveForward', 'getMoveJumpUp', 'getMoveDiagonal',
+    'getMoveDropDown', 'getMoveDown', 'getMoveUp', 'getMoveParkourForward']) wrap(name)
   return mv
 }
 
