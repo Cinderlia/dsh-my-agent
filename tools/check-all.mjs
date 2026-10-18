@@ -33,7 +33,7 @@ const ORDER = [
   'check-water-navigation.mjs', 'check-water-recovery.mjs', 'check-task-epoch.mjs', 'check-msa.mjs',
   'check-mc-craft.mjs', 'check-mc-furnace.mjs', 'check-mc-chest.mjs',
   'check-mc-observe-host.mjs', 'check-mc-view-render.mjs', 'check-mc-skin.mjs',
-  'check-mc-auto.mjs', 'check-mc-deps.mjs',
+  'check-mc-auto.mjs', 'check-mc-deps.mjs', 'check-pc-power.mjs',
   'check-session-memory.mjs', 'check-rules-file.mjs', 'check-logging.mjs', 'check-watch-chat.mjs', 'check-audit-session.mjs',
   'check-module-load.mjs',
   'check-core.mjs',
