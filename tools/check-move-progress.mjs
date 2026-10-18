@@ -1115,24 +1115,24 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     getMoveForward (node, dir, neighbors) {
       neighbors.push({
         cost: 12,
-        toBreak: [{ x: 1, y: 64, z: 0 }, { x: 2, y: 64, z: 0 }],
+        toBreak: [{ x: 1, y: 64, z: 0 }, { x: 3, y: 64, z: 0 }],
         toPlace: [{ x: 1, y: 64, z: 0, useOne: true }],
       })
     },
   })
   {
-    // 门（关着）+ 旁边的石头：门不许进 toBreak，石头照常可以挖
-    const mv = mkMv({ '1,64,0': blk('oak_door', false), '2,64,0': blk('stone', false) })
+    // 门（关着）+ 远处（第 3 格）的石头：门不许进 toBreak，远处的石头照常可以挖
+    const mv = mkMv({ '1,64,0': blk('oak_door', false), '3,64,0': blk('stone', false) })
     patchDoorMoves(mv)
     const out = []
     mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
     const m = out[0]
-    ok(m.toBreak.length === 1 && m.toBreak[0].x === 2, '🔴 门不进"要挖的方块"（stone 照旧可挖）', JSON.stringify(m.toBreak))
+    ok(m.toBreak.length === 1 && m.toBreak[0].x === 3, '🔴 门不进"要挖的方块"（远处的 stone 照旧可挖）', JSON.stringify(m.toBreak))
     ok(!m.toPlace.some((p) => p.useOne), '🔴 门的 useOne 一律删掉（vendor 在"只有 useOne"时会 crash：placingBlock 变 undefined）', JSON.stringify(m.toPlace))
   }
   {
     // 门已经开着：同样不该再 activateBlock（那等于把它关回去）
-    const mv = mkMv({ '1,64,0': blk('oak_door', true), '2,64,0': blk('stone', false) })
+    const mv = mkMv({ '1,64,0': blk('oak_door', true), '3,64,0': blk('stone', false) })
     patchDoorMoves(mv)
     const out = []
     mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
@@ -1140,7 +1140,7 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
   }
   {
     // 铁门按不开：保留原行为（别把唯一的路堵死）
-    const mv = mkMv({ '1,64,0': blk('iron_door', false), '2,64,0': blk('stone', false) })
+    const mv = mkMv({ '1,64,0': blk('iron_door', false), '3,64,0': blk('stone', false) })
     patchDoorMoves(mv)
     const out = []
     mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
@@ -1168,7 +1168,7 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
   {
     // 🔴 挖门的工钱也要退：只删 toBreak 不扣 cost，A* 仍觉得"挖门"和"走门"一样贵
     const doorBlk = { name: 'oak_door', getProperties: () => ({ open: false }), digTime: () => 500 }
-    const mv = mkMv({ '1,64,0': doorBlk, '2,64,0': blk('stone', false) })
+    const mv = mkMv({ '1,64,0': doorBlk, '3,64,0': blk('stone', false) })
     mv.digCost = 4
     patchDoorMoves(mv)
     const out = []
@@ -1176,7 +1176,24 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     const m = out[0]
     // labor = (1 + 3*0.5) * 4 = 10 ⇒ 12 - 10 = 2
     ok(m.cost === 2, '🔴 门不进 toBreak 时把挖门的 cost 也退掉（12 → 2）', String(m.cost))
-    ok(m.toBreak.length === 1 && m.toBreak[0].x === 2, '…石头照旧可挖', JSON.stringify(m.toBreak))
+    ok(m.toBreak.length === 1 && m.toBreak[0].x === 3, '…远处的石头照旧可挖', JSON.stringify(m.toBreak))
+  }
+  {
+    /* 🔴 门前那格（紧挨着门的普通方块）：整条 move 作废 —— 只删 toBreak 会留下
+     *    "穿过实心方块"的假路，执行时原地卡住。 */
+    const mv = mkMv({ '1,64,0': blk('oak_door', false), '2,64,0': blk('stone', false) })
+    mv.getMoveForward = (node, dir, ns) => {
+      ns.push({ cost: 12, toBreak: [{ x: 1, y: 64, z: 0 }, { x: 2, y: 64, z: 0 }], toPlace: [] })
+    }
+    patchDoorMoves(mv)
+    const out = []
+    mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
+    ok(out.length === 0, '🔴 "得挖门旁边那格"的 move 直接作废（否则就是拆门框/门前的地砖）', JSON.stringify(out))
+    const mv2 = mkMv({ '1,64,0': blk('oak_door', false), '3,64,0': blk('stone', false) })
+    patchDoorMoves(mv2)
+    const out2 = []
+    mv2.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out2)
+    ok(out2.length === 1, '离门 2 格以上的石头不受影响（不是"门周围两格一律保护"）', JSON.stringify(out2.length))
   }
   {
     // 🔴 goto 的拒绝必须有人接：PathStopped 是 unhandledRejection ⇒ 宿主 fail-loud 直接 exit(1)
@@ -1336,6 +1353,28 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     b.pathfinder.isMining = () => false
     await b.dig(floorBlk)
     ok(dug === 1, 'AI 自己挖门脚那格 ⇒ 放行（只有寻路器自动挖才受保护）', JSON.stringify({ dug }))
+  }
+  {
+    /* 🔴 门前那格（紧挨着门的普通方块）：寻路器要挖 ⇒ 拦下并去按门 */
+    const { guardDoorDig } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    let dug = 0
+    let pressed = 0
+    const doorBlk = { name: 'oak_door', position: { x: 2, y: 64, z: 0 }, getProperties: () => ({ open: false, half: 'lower' }) }
+    const frontBlk = { name: 'stone', position: { x: 1, y: 64, z: 0 } }
+    const b = {
+      __inPathTick: true,
+      pathfinder: { isMining: () => true },
+      blockAt: (p) => (Number(p.x) === 2 ? doorBlk : { name: 'air', position: p }),
+      activateBlock: async () => { pressed++ },
+      dig: async () => { dug++ },
+    }
+    guardDoorDig(b)
+    await b.dig(frontBlk)
+    ok(dug === 0 && pressed === 1, '🔴 挖"门前那格"（寻路器发起）⇒ 不挖，转去按门', JSON.stringify({ dug, pressed }))
+    b.__inPathTick = false
+    b.pathfinder.isMining = () => false
+    await b.dig(frontBlk)
+    ok(dug === 1, 'AI 自己挖门前那格 ⇒ 放行', JSON.stringify({ dug }))
   }
   {
     /* 🔴 统一在 getNeighbors 上过滤：与"是哪个 getMove* 生成的"无关 */

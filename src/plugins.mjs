@@ -269,11 +269,37 @@ export function guardDoorDig (b, { log = null } = {}) {
     } catch {}
     return null
   }
+  /* 紧挨着门的普通方块：门**前面那一格**、门框、门后那一格。
+   * 2026-10-18 用户实机：门脚下的砖不挖了，但"门前那块"还在被挖 ——
+   * 那一格既不是门、也不在门下方，规划层与执行层都认不出来。
+   * 只在**寻路器发起**时保护（见下面 `fromPathfinder()` 判断），AI 自己要求挖照旧放行，
+   * 所以不会出现"房子周围一律不许挖"。 */
+  const doorNextTo = (block) => {
+    const p = block?.position
+    if (!p || typeof b.blockAt !== 'function') return null
+    const px = Math.floor(Number(p.x)), py = Math.floor(Number(p.y)), pz = Math.floor(Number(p.z))
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          if (!dx && !dy && !dz) continue
+          let q = null
+          try { q = b.blockAt(new Vec3(px + dx, py + dy, pz + dz)) } catch { continue }
+          const n = q?.name
+          if (typeof n === 'string' && DOOR_BLOCK_RE.test(n) && !IRON_DOOR_RE.test(n)) return q
+        }
+      }
+    }
+    return null
+  }
   b.dig = function (block, ...rest) {
-    const doorBlk = protectedDoorOf(block)
     /* AI 自己叫的挖（不在寻路 tick 里、也没在挖矿）⇒ 一概放行：
      * 只有"寻路器自动挖"才受门保护，别因为附近有门就禁止 AI 拆方块。 */
-    if (!doorBlk || !fromPathfinder()) return orig(block, ...rest)
+    if (!fromPathfinder()) return orig(block, ...rest)
+    /* 要挖的**本身就是门**（含铁门）⇒ 只按门本身那条规则判断，不再看邻居：
+     * 铁门旁正好有一扇木门时，不能因此就拦住"挖铁门" —— 那是正常脱困。 */
+    const itselfDoor = typeof block?.name === 'string' && DOOR_BLOCK_RE.test(block.name)
+    const doorBlk = protectedDoorOf(block) ?? (itselfDoor ? null : doorNextTo(block))
+    if (!doorBlk) return orig(block, ...rest)
     const nm = doorBlk.name
     return (async () => {
       const target = doorFaceOf(b, doorBlk) ?? doorBlk
@@ -433,8 +459,24 @@ export function patchDoorMoves (mv) {
    * 逐个包 `getMoveForward`/`getMoveJumpUp`/… 是在维护一份"生成器清单"，
    * vendor 一共 7 个生成器（还有 DropDown / Down / Up / ParkourForward），漏一个
    * 那种移动就仍带着"挖门"。改为**所有候选 move 一律过一遍**，与来源无关。 */
+  /* 紧挨着门的普通方块（门前一格/门框/门后一格）：2026-10-18 用户实机 ——
+   * 门脚下的砖已不挖，但"门前那块"还会被挖；它既不是门、也不在门下方。
+   * 注意这里**不是**把门周围两格永久保护：只有"寻路为了走过去而要挖它"时才作废这条 move，
+   * AI 自己叫的挖掘不受影响（执行层 `guardDoorDig` 同理只拦寻路器发起的）。 */
+  const isDoorAdjacent = (node, p) => {
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          if (!dx && !dy && !dz) continue
+          if (isDoor(doorAt(node, { x: p.x + dx, y: p.y + dy, z: p.z + dz }))) return true
+        }
+      }
+    }
+    return false
+  }
+  /* @returns {boolean} false = 这条 move 作废（规划里就不该从门旁边挖过去） */
   const clean = (node, m) => {
-    if (!m) return
+    if (!m) return true
     if (Array.isArray(m.toBreak) && m.toBreak.length) {
       const kept = []
       for (const p of m.toBreak) {
@@ -448,6 +490,10 @@ export function patchDoorMoves (mv) {
           m.cost = Math.max(0, (Number(m.cost) || 0) - laborOf(blk))
           continue
         }
+        /* 门旁边的普通方块：**整条 move 作废**。
+         * 只把 toBreak 删掉会留下一条"穿过实心方块"的假路（执行时走不动、原地卡住）；
+         * 作废后 A* 会改走门/绕路 —— 门由 `openNearbyDoor` 负责打开。 */
+        if (isDoorAdjacent(node, p)) return false
         kept.push(p)
       }
       m.toBreak = kept
@@ -467,8 +513,7 @@ export function patchDoorMoves (mv) {
     mv.getNeighbors = function (node) {
       const moves = origNeighbors.call(this, node)
       if (!Array.isArray(moves)) return moves
-      for (const m of moves) clean(node, m)
-      return moves
+      return moves.filter((m) => clean(node, m))
     }
     mv.__dshDoorPatched = true
     return mv
@@ -481,7 +526,9 @@ export function patchDoorMoves (mv) {
       const before = Array.isArray(neighbors) ? neighbors.length : 0
       const r = orig.call(this, node, dir, neighbors)
       if (!Array.isArray(neighbors)) return r
-      for (let i = before; i < neighbors.length; i++) clean(node, neighbors[i])
+      for (let i = neighbors.length - 1; i >= before; i--) {
+        if (clean(node, neighbors[i]) === false) neighbors.splice(i, 1)
+      }
       return r
     }
   }
