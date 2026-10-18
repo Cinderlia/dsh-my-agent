@@ -747,9 +747,9 @@ export class McBot extends EventEmitter {
       walkPathfinder: (t, o) => this.#walkPathfinder(t, o),
       beginMove: () => this.#beginMove(),
       releaseControls: () => this.#releaseControls(),
+      cfg: this.cfg,   // 挖台阶补救要读 walkCanDig/walkCarveStep（2026-10-18 审计 Bug 3）
     }
   }
-
   /* ─────────── 手上的东西 / 背包快照：已搬到 `src\inventory.mjs`（路线图第 ④ 条第七刀）─────────── */
 
   /** 站到地上再动手（实现见 `src\dig-guard.mjs` 的 `waitGrounded`；这里只把 abort signal 传进去） */

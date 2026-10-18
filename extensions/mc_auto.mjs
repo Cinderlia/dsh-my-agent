@@ -66,6 +66,16 @@ export const DEFAULT_STANDING = '和正常玩家一样发展，最后击败末�
 /* ─────────────────────────── 默认配置 ─────────────────────────── */
 
 export const AUTO_DEFAULTS = {
+  /**
+   * 运行模式（2026-10-18 用户拍板，默认 `ai-led`）：
+   *   · `ai-led`   —— AI 决策：反射层只**监测事件 + 叫醒 + 记录决策**，不替它吃/捡/穿/跟/环顾，
+   *                   连"危险方块后退、苦力怕后撤、水下自救"也默认不做。
+   *   · `balanced` —— AI 决策，但保留**几乎不可逆**的紧急保命：危险方块后退、苦力怕后撤、水下自救。
+   *   · `legacy`   —— 旧的自动行为（吃/捡/穿/跟随/环顾/保命全开）。
+   * 下面这些布尔项（autoEat/pickup/wearArmor/lookAround/follow/avoid/creeperFlee/waterRecover）
+   * **显式写过**就优先于模式默认值（见 `behaviorOf`）。
+   */
+  mode: 'ai-led',
   /** 反射层总开关（关掉=只有空闲决策层还会叫醒 AI） */
   enabled: true,
   /** 空闲决策层：闲着这么久就叫醒 AI（秒）。用户 2026-10-18 审计后改成 10 秒（原 5 秒） */
@@ -116,6 +126,9 @@ export const AUTO_DEFAULTS = {
    */
   creeperFlee: true,
 
+  /** 水下自救（自己搜出口、游上去）。`ai-led` 默认不接管；显式 true 才做 */
+  waterRecover: true,
+
   /** 自保叫醒时**先停下手里的事**（默认开）。用户 2026-10-14 任务驱动第三步：
    * "先停止采集，再由 AI 决定逃跑、战斗还是继续任务"。
    *
@@ -136,6 +149,17 @@ const RANGES = {
   followDistance: [1, 10],
   quietAfterToolMs: [500, 60_000],
 }
+
+/** 三档模式各自的行为默认值（用户 2026-10-18 拍板：默认 ai-led） */
+const MODE_DEFAULTS = {
+  'ai-led': { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: false, creeperFlee: false, waterRecover: false },
+  balanced: { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: true, creeperFlee: true, waterRecover: true },
+  legacy: { lookAround: true, autoEat: true, pickup: true, wearArmor: true, follow: true, avoidReact: true, creeperFlee: true, waterRecover: true },
+}
+export const AUTO_MODES = Object.keys(MODE_DEFAULTS)
+
+/** 任务停滞判定（毫秒）：台账 90 秒没变化就算"卡住了" */
+const TASK_STALL_MS = 90_000
 
 /** 退避封顶（毫秒） */
 const MAX_BACKOFF_MS = 30 * 60_000
@@ -483,10 +507,13 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       const file = join(dir, 'auto.json')
       if (!existsSync(file)) return cfg
       const raw = JSON.parse(readFileSync(file, 'utf8'))
+      /** 用户显式写过的键：模式默认值不能盖掉它们（2026-10-18 P1-6） */
+      const ex = []
       for (const [k, v] of Object.entries(raw ?? {})) {
         const c = coerce(k, v)
-        if (c !== undefined) cfg[k] = c
+        if (c !== undefined) { cfg[k] = c; ex.push(k) }
       }
+      cfg.__explicit = ex
     } catch { /* 配置文件坏了不影响运行 */ }
     return cfg
   }
@@ -495,7 +522,9 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     try {
       if (!dir) return false
       mkdirSync(dir, { recursive: true })
-      writeFileSync(join(dir, 'auto.json'), JSON.stringify(cfg, null, 2), 'utf8')
+      // `__explicit` 只是内存里的"哪些键是用户显式写的"，别写进文件
+      const { __explicit, ...rest } = cfg
+      writeFileSync(join(dir, 'auto.json'), JSON.stringify(rest, null, 2), 'utf8')
       return true
     } catch { return false }
   }
@@ -515,9 +544,29 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       if (c === undefined) { rejected.push(k); continue }
       cfg[k] = c
       applied[k] = c
+      if (!Array.isArray(cfg.__explicit)) cfg.__explicit = []
+      if (!cfg.__explicit.includes(k)) cfg.__explicit.push(k)
     }
     if (persist && Object.keys(applied).length) saveConfig(memDirOf(agent), cfg)
     return { cfg, applied, rejected }
+  }
+
+  /**
+   * 算"这个模式实际该做什么"：模式表打底，**显式写过的键**再盖上去。
+   * 显式 = auto.json 里写过、或 `mc_auto set` 过（loadConfig / setConfig 记在 `__explicit`）。
+   */
+  const behaviorOf = (cfg) => {
+    const mode = MODE_DEFAULTS[cfg?.mode] ? cfg.mode : 'ai-led'
+    const out = { mode, ...MODE_DEFAULTS[mode] }
+    const ex = Array.isArray(cfg?.__explicit) ? cfg.__explicit : []
+    const over = (key, as = key) => {
+      if (ex.includes(key) && typeof cfg[key] === 'boolean') out[as] = cfg[key]
+    }
+    over('lookAround'); over('autoEat'); over('pickup'); over('wearArmor')
+    over('avoid', 'avoidReact'); over('creeperFlee'); over('waterRecover')
+    // follow：显式给了玩家名 = 明确授权的跟随任务，任何模式都允许
+    out.follow = (mode === 'legacy' || ex.includes('follow')) && Boolean(cfg?.follow)
+    return out
   }
 
   /* ── 会话状态 ── */
@@ -571,6 +620,20 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         noActionStreak: 0,
         /** 叫醒后"只说话没动手"时补的第二条催促（每次叫醒最多一条） */
         nudgedAt: 0,
+        /** 事件队列（P0-3）：自保 / 打断 / 任务停滞 / 玩家请求都进这里，按优先级去重 */
+        events: [],
+        eventSeq: 0,
+        /** 当前决策轮（P0-4）：叫醒 → 观察 → 一个动作 → 结果 → 下一轮观察 */
+        decision: null,
+        decisionSeq: 0,
+        decisions: [],
+        /** 只读工具读了多少次（审计用：这次动作是在哪一次观察之后做的） */
+        obsVer: 0,
+        actionIdSeq: 0,
+        /** 任务停滞检测（P2-9）：台账签名 + 上次变化时刻 */
+        taskSig: null,
+        taskStallAt: 0,
+        lastEventWakeAt: 0,
         lastError: null,
         lastAction: null,
         stats: { wakes: 0, dangerWakes: 0, alerts: 0, nudges: 0, looks: 0, watches: 0, eats: 0, pickups: 0, escapes: 0, follows: 0, denied: 0, waterRecovers: 0, waterEscapes: 0 },
@@ -581,24 +644,143 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
   }
 
   /** 工具调用开始：重置空闲计时（"AI 在开车"） */
-  const noteToolStart = (agentId) => {
+  const noteToolStart = (agentId, exec = null) => {
     const sid = String(agentId ?? '')
     if (!sid) return
     const s = stateOf(sid)
     s.lastToolAt = now()
     s.inFlight++
+    const tool = String(exec?.name ?? exec?.tool ?? '')
+    if (READ_ONLY_RE.test(tool)) {
+      s.obsVer++
+      // 上一轮决策缺"下一次观察"版本 → 就是这一次（审计链：动作 → 观察）
+      const last = s.decisions[s.decisions.length - 1]
+      if (last && last.nextObservationId == null) last.nextObservationId = s.obsVer
+    }
+    noteDecisionTool(s, tool)
     // 🔴 叫醒后只要 AI 真的动了手，退避**当场清零**（不能等下次叫醒才算）：
     //    否则上一轮的 2^n 长间隔会把"AI 已经开始干活"这件事一直挡在门外，退避再也回不来。
     if (s.lastWakeAt > 0 && s.lastToolAt > s.lastWakeAt) s.noActionStreak = 0
     return s
   }
 
-  const noteToolEnd = (agentId) => {
+  /* ── 事件队列 + 决策审计（2026-10-18 用户方案 P0-3 / P0-4） ── */
+
+  const EVENT_TTL_MS = 120_000
+  const EVENT_MAX = 40
+  const EVENT_PRIORITY = {
+    drowning: 100, suffocate: 95, creeper: 90, damage: 85,
+    interrupt: 60, task_stalled: 50, player_request: 45, threat: 30, idle: 0,
+  }
+  const READ_ONLY_RE = /^mc_(observe|map|scan|status|inventory|entities|events|diag|capabilities|kit_memory|watch|sessions|accounts|ping)$/
+
+  /**
+   * 事件入队：同一 `kind+key` 且还没标 done 的合并（不重复刷屏）。
+   * 返回事件对象（带 `id`，决策记录里用它对上号）。
+   */
+  const pushAutoEvent = (s, kind, key, data = {}, t = now()) => {
+    if (!s) return null
+    const k = String(key ?? '')
+    let e = s.events.find((x) => x.kind === kind && x.key === k && x.state !== 'done' && t - x.at < EVENT_TTL_MS)
+    if (e) {
+      e.at = t
+      e.data = { ...e.data, ...data }
+      e.hits = (e.hits ?? 1) + 1
+      return e
+    }
+    e = { id: `e${++s.eventSeq}`, kind, key: k, at: t, data: { ...data }, state: 'pending', hits: 1, decisionId: null }
+    s.events.push(e)
+    while (s.events.length > EVENT_MAX) s.events.shift()
+    return e
+  }
+
+  const settleEvent = (s, id) => {
+    const e = s?.events?.find((x) => x.id === id)
+    if (e) { e.state = 'done'; e.doneAt = now() }
+    return e ?? null
+  }
+
+  /** 待处理事件：过期的丢掉，按优先级（安全 > 打断 > 任务 > 玩家 > 威胁）排。 */
+  const pendingEvents = (s, t = now()) => {
+    const list = (s?.events ?? []).filter((e) => e.state === 'pending' && t - e.at < EVENT_TTL_MS)
+    return list.sort((a, b) => (EVENT_PRIORITY[b.kind] ?? 0) - (EVENT_PRIORITY[a.kind] ?? 0) || a.at - b.at)
+  }
+
+  const beginDecision = (s, events = [], t = now()) => {
+    const d = {
+      id: `d${++s.decisionSeq}`,
+      triggers: events.map((e) => e.id),
+      observationId: s.obsVer,
+      actionId: null,
+      tool: null,
+      phase: 'thinking',
+      startedAt: t,
+      lastProgressAt: t,
+    }
+    s.decision = d
+    for (const e of events) e.decisionId = d.id
+    return d
+  }
+
+  const noteDecisionTool = (s, name) => {
+    const d = s?.decision
+    if (!d) return null
+    d.tool = String(name ?? '')
+    d.lastProgressAt = now()
+    if (!d.actionId && !READ_ONLY_RE.test(d.tool)) {
+      d.actionId = `a${++s.actionIdSeq}`
+      d.phase = 'acting'
+    }
+    return d
+  }
+
+  /** 从工具执行的壳子里读结果（壳子形状不确定，尽量兼容）。 */
+  const execOutcome = (exec) => {
+    const st = String(exec?.state ?? exec?.status ?? '')
+    if (/cancel|abort|interrupt|抢占|中断/i.test(st)) return 'cancelled'
+    if (/error|fail|错|失败/i.test(st)) return 'error'
+    if (exec?.error) return 'error'
+    let r = exec?.result
+    try { r = typeof r === 'function' ? r() : r } catch { r = null }
+    if (r && r.ok === false) return 'error'
+    return 'ok'
+  }
+
+  /**
+   * 收掉一轮决策，写一条审计记录：
+   * 决策号 / 触发事件 / 观察版本 / 动作号 / 选用工具 / 执行结果 / 中断原因 / 下一次观察版本。
+   */
+  const settleDecision = (s, outcome = 'ok', extra = {}) => {
+    const d = s?.decision
+    if (!d) return null
+    const rec = {
+      decisionId: d.id,
+      triggers: d.triggers,
+      observationId: d.observationId,
+      chosenTool: d.tool,
+      actionId: d.actionId,
+      executionOutcome: outcome,
+      interruptionReason: extra.interruptionReason ?? null,
+      nextObservationId: extra.nextObservationId ?? null,
+      startedAt: d.startedAt,
+      at: now(),
+    }
+    s.decisions.push(rec)
+    while (s.decisions.length > 30) s.decisions.shift()
+    for (const id of d.triggers) settleEvent(s, id)
+    s.decision = null
+    return rec
+  }
+
+  const noteToolEnd = (agentId, exec = null) => {
     const sid = String(agentId ?? '')
     if (!sid) return
     const s = stateOf(sid)
     s.lastToolAt = now()
     s.inFlight = Math.max(0, s.inFlight - 1)
+    const name = String(exec?.name ?? exec?.tool ?? '')
+    // 这一轮决策的"动作"跑完了 ⇒ 记结果（观察型工具不结算，等它动手）
+    if (s.decision?.actionId && (!name || s.decision.tool === name)) settleDecision(s, execOutcome(exec))
   }
 
   /* ── 反射动作 ── */
@@ -773,6 +955,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     if (!bot || !b) return null
     const moving = Boolean(b?.pathfinder?.goal)
     if (!(s.busy === true || s.inFlight > 0 || moving)) return null
+    pushAutoEvent(s, 'interrupt', 'stop', { why: '自保叫醒时先停下手里的动作' })
     try { Promise.resolve(bot.interruptMove?.('自保：先停手')).catch(() => {}) } catch { /* 忽略 */ }
     s.busy = false
     let stepTxt = ''
@@ -1056,6 +1239,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       s.nudgedAt = 0
       s.dangerWakeTimes = (s.dangerWakeTimes ?? []).filter((x) => t - x < 3_600_000)
       s.dangerWakeTimes.push(t)
+      // 这一声已经把事件说给 AI 了：开一轮决策，事件标 sent（等它的动作来结算）
+      const evs = pendingEvents(s, t)
+      beginDecision(s, evs, t)
+      for (const e of evs) e.state = 'sent'
       s.stats.dangerWakes++
       logLine(suffocate
         ? `mc_auto：头卡在方块里（${suffocate.name} @ ${suffocate.x}, ${suffocate.y}, ${suffocate.z}，氧气 ${air ?? '?'}/20）→ 已叫醒 AI`
@@ -1228,6 +1415,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
      *   去捡东西时反射层一声不吭。`busy` 只该挡住"反射层替你按控制位"，不该挡住"看一眼并叫你"，
      *   所以现在只把**动作**（按 back/jump）关掉，检测与 `wakeForDanger` 照跑。 */
     const busy = Boolean(s.busy)
+    const beh = behaviorOf(cfg)
     const b = sess?.bot?.bot
     if (s.shieldOffAt && t >= s.shieldOffAt) {
       s.shieldOffAt = 0
@@ -1242,14 +1430,17 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const here = [blockNameAt(b, p), blockNameAt(b, p.offset(0, 1, 0)), blockNameAt(b, p.offset(0, -1, 0))]
     const bad = here.find((n) => n && DANGER.test(n))
     if (bad) {
+      pushAutoEvent(s, 'damage', `danger:${bad}`, { block: bad, y: Math.round(p.y) })
       // 只在"刚开始脱离"时计数 + 记日志：危险没消失时每 tick 都按后退，
       // 但不要每 tick 都 +1（否则统计里 escapes 会被同一滩岩浆刷爆）
-      if (s.escaping === 0) {
+      if (beh.avoidReact && s.escaping === 0) {
         s.stats.escapes++
         logLine(`mc_auto：${bad} 就在脚下/身上，${busy ? '先提醒 AI（我这一步还没跑完，不抢控制位）' : '后退脱离'}`)
       }
-      s.escaping = Math.max(s.escaping, 8)
+      if (beh.avoidReact) s.escaping = Math.max(s.escaping, 8)
+      else if (s.escaping === 0) logLine(`mc_auto：${bad} 就在脚下/身上（ai-led：只记事件，不替你后退）`)
     }
+    if (s.escaping > 0 && !beh.avoidReact) s.escaping = 0
     if (s.escaping > 0) {
       s.escaping--
       if (busy) return              // 忙着就不抢控制位（但上面的检测与日志照样做）
@@ -1263,7 +1454,6 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       s.lastAction = '脱离危险'
       return
     }
-    if (t - s.lastAlertAt < 5000) return
     let health = 20
     try { health = num(sess.bot?.status?.()?.health, 20) } catch { return }
     // 掉血 = 挨打了（entityHurt 万一没挂上，这条兜底；远程怪的箭也是这么发现的）
@@ -1305,6 +1495,12 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const headChanged = headSolidNow && s.lastHeadSolid === false
     s.lastHeadSolid = headSolidNow
     const suffocant = !submerged && !fellRecently && headSolidNow && (headChanged || hurtRecently) ? headName : null
+    if (suffocant) {
+      pushAutoEvent(s, 'suffocate', `head:${Math.round(p.x)},${Math.round(p.y + 1)},${Math.round(p.z)}`,
+        { name: suffocant, health: Math.round(health) })
+    }
+    /* 节流窗口内也别往下走：下面"挨了打但看不到怪"会把窒息误判成远程怪。 */
+    if (suffocant && t - num(s.lastSuffocateAt, 0) <= SUFFOCATE_GAP_MS) return
     if (suffocant && t - num(s.lastSuffocateAt, 0) > SUFFOCATE_GAP_MS) {
       const r = wakeForDanger(s, sess, cfg, t, {
         health,
@@ -1317,8 +1513,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         s.lastSuffocateAt = t
         s.stats.alerts++
         s.lastAction = '窒息提醒'
-        return
       }
+      /* 头被方块封住这件事已经解释清楚了：别让下面的"挨了打但看不到怪"再报一次
+       * （那会把窒息误判成远程怪——2026-10-18 实测：一改就多喊了一遍）。 */
+      return
     }
     const inWater = submerged || Boolean(e?.isInWater)
     if (submerged) { if (!s.submergedSince) s.submergedSince = t } else s.submergedSince = 0
@@ -1350,14 +1548,16 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       const urgent = hurtRecently || byHurt || (air != null && air <= DROWN_AIR)
       /* 🔴 用户点名的"水下寻路"：叫醒 AI 的同时，反射层**自己也去搜出口、走一条路线**
        *    （自动接管，但走完一定 `agent.steer` 报一条 —— 绝不偷偷接管）。 */
-      const recovering = startWaterRecover(s, sess, cfg, t, {
+      const recovering = beh.waterRecover ? startWaterRecover(s, sess, cfg, t, {
         trigger: {
           why: (air != null && air <= DROWN_AIR) ? 'oxygen-low'
             : hurtRecently ? 'taking-damage'
               : draining ? 'oxygen-dropping' : 'no-progress',
           detail: air == null ? `头在水下 ${subSec || '?'} 秒` : `氧气 ${air}/20`,
         },
-      })
+      }) : false
+      pushAutoEvent(s, 'drowning', `water:${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`,
+        { air, health: Math.round(health), subSec })
       wakeForDanger(s, sess, cfg, t, {
         health, hurt: hurtRecently, drown: true, air, submerged, subSec, foes: [],
         gap: urgent ? DROWN_WAKE_GAP_MS : DROWN_SUBMERGE_GAP_MS,
@@ -1384,6 +1584,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       /* P0-B：**先判摔伤，再判远程怪** —— 两者在插件里长得一模一样（血掉了 + 附近没怪），
        * 只有垂直位移能分开。判反了的代价是让 AI 去找一个不存在的敌人（2026-10-17 实机）。 */
       if (fellRecently != null) {
+        pushAutoEvent(s, 'damage', 'fell', { drop: fellRecently.drop, health: Math.round(health) })
         s.lastAlertAt = t
         if (t - num(s.lastAlertLoggedAt, 0) > 30_000) {
           s.lastAlertLoggedAt = t
@@ -1401,6 +1602,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         logLine(`mc_auto：挨了打但 ${RANGED_NEAR_RADIUS} 格内看不到怪（多半是远程/隔墙）→ 叫醒 AI 定位`)
       }
       s.stats.alerts++
+      pushAutoEvent(s, 'damage', 'unseen', { health: Math.round(health) })
       wakeForDanger(s, sess, cfg, t, { health, hurt: true, blind: true, foes: [] })
       return
     }
@@ -1410,11 +1612,19 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const creepers = foes.filter((f) => /creeper/i.test(f.name) && f.distance <= CREEPER_FLEE_R
       && !losBlocked(b, eyeOf(f.entity.position), eyeOf(e.position)))
     let creeperFled = false
-    for (const c of creepers) if (creeperFlee(s, sess, cfg, t, c)) creeperFled = true
+    if (beh.creeperFlee) {
+      for (const c of creepers) if (creeperFlee(s, sess, cfg, t, c)) creeperFled = true
+    } else {
+      for (const c of creepers) {
+        pushAutoEvent(s, 'creeper', `c:${c.entity?.id ?? c.name}`, { name: c.name, distance: Math.round(c.distance) })
+      }
+    }
     // AI 正在动手、怪也没贴上来（没挨打）→ 不打扰它，等它这一轮跑完
     if (s.inFlight > 0 && !(hurtRecently || threat.distance <= URGENT_RADIUS)) return
 
     const tp = threat.entity.position
+    pushAutoEvent(s, 'damage', `threat:${threat.entity?.id ?? threat.name}`,
+      { name: threat.name, distance: Math.round(threat.distance), health: Math.round(health) })
     s.lastThreatPos = { x: tp.x, y: tp.y, z: tp.z }
     s.lastAlertAt = t
     // 日志别每 5 秒刷一遍：同一个怪 30 秒内只记一次
@@ -1601,7 +1811,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
           ? `⚠️ 你已经连着 ${s.noActionStreak} 轮只说话/站着 —— 这一轮**先动手再说话**（挖/走/建/打都算），别汇报、别问。\n`
           : '')
         + (hasPlayer ? '👥 旁边有人：直接上手帮他（他挖你搬、他盖你递料、他被怪打你上），只有动他东西才问一句。\n' : '')
-        + '路线、三条硬规矩、默认约束都照上一条；**这一轮真的做一个改世界的动作**（有台账就 `mc_task {action:"run"}` 推一步），干完一句话说结果。'
+        + '路线、三条硬规矩、默认约束都照上一条；**这一轮只做一个动作**（有台账就 `mc_task {action:"run"}` 推一步），做完先看结果，再一句话说结果。'
     }
     return `【自主行动轮｜我已经 ${idleSec}s 没被安排了】他没在派活，这段时间归你自己安排。\n`
       + parts.join('\n') + '\n\n'
@@ -1614,9 +1824,11 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       + '这一轮**按顺序做**：① 需要就先 `mc_observe` 看一眼（**不强制** —— 什么时候看你自己判断：要动手之前、找路、看不清周围、刚被卡住时看一眼最划算；心里有数就直接跳过，别为了看图而看图）；'
       + '② 接着上一步的进度干（**先看台账**：`mc_task {action:"run"}` 把手上那条推进一步，或者 `get` 看明细；'
       + '台账在磁盘上，断线 / 压缩都不会丢 —— 别每轮从零想）；'
-      + '③ **真的动手做 2~4 个会改变世界的动作**（`mc_move` / `mc_dig` / `mc_build` / `mc_act` / `mc_give`）；'
+      + '③ **只做一个动作**（`mc_move` / `mc_dig` / `mc_build` / `mc_act` / `mc_give`），做完**先看结果再决定下一步**；'
       + '④ 干完往记忆里记一句"干到哪了"（`mc_kit_memory`），下次接着干。\n'
       + '　**走不动 / 卡住 / 掉坑里上不来**（`mc_move` 报 arrived 但人没动、或原地打转）→ 相信 `mineflayer-pathfinder` 的寻路结果；失败就换一个可达目标，别反复撞墙或盲跳。\n\n'
+      + '🔁 一次只走一步：观察 → 做一个动作 → 看结果 → 重新观察。**别一口气连发 4 个动作** —— 前一个失败，后面全废；执行结果里有失败原因（stuck / NoPath / timeout / 被抢占）就**先换做法**，别同参数重试。\n'
+      + '　保命要点（触发时我会单独叫你，这里只是常识）：水里别一直往上跳，先找岸边/垫脚；苦力怕先离 8 格；摔伤后走斜台阶，别搭直柱。\n\n'
       + '🔴 三条硬规矩（他明确要求过）：\n'
       + '· **不要问他"要我做什么"** —— 他不回话就是默认让你自己决定；你要的是"在做事"，不是"在等指令"。\n'
       + '· **不要用 `mc_events waitSec` 干等回复** —— 等回复不算行动；要等就让反射层等，你先把事做了。\n'
@@ -1635,6 +1847,63 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       + '默认约束（他定的）：**别拆别人盖的东西、别动别人的箱子、别乱丢东西、别跑太远**；'
       + '真的没事可做才回一句"继续待着"（那是少数情况，不是默认选项）。\n'
       + '想改长期目标/自主程度：`mc_auto set {"standing":"..."}`｜status 看状态 / off 全停 / stay 别乱走 / follow <玩家名>。'
+  }
+
+  /** 事件 → 一句话事实清单（AI 只需要知道"发生了什么 + 事实 + 优先级"） */
+  const eventLines = (evs, t) => {
+    const L = []
+    for (const e of evs.slice(0, 6)) {
+      const d = e.data ?? {}
+      if (e.kind === 'drowning') L.push(`· 溺水：头在水下${d.subSec != null ? ` ${d.subSec} 秒` : ''}${d.air != null ? `，氧气 ${d.air}/20` : ''}，血 ${d.health ?? '?'}/20`)
+      else if (e.kind === 'suffocate') L.push(`· 窒息：头卡在 ${d.name ?? '方块'} 里（y=${d.y ?? '?'}），血 ${d.health ?? '?'}/20`)
+      else if (e.kind === 'creeper') L.push(`· 苦力怕贴脸：${d.name ?? 'creeper'} 在 ${d.distance ?? '?'} 格（我没退）`)
+      else if (e.kind === 'damage') L.push(`· 挨打/危险：${d.name ?? d.block ?? '受伤'}${d.distance != null ? ` ${d.distance} 格` : ''}${d.fell?.drop ? ` 摔了 ${d.fell.drop} 格` : ''}（血 ${d.health ?? '?'}/20，${Math.round((t - e.at) / 1000)}s 前）`)
+      else if (e.kind === 'interrupt') L.push(`· 动作被打断：${d.why ?? '先停手'}`)
+      else if (e.kind === 'task_stalled') L.push(`· 任务停滞：${d.brief ?? d.status ?? '台账 90 秒没变化'}`)
+      else if (e.kind === 'player_request') L.push(`· 玩家请求：${d.text ?? '（有话说）'}`)
+      else if (e.kind === 'threat') L.push(`· 威胁：${d.name ?? '?'} 在 ${d.distance ?? '?'} 格`)
+    }
+    return L
+  }
+
+  /**
+   * 事件叫醒：有待处理事件就叫醒 AI，把事实一次说清。
+   * 与 `tryIdleWake` 的区别：不要求空闲满一个间隔（事件是"发生了一件事"），只受最小间隔与每小时配额限制。
+   */
+  const eventWake = (s, sess, cfg, t) => {
+    if (!cfg.enabled) return false
+    const agent = s.agent
+    if (!agent || typeof agent.steer !== 'function' || agent.status === 'running') return false
+    const evs = pendingEvents(s, t)
+    if (!evs.length) return false
+    if (t - num(s.lastEventWakeAt, 0) < Math.max(MIN_IDLE_SEC, cfg.minIdleGapSec) * 1000) return false
+    s.wakeTimes = s.wakeTimes.filter((x) => t - x < 3_600_000)
+    if (s.wakeTimes.length >= cfg.idleWakeMaxPerHour) { s.stats.denied++; return false }
+    const lines = eventLines(evs, t)
+    if (!lines.length) return false
+    const text = `【自主行动轮｜检测到 ${evs.length} 件事】\n`
+      + lines.join('\n') + '\n\n'
+      + '🔴 一次只做一个动作：先挑优先级最高的那件，做完**先看结果**再决定下一步。\n'
+      + '　做之前需要就用 `mc_observe` / `mc_status` 看一眼；别问"要我做什么"，也别用 `mc_events waitSec` 空等。\n'
+      + `🎯 长期目标：${cfg.standing}\n`
+    try {
+      s.lastEventWakeAt = t
+      s.wakeTimes.push(t)
+      beginDecision(s, evs, t)
+      agent.steer(userMessage({
+        content: [{ type: 'text', text }],
+        source: { kind: 'plugin:dsh-mc-agent', form: 'notice', summary: `MC 自主行动：${evs[0].kind}` },
+      }))
+      for (const e of evs) e.state = 'sent'
+      s.lastWakeAt = t
+      s.stats.wakes++
+      logLine(`mc_auto：事件叫醒（${evs.map((e) => e.kind).join('/')}）`)
+      return true
+    } catch (e) {
+      s.stats.denied++
+      s.lastError = `事件叫醒失败：${e?.message ?? e}`
+      return false
+    }
   }
 
   const tryIdleWake = (s, sess, cfg, t) => {
@@ -1690,7 +1959,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       agent.steer(userMessage({
         content: [{
           type: 'text',
-          text: '（别问了，直接做：挑一件小事**做完** —— 走两步、挖一块、递个东西都算；拿不准眼前什么情况就先 `mc_observe` 看一眼。）',
+          text: '（别问了，直接做一个动作：挑一件小事做完 —— 走两步、挖一块、递个东西都算；拿不准就先 `mc_observe` 看一眼，做完看结果再决定下一步。）',
         }],
         source: { kind: 'plugin:dsh-mc-agent', form: 'notice', summary: 'MC 自主行动：别问，直接做' },
       }))
@@ -1754,6 +2023,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
      */
     const quiet = s.inFlight === 0 && sinceTool >= cfg.quietAfterToolMs
     const calm = !s.busy && sinceTool >= cfg.quietAfterToolMs
+    const beh = behaviorOf(cfg)
 
     // AI 刚动过手 → 把它给的朝向记成"基础朝向"（环顾只在它附近晃，不会把身子拧到背后去）
     if (sinceTool < cfg.quietAfterToolMs) {
@@ -1767,7 +2037,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     if (cfg.avoid) { try { avoid(s, sess, cfg, t) } catch (e) { s.lastError = `avoid 出错：${e?.message ?? e}` } }
 
     // ② 空闲转头（不动位置）
-    if (calm && cfg.enabled) {
+    if (calm && cfg.enabled && beh.lookAround) {
       if (cfg.lookAround) { try { lookAround(s, sess, cfg, t) } catch (e) { s.lastError = `look 出错：${e?.message ?? e}` } }
     }
 
@@ -1777,21 +2047,40 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     if (quiet && cfg.enabled && agentIdle) {
       // 自动吃**无条件调**：函数内部按开关 enable/disable 插件（关掉时也得进去 disableAuto，
       // 否则插件会一直吃下去）
+      // 吃：不管开没开都要进去（关掉时也得 disableAuto，否则插件一直自己吃）
+      cfg.autoEat = beh.autoEat
       autoEat(s, sess, cfg, t).catch(() => {})
-      if (cfg.pickup) { pickup(s, sess, cfg, t).catch(() => {}) }
+      if (beh.pickup) { pickup(s, sess, cfg, t).catch(() => {}) }
       // 有甲就穿（"变强"里最便宜的一步，跟打不打没关系）：AI 没在动手时才碰背包
-      if (cfg.wearArmor !== false && t - num(s.lastArmorAt, 0) > 10_000) {
+      if (beh.wearArmor && t - num(s.lastArmorAt, 0) > 10_000) {
         s.lastArmorAt = t
         viaScheduler(sess, 'auto:armor', ['inventory'], () => wearArmor(sess?.bot?.bot)).catch(() => {})
       }
-      if (!s.busy) {
+      if (!s.busy && beh.follow) {
         try {
           follow(s, sess, cfg, t)
         } catch (e) { s.lastError = `移动出错：${e?.message ?? e}` }
       }
     }
 
-    // ⑤ 空闲决策层
+    // ④′ 任务停滞（P2-9）：台账签名 90 秒没变 → 记事件（别让 AI 以为还在推进）
+    if (agentIdle && quiet) {
+      try {
+        const at = activeTaskOf(sess)
+        const sig = at ? `${at.taskId}|${at.updatedAt ?? ''}|${at.status}|${(at.steps ?? []).filter((x) => x.status === 'running').length}` : null
+        if (sig && sig === s.taskSig) {
+          if (!s.taskStallAt) s.taskStallAt = t
+          else if (t - s.taskStallAt > TASK_STALL_MS) {
+            pushAutoEvent(s, 'task_stalled', at.taskId, { status: at.status, brief: taskBriefLine(at) })
+          }
+        } else { s.taskSig = sig; s.taskStallAt = 0 }
+      } catch { /* 台账读不出来就不管 */ }
+    }
+    // ④″ 决策超时：叫醒后 2 分钟没落地一个动作 → 记为 stalled，别一直挂着
+    if (s.decision && t - s.decision.lastProgressAt > 120_000) settleDecision(s, 'stalled')
+
+    // ⑤ 事件叫醒（有事件优先）+ 空闲决策层
+    try { eventWake(s, sess, cfg, t) } catch (e) { s.lastError = `eventWake 出错：${e?.message ?? e}` }
     try { tryIdleWake(s, sess, cfg, t) } catch (e) { s.lastError = `idleWake 出错：${e?.message ?? e}` }
     // ⑥ 叫醒后只说话没动手 → 补一条催促（每次叫醒最多一条）
     try { maybeNudge(s, sess, cfg, t) } catch (e) { s.lastError = `催促出错：${e?.message ?? e}` }
@@ -1831,8 +2120,14 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     // 还没 tick 过也要能看到本会话信息（有活会话才建状态；没有就保持 null）
     const s = sid ? (sessions.get(sid) ?? (sess ? stateOf(sid) : null)) : null
     const t = now()
+    const beh = behaviorOf(cfg)
+    const { __explicit, ...cfgView } = cfg
     return {
-      config: { ...cfg },
+      mode: beh.mode,
+      behavior: beh,
+      pendingEvents: s ? pendingEvents(s, t).map((e) => ({ id: e.id, kind: e.kind, at: e.at, hits: e.hits, data: e.data })) : [],
+      recentDecisions: s ? (s.decisions ?? []).slice(-3) : [],
+      config: cfgView,
       defaults: { ...AUTO_DEFAULTS },
       session: s
         ? {
@@ -1849,6 +2144,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
             playerObs: s.playerObs ?? [],
             lastAction: s.lastAction,
             lastError: s.lastError,
+            eventWakeAgoSec: s.lastEventWakeAt ? Math.round((t - s.lastEventWakeAt) / 1000) : null,
+            decision: s.decision
+              ? { id: s.decision.id, phase: s.decision.phase, triggers: s.decision.triggers, tool: s.decision.tool, actionId: s.decision.actionId }
+              : null,
             stats: { ...s.stats },
           }
         : null,
@@ -1859,12 +2158,13 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
   const toolSpec = () => ({
     name: 'mc_auto',
     description: '🤖 **自主层**（让它像正常玩家）：不传参数 = 看状态。\n'
-      + '① **反射层**（不花 token，常开）：AI 没调工具时环顾/吃/捡/躲岩浆火仙人掌/跟随；'
-      + '**被怪打、怪贴脸、头卡方块窒息、水里憋气 → 立刻叫醒 AI 定策略**'
-      + '（我自己只停手，不跑、不还手；`dangerStopWork` 可关）；附近有玩家就看着他；工具调用后静默 6s。\n'
-      + `② **空闲决策层**（花 token）：AI 闲 ${AUTO_DEFAULTS.idleWakeSec} 秒就叫醒它，带上玩家动态/长期目标/没做完的台账，`
-      + '让它自己开工（**不许反问"要我做什么"**；只有动别人箱子建筑才 mc_say 问、问完不等）；45s 没动手补一条"别问，直接做"。\n'
-      + `每小时最多 ${AUTO_DEFAULTS.idleWakeMaxPerHour} 次；叫醒后没做事 ⇒ 间隔翻倍（封顶 30 分钟），做了事复位。\n`
+      + '**模式**（`set {"mode":"ai-led"|"balanced"|"legacy"}`，默认 `ai-led`）：\n'
+      + '· `ai-led`：AI 决策。反射层只**监测事件 + 叫醒 + 记录决策**，不替它吃/捡/穿/跟/环顾，连保命后退也不做。\n'
+      + '· `balanced`：AI 决策，保留几乎不可逆的紧急保命（危险方块后退、苦力怕后撤、水下自救）。\n'
+      + '· `legacy`：旧的自动行为全开。\n'
+      + '**事件层**：溺水/窒息/苦力怕/挨打/动作被打断/任务停滞 → 按优先级入队、去重；叫醒时只给事实，'
+      + '每个动作都记一条决策审计（观察版本 → 动作 → 结果 → 下一次观察）。\n'
+      + `**空闲层**：闲 ${AUTO_DEFAULTS.idleWakeSec} 秒叫醒（每小时 ${AUTO_DEFAULTS.idleWakeMaxPerHour} 次；没动作 ⇒ 间隔翻倍，封顶 30 分钟），45s 没动手补一条"别问，直接做"。\n`
       + '用法：`status`（默认）｜`off` 关反射层（🔴 **不是全停**：空闲叫醒还开，要 `set {"idleWake":false}`；`avoid` 独立开关）｜`on` 全开｜'
       + '`stay` 站定｜`follow`+who 跟随｜`wake` 立刻叫醒一次｜`set`+patch 改参数（落 `.dsh-mc-agent/auto.json`）。\n'
       + '**他在对话里改了主意 → 立刻用 `set` 把 `standing` 写成他那句新的**；他没发话就别自己改。\n'
@@ -1960,7 +2260,12 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     },
   })
 
-  return { tick, cfgFor, setConfig, statusOf, toolSpec, stateOf, noteToolStart, noteToolEnd, sessions, configs }
+  return {
+    tick, cfgFor, setConfig, statusOf, toolSpec, stateOf, noteToolStart, noteToolEnd, sessions, configs,
+    /** 给别的扩展推事件用（P1-7 玩家请求等）：kind 见 EVENT_PRIORITY */
+    pushEvent: (agentId, kind, key, data) => pushAutoEvent(stateOf(String(agentId ?? '')), kind, key, data),
+    behaviorOf, pendingEvents,
+  }
 }
 
 /* ─────────────────────────── 插件挂载 ─────────────────────────── */
@@ -1987,7 +2292,7 @@ export async function apply (api) {
       return typeof next === 'function' ? next() : undefined
     })
     ctx.on('tools/post-execute', async (exec, result, next) => {
-      try { auto.noteToolEnd(exec?.agent?.id) } catch { /* 忽略 */ }
+      try { auto.noteToolEnd(exec?.agent?.id, exec) } catch { /* 忽略 */ }
       return typeof next === 'function' ? next() : undefined
     })
   } catch (err) {

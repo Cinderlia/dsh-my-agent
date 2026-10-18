@@ -381,7 +381,7 @@ section('⑧ 接线：移动层自动接管、反射层通知 AI、都不另起�
     '限流 15 秒 / 单次上限 15 秒')
   ok(/waterRecover: recovering/.test(au) && /同时在试着自己找出口/.test(auSrc),
     '🔴 叫醒文案里如实说"我同时在试着自己找出口"（不偷偷接管）')
-  ok(/const recovering = startWaterRecover\(s, sess, cfg, t, \{/.test(au),
+  ok(/const recovering = beh\.waterRecover \? startWaterRecover\(s, sess, cfg, t, \{/.test(au),
     '只在**憋气**那条分支里启动自救（挨打那条照旧只叫醒、不自己动）')
   /* 自救这一路自己不许按键盘（按 jump 抬一下是**原有**的濒死保命动作，不在这条里） */
   /* 2026-10-18：`startWaterRecover` 与 `avoid` 之间现在还有苦力怕应急（会按控制位），

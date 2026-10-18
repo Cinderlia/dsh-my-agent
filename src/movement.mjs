@@ -359,6 +359,8 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
     if (self._moveGen === gen) ctx.releaseControls()
   }
   const end = b.entity?.position ?? start
+  /* 2026-10-18 审计 Bug 2（泳：同一份三维分量，别让 water 路径只剩 `moved`）。 */
+  const swimDx = r2(end.x - start.x), swimDy = r2(end.y - start.y), swimDz = r2(end.z - start.z)
   moved = r2(start.distanceTo(end))
   const left = r2(end.distanceTo(goal))
   const outOfWater = !inWaterNow(b)
@@ -369,6 +371,11 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
     ms: Date.now() - t0,
     remaining: left,
     moved,
+    movedHorizontal: r2(Math.hypot(swimDx, swimDz)),
+    movedVertical: swimDy,
+    moved3d: r2(Math.hypot(swimDx, swimDy, swimDz)),
+    /* 水里的"实际漂移"：对抗水流 / 判断有没有被冲走就靠它（报告 P2 第 7 条） */
+    delta: { x: swimDx, y: swimDy, z: swimDz },
     via: 'swim',
     /* 🔴 2026-10-18 审计：以前 `stuck: stuckWhy != null || !outOfWater` ——
      *    只要这一趟结束时人还在水里就报 stuck，哪怕它是**笔直往前游、一直在靠近目标**。
@@ -589,7 +596,19 @@ export const MOVE_ESCAPES = ['repath', 'jump', 'backoff']
  *    这里把那套手工动作**收进走路层**：卡住且离目标 ≤ `MOVE_CARVE_RADIUS` 时，朝目标方向
  *    挖开"挡在脚上/头顶"的那一格（只挖实心、非危险、底下有支撑的），然后重试同一个 `goto`。
  *    不改脱困阶梯的顺序（那是用户 2026-10-15 定的），只在阶梯**之前**补这一次。 */
-export const MOVE_CARVE_RADIUS = 4.5    // 离目标这么近还卡住，才值得动镐子
+export const MOVE_CARVE_RADIUS = 4.5    // 离目标这么近还卡住，才值得动镐子（远处改看"眼前有没有挡路的"）
+/* 🔴 2026-10-18 审计（报告 Bug 3）：自动补救挖的是**世界**，不能只凭"它挡路"就挖。
+ *    箱子 / 各种矿石 / 工作台熔炉附魔台 / 刷怪笼 / 重生锚 …… 一律不碰：那些是 AI 的资源、
+ *    容器或装置，挖掉是不可逆的损失。要让某类方块可挖，得由 AI 自己调 `mc_act{break}`，
+ *    别把它做成"走路失败就顺手挖了"。 */
+export const CARVE_PROTECTED = new RegExp('(' + [
+  '_ore$', '^ancient_debris$', '^raw_[a-z_]+$',
+  '^chest$', '^trapped_chest$', '^barrel$', '^shulker_box$', '_shulker_box$',
+  '^crafting_table$', '^furnace$', '^blast_furnace$', '^smoker$', '^enchanting_table$',
+  '^anvil$', '^chipped_anvil$', '^damaged_anvil$', '_bed$', '^spawner$', '^trial_spawner$',
+  '^vault$', '^beacon$', '^lectern$', '^brewing_stand$', '^cauldron$', '^hopper$',
+  '^dispenser$', '^dropper$', '^respawn_anchor$', '^nether_portal$', '^end_portal',
+].join('|') + ')')
 export const MOVE_CARVE_CELLS = 2       // 一次最多往前看几格
 export const MOVE_CARVE_TRIES = 2       // 一次 walkPathfinder 里最多补挖几次
 
@@ -605,6 +624,47 @@ export function escapeTextOf (step) {
 }
 
 /**
+ * 眼前有没有"挡路的、能挖的、挖了不会掉下去"的那一格。（Bug 4：卡住该不该试挖，
+ * 看的是**眼前障碍**，不是"离终点还有几格"。）
+ *
+ * 判据与 `carveStepAhead` 完全一致（同方向、同保护名单、同"底下要有支撑"），
+ * 所以它说"有"就一定能挖；返回 `null` 表示"没有可下手的障碍"。
+ * @returns {null | {x:number,y:number,z:number,name:string,cell:'feet'|'head',headroom:number}}
+ */
+export function obstacleAheadOf (b, target, { cells = MOVE_CARVE_CELLS } = {}) {
+  const me = b?.entity?.position
+  if (!me || !target) return null
+  const fx = Math.floor(me.x), fy = Math.floor(me.y), fz = Math.floor(me.z)
+  const dx = Number(target.x) - me.x, dz = Number(target.z) - me.z
+  if (!Number.isFinite(dx) || !Number.isFinite(dz)) return null
+  const at = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z)) } catch { return null } }
+  const nameOf = (blk) => { try { return blk?.name ?? null } catch { return null } }
+  const solid = (n) => Boolean(n) && isSolidBlock(n)
+  const diggable = (n) => {
+    if (!solid(n) || BRIDGE_FATAL.test(n) || isLiquid(n) || CARVE_PROTECTED.test(n)) return false
+    return !/^(bedrock|barrier|command_block|chain_command_block|repeating_command_block|obsidian|end_portal_frame)$/.test(n)
+  }
+  const sx = Math.sign(dx), sz = Math.sign(dz)
+  const dirs = []
+  if (Math.abs(dx) >= Math.abs(dz)) { if (sx) dirs.push([sx, 0]); if (sz) dirs.push([0, sz]) }
+  else { if (sz) dirs.push([0, sz]); if (sx) dirs.push([sx, 0]) }
+  for (const [ddx, ddz] of dirs) {
+    for (let d = 1; d <= cells; d++) {
+      const x = fx + ddx * d, z = fz + ddz * d
+      if (x === fx && z === fz) continue
+      const feetN = nameOf(at(x, fy, z))
+      const headN = nameOf(at(x, fy + 1, z))
+      const floorN = nameOf(at(x, fy - 1, z))
+      if (!floorN || !solid(floorN) || BRIDGE_FATAL.test(floorN) || isLiquid(floorN)) continue
+      const headroom = solid(headN) ? 0 : 1
+      if (solid(feetN) && diggable(feetN)) return { x, y: fy, z, name: feetN, cell: 'feet', headroom }
+      if (solid(headN) && diggable(headN)) return { x, y: fy + 1, z, name: headN, cell: 'head', headroom }
+    }
+  }
+  return null
+}
+
+/**
  * 窄隧道/台阶的"手工补救"：朝目标方向挖掉挡在**脚上**或**头顶**的那一格实心方块。
  *
  * 背景见 `MOVE_CARVE_RADIUS` 的注释（实机：1×2 窄道里的 1 格台阶，A* 上不去）。
@@ -616,13 +676,15 @@ export function escapeTextOf (step) {
  *
  * 返回挖了几格（0 = 没得挖 / 不该挖）。**只挖不改走路** —— 挖完由调用方重跑同一个 `goto`。
  */
-export async function carveStepAhead (b, target, { cells = MOVE_CARVE_CELLS, radius = MOVE_CARVE_RADIUS } = {}) {
+export async function carveStepAhead (b, target, { cells = MOVE_CARVE_CELLS, radius = MOVE_CARVE_RADIUS, ignoreRange = false } = {}) {
   const me = b?.entity?.position
   if (!me || !target) return 0
   const fx = Math.floor(me.x), fy = Math.floor(me.y), fz = Math.floor(me.z)
   const dx = Number(target.x) - me.x, dz = Number(target.z) - me.z
   if (!Number.isFinite(dx) || !Number.isFinite(dz)) return 0
-  if (Math.hypot(dx, dz) > radius) return 0
+  /* Bug 4：卡住的起因常常是**眼前这一格**，不是"离终点还远"。到底该不该挖由调用方判
+   * （`obstacleAheadOf`），这里只保留"直接调用时的保守默认"。 */
+  if (!ignoreRange && Math.hypot(dx, dz) > radius) return 0
   const at = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z)) } catch { return null } }
   const nameOf = (blk) => { try { return blk?.name ?? null } catch { return null } }
   const solid = (blk) => { const n = nameOf(blk); return Boolean(n) && isSolidBlock(n) }
@@ -631,6 +693,7 @@ export async function carveStepAhead (b, target, { cells = MOVE_CARVE_CELLS, rad
     const n = nameOf(blk)
     if (!n || !isSolidBlock(n)) return false
     if (BRIDGE_FATAL.test(n) || isLiquid(n)) return false
+    if (CARVE_PROTECTED.test(n)) return false      // 容器 / 矿石 / 装置：不替 AI 做这种不可逆的决定
     return !/^(bedrock|barrier|command_block|chain_command_block|repeating_command_block|obsidian|end_portal_frame)$/.test(n)
   }
   /* 方向：先主轴（离得远的那个轴），再另一条轴 —— 斜着走楼梯时两条都要看。 */
@@ -821,6 +884,32 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       + '多半是垫柱子/搭路时**放方块被服务端拒了**（那一刻人已经在半空）。先看清脚下站稳没有，'
       + '**别对着同一个高度反复爬**。'
   }
+  /* 🔴 2026-10-18 审计（用户转来的报告 Bug 2）：`moved` 只有水平位移（`hypot(dx, dz)`）。
+   *    掉下去 21 格时它报 4.24（靠 `fell` 补），上一格台阶时它报 0（`fell` 又不触发）——
+   *    模型没法从 `moved` 本身看出"我到底是平移了、爬上去了，还是掉下去了"。
+   *    现在一次给全：`moved`（兼容，仍是水平）+ `movedHorizontal` / `movedVertical`（dy，正=上升）/
+   *    `moved3d`（三维直线距离）/ `delta: {x,y,z}`。判"有没有进展"要看水平，判"上没上去"看垂直。 */
+  const deltaOf = (p) => {
+    const dx = Number((Number(p?.x ?? start.x) - start.x).toFixed(2))
+    const dy = Number((Number(p?.y ?? start.y) - start.y).toFixed(2))
+    const dz = Number((Number(p?.z ?? start.z) - start.z).toFixed(2))
+    const horizontal = Number(Math.hypot(dx, dz).toFixed(2))
+    return {
+      moved: horizontal,
+      movedHorizontal: horizontal,
+      movedVertical: dy,
+      moved3d: Number(Math.hypot(dx, dy, dz).toFixed(2)),
+      delta: { x: dx, y: dy, z: dz },
+    }
+  }
+  /** 垂直位移的一句人话（≥1 格才说，平地不算）。 */
+  const vertNote = (p) => {
+    const d = deltaOf(p)
+    if (Math.abs(d.movedVertical) < 1) return ''
+    return d.movedVertical > 0
+      ? `，垂直上升了 ${Math.abs(d.movedVertical)} 格`
+      : `，垂直下降了 ${Math.abs(d.movedVertical)} 格`
+  }
   /* 🔴 目标 y 可能是半空（地图/扫描给的是"地表高度"、树冠、别人站的 y）—— 直接朝那个 y 走，
    *    pathfinder 会一路垫方块往上爬（"搭路一直搭到空气上"）。收到底面再走。 */
   const ty = standableY(b, target.x, target.y, target.z)
@@ -967,19 +1056,25 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         if (e?.mcPathThrash) pathThrash++          // P1：这次是被"路径反复失效"逼进阶梯的
         if (e?.mcStuck) {
           /* 2026-10-18：**阶梯之前**先试一次"挖开挡路的台阶/天花板"（见 `carveStepAhead`）。
-           * 只在人已经贴着目标（≤ MOVE_CARVE_RADIUS）时做 —— 远处卡住多半是别的原因，
-           * 乱挖会白吃时间、还可能把路挖坏。挖到了就重跑同一个 `goto`（不算一级脱困）。 */
-          if (carveTries < MOVE_CARVE_TRIES) {
+           * 2026-10-18 审计后（Bug 3 / Bug 4）：
+           *   · 挖**必须服从配置**：`walkCanDig:false`（寻路不许挖）或 `walkCarveStep:false`
+           *     （单独关掉这个补救）时，一步都不许挖；
+           *   · 该不该动手看**眼前障碍**（`obstacleAheadOf`），不是"离终点还剩几格" ——
+           *     目标在 20 格外的台阶，照样卡在眼前这一格上。
+           * 挖到了就重跑同一个 `goto`（不算一级脱困）。 */
+          const carveAllowed = ctx.cfg?.walkCanDig !== false && ctx.cfg?.walkCarveStep !== false
+          if (carveAllowed && carveTries < MOVE_CARVE_TRIES) {
             const end = b.entity.position
             const dNow = Math.hypot(end.x - target.x, end.z - target.z)
-            if (dNow <= MOVE_CARVE_RADIUS) {
+            const obstacle = obstacleAheadOf(b, target)
+            if (dNow <= MOVE_CARVE_RADIUS || obstacle) {
               carveTries++
               try { ctx.stopPathing?.(b) } catch {}
               await sleep(60)
-              const n = await carveStepAhead(b, target)
+              const n = await carveStepAhead(b, target, { ignoreRange: true })
               if (n > 0) {
                 carved += n
-                self.log(`⛏ 离目标 ${dNow.toFixed(1)} 格走不动 —— 挖开了 ${n} 格挡路的方块，再试一次`)
+                self.log(`⛏ ${obstacle ? `眼前 ${obstacle.name} 挡路` : `离目标 ${dNow.toFixed(1)} 格走不动`} —— 挖开了 ${n} 格，再试一次`)
                 continue
               }
             }
@@ -1003,9 +1098,21 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     const horiz = Math.hypot(end.x - target.x, end.z - target.z)
     const vert = end.y - ty
     const vertBad = vert < -1.5 || vert > 1.5
+    /* 🔴 2026-10-18 审计（用户转来的报告 Bug 1）：判"到没到"**不能先看距离、后看"是不是我的目标"**。
+     *    vendor 的 `goal_reached` 是全局事件，别人的移动到点会把我这次 goto 一起 resolve；
+     *    只要人恰好落在宽松距离（`arrive + 1.0`）以内，旧代码就直接报 arrived，绕过了 mine 诊断。
+     *    现在先算 mine：`mine === false` 一律按"不是我的目标"处理（走下面 goal-reached-elsewhere），
+     *    距离只用来区分"插件早报但确实是我的目标"。`mine === null` = 判不了（假 bot 没有真 Vec3）。 */
+    const fp = typeof end?.floored === 'function' ? end.floored() : null
+    const up1 = fp && typeof fp.offset === 'function' ? fp.offset(0, 1, 0) : null
+    const mine = !fp || typeof goal?.isEnd !== 'function' ? null
+      : Boolean(goal.isEnd(fp) || (up1 && goal.isEnd(up1)))
     // ⚠️ 现成的插件报"到了"，也**自己核一遍距离**：`goal_reached` 个别情况会早一点
     //    （目标格被占住 / 站在半砖上 / 只到附近），盲信就又变成"谎报 arrived"。
-    if (left > arrive + 1.0 || vertBad) {
+    /* 站在目标点上（≤0.5 格）就不必再问 `isEnd`：GoalNear 的半径本来就允许这一圈。
+     * 反过来，只要离得远、又不满足当前 goal，就一律先按"不是我的目标"处理。 */
+    const onSpot = left <= 0.5 && !vertBad
+    if (!onSpot && (mine === false || left > arrive + 1.0 || vertBad)) {
       // 🔴 先分清"插件真的早报"还是"别人的 goal_reached 把我这次 goto 一起 resolve 了"。
       //    vendor 的 lib/goto.js:60 监听的是 bot 上的**全局** `goal_reached`，`goalReached()`
       //    连事件带的 goal 参数都不看 ⇒ 自主层的逃跑/跟随同时在走时，**它**到点会顺手把
@@ -1013,16 +1120,11 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       //    秒返回 `moved=0` + `goal_reached-but-far`，模型被告知"插件说到了但还差 5 格"。
       //    判据：pathfinder 自己用的是 `stateGoal.isEnd(pos.floored())`（index.js:590，
       //    还允许 +1 格），**我自己的 goal 没满足 ⇒ 这次 resolve 必然来自别人的 goal**。
-      const fp = typeof end?.floored === 'function' ? end.floored() : null
-      const up1 = fp && typeof fp.offset === 'function' ? fp.offset(0, 1, 0) : null
-      // mine === null 表示"判不了"（假 bot 的位置不是真 Vec3）⇒ 不据此下结论
-      const mine = !fp || typeof goal?.isEnd !== 'function' ? null
-        : Boolean(goal.isEnd(fp) || (up1 && goal.isEnd(up1)))
       if (self._moveGen !== gen) {
         return {
           arrived: false, position: at(end), ms: Date.now() - t0,
           remaining: Number(left.toFixed(2)),
-          moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
+          ...deltaOf(end),
           via: 'pathfinder', stuck: true, reason: 'preempted',
           ...roadInfo(), ...moveInfo(), ...fellInfo(end),
           hint: `${fellNote(end)}这次走路被**另一次移动**接管了（旁边有怪时是自保反射先跑，也可能是又发了一次 mc_move）：`
@@ -1046,7 +1148,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         return {
           arrived: false, position: at(end), ms: Date.now() - t0,
           remaining: Number(left.toFixed(2)),
-          moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
+          ...deltaOf(end),
           via: 'pathfinder', stuck: true, reason: 'goal_reached-but-far', ...moveInfo(), ...fellInfo(end),
           // P1：把两个轴分开报 —— 否则"水平到了但高了两格"看起来和"还差 5 格"一模一样
           horiz: Number(horiz.toFixed(2)), vert: Number(vert.toFixed(2)),
@@ -1058,7 +1160,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         return {
           arrived: false, position: at(end), ms: Date.now() - t0,
           remaining: Number(left.toFixed(2)),
-          moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
+          ...deltaOf(end),
           via: 'pathfinder', stuck: true,
           reason: emptyNoPath ? 'NoPath' : 'goal-reached-elsewhere',
           ...roadInfo(), ...moveInfo(), ...fellInfo(end),
@@ -1074,7 +1176,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       return {
         arrived: false, position: at(end), ms: Date.now() - t0,
         remaining: Number(left.toFixed(2)),
-        moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
+        ...deltaOf(end),
         via: 'pathfinder', stuck: true, reason: 'goal_reached-but-far', ...moveInfo(), ...fellInfo(end),
         hint: `${fellNote(end)}寻路插件说到了，但离目标还有 ${left.toFixed(1)} 格（可能被占住或只到附近）—— 再走一次，或换个目标点。`,
       }
@@ -1083,7 +1185,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       arrived: true,
       position: at(end),
       ms: Date.now() - t0,
-      moved: Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2)),
+      ...deltaOf(end),
       /* 到了也报 `remaining`（实机第 6 跑：`walkTo` 明明到了、`remaining` 却是 undefined，
        * 测试脚本只能打 `-`，看着像"谎报到达"）。 */
       remaining: Number(left.toFixed(2)),
@@ -1094,7 +1196,8 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   } catch (e) {
     if (e?.mcAborted) throw e
     const end = b.entity.position
-    const moved = Number(Math.hypot(end.x - start.x, end.z - start.z).toFixed(2))
+    const d = deltaOf(end)
+    const moved = d.moved
     const remaining = Number(end.distanceTo(new Vec3(target.x, ty, target.z)).toFixed(2))
     /* P0-1：`mcStuck` = 采样器判卡住（脱困阶梯走完还没进展）—— 这跟"时间用完了"、
      * "被抢占"、"没路可走"都是**不同结局**，必须分开报，否则模型会继续原地重发。 */
@@ -1132,6 +1235,10 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
      *    —— 4 秒一格没挪，却告诉模型"不是走不通"，于是它一次次重发同一个走不到的点。
      *    判据补一条：**既没挪动、也没靠近** 就不算"时间到了"，得如实说卡住了。 */
     const noProgress = moved < 0.6 && remaining >= startRemaining - 0.3
+    /* P1（用户报告“失败结果要可操作”）：卡住时别只说"没路/没进展"，把眼前那格也报出来，
+     * 让 AI 自己决定挖、绕、搭桥还是换目标 —— 走路层不替它做这个决定。 */
+    let blockedAhead = null
+    try { blockedAhead = obstacleAheadOf(b, target) } catch { blockedAhead = null }
     /* `reason` 也别把内部字符串原样透出去（旧版漏出过 `Error` / `block_updated`） */
     const REASON_TEXT = { stuck: 'stuck', block_updated: 'block-changed', goal_changed: 'goal-changed', path_stopped: 'stopped', path_reset: 'path-reset' }
     const PF_ERR = new Set(['NoPath', 'Timeout', 'PathStopped', 'GoalChanged', 'NoPathFound'])
@@ -1149,14 +1256,21 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       position: at(end),
       ms: Date.now() - t0,
       remaining,
-      moved,
+      ...d,
       via: 'pathfinder',
       stuck: true,
       reason: reasonOut,
       ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(), ...moveInfo(), ...fellInfo(end),
-      hint: `${fellNote(end)}${nm}（从 ${startRemaining.toFixed(1)} 格变成 ${remaining.toFixed(1)} 格，挪了 ${moved} 格）`
+      ...(blockedAhead ? { blockedAhead } : {}),
+      hint: `${fellNote(end)}${nm}（从 ${startRemaining.toFixed(1)} 格变成 ${remaining.toFixed(1)} 格，挪了 ${moved} 格${vertNote(end)}）`
          // 地形那一句（导航 P2）：只在**真有用**的时候说 —— 沟要说"用 bridge"，
          // 危险地形要说"别走这边"，平地/未知不说（说了纯占地方）
+         // 眼前那格挡路的方块（P1：AI 自己决定挖/绕/搭桥，走路层只把事实摆出来）
+         + (blockedAhead && !preempted
+           ? `—— 眼前挡路的是 **${blockedAhead.name}**（${blockedAhead.cell === 'feet' ? '齐脚那格' : '头顶那格'} `
+             + `${blockedAhead.x},${blockedAhead.y},${blockedAhead.z}）：挖得动的话直接 `
+             + `\`mc_act {mode:"break", x:${blockedAhead.x}, y:${blockedAhead.y}, z:${blockedAhead.z}}\` 挖掉它，再叫 mc_move。`
+           : '')
          + (!preempted && terrain.kind === 'gap'
            ? `—— 你脚边是**${terrain.text}**（${terrain.note}）：别绕着试了，直接 \`mc_act {mode:"bridge"}\` 朝目标搭过去。`
            : !preempted && terrain.kind === 'hazard'

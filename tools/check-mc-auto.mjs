@@ -165,7 +165,9 @@ const setup = ({ sid = 'a1', agentStatus = 'idle', world = {}, gate = null, last
   let T = 1_000_000
   const auto = createAuto({ registry: reg, rng, now: () => T, workspaceOf, memRootOf, logLine: () => {} })
   auto.cfgFor(agent)
-  const p = timing ? { ...TIMING_BASE, ...patch } : patch
+  // 2026-10-18：产品默认模式改成 ai-led（反射层不再自己吃/捡/穿/跟/环顾）。
+  // 下面这些断言测的是**旧反射层的行为细节**，所以夹具默认跑 legacy；测模式的用例自己传 mode。
+  const p = { mode: 'legacy', ...(timing ? TIMING_BASE : {}), ...patch }
   if (Object.keys(p).length) auto.setConfig(agent, p, { persist: false })
   return {
     w, agent, sess, reg, auto,
@@ -1319,7 +1321,7 @@ section('11. 叫醒文案省 token：完整版每 10 分钟一次，其余短版
   ok('短版确实更短（省 token）', second.length > 0 && second.length < longLen * 0.75,
     JSON.stringify({ long: longLen, short: second.length }))
   ok('短版保留：现状 / 长期目标 / 要动手，但不复述规矩条文',
-    /长期目标/.test(second) && /改世界的动作/.test(second) && !/不要问他"要我做什么"/.test(second), second.slice(0, 200))
+    /长期目标/.test(second) && /只做一个动作/.test(second) && !/不要问他"要我做什么"/.test(second), second.slice(0, 200))
   ok('短版明确说"路线、规矩照上一条"（不丢约束）', /照上一条/.test(second), second.slice(0, 200))
 
   // 过了 10 分钟 ⇒ 又发完整版
@@ -1338,6 +1340,77 @@ section('11. 叫醒文案省 token：完整版每 10 分钟一次，其余短版
   const src = strip(readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8'))
   ok('常量 BRIEF_EVERY_MS = 10 分钟', /BRIEF_EVERY_MS = 10 \* 60_000/.test(src))
   ok('短版分支只看"这一轮必须知道的"', /if \(!briefFull\) \{/.test(src))
+}
+
+section('12. 事件 / 决策审计 / 三种模式（2026-10-18 用户方案 P0+P1+P2）')
+{
+  const strip = (x) => String(x).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const src = strip(readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8'))
+  ok('默认模式是 ai-led', /mode: 'ai-led'/.test(src))
+  ok('三档模式表存在', /MODE_DEFAULTS = \{/.test(src) && /balanced/.test(src) && /legacy/.test(src))
+  ok('显式键优先于模式', /__explicit/.test(src))
+
+  const h = setup({ timing: false, patch: { enabled: true, mode: 'ai-led' } })
+  const b0 = h.auto.behaviorOf(h.cfg())
+  ok('ai-led：不环顾/不吃/不捡/不穿/不跟/不保命',
+    b0.mode === 'ai-led' && b0.lookAround === false && b0.autoEat === false && b0.pickup === false
+    && b0.wearArmor === false && b0.follow === false && b0.avoidReact === false
+    && b0.creeperFlee === false && b0.waterRecover === false, JSON.stringify(b0))
+
+  h.auto.setConfig(h.agent, { autoEat: true }, { persist: false })
+  const b1 = h.auto.behaviorOf(h.cfg())
+  ok('显式 autoEat:true 只改这一项', b1.autoEat === true && b1.pickup === false && b1.mode === 'ai-led', JSON.stringify(b1))
+
+  h.auto.setConfig(h.agent, { mode: 'legacy' }, { persist: false })
+  const b2 = h.auto.behaviorOf(h.cfg())
+  ok('legacy 全开', b2.lookAround && b2.autoEat && b2.pickup && b2.wearArmor && b2.avoidReact && b2.creeperFlee && b2.waterRecover, JSON.stringify(b2))
+  h.auto.setConfig(h.agent, { pickup: false }, { persist: false })
+  ok('显式 pickup:false 覆盖 legacy', h.auto.behaviorOf(h.cfg()).pickup === false)
+
+  const e1 = h.auto.pushEvent('a1', 'threat', 'z1', { name: 'zombie', distance: 3 })
+  const e2 = h.auto.pushEvent('a1', 'threat', 'z1', { distance: 2 })
+  ok('同 kind+key 事件合并（不刷屏）', e1 && e2 && e1.id === e2.id && e2.hits >= 2, JSON.stringify({ id: e1?.id, hits: e2?.hits }))
+  h.auto.pushEvent('a1', 'drowning', 'w1', { air: 3, health: 8 })
+  const pe = h.auto.pendingEvents(h.state(), h.now())
+  ok('优先级：溺水排在威胁前面', pe[0]?.kind === 'drowning', pe.map((x) => x.kind).join(','))
+  ok('事件带事实字段', pe[0]?.data?.air === 3 && pe[0]?.data?.health === 8, JSON.stringify(pe[0]?.data))
+
+  h.setT(h.now() + 61_000)
+  h.tick(h.now())
+  await flush()
+  const st1 = h.state()
+  ok('事件叫醒会开一轮决策', Boolean(st1.decision) && st1.decision.triggers.length === 2, JSON.stringify(st1.decision))
+  ok('事件叫醒后事件标 sent（不重复报）', st1.events.filter((e) => e.state === 'sent').length === 2, JSON.stringify(st1.events.map((e) => [e.kind, e.state])))
+
+  h.auto.noteToolStart('a1', { name: 'mc_move' })
+  const mid = h.state()
+  ok('动作工具给决策分配 actionId', mid.decision?.actionId != null && mid.decision.phase === 'acting', JSON.stringify(mid.decision))
+  h.auto.noteToolEnd('a1', { name: 'mc_move', state: 'error' })
+  const rec = h.state().decisions[0]
+  ok('动作结束写审计：工具/结果/触发事件', Boolean(rec) && rec.chosenTool === 'mc_move' && rec.executionOutcome === 'error' && rec.triggers.length === 2, JSON.stringify(rec))
+  ok('决策收尾会结算事件', h.state().events.every((e) => e.state === 'done'), JSON.stringify(h.state().events.map((e) => e.state)))
+  h.auto.noteToolStart('a1', { name: 'mc_observe' })
+  h.auto.noteToolEnd('a1', { name: 'mc_observe' })
+  ok('观察工具递增 obsVer 并回填下一条决策', h.state().obsVer >= 1 && h.state().decisions[0].nextObservationId != null,
+    JSON.stringify({ obs: h.state().obsVer, next: h.state().decisions[0].nextObservationId }))
+
+  const hs = setup({ patch: { quietAfterToolMs: 500, idleWakeSec: 99_999, minIdleGapSec: 5, lookAround: false } })
+  hs.sess.bot.taskList = () => [{ taskId: 't1', status: 'running', updatedAt: 111, steps: [{ id: 's1', status: 'running' }] }]
+  // 第一条 tick 只是建状态（lastToolAt = 现在，quiet 为 false），所以多推几拍
+  hs.setT(hs.at(10_000)); hs.tick(hs.now()); await flush()
+  hs.setT(hs.at(20_000)); hs.tick(hs.now()); await flush()
+  hs.setT(hs.at(120_000)); hs.tick(hs.now()); await flush()
+  hs.setT(hs.at(220_000)); hs.tick(hs.now()); await flush()
+  ok('台账 90 秒没变化 ⇒ 记 task_stalled 事件', hs.state().events.some((e) => e.kind === 'task_stalled'), JSON.stringify(hs.state().events.map((e) => e.kind)))
+
+  const st = h.auto.statusOf(h.agent, h.sess)
+  ok('status 报模式与生效行为', st.mode === 'legacy' && st.behavior?.pickup === false, JSON.stringify({ mode: st.mode }))
+  ok('status 报待处理事件与最近决策', Array.isArray(st.pendingEvents) && Array.isArray(st.recentDecisions), JSON.stringify(Object.keys(st)))
+
+  ok('stopWork 记 interrupt 事件', /pushAutoEvent\(s, 'interrupt'/.test(src))
+  ok('step 里有事件叫醒与任务停滞', /eventWake\(s, sess, cfg, t\)/.test(src) && /task_stalled/.test(src))
+  ok('提示词要求一次只做一个动作', /只做一个动作/.test(src) && /一次只走一步/.test(src))
+  ok('工具描述写了三档模式与默认 ai-led', /ai-led/.test(src) && /默认 `ai-led`/.test(src))
 }
 
 /* ───────────────────────── 汇总 ───────────────────────── */

@@ -350,7 +350,18 @@ function mkSelf (bot, budgetMs = 20000) {
     _moveGen: 0,
     logs: [],
     _pf: {
-      goals: { GoalNear: class { constructor (x, y, z, r) { this.x = x; this.y = y; this.z = z; this.rangeSq = r } isEnd () { return false } } },
+      goals: {
+        GoalNear: class {
+          constructor (x, y, z, r) { this.x = x; this.y = y; this.z = z; this.range = r }
+          /* 2026-10-18：假 goal 也要有真 isEnd —— 到达判定现在先看"是不是我的目标"，
+           * 永远 false 的桩会把所有"到附近"的用例判成 goal-reached-elsewhere。 */
+          isEnd (p) {
+            const q = p?.position ?? p
+            const dx = q.x - this.x, dy = q.y - this.y, dz = q.z - this.z
+            return Math.hypot(dx, dz) <= this.range + 3.0 && Math.abs(dy) <= 1.5
+          }
+        },
+      },
       Movements: class {},
     },
     msLeft: () => 30000,
@@ -454,8 +465,14 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(/const step = escapeStepOf\(attempt - 1\)/.test(src), '每轮按阶梯取脱困动作')
   ok(/err\.mcStuck = true[\s\S]{0,120}?err\.mcExhausted = true/.test(src), '阶梯用完抛的是带 mcStuck 的错误')
   ok(/if \(e\?\.mcStuck\)[\s\S]{0,1400}?attempt\+\+[\s\S]{0,200}?continue/.test(src), '采样器判卡 ⇒ 补救没戏就进下一轮脱困')
-  ok(/await carveStepAhead\(b, target\)/.test(src) && /carveTries < MOVE_CARVE_TRIES/.test(src),
-    '🔴 阶梯之前先试"挖开挡路的台阶"（贴着目标时，2026-10-18）')
+  ok(/await carveStepAhead\(b, target, \{ ignoreRange: true \}\)/.test(src) && /carveTries < MOVE_CARVE_TRIES/.test(src),
+    '🔴 阶梯之前先试"挖开挡路的台阶"（2026-10-18 实机；审计后改成看眼前障碍）')
+  ok(/const carveAllowed = ctx\.cfg\?\.[\s\S]{0,120}?walkCarveStep !== false/.test(src),
+    '🔴 自动挖台阶服从 walkCanDig / walkCarveStep（不许绕过配置）')
+  ok(/export const CARVE_PROTECTED = new RegExp/.test(src), '容器/矿石/装置有保护名单（不替 AI 挖掉）')
+  ok(/export function obstacleAheadOf/.test(src) && /obstacleAheadOf\(b, target\)/.test(src),
+    '🔴 该不该挖看"眼前障碍"，不是离终点还有几格')
+  ok(/\.\.\.\(blockedAhead \? \{ blockedAhead \} : \{\}\)/.test(src), '失败结果带"眼前挡路的是什么"')
   ok(/const exhausted = Boolean\(e\?\.mcStuck\)/.test(src), 'catch 里认出 mcStuck')
   ok(/: exhausted \? 'unreachable'/.test(src), '🔴 reason 里有 unreachable 这一档')
   ok(/const moveInfo = \(opts = \{\}\) => \(\{/.test(src), 'moveInfo 是个多字段的汇总（地形 + 脱困 + 路径失效）')
@@ -480,7 +497,9 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(/REASON_TEXT\[k\] \?\? k/.test(src), '报出去的理由也翻成人话（不漏内部字符串）')
   // ── P1：到达判定分两轴 ──
   ok(/const vertBad = vert < -1\.5 \|\| vert > 1\.5/.test(src), '🔴 垂直窗口 ±1.5 格（一步台阶以内）')
-  ok(/if \(left > arrive \+ 1\.0 \|\| vertBad\)/.test(src), '🔴 高度不对也算"没到"（水平到了、人却在目标上下）')
+  ok(/if \(!onSpot && \(mine === false \|\| left > arrive \+ 1\.0 \|\| vertBad\)\)/.test(src), '🔴 高度不对也算"没到"（水平到了、人却在目标上下）')
+  ok(/const onSpot = left <= 0\.5 && !vertBad/.test(src), '站在目标点上（≤0.5 格）直接算到（GoalNear 半径内的合理圈）')
+  ok(src.indexOf('const mine = !fp') < src.indexOf('if (!onSpot && (mine === false || left > arrive'), '🔴 先判"是不是我的目标"，再看距离（别人到点不许误报成功）')
   ok(/horiz: Number\(horiz\.toFixed\(2\)\), vert: Number\(vert\.toFixed\(2\)\)/.test(src), '两个轴分开报给模型')
   ok(/高度不对/.test(src), 'hint 里点明是"高度不对"（不是"还差 N 格"）')
   ok(/vertBad && horiz <= arrive \+ 1\.0/.test(src), '🔴 "站错层"要单独报（不然会被 `mine === false` 那条吞掉）')
@@ -493,7 +512,7 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(/check-move-progress\.mjs/.test(all), 'check-all.mjs 的 ORDER 里登记了这一套')
 }
 
-/* ═══════════ ⑨ noTower：逃跑时不许寻路器原地垫方块往上爬 ═══════════
+/* ═══════════════ ⑨ noTower：逃跑时不许寻路器原地垫方块往上爬 ═══════════
  * 用户 2026-10-17 实机：撤退时 pathfinder 把方块垫在自己脚下，一路升到 y=57，越逃越远。
  * vendor 的 `allow1by1towers` 默认 true，而全仓**没有任何一处**设置过它（只出现在注释里）。 */
 section('⑨ noTower（逃跑时关掉"原地垫高"）')
@@ -600,6 +619,26 @@ function realCtx (self) {
 }
 
 /* ═══════════════ ⑧ 窄隧道/台阶的手工补救（carveStepAhead）═══════════════ */
+section('⑧′ 位移三种分量（2026-10-18 审计 Bug 2：moved 只有水平，上台阶/掉下去都看不出来）')
+{
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  const ctx = mkCtx(self, clock)
+  const target = { x: 0, y: 68, z: 0 }        // 正上方 4 格：只上升、不水平移动
+  clock.onTick = () => {
+    const p = bot.entity.position
+    if (p.y >= 68) { bot.settleGoto((q) => q.resolve()); return }
+    bot.entity.position = new Vec3(p.x, p.y + 1, p.z)
+  }
+  const r = await walkPathfinder(self, target, { arrive: 1.6, budget: 20000 }, ctx)
+  clock.stopPump()
+  ok(r.moved === 0, '水平没动 ⇒ moved: 0（兼容旧字段）', String(r.moved))
+  ok(r.movedVertical === 4 && r.moved3d === 4, '🔴 垂直位移单独报（movedVertical 4 / moved3d 4）',
+    JSON.stringify({ v: r.movedVertical, d3: r.moved3d }))
+  ok(r.delta && r.delta.y === 4, 'delta.y 是原始分量，不是"总距离"', JSON.stringify(r.delta))
+}
+
 section('⑧ 贴着目标却卡住 ⇒ 挖开挡在脚上/头顶的那一格（2026-10-18 实机）')
 
 function mkCarveBot (cells = {}, at = [0, 64, 0]) {
@@ -697,9 +736,69 @@ const carve = mod.carveStepAhead
   ok(r.carved >= 1, '结果里报 carved（挖开了几格）', String(r.carved))
   ok(b.calls.goto === 2 && r.repathCount === undefined, '🔴 补救只重跑同一个 goto，**不**算一级脱困（repathCount 不出现）',
     JSON.stringify({ goto: b.calls.goto, repathCount: r.repathCount }))
-  ok(self.logs.some((m) => /挖开了.*格挡路的方块/.test(m)), '日志写清"挖开了几格"', JSON.stringify(self.logs.slice(0, 2)))
+  ok(self.logs.some((m) => /挖开了 1 格/.test(m)), '日志写清"挖开了几格"', JSON.stringify(self.logs.slice(0, 2)))
 }
 
+/* ═══════════════ ⑧″ 挖台阶的保护与配置闸门（2026-10-18 审计 Bug 3/4）═══════════════ */
+await (async () => {
+section('⑧″ 自动挖台阶：不挖箱子/矿石，服从 walkCanDig / walkCarveStep，远处看眼前')
+{
+  const { obstacleAheadOf } = mod
+  // 挡路的是一整排"箱子/钻石矿" ⇒ 一格都不挖
+  const b1 = mkCarveBot({ '1,64,0': 'chest', '1,63,0': 'stone' })
+  ok((await carve(b1, { x: 1, y: 64, z: 0 })) === 0 && b1.dug.length === 0, '箱子挡路 ⇒ 不挖', JSON.stringify(b1.dug))
+  const b2 = mkCarveBot({ '1,64,0': 'diamond_ore', '1,63,0': 'stone' })
+  ok((await carve(b2, { x: 1, y: 64, z: 0 })) === 0, '矿石挡路 ⇒ 不挖（那是 AI 的资源）', JSON.stringify(b2.dug))
+  // 目标在很远处（>半径），但眼前就有台阶 ⇒ 也要能挖（ignoreRange）
+  const b3 = mkCarveBot({ '1,64,0': 'stone', '1,63,0': 'stone' })
+  ok((await carve(b3, { x: 40, y: 64, z: 0 })) === 0, '默认仍保守：远处不走就直接调不挖', JSON.stringify(b3.dug))
+  const b4 = mkCarveBot({ '1,64,0': 'stone', '1,63,0': 'stone' })
+  const n4 = await carve(b4, { x: 40, y: 64, z: 0 }, { ignoreRange: true })
+  ok(n4 === 1 && b4.dug.includes('1,64,0'), '🔴 由调用方判定"眼前有障碍"时可以挖（目标在 40 格外）', JSON.stringify(b4.dug))
+  // obstacleAheadOf：箱子不算"可下手"，石头才算
+  ok(obstacleAheadOf(mkCarveBot({ '1,64,0': 'chest', '1,63,0': 'stone' }), { x: 5, y: 64, z: 0 }) === null,
+    '箱子挡路 ⇒ obstacleAheadOf 报"没有可下手的障碍"')
+  ok(obstacleAheadOf(mkCarveBot({ '1,64,0': 'stone', '1,63,0': 'stone' }), { x: 5, y: 64, z: 0 })?.name === 'stone',
+    '石头挡路 ⇒ obstacleAheadOf 报出坐标与方块名')
+  // 配置闸门：walkCanDig:false 时整个 carve 分支不执行
+  {
+    const clock = autoClock()
+    const bot = mkLoopBot()
+    const digged = []
+    bot.dig = async (blk) => { digged.push(`${blk.position.x},${blk.position.y},${blk.position.z}`) }
+    bot.pathfinder.bestHarvestTool = () => ({ name: 'iron_pickaxe' })
+    bot.equip = async () => {}
+    bot.blockAt = (v) => ({ name: 'stone', position: v })
+    const self = mkSelf(bot)
+    const ctx = mkCtx(self, clock)
+    ctx.cfg = { walkCanDig: false }
+    clock.onTick = () => { if (bot._pending) { const p = bot._pending; bot._pending = null; const e = new Error('stuck'); e.mcStuck = true; p.reject(e) } }
+    const r = await walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 6000 }, ctx)
+    clock.stopPump()
+    ok(digged.length === 0, '🔴 walkCanDig:false ⇒ 一格都不挖（配置没被绕过）', JSON.stringify(digged))
+    ok(r.arrived === false && r.reason === 'unreachable', '照样如实报走不动', JSON.stringify({ a: r.arrived, r: r.reason }))
+  }
+}
+})()
+
 console.log(`\n${'─'.repeat(50)}`)
+/* ── ⑧‴ 失败结果可操作：眼前障碍 + 泳的三维位移（2026-10-18 审计 P1/Bug2）── */
+section('⑧‴ 失败结果"可操作"：眼前挡路的那格 + 泳也算三维位移')
+{
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  bot.blockAt = (v) => ({ name: (v.y === 63 ? 'stone' : (v.x === 1 && v.y === 64 ? 'stone' : 'air')), position: v })
+  const self = mkSelf(bot)
+  const ctx = mkCtx(self, clock)
+  clock.onTick = () => { if (bot._pending) { const p = bot._pending; bot._pending = null; const e = new Error('stuck'); e.mcStuck = true; p.reject(e) } }
+  const r = await walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 4000 }, ctx)
+  clock.stopPump()
+  ok(r.blockedAhead && r.blockedAhead.name === 'stone' && r.blockedAhead.cell === 'feet',
+    '🔴 失败结果里带上"眼前挡路的是什么"（名字/坐标/脚还是头）', JSON.stringify(r.blockedAhead))
+  ok(/mc_act \{mode:"break"/ .test(r.hint ?? ''), 'hint 直接给出"挖掉它"的可执行命令', String(r.hint).slice(0, 120))
+  const src = read('../src/movement.mjs')
+  ok(/movedHorizontal: r2\(Math\.hypot\(swimDx, swimDz\)\)/.test(src) && /movedVertical: swimDy/.test(src),
+    '🔴 游泳也报三维分量（以前只有水平 moved）')
+}
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)
