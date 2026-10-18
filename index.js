@@ -33,6 +33,7 @@ import { defineTool, toolDefKind } from './src/tool-def.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
 import { runText } from './src/task-exec.mjs'
+import { prepCheck } from './src/prep.mjs'
 import { PRIORITY, DEFAULT_WAIT_MS } from './src/action-scheduler.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -3021,14 +3022,14 @@ export function apply(ctx, rawConfig) {
       + 'mode="jump" 原地跳一下（爬台阶/脱困，不需要坐标）；'
       + 'mode="swim" 在水里游到 x/y/z（不给坐标就只上浮换气）。\n'
       + '🔴 **一次只走 10 秒**（用户要求：单次调用别超过 11 秒）。没走到会返回 '
-      + '`arrived:false` + `remaining`（还差几格）+ `hint`——**直接再叫一次 mc_move 往同一个目标走就行**，'
-      + '会从当前位置接着走；走远路就是连着叫几次，比一次挂 90 秒好（挂住的时候用户看不到消息）。\n'
+      + '`arrived:false` + `remaining`（还差几格）+ `hint`——**直接再叫一次往同一目标走**，'
+      + '从当前位置接着走；走远路连着叫几次，比一次挂 90 秒好（挂住时用户看不到消息）。\n'
       + '🔴 **在水里**（`mc_status` 里 `在水里`）寻路基本不动（A* 不把水当节点，实机"4 秒只挪 1 格"）：'
-      + '`mc_move` 会自动直接游（按住 forward+jump 浮在水面，实测 2 格/秒），上了岸再交回寻路。'
+      + '会自动直接游（按住 forward+jump，实测 2 格/秒），上岸再交回寻路。'
       + '**快淹死了就 `mode:"swim"` 不给坐标**（只上浮换气）：水挖不掉，别去 `mc_dig` 水。\n'
-      + '🔴 **默认不原地垫 1×1 柱**（`allowTower:true` 才允许）—— 垫柱被服务端拒会直接摔下去，实机摔死过；'
-      + '要上高处请走斜台阶。默认只在路上垫台阶（`pillared` 会报 `pillaredWith`/`held`）。'
-      + '🧭 `intent` 决定"到"的标准：near（默认，到附近）/ stand（站到那格上）/ interact（够得着即可，2.2 格）/ same-level（必须同一层）。',
+      + '🔴 **默认不原地垫 1×1 柱**（`allowTower:true` 才允许）—— 被服务端拒会摔死；要上高处走斜台阶。'
+      + '路上垫台阶会报 `pillaredWith`/`held`。'
+      + '🧭 `intent` 决定"到"的标准：near（默认）/ stand（站那格上）/ interact（够得着，2.2 格）/ same-level（同一层）。',
     parameters: {
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       mode: { type: 'string', description: 'walk / fly / jump / swim（创造模式缺省 fly；jump 不需要坐标；swim 不给坐标就只上浮换气）' },
@@ -3069,18 +3070,18 @@ export function apply(ctx, rawConfig) {
     description: '与游戏世界互动（**优先用它，别用服务器指令**）。mode：\n'
       + '· look 看向坐标或玩家(who)：look+who\n'
       + '· toward 看向并走近某个玩家(who)\n'
-      + '· place  放方块到 (x,y,z)；悬空先垫脚（=搭高）\n'
-      + '· bridge 搭路：朝 (x,y,z) 一格格铺（铺在脚下一层），每块等服务端确认才走；有坠落/岩浆风险就停；铺完把手换回原来的东西\n'
+      + '· place  放方块 (x,y,z)；悬空先垫脚（=搭高）\n'
+      + '· bridge 搭路：朝 (x,y,z) 一格格铺（脚下一层），每块等服务端确认才走；有坠落/岩浆风险就停；铺完换回原来的东西\n'
       + '· break  破坏 (x,y,z)：先自动换对的工具；换不上就拒绝\n'
-      + '· use    使用方块或实体(who)：开门、按钮、拉杆、喂动物；都不给=用手上的东西\n'
+      + '· use    用方块/实体(who)：开门、按钮、拉杆、喂动物；都不给=用手上的东西\n'
       + '· useitem 用手上的东西：扔眼睛/雪球\n'
-      + '· shoot 射箭：hawkeye 算弹道，自动换弓/拉满/放箭。水晶给 x/y/z，末影龙给 who:"ender_dragon"；count 连射 ≤5\n'
-      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就按 priority 挑（默认 threat 威胁最大 / nearest 最近 / weakest 血最少）。开打先换把趁手的、举盾、给建议（不替你撤退）；kite 放风筝\n'
+      + '· shoot 射箭：自动换弓/拉满/放箭。水晶 x/y/z，龙 who:"ender_dragon"；count ≤5\n'
+      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给按 priority 挑（threat/nearest/weakest）。开打先换把趁手的、举盾、给建议（不替你撤退）；kite 放风筝\n'
       + '· equip 装备(name)：护甲自动穿（盾→副手），其余拿到手上；to 指定格子\n'
       + '· enchant 附魔台：option 0-2；不给只报选项\n'
       + '· anvil 铁砧：combine(默认)/rename；item+name\n'
       + '· smithing 锻造台：item/name/template\n'
-      + '· toss 丢弃(name,count)',
+      + '· prep  出发前自查 for:nether/end：附魔/附魔台/书架/青金石…缺哪样报哪样\n'      + '· toss 丢弃(name,count)',
     parameters: {
       mode: { type: 'string', description: '见上面各 mode（默认 look）' },
       who: { type: 'string', description: '玩家或实体名（look/toward/use/attack）' },
@@ -3091,6 +3092,8 @@ export function apply(ctx, rawConfig) {
       name: { type: 'string', description: '方块或物品名（place/equip/toss/anvil/smithing 用）' },
       to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand/hand；只给 = 脱掉' },
       count: { type: 'number', description: 'toss 丢几个（默认 1）；shoot 连射几箭（默认 1，最多 5）' },
+      /* ⚠️ `for` 是 JS 保留字，解构时必须 `args.for`，不能写 `const { for } = args` */
+      for: { type: 'string', description: 'prep 查哪一趟：nether（默认）/ end' },
       waitTime: { type: 'number', description: 'shoot 拉弓多久再放（默认 1200ms）' },
       weapon: { type: 'string', description: 'shoot 用什么射（默认 bow；可 crossbow/trident）' },
       hold: { type: 'number', description: 'useitem 按住毫秒（拉弓 1000）' },
@@ -3133,7 +3136,10 @@ export function apply(ctx, rawConfig) {
         case 'anvil':   return { mode, ...(await bot.anvilTable({ action: args.action, item: args.item, name: args.name, x: args.x, y: args.y, z: args.z })) }
         case 'smithing': return { mode, ...(await bot.smithingTable({ item: args.item, name: args.name, template: args.template, x: args.x, y: args.y, z: args.z })) }
         case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
-        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/shoot/attack/equip/enchant/anvil/smithing/toss）`)
+        /* 出发前自查（用户 2026-10-19：「把附魔台 / 青金石 / 书架也加进前置清单」）——
+         * 规矩写在 RULES.md 里模型不一定照做，这里**数真状态**：附魔、附魔台、书架、青金石、等级… */
+        case 'prep':    return withOutcome({ mode, ...(prepCheck(bot.requireBot(), { for: args.for })) })
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/shoot/attack/equip/enchant/anvil/smithing/prep/toss）`)
       }
     },
   }))
