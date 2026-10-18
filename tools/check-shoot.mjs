@@ -46,7 +46,9 @@ const makeBot = ({ items = [], gameMode = 'survival', consumeArrow = true, equip
     inventory: { items: () => inv },
     async equip (item, dest) {
       log.push(['equip', item.name, dest])
-      if (equipWorks) bot.heldItem = { name: item.name, count: item.count ?? 1 }
+      /* 真的 mineflayer：换手后 `heldItem` 就是背包里那个**同一个对象**（附魔/耐久都跟着），
+       * 所以这里也回背包里找，别新建一个 —— 否则"无限附魔"这类读附魔的判据测不出来。 */
+      if (equipWorks) bot.heldItem = inv.find((i) => i.name === item.name) ?? { name: item.name, count: item.count ?? 1 }
     },
     async look (yaw, pitch, force) { log.push(['look', Number(yaw), Number(pitch), force]) },
     async activateItem () { log.push(['activate']) },
@@ -272,6 +274,18 @@ section('⑫ 中文叫法：末影龙 / 末影水晶')
   ok(/ender_dragon/.test(String(r1.target?.name)), 'target 报的是 ender_dragon', String(r1.target?.name))
   const r2 = await shoot(mk('ender_crystal'), { who: '末影水晶' }, ctxOf(() => GRADE))
   ok(r2.ok && r2.fired === 1, 'who:"末影水晶" 找得到 ender_crystal', JSON.stringify({ ok: r2.ok, fired: r2.fired }))
+}
+
+section('⑬ 无限附魔（Infinity）的弓：箭数不掉也算射出去了')
+{
+  /* 无限附魔：服务端真的不扣箭（假 bot 也跟着不扣，否则测的不是这条判据） */
+  const b = makeBot({ items: [['bow', 1], ['arrow', 5]], consumeArrow: false })
+  b.__inv.find((i) => i.name === 'bow').enchants = [{ name: 'infinity', lvl: 1 }]
+  const r = await shoot(b, { x: 0, y: 70, z: 20, count: 2 }, ctxOf(() => GRADE, { pollMs: 0 }))
+  ok(r.fired === 2, '连射两箭（没被"箭数没变"打断）', String(r.fired))
+  ok(r.ok === true, '箭数一支没掉也判成功', String(r.ok))
+  ok(!r.why, '不报"箭数没变"', String(r.why))
+  ok(r.arrows.before === 5 && r.arrows.after === 5, '如实报箭数没变', JSON.stringify(r.arrows))
 }
 
 section('⑫ 箭数回包慢 200ms：不能当成"没射出去"')

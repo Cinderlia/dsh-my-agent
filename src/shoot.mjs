@@ -22,7 +22,8 @@
  *   ④ 弓要**拉满**才有那个初速（≥ 20 tick ≈ 1000ms）。不到 1 秒放箭，箭是"软"的 —— 落点会比算的短一大截。
  *   ⑤ 放箭瞬间的方向由服务端按**放箭那一包的 rotation** 决定：必须"先 look、再 deactivateItem"，
  *      顺序反了就是照着上一次的朝向射出去。
- *   ⑥ 创造模式**不消耗箭**，所以"箭数前后对比"这条证据在创造模式下不成立（不能据此判失败）。
+ *   ⑥ 创造模式、以及**带无限附魔（Infinity）的弓**都不消耗箭 —— "箭数前后对比"这条证据在这两种情况下
+ *      不成立（不能据此判失败），所以判据分 `noConsume` 与 `creative` 两件事。
  *   ⑦ 射完把**原来手里那件换回去**（用户 2026-10-19 对搭路的同一诉求：别让"为了射一箭"把
  *      手里的剑换成弓留在手上）。用的是 `bridge.mjs` 里那对 `heldSnapshotOf` / `restoreHeldOf`。
  */
@@ -54,15 +55,34 @@ export const arrowsIn = (b) => {
 export const infiniteArrows = (b) => String(b?.game?.gameMode ?? b?.player?.gameMode ?? '') === 'creative'
 
 /**
+ * 弓带无限附魔（Infinity）—— 生存模式下**也不耗箭**，所以"箭数掉了"不能再当证据。
+ *
+ * prismarine-item 两种形状都见过：`enchants`（数组，`{name,lvl}`）和 `enchantsByName`（对象）。
+ * 都不认识就按"没有"算（宁可多等 600ms 判失败，也不能把真射出去的箭判成没射）。
+ */
+export const infinityBow = (b) => {
+  const it = b?.heldItem
+  if (!it) return false
+  const has = (e) => /infinity/i.test(String(e?.name ?? e?.id ?? '')) && Number(e?.lvl ?? e?.level ?? 1) >= 1
+  if (Array.isArray(it.enchants) && it.enchants.some(has)) return true
+  const byName = it.enchantsByName
+  if (byName && typeof byName === 'object') {
+    if (Object.values(byName).some(has)) return true
+    if (has({ name: 'infinity', lvl: byName.infinity })) return true
+  }
+  return false
+}
+
+/**
  * 放完箭等"服务端把这箭记上"（箭数掉 1）—— 最多 600ms，掉下来就立刻回。
  *
  * 🔴 为什么不固定 `sleep(120)` 再看一眼：服务端有延迟/掉帧时，120ms 常常还没回包，
  *    于是"箭数没变"被误判成"这一箭没射出去"，整个连射当场停掉（2026-10-19 实测过）。
- *    创造模式没有箭数变化，固定等一小会儿就行。
+ *    创造模式 / 无限附魔没有箭数变化，固定等一小会儿就行。
  */
-async function arrowsAfterRelease (b, before, creative, stepMs = 100) {
+async function arrowsAfterRelease (b, before, noConsume, stepMs = 100) {
   const step = Math.max(0, Number(stepMs) || 0)
-  if (creative) { await sleep(step ? 150 : 0); return arrowsIn(b) }
+  if (noConsume) { await sleep(step ? 150 : 0); return arrowsIn(b) }
   for (let i = 0; i < 6; i++) {
     if (step) await sleep(step)
     const now = arrowsIn(b)
@@ -140,6 +160,8 @@ async function shootInner (b, args = {}, ctx = {}) {
   /* ② 箭：没有就别拉弓（服务端会白拉，白白吃掉这一轮的时间） */
   const arrowsBefore = arrowsIn(b)
   const creative = infiniteArrows(b)
+  /* 无限附魔的弓：生存也不耗箭 ⇒ 箭数变化不能当证据（`noConsume` 管判据，`creative` 只管结果里那一行） */
+  const noConsume = creative || infinityBow(b)
   if (arrowsBefore === 0 && !creative) {
     throw new Error(`没有箭（背包里箭 = 0）—— 先 mc_give 一组 arrow，或者去捡/合成，再射`)
   }
@@ -205,7 +227,7 @@ async function shootInner (b, args = {}, ctx = {}) {
     }
     await sleep(LOOK_SETTLE_MS)
     await t(b.deactivateItem(), 'use', '放箭')
-    const after = await arrowsAfterRelease(b, arrowsBefore, creative, ctx.pollMs)
+    const after = await arrowsAfterRelease(b, arrowsBefore, noConsume, ctx.pollMs)
     const used = arrowsBefore - after
     const blockedPos = grade.blockInTrayect?.position ?? null
     shots.push({
@@ -220,11 +242,11 @@ async function shootInner (b, args = {}, ctx = {}) {
       arrowsUsed: Math.max(0, used),
     })
     fired++
-    if (!creative && used <= 0) { why = '箭数没变 —— 服务端没认这次放箭（可能没拉满/被拒），别接着射'; break }
+    if (!noConsume && used <= 0) { why = '箭数没变 —— 服务端没认这次放箭（可能没拉满/被拒），别接着射'; break }
   }
 
   const arrowsAfter = arrowsIn(b)
-  const ok = fired > 0 && (creative || arrowsBefore > arrowsAfter)
+  const ok = fired > 0 && (noConsume || arrowsBefore > arrowsAfter)
   return {
     ok,
     weapon: String(weapon),
