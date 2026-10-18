@@ -861,6 +861,61 @@ export function doorOnRoute (b, target, { cells = MOVE_CARVE_CELLS } = {}) {
 }
 
 /**
+ * **从门里走过去**（2026-10-18 实机验证：门开着时 A* 规划"穿过门那格"偶尔原地磨到超时）。
+ *
+ * 门在规划层是"能穿的一格"，但出门这一两步没必要交给 A*：找到前进方向上的门 →
+ * 确保它开着 → 看着门中心按住 forward，直到门落到身后再松手。**不改 goal**。
+ *
+ * @returns {Promise<{passed:boolean, door?:string, why?:string, moved?:number}>}
+ */
+export async function walkThroughDoor (b, target, { budgetMs = 1_600, radius = 3.2 } = {}) {
+  try {
+    const p = b?.entity?.position
+    if (!p || typeof b?.blockAt !== 'function') return { passed: false, why: 'no-bot' }
+    const dir = doorOnRoute(b, target, { cells: 2 })
+    if (!dir) return { passed: false, why: 'no-door' }
+    const face = doorFaceOf(b, dir) ?? dir
+    if (DOOR_IRON_RE.test(String(face?.name ?? ''))) return { passed: false, why: 'iron' }
+    if (doorOpenStateOf(face) !== 'open') {
+      await openNearbyDoor(b, radius).catch(() => 0)
+      await sleep(160)
+    }
+    if (doorOpenStateOf(doorFaceOf(b, dir) ?? dir) !== 'open') return { passed: false, why: 'closed', door: face?.name }
+    /* 🔴 `doorBaseKey()` 返回的是 **字符串** `"x,y,z"`（给去重用的），不是对象 ——
+     * 第一版拿它当 `{x,y,z}` 用 ⇒ 中心点变 NaN ⇒ `lookAt(NaN)` ⇒ 物理把位置算成 NaN
+     * （实机表现为 bot 位置直接变 NaN、寻路全废）。这里直接取下半块的 `position`。 */
+    const base = (doorFaceOf(b, dir) ?? dir)?.position
+    if (!base || !Number.isFinite(base.x) || !Number.isFinite(base.z)) return { passed: false, why: 'bad-pos' }
+    const center = new Vec3(base.x + 0.5, base.y, base.z + 0.5)
+    const start = b.entity.position.clone()
+    const before = Math.hypot(target.x - start.x, target.z - start.z)
+    try { await b.lookAt(center, true) } catch {}
+    b.setControlState('forward', true)
+    const t0 = Date.now()
+    try {
+      while (Date.now() - t0 < budgetMs) {
+        await raceAbort(sleep(80), b.abortSignal, '穿门')
+        const now = b.entity.position
+        const toTargetX = Number(target.x) - now.x
+        const toTargetZ = Number(target.z) - now.z
+        const toDoorX = center.x - now.x
+        const toDoorZ = center.z - now.z
+        if (toDoorX * toTargetX + toDoorZ * toTargetZ < 0) break   // 门已经在身后
+        if (Math.hypot(toTargetX, toTargetZ) < 1.2) break           // 已经到目标附近
+      }
+    } finally {
+      try { b.setControlState('forward', false) } catch {}
+    }
+    const end = b.entity.position.clone()
+    const after = Math.hypot(target.x - end.x, target.z - end.z)
+    const moved = Math.round(Math.hypot(end.x - start.x, end.z - start.z) * 100) / 100
+    return { passed: after < before - 0.15, door: face?.name, moved, before: Math.round(before * 100) / 100, after: Math.round(after * 100) / 100 }
+  } catch (e) {
+    return { passed: false, why: String(e?.message ?? e).slice(0, 120) }
+  }
+}
+
+/**
  * 把身边关着的门/栅栏门/活板门打开（只开、不管关；够不着就什么都不做）。
  *
  * 顺序很要紧（2026-10-18 用户指出，实机"卡在门外一直开门"）：
@@ -1416,7 +1471,10 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
    *  外加地形分类（P2）：只有不是平地时才报（平地是默认，报了纯占地方）。
    *  `opts.arrived` —— **到达时**把出发时那份改名成 `terrainAtStart`。到了新位置还叫 `terrain`
    *  会被读成"我现在脚边是这个"：从沟边跨到平地上，它仍写着 `gap`，属**主动误导**。 */
+  /* 穿门结果（在 `try` 之前就要声明：`moveInfo()` 闭包要读它） */
+  let doorWalk = null
   const moveInfo = (opts = {}) => ({
+    ...(doorWalk ? { doorWalk } : {}),
     ...(terrain.kind === 'flat' || terrain.kind === 'unknown' ? {}
       : { [opts.arrived ? 'terrainAtStart' : 'terrain']: terrain.kind }),
     ...(() => {
@@ -1439,6 +1497,16 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   try {
     /* `attempt` 手动推进（不在 for 头里自增）："挖开挡路的台阶"是**同一次尝试内的重试**，
      * 不该白吃一级脱困阶梯 —— 2026-10-18 实机加的，见 `carveStepAhead`。 */
+    /* 🔴 2026-10-18 实机（用户："你屋里我寻路进不去"的后续验证）：门开着时 A* 规划
+     * "穿门那一格"偶尔原地磨到超时（`path_reset: goal_updated` 反复）。
+     * 出门这一两步不交给 A*：先看着门中心物理走过去，再让 A* 走剩下的路。 */
+    try {
+      if (doorOnRoute(b, target, { cells: 2 }) && Date.now() - t0 < budget - 900) {
+        const leftMs = Math.max(500, Math.min(1_600, budget - (Date.now() - t0) - 700))
+        doorWalk = await walkThroughDoor(b, target, { budgetMs: leftMs })
+        if (doorWalk?.passed) self.log(`🚪 从门里走过去（${doorWalk.door ?? '门'}）`)
+      }
+    } catch {}
     let attempt = 0
     for (;;) {
       if (attempt > 0) {

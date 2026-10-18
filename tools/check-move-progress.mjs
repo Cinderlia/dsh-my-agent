@@ -1510,5 +1510,64 @@ section('⑮ 寻路 tick 不许把宿主带崩（2026-10-18 真机闪退：Canno
   const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
   ok(/process\.on\('uncaughtException'/.test(idx), '宿主级还有一层"未捕获异常"记录（只记栈，不拦宿主处置）')
 }
+section('⑯ 从门里走过去（2026-10-18 实机：门开着反而磨在门口）')
+{
+  const { walkThroughDoor } = await import(new URL('../src/movement.mjs', import.meta.url))
+  /* 假世界：门在 (5,64,6)，人在 (5,64,5)，目标在门外 (5,64,8) */
+  const mkDoorBot = ({ name = 'oak_door', open = true, forwardStep = 1.6, iron = false } = {}) => {
+    /* 上下半格共享同一个 props（门只有一份状态；每次 new 一个对象的话"按开"就不生效） */
+    const props = { open }
+    const blocks = new Map([
+      [`5,64,6`, { name, physical: true, position: new Vec3(5, 64, 6), getProperties: () => ({ ...props, half: 'lower' }), shapes: [{}, {}] }],
+      [`5,65,6`, { name, physical: true, position: new Vec3(5, 65, 6), getProperties: () => ({ ...props, half: 'upper' }), shapes: [{}, {}] }]
+    ])
+    const calls = { activated: 0, forward: [], look: 0 }
+    const pos = new Vec3(5.5, 64, 5.5)
+    const bot = {
+      entity: { position: pos },
+      blockAt: (p) => blocks.get(`${p.x},${p.y},${p.z}`) ?? { name: 'air', physical: false, position: p, shapes: [], getProperties: () => ({}) },
+      activateBlock: async () => { calls.activated++; if (!iron) props.open = !props.open },
+      lookAt: async () => { calls.look++ },
+      setControlState: (k, v) => {
+        calls.forward.push(`${k}:${v}`)
+        if (k === 'forward' && v) pos.z += forwardStep
+      }
+    }
+    return { bot, calls, blocks }
+  }
+  {
+    const { bot, calls } = mkDoorBot({ open: true })
+    const r = await walkThroughDoor(bot, { x: 5, y: 64, z: 8 }, { budgetMs: 400 })
+    ok(r.passed === true, '门开着 ⇒ 直接走过去', JSON.stringify(r))
+    ok(r.door === 'oak_door', '结果里报是哪扇门')
+    ok(calls.forward.join(',') === 'forward:true,forward:false', '按 forward 然后松开', calls.forward.join(','))
+    ok(calls.activated === 0, '门已经开着就不要再按（再按会把它关上）')
+  }
+  {
+    const { bot, calls, blocks } = mkDoorBot({ open: false })
+    const r = await walkThroughDoor(bot, { x: 5, y: 64, z: 8 }, { budgetMs: 400 })
+    ok(calls.activated >= 1, '门关着 ⇒ 先按开')
+    ok(blocks.get('5,64,6').getProperties().open === true, '按开之后门确实开了')
+    ok(blocks.get('5,65,6').getProperties().open === true, '上下半格是同一扇门（状态一致）')
+    ok(r.passed === true, '按开之后能走过去')
+  }
+  {
+    const { bot, calls } = mkDoorBot({ name: 'iron_door', open: false, iron: true })
+    const r = await walkThroughDoor(bot, { x: 5, y: 64, z: 8 }, { budgetMs: 300 })
+    ok(r.passed === false && (r.why === 'iron' || r.why === 'no-door'), '铁门按不开 ⇒ 不硬来（当实心墙，交给上层）', JSON.stringify(r))
+    ok(calls.forward.length === 0, '铁门连 forward 都不按')
+  }
+  {
+    const bot = { entity: { position: new Vec3(0, 64, 0) }, blockAt: () => ({ name: 'air' }), activateBlock: async () => {}, lookAt: async () => {}, setControlState: () => {} }
+    const r = await walkThroughDoor(bot, { x: 0, y: 64, z: 6 }, { budgetMs: 200 })
+    ok(r.passed === false && r.why === 'no-door', '前进方向没门 ⇒ 什么都不做')
+  }
+  /* 🔴 回归：`doorBaseKey()` 返回字符串，第一版当对象用 ⇒ 中心点 NaN ⇒ bot 位置变 NaN */
+  const src = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  ok(/const base = \(doorFaceOf\(b, dir\) \?\? dir\)\?\.position/.test(src), '🔴 门中心取的是下半块的 `position`（不是 doorBaseKey 的字符串）')
+  ok(/Number\.isFinite\(base\.x\)/.test(src), '中心点坐标要过 `Number.isFinite`（NaN 会让整个物理位置变 NaN）')
+  ok(/\.\.\.\(doorWalk \? \{ doorWalk \} : \{\}\)/.test(src), '走路结果里会报 doorWalk（AI 能看到这次是不是从门里过的）')
+}
+
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)
