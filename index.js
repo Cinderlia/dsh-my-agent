@@ -3141,7 +3141,8 @@ export function apply(ctx, rawConfig) {
       + '逐步执行，默认遇错即停。\n'
       + '🔴 **整串只跑 10 秒**（用户要求：单次调用别超过 11 秒）。没跑完会返回 `stoppedAt`（停在第几步，'
       + '从 0 数）+ `remaining` + `hint`——**再叫一次 mc_sequence，steps 从停下的那一步往后发就行**，'
-      + '前面已经做完了。所以宁可拆成"一串 3~4 步"叫几次，也别写一大串（一大串跑到 10 秒就断了）。',
+      + '前面已经做完了。所以宁可拆成"一串 3~4 步"叫几次，也别写一大串（一大串跑到 10 秒就断了）。\n'
+      + '跑完会顺手报 `around`（12 格内身边有谁：名字/距离/血量，最多 6 个）—— 不用再单独叫 `mc_entities`。',
     parameters: {
       steps: { type: 'array', items: { type: 'object', additionalProperties: true }, description: '步骤数组（上限 64；但一次只跑得完 10 秒的量）' },
       stopOnError: { type: 'boolean', description: '出错是否停（默认 true）' },
@@ -3151,10 +3152,15 @@ export function apply(ctx, rawConfig) {
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
-      return sess.bot.runSequence(args.steps, {
+      const r = await sess.bot.runSequence(args.steps, {
         stopOnError: args.stopOnError !== false,
         budgetMs: callBudget(args.budgetMs),
       })
+      /* 2026-10-18 用户要求：「mc_sequence 用完以后也加上自动用 observer」——指和 `mc_move`
+       * 一样，**跑完顺手报一句周围实体**（`around`，12 格内最多 6 个、附近没人就没有这个字段）。
+       * 连串动作最怕"做完了但不知道身边来了谁"：一步走完直接撞上僵尸/骷髅。
+       * 只读、不加任何等待，代价是每个名字几个字符。 */
+      return { ...r, ...aroundOf(sess) }
     },
   }))
 

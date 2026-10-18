@@ -437,6 +437,17 @@ section('⑦ index.js —— 每个 mc_* 工具的 DSH 层 timeoutMs ≤ 12 秒�
   ok(/perCallMs: CALL_MS/.test(src), 'mc_capabilities 里报了 perCallMs（模型能自己看到上限）')
   const mcMove = found.find((f) => f.tool === 'mc_move')
   ok(mcMove && mcMove.ms <= 12_000, 'mc_move 的 timeoutMs 也压到 12 秒内', JSON.stringify(mcMove))
+
+  /* 2026-10-18 用户要求：「mc_sequence 用完以后也加上自动用 observer」「和 move 一样」——
+   * 指的是跑完顺手报 `around`（12 格内最多 6 个），别再单独叫 mc_entities。
+   * 用源码文本钉住接线：从 `mc_sequence` 的注册块里找 `...aroundOf(sess)`。 */
+  const seqAt = src.indexOf("name: 'mc_sequence'")
+  const seqChunk = seqAt < 0 ? '' : src.slice(seqAt, seqAt + 4_000)
+  ok(/\.\.\.aroundOf\(sess\)/.test(seqChunk), 'mc_sequence 跑完也带 around（和 mc_move 同一条读口）')
+  ok(/around/.test(seqChunk) && /mc_entities/.test(seqChunk), 'mc_sequence 描述里说明了 around（不用再叫 mc_entities）')
+  const mvAt = src.indexOf("name: 'mc_move'")
+  const mvChunk = mvAt < 0 ? '' : src.slice(mvAt, mvAt + 6_000)
+  ok(/\.\.\.aroundOf\(sess\)/.test(mvChunk), 'mc_move 仍然带 around（两边口径一致）')
 }
 
 /* ─────────── ⑧ 扩展：timeoutMs 也 ≤ 12 秒 ─────────── */
