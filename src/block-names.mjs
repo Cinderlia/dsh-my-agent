@@ -24,6 +24,15 @@ export const PASSABLE = /^(air|cave_air|void_air|short_grass|tall_grass|fern|lar
 export const isPassable = (n) => Boolean(n) && PASSABLE.test(String(n))
 
 /** 头顶有这些东西**不算**"在地下"（树冠、竹子、雪层…）：站在树下 / 竹林里看地表图更有用 */
+/**
+ * 头在那格里**不会窒息**的方块：门/活板门/栅栏门/床/半砖/楼梯这些**不占满整格**。
+ *
+ * 🔴 2026-10-18 实机：AI 从**开着的门**里走过时，`isSolidBlock('oak_door')` 为真 ⇒ 被当成
+ *    "头卡在方块里正在窒息"，每次穿门都叫醒 + `stopWork`，实机表现是"穿个门要两次工具调用"。
+ *    判据不是"能不能走"（门在没开时确实不能走），而是"这一格有没有被方块塞满"。
+ */
+export const NON_SUFFOCATING = /_(?:door|trapdoor|fence_gate|bed|slab|stairs)$/
+
 export const SOFT_ROOF = /_leaves$|_log$|_wood$|^bamboo|^snow|_snow$|cactus|^moss|^melon|^pumpkin|_sapling$|_flower$|^vine$|glow_lichen|^hanging_roots$|^big_dripleaf/
 
 /**

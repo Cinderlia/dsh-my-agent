@@ -42,7 +42,7 @@
 import { userMessage } from '../src/user-message.mjs'
 import { clamp } from './mc_util.mjs'
 import { BRIDGE_FATAL } from '../src/bridge.mjs'
-import { isSolidBlock, isPassable, SOFT_ROOF } from '../src/block-names.mjs'
+import { isSolidBlock, isPassable, NON_SUFFOCATING, SOFT_ROOF } from '../src/block-names.mjs'
 import { hostilityOf } from '../src/entity-names.mjs'
 import { floorMapOf, hazardCellsOf } from '../src/map-render.mjs'
 import { recoverFromWater, waterReportText } from '../src/water-recovery.mjs'
@@ -1485,7 +1485,9 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
      *    而假世界能随便造 air，测试还全绿 —— 2026-10-18 审计抓到的就是这条。
      *    窒息既不算"被打"也不算"溺水"：不点名的话 AI 会以为闲下来了，然后每秒掉 1 点血安静地死。 */
     const headName = here[1]
-    const headSolidNow = Boolean(headName && isSolidBlock(headName) && !SOFT_ROOF.test(headName))
+    /* 门/活板门/栅栏门/床/半砖/楼梯**不占满整格**，站在里面不窒息（2026-10-18 实机：
+     * 穿过开着的门时被当成"头卡在方块里"，每次都叫醒 + 停手 ⇒ 穿门要两次工具调用）。 */
+    const headSolidNow = Boolean(headName && isSolidBlock(headName) && !SOFT_ROOF.test(headName) && !NON_SUFFOCATING.test(headName))
     /* 🔴 判据只看"头被盖住"这件事本身，**不能靠氧气读数**：窒息（沙埋/卡墙）走的是另一套伤害，
      *    服务端只在水下才发 `air_supply` —— 地面/刚出生时 `oxygenLevel` 是 null，被沙埋也不会变，
      *    原来那条 `air <= 19` 会把功能整个关死（2026-10-18 审计抓到的 P0，测试用假 air 所以没暴露）。

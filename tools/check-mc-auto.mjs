@@ -863,6 +863,23 @@ section('3.8 头卡在方块里（窒息）→ 叫醒 AI（2026-10-18 审计）'
   await flush()
   ok('头在树叶里（SOFT_ROOF）⇒ 不按窒息报', leaf.agent.steers.length === 0, steered(leaf).slice(0, 80))
 
+  // ⑤′ 穿门/站门里（开着的门）⇒ **不**报窒息（门不占满整格；2026-10-18 实机穿门被误判）
+  const door = buried({ '10,65,20': 'oak_door' })
+  door.state().lastHeadSolid = false
+  door.tick(door.at(1000))
+  await flush()
+  ok('头那格是门 ⇒ 不按窒息报（穿门不该被叫醒）', door.agent.steers.length === 0, steered(door).slice(0, 80))
+  const slab = buried({ '10,65,20': 'oak_slab' })
+  slab.state().lastHeadSolid = false
+  slab.tick(slab.at(1000))
+  await flush()
+  ok('头那格是半砖 ⇒ 不按窒息报（半格塞不满）', slab.agent.steers.length === 0, steered(slab).slice(0, 80))
+  const bed = buried({ '10,65,20': 'red_bed' })
+  bed.state().lastHeadSolid = false
+  bed.tick(bed.at(1000))
+  await flush()
+  ok('头那格是床 ⇒ 不按窒息报', bed.agent.steers.length === 0, steered(bed).slice(0, 80))
+
   // ⑥ 头是空气（正常站着）⇒ 当然不报
   const clean = setup({ patch: { lookAround: false } })
   clean.tick(clean.at(1000))
