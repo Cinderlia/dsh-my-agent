@@ -170,6 +170,47 @@ export function resetMcDepCache () { _depCache.clear() }
  * 手写的那套（按住前进 + 卡住就跳/挖/垫）在真机就是瞎动；pathfinder 是 A* + 自动挖/垫/绕路，
  * 自带卡住检测（3.5s 没进展 → `path_reset('stuck')`）和 noPath 判定。见文件顶部 `loadPathfinder`。
  */
+/**
+ * 把 pathfinder 挂在 tick 上的监听**接过来**（见 `setupPathfinder` 里 2026-10-18 崩溃的注释）。
+ *
+ * 为什么必须接：那个监听（`monitorMovement`）在 vendor 里是裸的，任何一次
+ * `placingBlock`/`bot.entity` 是 undefined 都会从 `setInterval` 回调抛到进程级 ——
+ * 宿主只对 `unhandledRejection` fail-loud，`uncaughtException` 直接**应用闪退**。
+ *
+ * 接管后：
+ * - 统一挂到新事件 `physicsTick`（vendor 写的是已废弃的 `physicTick`）；
+ * - `bot.entity?.position` 不在了（断线/重生一瞬）就跳过这一拍；
+ * - 监听里抛错 ⇒ 记一条（每分钟最多一条）+ 停寻路 + 继续跑。
+ *
+ * @returns {number} 接管了几个监听（0 = 没装上 pathfinder，正常）
+ */
+export function guardPathfinderTicks (b, { log = null } = {}) {
+  if (!b?.on || typeof b.listeners !== 'function') return 0
+  const fns = []
+  for (const ev of ['physicTick', 'physicsTick']) {
+    for (const fn of b.listeners(ev) ?? []) if (typeof fn === 'function' && !fns.includes(fn)) fns.push(fn)
+  }
+  if (!fns.length) return 0
+  for (const ev of ['physicTick', 'physicsTick']) b.removeAllListeners?.(ev)
+  let lastLogAt = 0
+  for (const fn of fns) {
+    b.on('physicsTick', function (...args) {
+      if (!b.entity?.position) return
+      try {
+        return fn.apply(this, args)
+      } catch (e) {
+        const now = Date.now()
+        if (now - lastLogAt > 60_000) {
+          lastLogAt = now
+          try { log?.(`寻路 tick 里抛错（已拦住，没让宿主崩）：${e?.stack ?? e?.message ?? e}`) } catch {}
+        }
+        try { b.pathfinder?.stop?.() } catch {}
+      }
+    })
+  }
+  return fns.length
+}
+
 export async function setupPathfinder (self, { spec = null } = {}) {
   const b = self.bot
   if (!b) return false
@@ -182,6 +223,14 @@ export async function setupPathfinder (self, { spec = null } = {}) {
   }
   try {
     if (typeof b.pathfinder?.goto !== 'function') b.loadPlugin(mod.pathfinder)
+    /* 2026-10-18 真机崩溃：pathfinder 的 `monitorMovement` 挂在 tick 上，某次
+     * `placingBlock`/`bot.entity` 是 undefined ⇒ `TypeError: Cannot read properties of undefined (reading 'y')`
+     * 从 setInterval 回调里抛出去 = uncaughtException = **整个 DSH 宿主进程退出**（不是掉线，是应用闪退）。
+     * 它同时还在用已废弃的 `physicTick` 事件。这里把它的 tick 监听接过来：
+     * ① 换到新事件 `physicsTick`（不再触发弃用警告）② `entity` 还没回来就跳过
+     * ③ 抛错时只记日志并停住寻路，绝不让它冒到进程级。 */
+    const guarded = guardPathfinderTicks(b, { log: (m) => self.log(m) })
+    if (guarded) self.logDebug(`pathfinder tick 已接管（${guarded} 个监听）`)
     // 想路线的预算：服务器卡顿时别想太久；搜索半径别放到无限。
     // 🔴 4000 太短了 —— 2026-10-06 实机挖树时频繁 "Took to long to decide path to goal!"，
     //    collectBlock 因此整批失败（改成逐个喂之后至少不会再一坏全坏）。8000 让"目标在高处、

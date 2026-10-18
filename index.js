@@ -1965,6 +1965,22 @@ export function apply(ctx, rawConfig) {
     })
   } catch (e) { logLine(`装未处理拒绝记录器失败（不影响使用）：${e?.message ?? e}`) }
 
+  /* ─────────── 「闪退」网：uncaughtException 至少留下栈 ───────────
+   * 2026-10-18：mineflayer-pathfinder 的 tick 监听在某次 `placingBlock` 为 undefined 时抛错，
+   * 从 setInterval 回调冒到进程级 ⇒ 宿主直接弹"应用无法启动或已意外停止"。
+   * 真正的修法是接管那个监听（`src/plugins.mjs` 的 `guardPathfinderTicks`），
+   * 这里只是**最后一层记录**：真还有别的裸抛，至少下次能在插件日志里看到栈。
+   * ⚠️ 只记录，不 exit（宿主自己的处置照旧）。 */
+  try {
+    let loggedCrash = 0
+    process.on('uncaughtException', (err) => {
+      if (loggedCrash >= 5) return
+      loggedCrash++
+      const stack = err?.stack ?? String(err)
+      logLine(`🔴 未捕获异常（可能是宿主崩掉的原因，栈如下）：${stack.split('\n').slice(0, 8).join(' ⏎ ')}`)
+    })
+  } catch (e) { logLine(`装未捕获异常记录器失败（不影响使用）：${e?.message ?? e}`) }
+
   const text = (value, render) => ({
     schema: { type: 'object', properties: {}, additionalProperties: true },
     render: (args, value2) => [{ type: 'text', text: render ? render(args, value2) : String(value2?.text ?? JSON.stringify(value2, null, 2)) }],

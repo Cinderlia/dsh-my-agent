@@ -23,6 +23,7 @@
  * 用法：node tools/check-move-progress.mjs
  */
 import { readFileSync } from 'node:fs'
+import { EventEmitter } from 'node:events'
 import vec3pkg from 'vec3'
 
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
@@ -1038,6 +1039,35 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
   ok(/guardDoorActivate\(b\)/.test(plug), 'setupPlugins 里装了"我们按开的门别被再按"')
   ok(/__autoOpenedDoors instanceof Map/.test(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')),
     '定时器按开门时记账（供上面的守卫用）')
+}
+section('⑮ 寻路 tick 不许把宿主带崩（2026-10-18 真机闪退：Cannot read properties of undefined (reading y)）')
+{
+  const { guardPathfinderTicks } = await import(new URL('../src/plugins.mjs', import.meta.url))
+  const b = new EventEmitter()
+  b.entity = { position: { x: 0, y: 64, z: 0 } }
+  let ticks = 0
+  let stops = 0
+  b.pathfinder = { stop () { stops++ } }
+  b.on('physicTick', () => { ticks++; throw new TypeError("Cannot read properties of undefined (reading 'y')") })
+  const n = guardPathfinderTicks(b, { log: () => {} })
+  ok(n === 1, '把 vendor 挂在旧事件 physicTick 上的监听接管了', String(n))
+  ok(b.listeners('physicTick').length === 0, '旧事件上不再留裸监听（弃用警告也一起没了）')
+  ok(b.listeners('physicsTick').length === 1, '改挂到新事件 physicsTick')
+  let threw = false
+  try { b.emit('physicsTick') } catch { threw = true }
+  ok(!threw, '🔴 监听里抛错不再冒到进程级（以前这一下 = 整个 DSH 闪退）')
+  ok(ticks === 1, '这一拍确实执行到了（不是被吞掉不跑）')
+  ok(stops === 1, '抛错后先停住寻路，别带着坏状态继续走')
+  b.entity = null
+  b.emit('physicsTick')
+  ok(ticks === 1, '断线/重生一瞬（entity 还没回来）跳过这一拍，不进 monitorMovement', String(ticks))
+  b.entity = { position: { x: 0, y: 64, z: 0 } }
+  b.emit('physicsTick')
+  ok(ticks === 2, 'entity 回来后继续跑')
+  const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
+  ok(/guardPathfinderTicks\(b/.test(plug), 'setupPathfinder 里真的调了这个接管')
+  const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  ok(/process\.on\('uncaughtException'/.test(idx), '宿主级还有一层"未捕获异常"记录（只记栈，不拦宿主处置）')
 }
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

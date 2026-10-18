@@ -11,6 +11,32 @@
 
 ## [未发布]
 
+### 💥 修复（寻路插件的一拍错误会把整个 DSH 带崩，2026-10-18）
+
+实机现场：玩着玩着应用直接弹「**应用无法启动或已意外停止**」，不是掉线、不是工具报错，是整个宿主进程没了。崩溃栈：
+
+```
+dsh: fatal uncaught exception: TypeError: Cannot read properties of undefined (reading 'y')
+    at EventEmitter.monitorMovement (…/mineflayer-pathfinder/index.js:538:63)
+    at EventEmitter.emit (node:events:526:24)
+    at tickPhysics (…/mineflayer/lib/plugins/physics.js:85:11)
+```
+
+两句都是线索：
+
+- `monitorMovement` 是 pathfinder 挂在 tick 上的内部函数，它会读 `bot.entity.position` 和"要放的方块"；断线 / 重生那一瞬、或一次放置刚好收尾时，这两样会是 `undefined` —— 它没有防守。
+- 这行代码从 **`setInterval` 回调**里抛出去，就是 `uncaughtException`；宿主只对 `unhandledRejection` 有兜底，这条直接**闪退**。
+- 顺带暴露的还有：vendor 用的还是已废弃的 `physicTick` 事件（mineflayer 每次启动都在提醒）。
+
+修法（`src/plugins.mjs` 的 `guardPathfinderTicks`）：
+
+1. **接管 pathfinder 的 tick 监听**：从旧的 `physicTick` 挪到新的 `physicsTick`（弃用警告消失，行为不变）。
+2. **`bot.entity` 还没回来就跳过这一拍** —— 那一拍本来也没有任何可做的事。
+3. **监听里抛错就地拦住**：记一条日志（每分钟最多一条）、停住寻路（别带着坏状态继续），宿主继续跑。
+4. 宿主级再补一层"未捕获异常"**只记栈**的记录器（`index.js`）：真还有别的裸抛，下次至少能在插件日志里看到栈，不用对着"意外停止"猜。
+
+回归：`check-move-progress` 221/0 → **231/0**（新增 10 条：旧事件监听被接管、改挂新事件、抛错不外溢、这一拍真的跑、抛错后停寻路、entity 缺失跳过、回来后继续、装配点真的调了、宿主级记录器在）；`check-all --fast` 42/42。
+
 ### 🚪 修复（门：会开但走不过去、还顺手挖墙 —— 这一版把 vendor 的两处坑补上了，2026-10-18）
 
 用户第二次实机反馈：「现在还是不会走门，会开但是不走门那，还是会挖方块」。查下去是 vendor `mineflayer-pathfinder` 里**两个独立的问题叠在一起**：
