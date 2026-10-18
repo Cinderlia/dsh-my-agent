@@ -1475,7 +1475,7 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
   ok(/pathfinder\?\.isMining\?\.\(\)/.test(plug), '🔴 来源判断包含 pathfinder.isMining()（覆盖装备工具的异步窗口）')
   ok(/guardDoorDig\(b/.test(plug), 'setupPlugins 里装了 door dig 守卫')
   ok(/const prev = b\.__inPathTick/.test(plug), '寻路 tick 里打了 `__inPathTick` 标记（只有这段里的挖才换成开门）')
-  ok(/export function patchDoorMoves/.test(plug) && /patchDoorMoves\(mv\)/.test(plug), 'movements() 里真的挂了这个补丁')
+  ok(/export function patchDoorMoves/.test(plug) && /patchDoorMoves\(mv, \{ digPenalty/.test(plug), 'movements() 里真的挂了这个补丁（带 preferDoors 的惩罚）')
   ok(/guardDoorActivate\(b\)/.test(plug), 'setupPlugins 里装了"我们按开的门别被再按"')
   ok(/guardPathfinderRejections\(b/.test(plug), '🔴 setupPathfinder 里给 goto 的拒绝挂了 catch（否则 PathStopped 会炸宿主）')
   ok(/__autoOpenedDoors instanceof Map/.test(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')),
@@ -1567,6 +1567,53 @@ section('⑯ 从门里走过去（2026-10-18 实机：门开着反而磨在门�
   ok(/const base = \(doorFaceOf\(b, dir\) \?\? dir\)\?\.position/.test(src), '🔴 门中心取的是下半块的 `position`（不是 doorBaseKey 的字符串）')
   ok(/Number\.isFinite\(base\.x\)/.test(src), '中心点坐标要过 `Number.isFinite`（NaN 会让整个物理位置变 NaN）')
   ok(/\.\.\.\(doorWalk \? \{ doorWalk \} : \{\}\)/.test(src), '走路结果里会报 doorWalk（AI 能看到这次是不是从门里过的）')
+}
+
+section('⑰ preferDoors：挖墙要多付一笔，走门/绕路不付（2026-10-18 用户要求）')
+{
+  const { patchDoorMoves } = await import(new URL('../src/plugins.mjs', import.meta.url))
+  const { DEFAULTS } = await import(new URL('../src/core.mjs', import.meta.url))
+  const mkMv = () => {
+    const blocks = new Map([
+      [`5,64,6`, { name: 'oak_door', physical: true, position: new Vec3(5, 64, 6), getProperties: () => ({ half: 'lower', open: true }), shapes: [{}, {}] }],
+      [`5,65,6`, { name: 'oak_door', physical: true, position: new Vec3(5, 65, 6), getProperties: () => ({ half: 'upper', open: true }), shapes: [{}, {}] }],
+      [`3,64,6`, { name: 'stone', physical: true, position: new Vec3(3, 64, 6), getProperties: () => ({}), shapes: [{}], digTime: () => 400 }]
+    ])
+    return {
+      openable: new Set(), digCost: 4, placeCost: 12, canOpenDoors: true,
+      bot: { pathfinder: { bestHarvestTool: () => ({ type: 1 }) } },
+      getBlock: (n, dx, dy, dz) => blocks.get(`${n.x + dx},${n.y + dy},${n.z + dz}`) ??
+        { name: 'air', physical: false, shapes: [], position: new Vec3(n.x + dx, n.y + dy, n.z + dz), getProperties: () => ({}) },
+      getNeighbors: () => ([
+        { cost: 1, toBreak: [], toPlace: [] },                                  // 平地走
+        { cost: 1.41, toBreak: [], toPlace: [] },                               // 斜走
+        { cost: 9, toBreak: [new Vec3(3, 64, 6)], toPlace: [] },                // 挖石头走
+        { cost: 3, toBreak: [new Vec3(5, 64, 6), new Vec3(5, 65, 6)], toPlace: [] } // 穿门（门会被剔掉）
+      ])
+    }
+  }
+  const node = { x: 5, y: 64, z: 5, remainingBlocks: 64 }
+  {
+    const mv = mkMv()
+    patchDoorMoves(mv, { digPenalty: 8 })
+    const out = mv.getNeighbors(node)
+    const flat = out.filter((m) => m.toBreak.length === 0)
+    const dig = out.filter((m) => m.toBreak.length > 0)
+    ok(flat.length === 3, '不挖方块的移动有 3 条（平地/斜走/穿门）', String(flat.length))
+    ok(flat.every((m) => m.cost <= 3), '不挖的移动**不加**惩罚（穿门那条 cost 还是 3）', JSON.stringify(flat.map((m) => m.cost)))
+    ok(dig.length === 1 && dig[0].cost === 17, '挖石头的移动 cost 9 → 17（+8）', JSON.stringify(dig.map((m) => m.cost)))
+  }
+  {
+    const mv = mkMv()
+    patchDoorMoves(mv, { digPenalty: 0 })
+    const out = mv.getNeighbors(node)
+    ok(out.find((m) => m.toBreak.length > 0)?.cost === 9, 'preferDoors:false（惩罚 0）⇒ 代价原样', String(out.find((m) => m.toBreak.length > 0)?.cost))
+  }
+  ok(DEFAULTS.preferDoors === true, '默认开（preferDoors:true）')
+  ok(DEFAULTS.doorDigPenalty === 8, '默认惩罚 8')
+  const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
+  ok(/self\.cfg\.preferDoors !== false/.test(plug), 'movements() 真的读了 preferDoors 开关')
+  ok(/digPenalty: preferDoors \? Number\(self\.cfg\.doorDigPenalty \?\? 8\) : 0/.test(plug), '惩罚值可配置（doorDigPenalty，关掉就是 0）')
 }
 
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)

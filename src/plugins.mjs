@@ -429,7 +429,7 @@ const IRON_DOOR_RE = /^iron_(door|trapdoor)$/
  *
  * 只过滤木门/栅栏门/活板门；铁门按不开，保留原行为。
  */
-export function patchDoorMoves (mv) {
+export function patchDoorMoves (mv, { digPenalty = 0 } = {}) {
   if (!mv) return mv
   const doorAt = (node, p) => {
     try { return mv.getBlock?.(node, p.x - node.x, p.y - node.y, p.z - node.z) ?? null } catch { return null }
@@ -520,6 +520,14 @@ export function patchDoorMoves (mv) {
       /* 🔴 兜底：门保护不该把整个世界变成"无路可走"。
        * 万一某个节点上所有候选都因为"得挖门旁边的方块"被作废，就退回未过滤的候选 ——
        * 执行层 `guardDoorDig` 仍然不会真去挖门/门框，宁可交给脱困阶梯也不要凭空 NoPath。 */
+      /* 🔴 `preferDoors`（2026-10-18 用户要求）：**所有"还得挖方块"的移动加一笔固定惩罚**。
+       * 门/绕路本身不受影响，只是"挖墙"更不划算 ⇒ 有门的房子会优先走门、宁可多绕两步。
+       * 放在 `clean()` 之后：门已经从 `toBreak` 里剔掉了，不会误伤"穿过门"。 */
+      if (digPenalty > 0) {
+        for (const m of kept) {
+          if (Array.isArray(m.toBreak) && m.toBreak.length) m.cost = (Number(m.cost) || 0) + digPenalty
+        }
+      }
       return kept.length > 0 ? kept : moves
     }
     mv.__dshDoorPatched = true
@@ -594,7 +602,11 @@ export function movements (self, { terrain = null } = {}) {
   applyProfile(mv, profile)
   mv.scafoldingBlocks = scaffoldingItemIds(b)      // 背包里能垫的方块（**item id**，见该函数注释）
   /* 2026-10-18：门只许"按开"，不许挖；已经开着就别再按（否则等于关回去）。见 `patchDoorMoves`。 */
-  patchDoorMoves(mv)
+  /* `preferDoors`（默认开）：给"还要挖方块"的移动加 8 点惩罚 —— 平地挖一格石头本来
+   * 就要 ~18 点（`digCost` 4 × (1 + 3×挖掘秒数)），再 +8 基本等于"多绕二十几步"，
+   * 有门就走门。用户要挖墙可以显式 `preferDoors:false`，或直接叫 `mc_dig`。 */
+  const preferDoors = self.cfg.preferDoors !== false
+  patchDoorMoves(mv, { digPenalty: preferDoors ? Number(self.cfg.doorDigPenalty ?? 8) : 0 })
   return mv
 }
 

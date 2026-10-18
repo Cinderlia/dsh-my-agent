@@ -184,9 +184,9 @@ export const DEFAULTS = {
   authPass: process.env.MC_AUTH_PASS ?? '',
   connectTimeoutMs: 45_000,
   moveBudgetMs: 40_000,
+  preferDoors: true, doorDigPenalty: 8,   // 优先走门/绕路：给"挖墙"加代价（2026-10-18）
   chatHistory: 300,
-  /* 自动重连最多试几次（2026-10-08 审计报告 F1：以前**没有上限**，5s→10s→…→60s 无限重试，
-   *  而看门狗会注入"正在自动重连，先别再操作角色" ⇒ AI 停手死等一个永远不来的重连）。 */
+  /* 自动重连最多试几次（以前没上限、5s→…→60s 无限重试，看门狗又让 AI 干等）。 */
   maxReconnectAttempts: 5,
   /**
    * 日志落盘位置。🔴 **默认不写插件包目录**（装进 `node_modules/` 后那可能是只读的、
