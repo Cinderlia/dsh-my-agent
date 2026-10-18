@@ -946,5 +946,70 @@ section('⑬ 长路线续行 + 地形局部重估（2026-10-18 审计 P1）')
     '🔴 脱困后真的重判地形并按新地形重设 Movements')
   ok(/if \(noTower\) mv2\.allow1by1towers = false/.test(src), '重设 Movements 时 noTower 依旧生效（别把逃跑那条腿放回来）')
 }
+section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（2026-10-18 实机第二次反馈）')
+{
+  const { patchDoorMoves, guardDoorActivate } = await import(new URL('../src/plugins.mjs', import.meta.url))
+  const blk = (name, open) => ({ name, getProperties: () => ({ open }) })
+  /* 假 Movements：只有 getMoveForward，规划出一条"挖门 + 推门"的 move */
+  const mkMv = (world) => ({
+    getBlock (node, dx, dy, dz) { return world[`${node.x + dx},${node.y + dy},${node.z + dz}`] ?? blk('air', false) },
+    getMoveForward (node, dir, neighbors) {
+      neighbors.push({
+        toBreak: [{ x: 1, y: 64, z: 0 }, { x: 2, y: 64, z: 0 }],
+        toPlace: [{ x: 1, y: 64, z: 0, useOne: true }],
+      })
+    },
+  })
+  {
+    // 门（关着）+ 旁边的石头：门不许进 toBreak，石头照常可以挖
+    const mv = mkMv({ '1,64,0': blk('oak_door', false), '2,64,0': blk('stone', false) })
+    patchDoorMoves(mv)
+    const out = []
+    mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
+    const m = out[0]
+    ok(m.toBreak.length === 1 && m.toBreak[0].x === 2, '🔴 门不进"要挖的方块"（stone 照旧可挖）', JSON.stringify(m.toBreak))
+    ok(m.toPlace.some((p) => p.useOne && p.x === 1), '门关着 ⇒ 保留"按开"那一步', JSON.stringify(m.toPlace))
+  }
+  {
+    // 门已经开着：不该再 activateBlock（那等于把它关回去）
+    const mv = mkMv({ '1,64,0': blk('oak_door', true), '2,64,0': blk('stone', false) })
+    patchDoorMoves(mv)
+    const out = []
+    mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
+    ok(out[0].toPlace.length === 0, '🔴 门已经开着 ⇒ 删掉"再按一下"那步', JSON.stringify(out[0].toPlace))
+  }
+  {
+    // 铁门按不开：保留原行为（别把唯一的路堵死）
+    const mv = mkMv({ '1,64,0': blk('iron_door', false), '2,64,0': blk('stone', false) })
+    patchDoorMoves(mv)
+    const out = []
+    mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
+    ok(out[0].toBreak.length === 2 && out[0].toPlace.length === 1, '铁门不在这条规则里（按不开，仍允许挖）', JSON.stringify(out[0].toBreak))
+  }
+  {
+    // guardDoorActivate：我们按开的门，vendor 的 useOne 再按时直接忽略
+    let calls = 0
+    const b = { activateBlock: async () => { calls++ } }
+    guardDoorActivate(b)
+    const openBlk = { position: { x: 1, y: 64, z: 0 }, getProperties: () => ({ open: true }) }
+    const closedBlk = { position: { x: 2, y: 64, z: 0 }, getProperties: () => ({ open: false }) }
+    b.__autoOpenedDoors.set('1,64,0', Date.now())
+    await b.activateBlock(openBlk)
+    ok(calls === 0, '🔴 刚被我们按开的门，vendor 再按 ⇒ 忽略（不关回去）', String(calls))
+    await b.activateBlock(closedBlk)
+    ok(calls === 1, '别的（关着的）门照常按', String(calls))
+    b.__autoOpenedDoors.set('2,64,0', Date.now())
+    await b.activateBlock(closedBlk)
+    ok(calls === 2, '门已经是关的 ⇒ 照常按（可能被谁关上了）', String(calls))
+    b.__autoOpenedDoors.set('1,64,0', Date.now() - 13_000)
+    await b.activateBlock(openBlk)
+    ok(calls === 3, '超过 12 秒就不再拦截（按正常交互处理）', String(calls))
+  }
+  const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
+  ok(/export function patchDoorMoves/.test(plug) && /patchDoorMoves\(mv\)/.test(plug), 'movements() 里真的挂了这个补丁')
+  ok(/guardDoorActivate\(b\)/.test(plug), 'setupPlugins 里装了"我们按开的门别被再按"')
+  ok(/__autoOpenedDoors instanceof Map/.test(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')),
+    '定时器按开门时记账（供上面的守卫用）')
+}
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

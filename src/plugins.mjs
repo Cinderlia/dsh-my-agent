@@ -207,6 +207,59 @@ export async function setupPathfinder (self, { spec = null } = {}) {
  * 给了它就**按地形挑权重**（台阶上挖便宜一点、沟边垫方块便宜一点、岩浆边一格都不许跳），
  * 不给就退回平地那套（= 改动前的全局值）。用户显式配置永远优先（见 `profileFor` 的 `over`）。
  */
+/** 门这类方块：能按开就不该挖（2026-10-18 实机第二次反馈："会开但是不走门那，还是会挖方块"）。 */
+export const DOOR_BLOCK_RE = /_(door|trapdoor|fence_gate)$/
+/** 铁门/铁活板门要红石，按不开 —— 这条规则不管它们（仍允许挖，至少能脱困）。 */
+const IRON_DOOR_RE = /^iron_(door|trapdoor)$/
+
+/**
+ * 给 vendor 的 `Movements` 打两个补丁（**只影响规划出来的那条 move**，不改 A*）：
+ *
+ * ① **别把门算进 `toBreak`**：vendor 的 `getMoveForward` 先
+ *    `cost += safeOrBreak(blockB, toBreak)`（门的上半格就是 blockB）—— "穿门"这条路
+ *    因此带着一条"把门挖掉"的账；执行到那一步就把门挖了，`canOpenDoors` 只救了门的下半格。
+ * ② **门已经开着就不要再 `activateBlock`**：vendor 的 `useOne` 是无条件按一下；
+ *    我们 400ms 定时器已经按开了，vendor 再按一次 = **又把门关上**（"开了但不走"）。
+ *
+ * 只过滤木门/栅栏门/活板门；铁门按不开，保留原行为。
+ */
+export function patchDoorMoves (mv) {
+  if (!mv) return mv
+  const doorAt = (node, p) => {
+    try { return mv.getBlock?.(node, p.x - node.x, p.y - node.y, p.z - node.z) ?? null } catch { return null }
+  }
+  const isDoor = (blk) => Boolean(blk?.name && DOOR_BLOCK_RE.test(blk.name) && !IRON_DOOR_RE.test(blk.name))
+  const isOpen = (blk) => { try { return blk?.getProperties?.()?.open === true } catch { return false } }
+  const wrap = (name) => {
+    const orig = mv[name]
+    if (typeof orig !== 'function') return
+    mv[name] = function (node, dir, neighbors) {
+      const before = Array.isArray(neighbors) ? neighbors.length : 0
+      const r = orig.call(this, node, dir, neighbors)
+      if (!Array.isArray(neighbors)) return r
+      for (let i = before; i < neighbors.length; i++) {
+        const m = neighbors[i]
+        if (!m) continue
+        if (Array.isArray(m.toBreak) && m.toBreak.length) {
+          m.toBreak = m.toBreak.filter((p) => !isDoor(doorAt(node, p)))
+        }
+        if (Array.isArray(m.toPlace) && m.toPlace.length) {
+          m.toPlace = m.toPlace.filter((p) => {
+            if (!p?.useOne) return true
+            const blk = doorAt(node, p)
+            return !(isDoor(blk) && isOpen(blk))
+          })
+        }
+      }
+      return r
+    }
+  }
+  wrap('getMoveForward')
+  wrap('getMoveJumpUp')
+  wrap('getMoveDiagonal')
+  return mv
+}
+
 export function movements (self, { terrain = null } = {}) {
   const b = self.bot
   const { Movements } = self._pf ?? {}
@@ -234,6 +287,8 @@ export function movements (self, { terrain = null } = {}) {
   // `getMoveUp`（1×1 柱子）那条路一起剪掉，机器人就爬不出坑了。
   applyProfile(mv, profile)
   mv.scafoldingBlocks = scaffoldingItemIds(b)      // 背包里能垫的方块（**item id**，见该函数注释）
+  /* 2026-10-18：门只许"按开"，不许挖；已经开着就别再按（否则等于关回去）。见 `patchDoorMoves`。 */
+  patchDoorMoves(mv)
   return mv
 }
 
@@ -256,6 +311,30 @@ export function adaptMovements (self, { feet = null, radius = null } = {}) {
 }
 
 /**
+ * 我们**自己按开**的门：vendor 的 `useOne` 是无条件 `activateBlock` ——
+ * 定时器刚把门按开，它走到门口又按一下，等于**把门关回去**（实机："开了但不走门"）。
+ * 这里给 `b.activateBlock` 加一层"最近被我们打开过的门，重复按直接忽略"。
+ * 只在 12 秒内、且门**现在确实是开着**时才忽略；别人关了/状态不明就照常按。
+ */
+export function guardDoorActivate (b) {
+  if (!b || typeof b.activateBlock !== 'function' || b.__doorGuard) return b
+  const orig = b.activateBlock.bind(b)
+  b.__doorGuard = true
+  b.__autoOpenedDoors = new Map()
+  b.activateBlock = async function (blk, ...rest) {
+    const key = blk?.position ? `${Math.floor(blk.position.x)},${Math.floor(blk.position.y)},${Math.floor(blk.position.z)}` : null
+    const at = key ? b.__autoOpenedDoors.get(key) : null
+    if (key && at && Date.now() - at < 12_000) {
+      let open = false
+      try { open = blk.getProperties?.().open === true } catch { open = false }
+      if (open) { b.__autoOpenedDoors.delete(key); return }
+    }
+    return orig(blk, ...rest)
+  }
+  return b
+}
+
+/**
  * 把**现成的**生态插件都挂上（`MC_DEPS` 里那几个）。缺哪个只是少那项能力，其它照旧。
  *
  * 顺序有依赖：pathfinder 必须最先（collectBlock / pvp 都要用它的 `Movements`）。
@@ -270,6 +349,9 @@ export async function setupPlugins (self, { spec = null } = {}) {
   const log = (m) => self.logDebug(m)
   const logWarn = (m) => self.log(m)      // 候选不可用 / 形状不对：真出问题时要看得见
   out.pathfinder = await setupPathfinder(self, { spec }).catch((e) => { self.log('pathfinder 初始化异常：' + e.message); return false })
+  /* 门：① 规划时别挖门/别重复按（`patchDoorMoves`，在 `movements()` 里）；
+   *     ② 执行时"我们刚按开的门"别被 vendor 的 useOne 再按回去（`guardDoorActivate`）。 */
+  guardDoorActivate(b)
   const mv = self.pfReady ? movements(self) : null
 
   // ① 走过去挖方块 / 捡掉落物（内部自己用 mineflayer-tool 换工具）

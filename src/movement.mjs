@@ -721,7 +721,13 @@ export async function openNearbyDoor (b, radius = DOOR_OPEN_R) {
           let isOpen = false
           try { isOpen = blk.getProperties?.().open === true } catch {}
           if (isOpen) continue
-          try { await b.activateBlock(blk); opened++ } catch {}
+          try {
+            await b.activateBlock(blk)
+            opened++
+            /* 记一笔"这扇是我们按开的"：vendor 规划里的 `useOne` 走到门口还会再按一次，
+             * 那一下会把门关回去（实机"开了但不走门"）。`guardDoorActivate` 据此忽略重复按。 */
+            if (b.__autoOpenedDoors instanceof Map) b.__autoOpenedDoors.set(`${pos.x},${pos.y},${pos.z}`, Date.now())
+          } catch {}
         }
       }
     }
