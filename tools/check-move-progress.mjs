@@ -1158,6 +1158,39 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     const dugBefore3 = dug
     await b.dig(closed)
     ok(dug === dugBefore3 + 1 && activated === actBefore, '🔴 AI 自己点名挖门（不在寻路 tick 里）⇒ 真的挖，不拦', `activated=${activated} dug=${dug}`)
+    /* 🔴 开门失败也绝不回落到挖门（用户 2026-10-18：别用毁门来掩盖失败） */
+    {
+      world.set('7,64,0', { name: 'oak_door', open: false })
+      const origAct = b.activateBlock
+      let thrown = 0
+      b.activateBlock = async () => { thrown++; throw new Error('server busy') }
+      const d0 = dug
+      b.__inPathTick = true
+      await b.dig(mkBlk(7, 64, 0))
+      ok(thrown === 1 && dug === d0 && world.get('7,64,0').open === false,
+        '🔴 activateBlock 抛错 ⇒ 记失败、不挖门（门还在）', `thrown=${thrown} dug=${dug} open=${world.get('7,64,0').open}`)
+      b.activateBlock = origAct
+      b.__inPathTick = false
+    }
+    /* 🔴 上半格 + 下半格都被寻路器要求处理 ⇒ 最多按一次，两半都不许被挖 */
+    {
+      world.set('9,64,0', { name: 'oak_door', open: false })
+      world.set('9,65,0', { name: 'oak_door', open: false })
+      const pressed2 = []
+      const origAct = b.activateBlock
+      b.activateBlock = async (blk) => { pressed2.push(`${blk.position.y}`); activated++; world.get(`${blk.position.x},${blk.position.y},${blk.position.z}`).open = true }
+      b.blockAt = (v) => mkBlk(v.x, v.y, v.z)
+      const lowerHalf = mkBlk(9, 64, 0)
+      const upperHalf = { name: 'oak_door', position: { x: 9, y: 65, z: 0 }, getProperties: () => ({ open: false, half: 'upper' }) }
+      const d1 = dug
+      b.__inPathTick = true
+      await b.dig(upperHalf)
+      await b.dig(lowerHalf)
+      ok(pressed2.length <= 1 && dug === d1 && pressed2[0] === '64',
+        '🔴 上下半格都被要求处理 ⇒ 最多按一次（下半格），一格都不挖', JSON.stringify({ pressed2, dug }))
+      b.activateBlock = origAct
+      b.__inPathTick = false
+    }
   }
   const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
   ok(/guardDoorDig\(b/.test(plug), 'setupPlugins 里装了 door dig 守卫')

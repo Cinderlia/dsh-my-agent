@@ -230,7 +230,8 @@ export function guardPathfinderTicks (b, { log = null } = {}) {
  * 先 `activateBlock` 按开；按开了就当"这一步完成了"，人直接走过去。
  *
  * 只拦**寻路器自己**发起的挖（`b.__inPathTick`）——AI 点名挖门照旧真的挖。
- * 按不开的（铁门/被方块顶住）回落到真挖，至少能脱困。
+ * **绝不回落到挖门**：开着 / 按开成功 / 按开失败 / 状态未知，一律不挖 ——
+ * 门是用户和世界的资产，失败就交给上层重新寻路（用户 2026-10-18 明确要求）。铁门不在这条里。
  */
 export function guardDoorDig (b, { log = null } = {}) {
   if (!b || typeof b.dig !== 'function' || b.__dshGuardedDig) return false
@@ -259,31 +260,29 @@ export function guardDoorDig (b, { log = null } = {}) {
       if (inFlight.has(key)) return
       if (Date.now() - Number(pressAt.get(key) ?? 0) < DOOR_PRESS_COOL_MS) return
       const state = doorOpenStateOf(target)
-      if (state === 'open') return                              // 已经开着：这一步当过了
-      if (state !== 'closed') return orig(block, ...rest)       // 状态读不到：不猜，照旧处理
+      if (state === 'open') return          // 已经开着：这一步当过了
+      if (state !== 'closed') {
+        /* 🔴 状态读不到也不许挖：不知道 ≠ 可以破坏（用户的明确要求） */
+        say(`🚪 ${nm} 状态读不到（${state}），不按也不挖（${key}）`)
+        return
+      }
+      if (typeof b.activateBlock !== 'function') {
+        say(`🚪 ${nm} 无法交互，已阻止寻路挖门（${key}）`)
+        return
+      }
       inFlight.add(key)
-      pressAt.set(key, Date.now())                              // await 之前就上锁（tick 会重入）
+      pressAt.set(key, Date.now())          // await 之前就上锁（tick 会重入）
       try {
         await b.activateBlock(target)
-        /* 回读确认：确认开了才当"这一步完成"；没确认就回落到真挖（至少能脱困） */
-        let after = doorOpenStateOf(typeof b.blockAt === 'function' ? b.blockAt(target.position) : target)
-        for (let i = 0; i < 3 && after !== 'open'; i++) {
-          await new Promise((r) => setTimeout(r, 50))
-          after = doorOpenStateOf(typeof b.blockAt === 'function' ? b.blockAt(target.position) : target)
-        }
-        if (after === 'open') {
-          if (b.__autoOpenedDoors instanceof Map) b.__autoOpenedDoors.set(key, Date.now())
-          b.__doorOpens = (b.__doorOpens ?? 0) + 1
-          say(`🚪 寻路要挖 ${nm} —— 改成按开（${key}）`)
-          return
-        }
-        say(`🚪 按了 ${nm} 但没确认开门（${after}），回落到挖（${key}）`)
+        if (b.__autoOpenedDoors instanceof Map) b.__autoOpenedDoors.set(key, Date.now())
+        b.__doorOpens = (b.__doorOpens ?? 0) + 1
+        say(`🚪 寻路请求开门 ${nm}，不挖门（${key}）`)
       } catch (e) {
-        say(`🚪 按开 ${nm} 失败（回落到挖）：${e?.message ?? e}`)
+        /* 🔴 开门失败也**绝不**回落到挖门：门是用户/世界的资产，失败就交给上层重新寻路 */
+        say(`🚪 ${nm} 未能打开，已阻止自动挖门：${e?.message ?? e}（${key}）`)
       } finally {
         inFlight.delete(key)
       }
-      return orig(block, ...rest)
     })()
   }
   b.__dshGuardedDig = true
