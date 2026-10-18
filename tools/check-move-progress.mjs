@@ -859,53 +859,84 @@ section('⑧‴ 失败结果"可操作"：眼前挡路的那格 + 泳也算三�
   const { DOOR_RE, openNearbyDoor, CARVE_PROTECTED, carveStepAhead } = mod
   ok(DOOR_RE.test('oak_door') && DOOR_RE.test('iron_trapdoor') && DOOR_RE.test('oak_fence_gate')
     && !DOOR_RE.test('oak_planks'), '门/活板门/栅栏门都认得，木板不算')
-  const mkDoorBot = (open = false) => {
+  /* 🔴 实机第四/五次反馈（"一直开门"）：① 上下半格被当成两扇门，一轮按两次 = 开了又关；
+   * ② 真实数据里**上半块可能没有 `open` 属性**，读成 undefined ⇒ 误判"还关着" ⇒ 再按一次；
+   * ③ 400ms 定时器重入时两次都过了检查 ⇒ 各按一次。这里逐个钉住。 */
+  const mkDoorWorld = ({ open = false, upperHasOpen = true, confirm = true } = {}) => {
+    const st = { open }
     const seen = []
     const b = {
       entity: { position: new Vec3(0, 64, 0) },
       blockAt (v) {
-        if (v.x === 1 && v.y === 64 && v.z === 0) {
-          return { name: 'oak_door', position: v, getProperties: () => ({ open }) }
+        const lower = v.x === 1 && v.z === 0 && v.y === 64
+        const upper = v.x === 1 && v.z === 0 && v.y === 65
+        if (lower) return { name: 'oak_door', position: v, getProperties: () => ({ open: st.open, half: 'lower' }) }
+        if (upper) {
+          return {
+            name: 'oak_door',
+            position: v,
+            getProperties: () => (upperHasOpen ? { open: st.open, half: 'upper' } : { half: 'upper' }),
+          }
         }
         return { name: 'air', position: v }
       },
-      async activateBlock (blk) { seen.push(`${blk.position.x},${blk.position.y},${blk.position.z}`) },
+      async activateBlock (blk) {
+        seen.push(`${blk.position.y}`)
+        if (confirm) st.open = !st.open
+      },
     }
-    return { b, seen }
+    return { b, st, seen }
   }
   {
-    const { b, seen } = mkDoorBot(false)
+    const { b, st, seen } = mkDoorWorld({ open: false })
     const n = await openNearbyDoor(b)
-    ok(n === 1 && seen.length === 1 && seen[0] === '1,64,0', '身边有关着的门 ⇒ 按一下（activateBlock）', JSON.stringify({ n, seen }))
+    ok(n === 1 && st.open === true && seen.length === 1 && seen[0] === '64',
+      '关着的门 ⇒ 按下半格一次、回读确认后报"开了"', JSON.stringify({ n, open: st.open, seen }))
   }
   {
-    const { b, seen } = mkDoorBot(true)
+    /* 核心回归：门开着 + 上半块没有 open 属性 —— 绝不能因为上半块 undefined 再按一次 */
+    const { b, st, seen } = mkDoorWorld({ open: true, upperHasOpen: false })
+    const n = await openNearbyDoor(b)
+    ok(n === 0 && seen.length === 0 && st.open === true,
+      '🔴 门已开着、上半块没有 open 属性 ⇒ 一次都不按（按了就把门关回去）', JSON.stringify({ n, seen, open: st.open }))
+  }
+  {
+    const { b, seen } = mkDoorWorld({ open: true })
     const n = await openNearbyDoor(b)
     ok(n === 0 && seen.length === 0, '门已经开着 ⇒ 不再乱按')
   }
-  /* 🔴 实机第四次反馈「会卡在门外然后一直开门」：门有上下两格，按两格 = 开了又关；
-   * 再叠加 400ms 定时器，就是无限开关。这里钉住"一扇门一轮只按一次 + 有冷却"。 */
   {
-    const { doorBaseKey, DOOR_PRESS_COOL_MS } = mod
-    const seen = []
-    const lowerPos = new Vec3(1, 64, 0)
-    const upperPos = new Vec3(1, 65, 0)
+    /* 并发：400ms 定时器重入 —— 同一扇门最多只有一次实际点击 */
+    const { b, seen, st } = mkDoorWorld({ open: false })
+    const [a1, a2] = await Promise.all([openNearbyDoor(b), openNearbyDoor(b)])
+    ok(seen.length === 1 && st.open === true, '🔴 两次扫描并发 ⇒ 同一扇门只点一次（在途锁）', JSON.stringify({ seen, a1, a2 }))
+  }
+  {
+    /* 服务端没确认打开：不能报成功，也不能马上再点 */
+    const { b, seen } = mkDoorWorld({ open: false, confirm: false })
+    const n1 = await openNearbyDoor(b)
+    ok(n1 === 0 && b.__doorLast?.closed?.length === 1, '服务端没确认 ⇒ 不报"开了"（记在 __doorLast.closed）', JSON.stringify(b.__doorLast))
+    const n2 = await openNearbyDoor(b)
+    ok(n2 === 0 && seen.length === 1, '没确认之后 1.5 秒内不再连点（seen 仍是 1）', JSON.stringify({ n2, seen }))
+  }
+  {
+    /* 铁门：按不开，不空点 */
     const b = {
       entity: { position: new Vec3(0, 64, 0) },
       blockAt (v) {
-        if (v.x === 1 && v.y === 64 && v.z === 0) return { name: 'oak_door', position: v, getProperties: () => ({ open: false, half: 'lower' }) }
-        if (v.x === 1 && v.y === 65 && v.z === 0) return { name: 'oak_door', position: v, getProperties: () => ({ open: false, half: 'upper' }) }
+        if (v.x === 1 && v.z === 0 && v.y === 64) return { name: 'iron_door', position: v, getProperties: () => ({ open: false, half: 'lower' }) }
         return { name: 'air', position: v }
       },
-      async activateBlock (blk) { seen.push(`${blk.position.y}`) },
+      async activateBlock () { throw new Error('铁门不该被按') },
     }
-    ok(doorBaseKey({ position: upperPos, getProperties: () => ({ half: 'upper' }) }) === '1,64,0'
-      && doorBaseKey({ position: lowerPos, getProperties: () => ({ half: 'lower' }) }) === '1,64,0',
+    const n = await openNearbyDoor(b)
+    ok(n === 0 && b.__doorLast?.iron?.length === 1, '🔴 铁门按不开 ⇒ 不空点（记进 __doorLast.iron）', JSON.stringify(b.__doorLast))
+  }
+  {
+    const { doorBaseKey, DOOR_PRESS_COOL_MS } = mod
+    ok(doorBaseKey({ position: new Vec3(1, 65, 0), getProperties: () => ({ half: 'upper' }) }) === '1,64,0'
+      && doorBaseKey({ position: new Vec3(1, 64, 0), getProperties: () => ({ half: 'lower' }) }) === '1,64,0',
       '🔴 上下半格折算成同一个"门轴"（否则会按两次 ⇒ 开了又关）')
-    const n1 = await openNearbyDoor(b)
-    ok(n1 === 1 && seen.length === 1 && seen[0] === '64', '🔴 一扇门一轮只按一次（按下半格，不按上半格）', JSON.stringify(seen))
-    const n2 = await openNearbyDoor(b)
-    ok(n2 === 0 && seen.length === 1, `按过之后 ${DOOR_PRESS_COOL_MS}ms 内不再按（否则每次轮询都把门关回去）`, JSON.stringify({ n2, seen }))
     ok(DOOR_PRESS_COOL_MS >= 1000, '按门冷却不能太短（门状态要时间同步回来）')
   }
   ok(CARVE_PROTECTED.test('oak_door') && CARVE_PROTECTED.test('oak_fence_gate'),
@@ -1071,36 +1102,55 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     const { guardDoorDig } = await import(new URL('../src/plugins.mjs', import.meta.url))
     let activated = 0
     let dug = 0
+    const world = new Map()   // `x,y,z` → { name, open }
+    const mkBlk = (x, y, z) => {
+      const st = world.get(`${x},${y},${z}`) ?? { name: 'air', open: false }
+      return {
+        name: st.name,
+        position: { x, y, z },
+        getProperties: () => (st.name.includes('door') ? { open: st.open, half: 'lower' } : {}),
+      }
+    }
+    world.set('1,64,0', { name: 'oak_door', open: false })
+    world.set('2,64,0', { name: 'oak_door', open: true })
+    world.set('3,64,0', { name: 'iron_door', open: false })
+    world.set('5,64,0', { name: 'oak_door', open: false })
     const b = {
       __inPathTick: false,
-      activateBlock: async () => { activated++ },
+      blockAt: (v) => mkBlk(v.x, v.y, v.z),
+      activateBlock: async (blk) => {
+        activated++
+        const st = world.get(`${blk.position.x},${blk.position.y},${blk.position.z}`)
+        if (st) st.open = !st.open
+      },
       dig: async () => { dug++ },
     }
     ok(guardDoorDig(b) === true, '装上了"寻路要挖门 ⇒ 先按开"')
     ok(guardDoorDig(b) === false, '重复安装不会套两层')
-    const closed = { name: 'oak_door', position: { x: 1, y: 64, z: 0 }, getProperties: () => ({ open: false }) }
-    const openDoor = { name: 'oak_door', position: { x: 2, y: 64, z: 0 }, getProperties: () => ({ open: true }) }
-    const iron = { name: 'iron_door', position: { x: 3, y: 64, z: 0 }, getProperties: () => ({ open: false }) }
+    const closed = mkBlk(1, 64, 0)
+    const openDoor = mkBlk(2, 64, 0)
+    const iron = mkBlk(3, 64, 0)
     b.__inPathTick = true
     await b.dig(closed)
-    ok(activated === 1 && dug === 0, '🔴 寻路中遇到关着的木门 ⇒ 按开，不挖', `activated=${activated} dug=${dug}`)
+    ok(activated === 1 && dug === 0 && world.get('1,64,0').open === true,
+      '🔴 寻路中遇到关着的木门 ⇒ 按开并回读确认，不挖', `activated=${activated} dug=${dug} open=${world.get('1,64,0').open}`)
     /* 同一个位置再来一次：1.5 秒冷却内不许再按（否则就是"开了又关"） */
-    await b.dig(closed)
+    await b.dig(mkBlk(1, 64, 0))
     ok(activated === 1 && dug === 0, '🔴 同一扇门按过之后立刻又要求挖 ⇒ 冷却内不再按（不关回去、也不挖）', `activated=${activated} dug=${dug}`)
     /* 上半格：按到的是下半格那一格 */
     const baseAt = { name: 'oak_door', position: { x: 5, y: 64, z: 0 }, getProperties: () => ({ open: false, half: 'lower' }) }
-    b.blockAt = () => baseAt
+    b.blockAt = (v) => ((v?.x === 5 && v?.y === 64) ? baseAt : mkBlk(v.x, v.y, v.z))
     const upper = { name: 'oak_door', position: { x: 5, y: 65, z: 0 }, getProperties: () => ({ open: false, half: 'upper' }) }
     const pressed = []
     const origActivate = b.activateBlock
-    b.activateBlock = async (blk) => { pressed.push(`${blk.position.y}`); activated++; }
+    b.activateBlock = async (blk) => { pressed.push(`${blk.position.y}`); activated++ }
     await b.dig(upper)
     ok(activated === 2 && pressed[0] === '64', '🔴 上半格被要求挖时按的是下半格（同一个门轴只按一次）', JSON.stringify({ activated, pressed }))
     b.activateBlock = origActivate
     const actBefore = activated
     const dugBefore = dug
     await b.dig(openDoor)
-    ok(dug === dugBefore + 1 && activated === actBefore, '门本来就开着 ⇒ 不按（交给原 dig 判空）', `activated=${activated} dug=${dug}`)
+    ok(dug === dugBefore && activated === actBefore, '门本来就开着 ⇒ 不按也不挖（这一步当成已经过了）', `activated=${activated} dug=${dug}`)
     const dugBefore2 = dug
     await b.dig(iron)
     ok(dug === dugBefore2 + 1 && activated === actBefore, '铁门按不开 ⇒ 照旧真的挖（能脱困）', `activated=${activated} dug=${dug}`)

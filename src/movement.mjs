@@ -713,23 +713,81 @@ export function doorBaseKey (blk) {
   return `${Math.floor(p.x)},${Math.floor(y)},${Math.floor(p.z)}`
 }
 
+/** 铁门/铁活板门：只有红石能开，手动按不开 —— 别反复空点。 */
+export const DOOR_IRON_RE = /^iron_(?:door|trapdoor)$/
+
 /** 同一扇门两次按之间的冷却：门开了之后 **再按一下就关回去了**（实机"卡在门外一直开门"）。 */
 export const DOOR_PRESS_COOL_MS = 1_500
 
+/** 按完之后等服务端把 `open` 同步回来：6 × 50ms = 最多 300ms。 */
+export const DOOR_CONFIRM_TRIES = 6
+export const DOOR_CONFIRM_MS = 50
+
+/**
+ * 读到方块时统一折算成"逻辑门"（下半块）。
+ *
+ * 🔴 2026-10-18 用户指出：真实游戏数据里**上半块的 `open` 可能根本不存在**，
+ *    只读上半块会得到 `undefined` —— 被当成"还关着"，于是再按一次，把刚开的门关回去。
+ *    所以判断和交互都必须落在下半块上。
+ */
+export function doorFaceOf (b, blk) {
+  try {
+    if (blk?.getProperties?.().half === 'upper' && typeof b?.blockAt === 'function') {
+      const p = blk.position
+      const lower = b.blockAt(new Vec3(Math.floor(p.x), Math.floor(p.y) - 1, Math.floor(p.z)))
+      if (lower?.name && DOOR_RE.test(lower.name)) return lower
+    }
+  } catch {}
+  return blk
+}
+
+/**
+ * 门的开合状态：`'open' | 'closed' | 'unknown'`。
+ * **不知道 ≠ 关着**：状态读不到时绝不能再点（再点可能就是关）。
+ */
+export function doorOpenStateOf (blk) {
+  let props = null
+  try { props = blk?.getProperties?.() } catch { return 'unknown' }
+  if (!props || typeof props !== 'object') return 'unknown'
+  if (props.open === true) return 'open'
+  if (props.open === false) return 'closed'
+  return 'unknown'
+}
+
+/** 按完之后回读，等它真的变成 `open`（最多 `DOOR_CONFIRM_TRIES` 次）。 */
+async function confirmDoorOpen (b, target) {
+  const read = () => doorOpenStateOf(typeof b?.blockAt === 'function' ? b.blockAt(target.position) : target)
+  let st = read()
+  for (let i = 0; i < DOOR_CONFIRM_TRIES && st !== 'open'; i++) {
+    await new Promise((r) => setTimeout(r, DOOR_CONFIRM_MS))
+    st = read()
+  }
+  return st
+}
+
 /**
  * 把身边关着的门/栅栏门/活板门打开（只开、不管关；够不着就什么都不做）。
- * @returns {Promise<number>} 这一轮真的按开了几扇
+ *
+ * 顺序很要紧（2026-10-18 用户指出，实机"卡在门外一直开门"）：
+ * ① 先折算成下半块 → ② 按门轴 key **先去重** → ③ 再看它是不是已经开着
+ * → ④ 冷却/在途锁 → ⑤ **先上锁再 await** → ⑥ 回读确认才报"开了"。
+ *
+ * @returns {Promise<number>} 这一轮**确认**真的开了几扇（`b.__doorLast` 里有明细）
  */
 export async function openNearbyDoor (b, radius = DOOR_OPEN_R) {
   try {
     const p = b?.entity?.position
     if (!p || typeof b.activateBlock !== 'function' || typeof b.blockAt !== 'function') return 0
     let opened = 0
+    const closed = []
+    const unknown = []
+    const iron = []
     const r = Math.ceil(radius)
     const me = new Vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z))
     const pressAt = b.__doorPressAt instanceof Map ? b.__doorPressAt : (b.__doorPressAt = new Map())
+    const inFlight = b.__doorInFlight instanceof Set ? b.__doorInFlight : (b.__doorInFlight = new Set())
     const now = Date.now()
-    const done = new Set()   // 这一轮已经按过的门轴（上下半格只按一次）
+    const done = new Set()   // 这一轮碰过的门轴（上下半格只算一次）
     for (let dx = -r; dx <= r; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
         for (let dz = -r; dz <= r; dz++) {
@@ -738,29 +796,48 @@ export async function openNearbyDoor (b, radius = DOOR_OPEN_R) {
           let blk = null
           try { blk = b.blockAt(pos) } catch { continue }
           if (!blk?.name || !DOOR_RE.test(blk.name)) continue
-          let isOpen = false
-          try { isOpen = blk.getProperties?.().open === true } catch {}
-          if (isOpen) continue
-          const key = doorBaseKey(blk) ?? `${pos.x},${pos.y},${pos.z}`
+          const target = doorFaceOf(b, blk)
+          const key = doorBaseKey(target) ?? `${pos.x},${pos.y},${pos.z}`
+          /* ① 先整扇门去重：哪怕它已经开着，这一轮也不再碰它 ——
+           *    绝不能让"上半格没有 open 属性"把一扇开着的门判成关着。 */
           if (done.has(key)) continue
-          /* 🔴 冷却：门已经被我们按开、但客户端那一格还没刷新时，**不能再按**
-           * （再按就是关上；然后下一轮又开 —— 实机表现为"卡在门外一直开门"）。 */
-          if (now - Number(pressAt.get(key) ?? 0) < DOOR_PRESS_COOL_MS) continue
           done.add(key)
+          if (DOOR_IRON_RE.test(target?.name ?? '')) { iron.push(key); continue }
+          const state = doorOpenStateOf(target)
+          /* ② 开着 ⇒ 不按；**读不到 ⇒ 也不按**（不知道 ≠ 关着，按错了就是把门关上）。 */
+          if (state !== 'closed') { if (state === 'unknown') unknown.push(key); continue }
+          if (inFlight.has(key)) continue
+          /* ③ 冷却：按过之后客户端那一格还没刷新时**不能再按**。 */
+          if (now - Number(pressAt.get(key) ?? 0) < DOOR_PRESS_COOL_MS) continue
+          /* ④ 先上锁再 await：400ms 定时器可能重入，两次调用都过了检查就会各按一次。 */
+          inFlight.add(key)
+          pressAt.set(key, Date.now())
           try {
-            await b.activateBlock(blk)
-            opened++
-            pressAt.set(key, now)
-            /* 记一笔"这扇是我们按开的"：vendor 规划里的 `useOne` 走到门口还会再按一次，
-             * 那一下会把门关回去（实机"开了但不走门"）。`guardDoorActivate` 据此忽略重复按。 */
-            if (b.__autoOpenedDoors instanceof Map) {
-              b.__autoOpenedDoors.set(`${pos.x},${pos.y},${pos.z}`, now)
-              if (key !== `${pos.x},${pos.y},${pos.z}`) b.__autoOpenedDoors.set(key, now)
+            await b.activateBlock(target)
+            const after = await confirmDoorOpen(b, target)
+            if (after === 'open') {
+              opened++
+              /* 记一笔"这扇是我们按开的"：vendor 规划里的 `useOne` 走到门口还会再按一次，
+               * 那一下会把门关回去（实机"开了但不走门"）。`guardDoorActivate` 据此忽略重复按。 */
+              if (b.__autoOpenedDoors instanceof Map) b.__autoOpenedDoors.set(key, Date.now())
+              for (const s of [target, blk]) {
+                const q = s?.position
+                if (q && b.__autoOpenedDoors instanceof Map) b.__autoOpenedDoors.set(`${q.x},${q.y},${q.z}`, Date.now())
+              }
+            } else if (after === 'closed') {
+              closed.push(key)
+            } else {
+              unknown.push(key)
             }
-          } catch {}
+          } catch (e) {
+            unknown.push(key)
+          } finally {
+            inFlight.delete(key)
+          }
         }
       }
     }
+    b.__doorLast = { opened, closed, unknown, iron }
     return opened
   } catch { return 0 }
 }

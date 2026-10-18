@@ -22,6 +22,9 @@ import { scaffoldingItemIds } from './place-items.mjs'
 import { patchDigTime } from './dig-speed.mjs'
 import { applyProfile, classifyTerrainCached, profileFor } from './terrain.mjs'
 import { avoidBlockIds } from './bridge.mjs'
+/* 门的判断/去重/冷却只有一份（`src/movement.mjs`）：上半格可能没有 `open` 属性，
+ * 必须统一下半块判断；两处各写一份就会各按一次（踩坑 #175/#176）。 */
+import { DOOR_PRESS_COOL_MS, doorBaseKey, doorFaceOf, doorOpenStateOf } from './movement.mjs'
 /**
  * ── 现成的 mineflayer 生态插件（PrismarineJS 官方/社区项目；**这些都不自己写**） ──────
  *
@@ -241,47 +244,44 @@ export function guardDoorDig (b, { log = null } = {}) {
   }
   /* 门有上下两格：按任意一格都能开关，**按两格 = 开了又关**。
    * 这里统一折算到"门轴那一格"，并按 1.5 秒冷却去重 —— 实机"卡在门外一直开门"就是
-   * 400ms 定时器 + 这里各按一次、上下半格再各按一次，来回把门打开又关上。 */
-  const DOOR_PRESS_COOL_MS = 1_500
-  const keyOf = (blk) => {
-    const p = blk?.position
-    if (!p) return null
-    let y = Number(p.y)
-    try { if (blk.getProperties?.().half === 'upper') y -= 1 } catch {}
-    return `${Math.floor(p.x)},${Math.floor(y)},${Math.floor(p.z)}`
-  }
+   * 400ms 定时器 + 这里各按一次、上下半格再各按一次，来回把门打开又关上。
+   * 与 `openNearbyDoor` 共享同一套 key / 冷却 / 在途锁（`b.__doorPressAt` / `b.__doorInFlight`）。 */
   b.dig = function (block, ...rest) {
     const nm = block?.name
     const isDoor = typeof nm === 'string' && DOOR_BLOCK_RE.test(nm) && !IRON_DOOR_RE.test(nm)
     if (!isDoor || !b.__inPathTick) return orig(block, ...rest)
     return (async () => {
-      const key = keyOf(block) ?? `${block?.position?.x},${block?.position?.y},${block?.position?.z}`
+      const target = doorFaceOf(b, block) ?? block
+      const key = doorBaseKey(target) ?? `${target?.position?.x},${target?.position?.y},${target?.position?.z}`
       const pressAt = b.__doorPressAt instanceof Map ? b.__doorPressAt : (b.__doorPressAt = new Map())
-      const now = Date.now()
-      /* 1.5 秒内按过这扇门 ⇒ 当这一步已经完成（别关回去，也别再挖） */
-      if (now - Number(pressAt.get(key) ?? 0) < DOOR_PRESS_COOL_MS) return
+      const inFlight = b.__doorInFlight instanceof Set ? b.__doorInFlight : (b.__doorInFlight = new Set())
+      /* 正在按 / 1.5 秒内按过这扇门 ⇒ 当这一步已经完成（别关回去，也别再挖） */
+      if (inFlight.has(key)) return
+      if (Date.now() - Number(pressAt.get(key) ?? 0) < DOOR_PRESS_COOL_MS) return
+      const state = doorOpenStateOf(target)
+      if (state === 'open') return                              // 已经开着：这一步当过了
+      if (state !== 'closed') return orig(block, ...rest)       // 状态读不到：不猜，照旧处理
+      inFlight.add(key)
+      pressAt.set(key, Date.now())                              // await 之前就上锁（tick 会重入）
       try {
-        const openNow = (() => { try { return block.getProperties?.().open === true } catch { return false } })()
-        if (!openNow && typeof b.activateBlock === 'function') {
-          /* 按"门轴那一格"（下半格）：上半格在客户端可能是另一个状态对象，
-           * 按两格就等于开了又关。 */
-          const p = block.position
-          let target = block
-          try {
-            if (block.getProperties?.().half === 'upper' && typeof b.blockAt === 'function') {
-              const base = b.blockAt(new Vec3(Math.floor(p.x), Math.floor(p.y) - 1, Math.floor(p.z)))
-              if (base?.name && DOOR_BLOCK_RE.test(base.name)) target = base
-            }
-          } catch {}
-          await b.activateBlock(target)
-          pressAt.set(key, Date.now())
+        await b.activateBlock(target)
+        /* 回读确认：确认开了才当"这一步完成"；没确认就回落到真挖（至少能脱困） */
+        let after = doorOpenStateOf(typeof b.blockAt === 'function' ? b.blockAt(target.position) : target)
+        for (let i = 0; i < 3 && after !== 'open'; i++) {
+          await new Promise((r) => setTimeout(r, 50))
+          after = doorOpenStateOf(typeof b.blockAt === 'function' ? b.blockAt(target.position) : target)
+        }
+        if (after === 'open') {
           if (b.__autoOpenedDoors instanceof Map) b.__autoOpenedDoors.set(key, Date.now())
           b.__doorOpens = (b.__doorOpens ?? 0) + 1
           say(`🚪 寻路要挖 ${nm} —— 改成按开（${key}）`)
           return
         }
+        say(`🚪 按了 ${nm} 但没确认开门（${after}），回落到挖（${key}）`)
       } catch (e) {
         say(`🚪 按开 ${nm} 失败（回落到挖）：${e?.message ?? e}`)
+      } finally {
+        inFlight.delete(key)
       }
       return orig(block, ...rest)
     })()
