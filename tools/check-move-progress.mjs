@@ -740,6 +740,108 @@ const carve = mod.carveStepAhead
   ok(self.logs.some((m) => /挖开了 1 格/.test(m)), '日志写清"挖开了几格"', JSON.stringify(self.logs.slice(0, 2)))
 }
 
+/* ═══════════════ ⑧′⁗ 门已经开着 ≠ 这一轮没开门（2026-10-18 用户指出）═══════════════ */
+section('⑧′⁗ 卡住恢复：门"通不通"要看门现在的状态，不是"我刚开了几扇"')
+{
+  const { doorAheadOpen } = mod
+  const mk = (name, props, at) => ({
+    name, position: new Vec3(...at), getProperties: props ? () => props : undefined,
+  })
+  const botWith = (doorCell, doorProps, at = [0, 64, 0]) => ({
+    entity: { position: new Vec3(...at) },
+    blockAt (v) {
+      const k = `${v.x},${v.y},${v.z}`
+      if (k === doorCell) return mk('oak_door', doorProps, [v.x, v.y, v.z])
+      return { name: v.y < 64 ? 'stone' : 'air', position: v }
+    },
+  })
+  const tgt = { x: 5, y: 64, z: 0 }
+  ok(doorAheadOpen(botWith('1,64,0', { open: true, half: 'lower' }), tgt) === true,
+    '🔴 前方那扇门开着（这一轮没新开）⇒ 也算"通"', String(doorAheadOpen(botWith('1,64,0', { open: true }), tgt)))
+  ok(doorAheadOpen(botWith('1,64,0', { open: false }), tgt) === false, '门关着 ⇒ 不算通')
+  ok(doorAheadOpen(botWith('1,64,0', null), tgt) === false, '🔴 读不到开合状态 ⇒ 不算通（不知道 ≠ 通）')
+  ok(doorAheadOpen(botWith('-1,64,0', { open: true }), tgt) === false, '背后的门开着 ⇒ 不算（只认朝目标那半边）')
+  ok(doorAheadOpen(botWith('1,64,0', { open: true }), { x: -5, y: 64, z: 0 }) === false,
+    '目标在反方向时，同一扇门就不再算"前方"')
+  /* 整条链路：门本来就开着 + 一直卡 ⇒ 重算路径、**不挖墙**，两轮后交给脱困阶梯 */
+  {
+    const clock = autoClock()
+    const bot = mkLoopBot()
+    const digged = []
+    bot.dig = async (blk) => { digged.push(`${blk.position.x},${blk.position.y},${blk.position.z}`) }
+    bot.pathfinder.bestHarvestTool = () => ({ name: 'iron_pickaxe' })
+    bot.equip = async () => {}
+    bot.blockAt = (v) => {
+      const k = `${v.x},${v.y},${v.z}`
+      if (k === '1,64,0' || k === '1,65,0') return { name: 'oak_door', position: v, getProperties: () => ({ open: true, half: v.y === 65 ? 'upper' : 'lower' }) }
+      return { name: v.y < 64 ? 'stone' : 'air', position: v }
+    }
+    const self = mkSelf(bot)
+    const ctx = mkCtx(self, clock)
+    clock.onTick = () => { if (bot._pending) { const p = bot._pending; bot._pending = null; const e = new Error('stuck'); e.mcStuck = true; p.reject(e) } }
+    const r = await walkPathfinder(self, { x: 8, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, ctx)
+    clock.stopPump()
+    ok(digged.length === 0, '🔴 门开着重试期间一格都不挖（不拆门框/门边的墙）', JSON.stringify(digged))
+    ok(self.logs.some((m) => /前方的门本来就开着/.test(m)), '日志说清"门本来就开着，重新算路"，而不是"按开了 0 扇"',
+      JSON.stringify(self.logs.slice(0, 3)))
+    ok(self.logs.some((m) => /不挖墙/.test(m)), '重试用完也不再挖墙，明确交给脱困阶梯')
+    ok(r.arrived === false, '最终走不到就如实报走不动（交给上层/AI）', JSON.stringify({ a: r.arrived, r: r.reason }))
+  }
+  /* ── 门前一格的方块 / 门脚支撑块：不许补挖（2026-10-18 用户指出）── */
+  {
+    const { doorOnRoute } = mod
+    const world = (cells) => ({
+      entity: { position: new Vec3(0, 64, 0) },
+      blockAt (v) {
+        const n = cells[`${v.x},${v.y},${v.z}`]
+        return { name: n ?? (v.y < 64 ? 'stone' : 'air'), position: v }
+      },
+    })
+    const tgt = { x: 8, y: 64, z: 0 }
+    ok(doorOnRoute(world({ '1,64,0': 'oak_door' }), tgt)?.name === 'oak_door',
+      '🔴 通行方向上有门 ⇒ 报出来（补挖必须停手）')
+    ok(doorOnRoute(world({ '2,64,0': 'oak_door' }), tgt)?.name === 'oak_door', '门在第二格也算（cells+1 扫描）')
+    ok(doorOnRoute(world({ '1,64,0': 'iron_door' }), tgt) === null, '铁门按不开、不算"通行受阻"')
+    ok(doorOnRoute(world({ '1,64,0': 'oak_door' }), { x: -8, y: 64, z: 0 }) === null, '背后的门不算')
+  }
+  {
+    /* 门前一格是普通石头、门关着且按不开 ⇒ 一格都不挖，如实报走不动 */
+    const clock = autoClock()
+    const bot = mkLoopBot()
+    const digged = []
+    bot.dig = async (blk) => { digged.push(`${blk.position.x},${blk.position.y},${blk.position.z}`) }
+    bot.pathfinder.bestHarvestTool = () => ({ name: 'iron_pickaxe' })
+    bot.equip = async () => {}
+    bot.blockAt = (v) => {
+      const k = `${v.x},${v.y},${v.z}`
+      if (k === '1,64,0' || k === '1,65,0') return { name: 'oak_door', position: v, getProperties: () => ({ open: false, half: v.y === 65 ? 'upper' : 'lower' }) }
+      return { name: v.y < 64 ? 'stone' : 'air', position: v }
+    }
+    const self = mkSelf(bot)
+    const ctx = mkCtx(self, clock)
+    clock.onTick = () => { if (bot._pending) { const p = bot._pending; bot._pending = null; const e = new Error('stuck'); e.mcStuck = true; p.reject(e) } }
+    const r = await walkPathfinder(self, { x: 8, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, ctx)
+    clock.stopPump()
+    ok(digged.length === 0, '🔴 门前那格/门脚支撑一格都不挖（不是"门前两格一律保护"，是"门在路线上就别补挖"）', JSON.stringify(digged))
+    ok(self.logs.some((m) => /不挖门、门框、门槛/.test(m)), '日志说清为什么不挖', JSON.stringify(self.logs.slice(0, 3)))
+    ok(r.arrived === false, '仍然走不通 ⇒ 如实报，交给 AI 决定（不替它拆房子）')
+  }
+  const src2 = read('../src/movement.mjs')
+  ok(/export function doorOnRoute/.test(src2) && /const doorBlocking = doorOnRoute\(b, target\)/.test(src2),
+    '🔴 卡住分支在补挖之前先查"路线上有没有门"')
+  ok(/export function doorOnRoute/.test(src2) && /cells \+ 1/.test(src2), '扫描按当前移动方向、范围是 cells+1（不是门周围固定两格）')
+  const plug2 = read('../src/plugins.mjs')
+  ok(/const isDoorSupport = \(node, p\)/.test(plug2) && /isDoorSupport\(node, p\)\) \{[\s\S]{0,160}?continue/.test(plug2),
+    '🔴 规划层：门脚支撑块也剔出 toBreak 并退工钱')
+  ok(/const protectedDoorOf = \(block\)/.test(plug2), '🔴 执行层：门脚支撑块也拦（不只门本身）')
+  const src = read('../src/movement.mjs')
+  ok(/const doorAlreadyOpen = doorOpened === 0 && doorAheadOpen\(b, target\)/.test(src),
+    '🔴 恢复分支把"门本来就开着"算作通')
+  ok(/let doorTries = 0/.test(src) && /if \(doorTries < 2\)/.test(src), '门重试有次数上限（不会因为门开着就死循环）')
+  ok(/不挖墙，交给脱困阶梯[\s\S]{0,160}?attempt\+\+/.test(src),
+    '重试用完 ⇒ 交给脱困阶梯，不走挖台阶分支')
+}
+
 /* ═══════════════ ⑧″ 挖台阶的保护与配置闸门（2026-10-18 审计 Bug 3/4）═══════════════ */
 await (async () => {
 section('⑧″ 自动挖台阶：不挖箱子/矿石，服从 walkCanDig / walkCarveStep，远处看眼前')
@@ -1212,6 +1314,28 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     b.pathfinder.isMining = () => false
     await b.dig(door)
     ok(dug === 1, 'AI 自己挖（既不在 tick 里、也不在挖矿中）⇒ 照旧真的挖', JSON.stringify({ dug }))
+  }
+  {
+    /* 🔴 门脚那格支撑：寻路器要挖它 ⇒ 也拦（用户 2026-10-18：门下面那格被挖掉）*/
+    const { guardDoorDig } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    let dug = 0
+    let pressed = 0
+    const doorBlk = { name: 'oak_door', position: { x: 1, y: 65, z: 0 }, getProperties: () => ({ open: false, half: 'lower' }) }
+    const floorBlk = { name: 'stone', position: { x: 1, y: 64, z: 0 } }
+    const b = {
+      __inPathTick: true,
+      pathfinder: { isMining: () => true },
+      blockAt: (p) => (Number(p.y) >= 65 ? doorBlk : floorBlk),
+      activateBlock: async () => { pressed++ },
+      dig: async () => { dug++ },
+    }
+    guardDoorDig(b)
+    await b.dig(floorBlk)
+    ok(dug === 0 && pressed === 1, '🔴 挖"门脚下那格"（寻路器发起）⇒ 不挖，转去按门', JSON.stringify({ dug, pressed }))
+    b.__inPathTick = false
+    b.pathfinder.isMining = () => false
+    await b.dig(floorBlk)
+    ok(dug === 1, 'AI 自己挖门脚那格 ⇒ 放行（只有寻路器自动挖才受保护）', JSON.stringify({ dug }))
   }
   {
     /* 🔴 统一在 getNeighbors 上过滤：与"是哪个 getMove* 生成的"无关 */

@@ -256,12 +256,27 @@ export function guardDoorDig (b, { log = null } = {}) {
     if (b.__inPathTick === true) return true
     try { return b.pathfinder?.isMining?.() === true } catch { return false }
   }
-  b.dig = function (block, ...rest) {
+  /* 要保护的"门"：① 正要挖的就是门；② 正要挖的方块**上方**是门（门脚支撑）。
+   * 第二种是 2026-10-18 用户指出的实机现象 —— 门没事，门下面那格被挖了。 */
+  const protectedDoorOf = (block) => {
     const nm = block?.name
-    const isDoor = typeof nm === 'string' && DOOR_BLOCK_RE.test(nm) && !IRON_DOOR_RE.test(nm)
-    if (!isDoor || !fromPathfinder()) return orig(block, ...rest)
+    if (typeof nm === 'string' && DOOR_BLOCK_RE.test(nm) && !IRON_DOOR_RE.test(nm)) return block
+    const p = block?.position
+    if (!p || typeof b.blockAt !== 'function') return null
+    try {
+      const above = b.blockAt(new Vec3(Math.floor(Number(p.x)), Math.floor(Number(p.y)) + 1, Math.floor(Number(p.z))))
+      if (above?.name && DOOR_BLOCK_RE.test(above.name) && !IRON_DOOR_RE.test(above.name)) return above
+    } catch {}
+    return null
+  }
+  b.dig = function (block, ...rest) {
+    const doorBlk = protectedDoorOf(block)
+    /* AI 自己叫的挖（不在寻路 tick 里、也没在挖矿）⇒ 一概放行：
+     * 只有"寻路器自动挖"才受门保护，别因为附近有门就禁止 AI 拆方块。 */
+    if (!doorBlk || !fromPathfinder()) return orig(block, ...rest)
+    const nm = doorBlk.name
     return (async () => {
-      const target = doorFaceOf(b, block) ?? block
+      const target = doorFaceOf(b, doorBlk) ?? doorBlk
       const key = doorBaseKey(target) ?? `${target?.position?.x},${target?.position?.y},${target?.position?.z}`
       const pressAt = b.__doorPressAt instanceof Map ? b.__doorPressAt : (b.__doorPressAt = new Map())
       const inFlight = b.__doorInFlight instanceof Set ? b.__doorInFlight : (b.__doorInFlight = new Set())
@@ -394,6 +409,15 @@ export function patchDoorMoves (mv) {
     try { return mv.getBlock?.(node, p.x - node.x, p.y - node.y, p.z - node.z) ?? null } catch { return null }
   }
   const isDoor = (blk) => Boolean(blk?.name && DOOR_BLOCK_RE.test(blk.name) && !IRON_DOOR_RE.test(blk.name))
+  /* 🔴 门**下方那格支撑**也不能挖（2026-10-18 用户指出）：只保护门本身时，
+   * 寻路器仍会把门槛下的地板列进 `toBreak`（挖掉门脚下的砖 = 门悬空掉下去/门框被拆）。
+   * 只认"正上方是普通门"的方块，铁门不算（按不开的门不当资产）。 */
+  const isDoorSupport = (node, p) => {
+    try {
+      const above = doorAt(node, { x: p.x, y: p.y + 1, z: p.z })
+      return isDoor(above)
+    } catch { return false }
+  }
   /* 把"挖这扇门"的工钱退掉：vendor 的 safeOrBreak 已经把它算进 `m.cost` 了，
    * 只在 toBreak 里删位置而不扣钱，A* 仍然觉得"挖门"和"走门"一样贵 ⇒ 还是选墙。
    * 公式照 `movements.js:290-298`（laborCost = (1 + 3*digTime/1000) * digCost）。 */
@@ -416,6 +440,11 @@ export function patchDoorMoves (mv) {
       for (const p of m.toBreak) {
         const blk = doorAt(node, p)
         if (isDoor(blk)) {
+          m.cost = Math.max(0, (Number(m.cost) || 0) - laborOf(blk))
+          continue
+        }
+        /* 门脚下的支撑块：同样剔掉并退工钱（挖它等于把门拆了） */
+        if (isDoorSupport(node, p)) {
           m.cost = Math.max(0, (Number(m.cost) || 0) - laborOf(blk))
           continue
         }

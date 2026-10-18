@@ -766,6 +766,101 @@ async function confirmDoorOpen (b, target) {
 }
 
 /**
+ * **前方那扇门现在是不是开着**（2026-10-18 用户指出：卡住恢复里只看"这一轮新开了几扇"）。
+ *
+ * 🔴 缺口：`openNearbyDoor()` 返回的是**本次新打开的数量**。门上一轮已经开了、
+ *    或者被 AI 自己开过、或者定时器 400ms 开过 —— 这时它返回 0，恢复分支就误以为
+ *    "门口没门"，转头去**挖旁边的墙**。判定要问的是"挡路的门现在通不通"，不是"我刚开了几扇"。
+ *
+ * 只认**朝向目标那半边的门**（点积为正），避免屋里别处的门开着就把挖台阶补救整个挡掉。
+ * 读不到状态（`unknown`）不算开 —— 不知道 ≠ 通。
+ *
+ * @returns {boolean}
+ */
+export function doorAheadOpen (b, target) {
+  try {
+    const p = b?.entity?.position
+    if (!p || typeof b.blockAt !== 'function') return false
+    const gx = Number(target?.x)
+    const gz = Number(target?.z)
+    if (!Number.isFinite(gx) || !Number.isFinite(gz)) return false
+    const dx = gx - p.x
+    const dz = gz - p.z
+    const len = Math.hypot(dx, dz)
+    if (len < 0.01) return false
+    const ux = dx / len
+    const uz = dz / len
+    const me = new Vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z))
+    const done = new Set()
+    for (let ox = -2; ox <= 2; ox++) {
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let oz = -2; oz <= 2; oz++) {
+          const pos = new Vec3(me.x + ox, me.y + oy, me.z + oz)
+          if (!DOOR_RE.test(String(b.blockAt(pos)?.name ?? ''))) continue
+          const target2 = doorFaceOf(b, b.blockAt(pos))
+          const key = doorBaseKey(target2) ?? `${pos.x},${pos.y},${pos.z}`
+          if (done.has(key)) continue
+          done.add(key)
+          if (DOOR_IRON_RE.test(target2?.name ?? '')) continue
+          if (doorOpenStateOf(target2) !== 'open') continue
+          const ddx = pos.x + 0.5 - p.x
+          const ddz = pos.z + 0.5 - p.z
+          const dl = Math.hypot(ddx, ddz)
+          if (dl > 2.6 || dl < 0.01) continue
+          /* 朝向目标：点积 > 0.2·dl ⇒ 这扇门在前进方向上（不是背后的门） */
+          if ((ddx * ux + ddz * uz) / dl < 0.2) continue
+          return true
+        }
+      }
+    }
+  } catch {}
+  return false
+}
+
+/**
+ * **前进方向的走廊里有没有门**（2026-10-18 用户指出）：`carveStepAhead` 只查"要挖的那格"
+ * 是不是受保护方块 —— 门前一格的普通石头不在名单里，照样会被挖穿，等于把门/门框拆了。
+ *
+ * 判据按**当前移动方向 + 门洞位置**，而不是"门周围两格一律保护"：
+ * 沿主轴/副轴往前 `cells + 1` 格、脚/头两层找普通门（铁门按不开，不算）。
+ * 找到了就返回那扇门，调用方据此**不做自动补挖**（开门/重算路径/交给 AI 决定）。
+ *
+ * @returns {object|null} 门方块
+ */
+export function doorOnRoute (b, target, { cells = MOVE_CARVE_CELLS } = {}) {
+  try {
+    const me = b?.entity?.position
+    if (!me || !target || typeof b.blockAt !== 'function') return null
+    const fx = Math.floor(me.x), fy = Math.floor(me.y), fz = Math.floor(me.z)
+    const dx = Number(target.x) - me.x
+    const dz = Number(target.z) - me.z
+    if (!Number.isFinite(dx) || !Number.isFinite(dz)) return null
+    const sx = Math.sign(dx), sz = Math.sign(dz)
+    const dirs = []
+    if (Math.abs(dx) >= Math.abs(dz)) { if (sx) dirs.push([sx, 0]); if (sz) dirs.push([0, sz]) }
+    else { if (sz) dirs.push([0, sz]); if (sx) dirs.push([sx, 0]) }
+    const check = (x, z) => {
+      for (let dy = 0; dy <= 1; dy++) {
+        let blk = null
+        try { blk = b.blockAt(new Vec3(x, fy + dy, z)) } catch { continue }
+        const n = blk?.name
+        if (typeof n === 'string' && DOOR_RE.test(n) && !DOOR_IRON_RE.test(n)) return blk
+      }
+      return null
+    }
+    for (const [ddx, ddz] of dirs) {
+      for (let d = 1; d <= cells + 1; d++) {
+        const x = fx + ddx * d, z = fz + ddz * d
+        if (x === fx && z === fz) continue
+        const hit = check(x, z)
+        if (hit) return hit
+      }
+    }
+    return null
+  } catch { return null }
+}
+
+/**
  * 把身边关着的门/栅栏门/活板门打开（只开、不管关；够不着就什么都不做）。
  *
  * 顺序很要紧（2026-10-18 用户指出，实机"卡在门外一直开门"）：
@@ -1308,6 +1403,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   /* 2026-10-18：窄隧道/台阶的"手工补救"（见 `carveStepAhead` 注释）。 */
   let carveTries = 0
   let carved = 0
+  /* 因"门"重试的次数（用户 2026-10-18 指出缺口）：门开着重算一次就该走通；
+   * 连着两轮还卡，说明不是门的事 ⇒ 交给脱困阶梯，别原地空转。 */
+  let doorTries = 0
   let watch = null
   /* 执行层开门：规划已经允许穿门（canOpenDoors），但这份 vendor 的 `useOne` 没有执行者 ——
    * 一边走一边探身边有没有关着的门，够得着就按一下。只在移动期间跑，收尾必清。 */
@@ -1402,9 +1500,33 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           /* 卡住时先按一下门（2026-10-18 实机：门关着，寻路不认 ⇒ 停 8 秒）。
            * 便宜、只读、无副作用：附近没有门就是一个空扫描。 */
           const doorOpened = await openNearbyDoor(b).catch(() => 0)
-          if (doorOpened > 0) {
-            self.log(`🚪 卡在门口 —— 按开了 ${doorOpened} 扇门，再试一次`)
-            attempt = Math.max(0, attempt - 1)   // 不算一级脱困：门开了原地就能继续走
+          /* 🔴 门"通不通" ≠ "这一轮新开了几扇"：门可能早被定时器/AI 开好了，
+           *    `openNearbyDoor()` 这时返回 0。只看数量就会误判成"门口没门"，
+           *    接着进挖台阶分支 —— 把门旁边的墙挖掉。 */
+          const doorAlreadyOpen = doorOpened === 0 && doorAheadOpen(b, target)
+          if (doorOpened > 0 || doorAlreadyOpen) {
+            if (doorTries < 2) {
+              doorTries++
+              self.log(doorOpened > 0
+                ? `🚪 卡在门口 —— 按开了 ${doorOpened} 扇门，再试一次`
+                : '🚪 前方的门本来就开着 —— 重新算路再试一次（不挖墙）')
+              attempt = Math.max(0, attempt - 1)   // 不算一级脱困：门开了原地就能继续走
+              await sleep(120)                     // 等服务端把"已开门"的碰撞状态同步给客户端
+              continue
+            }
+            /* 门开着重试两轮还是卡：不是门的问题，但**绝不能挖门边的墙**（那多半是把门框拆了）。
+             * 直接交给脱困阶梯/失败出口（那里会报 `blockedAhead`/`shaft` 让 AI 决定）。 */
+            self.log('🚪 门开着却还是过不去 —— 不挖墙，交给脱困阶梯')
+            attempt++
+            continue
+          }
+          /* 🔴 通行方向上还有门（关着/读不到/按不开）⇒ **一律不补挖**：
+           *    门前那一格、门框、门槛都不是"挡路的台阶"，挖它们等于拆房子。
+           *    交给脱困阶梯/失败出口，让 AI 看见 `blockedAhead`/`shaft` 自己决定。 */
+          const doorBlocking = doorOnRoute(b, target)
+          if (doorBlocking) {
+            self.log(`🚪 前方 ${doorBlocking.name} 在通行路线上 —— 不挖门、门框、门槛，交给脱困阶梯`)
+            attempt++
             continue
           }
           if (carveAllowed && carveTries < MOVE_CARVE_TRIES) {
