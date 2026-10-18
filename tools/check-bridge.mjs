@@ -28,7 +28,7 @@ const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 const {
   BRIDGE_MAX, BRIDGE_MIN_HEALTH, BRIDGE_DEEP,
   dirOf, dirNameOf, bridgeCellsOf, bridgeDirTo, dropBelow, hazardIn,
-  bridgeSafetyOf, confirmBlockAt, feetOf, bridgeAcross,
+  bridgeSafetyOf, confirmBlockAt, feetOf, bridgeAcross, heldSnapshotOf, restoreHeldOf,
   BRIDGE_FATAL, BRIDGE_FATAL_NAMES, avoidBlockIds,
 } = await import(new URL('../src/bridge.mjs', import.meta.url))
 
@@ -436,5 +436,59 @@ section('⑨ avoidBlockIds：把"要命方块"交给寻路器绕开')
 }
 
 console.log(`\n──────────────────────────────────────────────`)
+/* ═══════════════ ⑧ 铺完把手换回来（2026-10-19 实机：搭完还攥着圆石） ═══════════════ */
+section('⑧ 铺完把手换回来：之前的武器/镐子，所有返回路径都还原')
+{
+  /** 手里先拿着镐，背包里有圆石；placeBlock 会把方块塞到手上（真 mineflayer 就是这样） */
+  const mkScene = (o = {}) => {
+    const { w, bot } = gapScene({ depth: 5 })
+    bot.heldItem = { name: 'diamond_pickaxe', count: 1 }
+    bot.inventory = { items: () => [{ name: 'diamond_pickaxe', count: 1 }, { name: 'cobblestone', count: 64 }] }
+    bot.equip = async (item) => { bot.heldItem = { name: item.name, count: item.count } }
+    const self = mkSelf(bot, w, o)
+    const orig = self.placeBlock.bind(self)
+    self.placeBlock = async (t) => { bot.heldItem = { name: 'cobblestone', count: 64 }; return await orig(t) }
+    return { w, bot, self }
+  }
+  {
+    const { bot, self } = mkScene()
+    const r = await bridgeAcross(self, { dir: 'east', count: 2, name: 'cobblestone' })
+    ok(r.ok === true, '正常铺完', JSON.stringify(r).slice(0, 100))
+    ok(bot.heldItem?.name === 'diamond_pickaxe', '🔴 铺完自动切回之前的镐/武器', String(bot.heldItem?.name))
+    ok(r.held === 'diamond_pickaxex1', '结果里报的是**换回来的手**（held）', String(r.held))
+    ok(r.heldRestored === 'diamond_pickaxe', '结果里标了"换回了什么"（heldRestored）', String(r.heldRestored))
+    ok(r.heldBefore === 'diamond_pickaxex1', '搭之前手里是什么也留着（heldBefore）', String(r.heldBefore))
+  }
+  {
+    const { bot, w } = mkScene({ placeOk: false })
+    const self = mkSelf(bot, w, { placeOk: false })
+    const r = await bridgeAcross(self, { dir: 'east', count: 2, name: 'cobblestone' })
+    ok(r.ok === false, '放置失败 ⇒ 停（对照）')
+    ok(bot.heldItem?.name === 'diamond_pickaxe', '🔴 半路停下也要把手换回来', String(bot.heldItem?.name))
+  }
+  {
+    const { w, bot } = gapScene({ depth: 5 })
+    bot.heldItem = null
+    const self = mkSelf(bot, w)
+    const r = await bridgeAcross(self, { dir: 'east', count: 1, name: 'cobblestone' })
+    ok(r.ok === true && r.heldRestored === undefined, '空手开搭 ⇒ 不假装"换回来了"', String(r.heldRestored))
+    ok(heldSnapshotOf(bot) === null, 'heldSnapshotOf：空手 ⇒ null（没东西可还）')
+  }
+  {
+    const b = { heldItem: { name: 'cobblestone', count: 3 }, inventory: { items: () => [{ name: 'cobblestone', count: 3 }] }, equip: async () => {} }
+    const r = await restoreHeldOf(b, { name: 'diamond_sword' })
+    ok(r.restored === false && /已经没有 diamond_sword/.test(String(r.why)), '要还的东西不在背包里 ⇒ 如实说', String(r.why))
+    const b2 = { heldItem: { name: 'cobblestone', count: 3 }, inventory: { items: () => [{ name: 'diamond_sword', count: 1 }] }, equip: async () => {} }
+    const r2 = await restoreHeldOf(b2, { name: 'diamond_sword' })
+    ok(r2.restored === false && /手里是 cobblestone/.test(String(r2.why)), '换完回读不对 ⇒ 不算换回来', String(r2.why))
+    const b3 = { heldItem: { name: 'cobblestone', count: 3 }, inventory: { items: () => [{ name: 'diamond_sword', count: 1 }] }, equip: async () => { b3.heldItem = { name: 'diamond_sword', count: 1 } } }
+    const r3 = await restoreHeldOf(b3, { name: 'diamond_sword' })
+    ok(r3.restored === true && r3.now === 'diamond_sword', '换回来了（restored:true）', JSON.stringify(r3))
+    const b4 = { heldItem: { name: 'cobblestone', count: 3 }, inventory: { items: () => [{ name: 'diamond_sword', count: 1 }] }, equip: async () => { throw new Error('服务端拒了') } }
+    const r4 = await restoreHeldOf(b4, { name: 'diamond_sword' })
+    ok(r4.restored === false && /服务端拒了/.test(String(r4.why)), '换失败也不抛错（桥已经搭完了，如实说一句）', String(r4.why))
+  }
+}
+
 console.log(`check-bridge：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

@@ -357,7 +357,9 @@ section('⑧ 静态接线：core / index 都在')
   ok(/export function inWaterNow \(b\)/.test(strip(readFileSync(new URL('../src/world-observer.mjs', import.meta.url), 'utf8'))),
     'world-observer：inWaterNow 在新模块里（第十刀搬过去的）')
   ok(!/if \(!e\?\.isInWater\) \{\r?\n      return \{ inWater: false/.test(movSrc), 'swimUp 不再只看 entity.isInWater')
-  ok(/const submerged = submergedIn\(b, e\)[\s\S]{0,1200}const inWater = submerged \|\| Boolean\(e\?\.isInWater\)/.test(autoSrc),
+  /* 2026-10-19：中间插了"窒息判据"那段（2026-10-18 修误报），原来 1200 字符的窗口不够了 ——
+     * 放宽到 4000，断言的本意只是"先算 submerged 再合成 inWater"，不是钉住中间那段长度。 */
+  ok(/const submerged = submergedIn\(b, e\)[\s\S]{0,4000}const inWater = submerged \|\| Boolean\(e\?\.isInWater\)/.test(autoSrc),
     'mc_auto 的憋气判据以"头在水下"为主（以前 isInWater 读不到就整条分支不执行）')
   ok(/submergedIn = \(b, e\) => \{\r?\n  try \{\r?\n    if \(!e\?\.position\) return false/.test(autoSrc),
     'mc_auto 的 submergedIn 不再要求 e.isInWater')

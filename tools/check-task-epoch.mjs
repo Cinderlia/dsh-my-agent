@@ -490,5 +490,20 @@ section('⑤ suggestAction（"下一步建议"里的 tool/args 必须真能用�
   }
 }
 
+/* ⑬ 总目标不许被"续做"改小（2026-10-19 实机） */
+section('⑬ 续做同一条任务：总目标只能变大，不能被改小')
+{
+  const l = mkLedger()
+  const t = l.start({ kind: 'dig', item: 'obsidian', total: 10, params: { item: 'obsidian' } })
+  l.progress(t.taskId, { add: 5 })
+  ok(l.get(t.taskId).progress.total === 10, '开工 10 个 ⇒ total=10', String(l.get(t.taskId).progress.total))
+  /* 实机现场：AI 接着挖"剩下的 5 个"时又调了一次 auto({total:5})，台账于是变成 5/5 完成 */
+  l.auto({ kind: 'dig', item: 'obsidian', total: 5 })
+  ok(l.get(t.taskId).progress.total === 10, '🔴 续做 auto({total:5}) 不能把 total 改小', String(l.get(t.taskId).progress.total))
+  ok(l.get(t.taskId).progress.done === 5, '已挖的 5 个不受影响', String(l.get(t.taskId).progress.done))
+  l.auto({ kind: 'dig', item: 'obsidian', total: 12 })
+  ok(l.get(t.taskId).progress.total === 12, '真的想多挖两个时 total 可以变大', String(l.get(t.taskId).progress.total))
+}
+
 console.log(`\n${pass} ✅ / ${fail} ❌`)
 process.exit(fail ? 1 : 0)

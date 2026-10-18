@@ -1097,6 +1097,9 @@ export function obstacleAheadOf (b, target, { cells = MOVE_CARVE_CELLS } = {}) {
   const dirs = []
   if (Math.abs(dx) >= Math.abs(dz)) { if (sx) dirs.push([sx, 0]); if (sz) dirs.push([0, sz]) }
   else { if (sz) dirs.push([0, sz]); if (sx) dirs.push([sx, 0]) }
+  /* 2026-10-19 实机（"1 格宽巷道会卡，break 前面那格就过去"）：斜着拐弯时挡路的
+   * 既不在正前也不在正侧，而在对角那一格 —— 两条轴都走不通时再看一眼对角线。 */
+  if (sx && sz) dirs.push([sx, sz])
   for (const [ddx, ddz] of dirs) {
     for (let d = 1; d <= cells; d++) {
       const x = fx + ddx * d, z = fz + ddz * d
@@ -1150,6 +1153,9 @@ export async function carveStepAhead (b, target, { cells = MOVE_CARVE_CELLS, rad
   const dirs = []
   if (Math.abs(dx) >= Math.abs(dz)) { if (sx) dirs.push([sx, 0]); if (sz) dirs.push([0, sz]) }
   else { if (sz) dirs.push([0, sz]); if (sx) dirs.push([sx, 0]) }
+  /* 2026-10-19 实机（"1 格宽巷道会卡，break 前面那格就过去"）：斜着拐弯时挡路的
+   * 既不在正前也不在正侧，而在对角那一格 —— 两条轴都走不通时再看一眼对角线。 */
+  if (sx && sz) dirs.push([sx, sz])
   const digOne = async (blk) => {
     try {
       const tool = typeof b.pathfinder?.bestHarvestTool === 'function' ? b.pathfinder.bestHarvestTool(blk) : null
@@ -1458,6 +1464,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   /* 2026-10-18：窄隧道/台阶的"手工补救"（见 `carveStepAhead` 注释）。 */
   let carveTries = 0
   let carved = 0
+  /* 2026-10-19：默认 `noTower` 让"往上一格"常常无路 —— 真走不通、目标又在上方时，
+   * 允许**一次**垫柱兜底（只翻一次，别来回摇）。 */
+  let towerTried = 0
   /* 因"门"重试的次数（用户 2026-10-18 指出缺口）：门开着重算一次就该走通；
    * 连着两轮还卡，说明不是门的事 ⇒ 交给脱困阶梯，别原地空转。 */
   let doorTries = 0
@@ -1507,11 +1516,39 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         if (doorWalk?.passed) self.log(`🚪 从门里走过去（${doorWalk.door ?? '门'}）`)
       }
     } catch {}
+    /* 2026-10-19 实机（lessons：`doorWalk:{passed:false, why:"closed"}` 时它直接放弃）：
+     * 门没过去 = 再按一次门、再走一次，而不是立刻交给脱困阶梯。 */
+    if (doorWalk && doorWalk.passed !== true) {
+      try {
+        const opened = await openNearbyDoor(b)
+        const leftMs2 = Math.max(400, Math.min(1_200, budget - (Date.now() - t0) - 600))
+        const again = await walkThroughDoor(b, target, { budgetMs: leftMs2 })
+        doorWalk = { ...again, retry: true, opened: Number(opened) || 0 }
+        if (again?.passed) self.log(`🚪 门没开透，补按 ${opened} 下后走过去了（${again.door ?? '门'}）`)
+      } catch {}
+    }
     let attempt = 0
     for (;;) {
       if (attempt > 0) {
         const step = escapeStepOf(attempt - 1)
         if (!step) {
+          /* 阶梯走完还是没进展：**如果目标在上方、头顶又是空的**，先试一次垫柱兜底
+           * （2026-10-19 实机：`noTower` 默认之后，楼梯/竖井这类"往上一格"目标反而更难上）。 */
+          if (!towerTried) {
+            const p0 = b.entity?.position
+            const upGap = p0 ? Number(target?.y) - p0.y : 0
+            const nameAt = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z))?.name ?? null } catch { return null } }
+            const hardAt = (y) => { if (!p0) return true; const n = nameAt(Math.floor(p0.x), y, Math.floor(p0.z)); return Boolean(n) && isSolidBlock(n) }
+            if (p0 && upGap >= 1.5 && !hardAt(Math.floor(p0.y) + 2) && !hardAt(Math.floor(p0.y) + 3)) {
+              towerTried = 1
+              const mv3 = ctx.movements(terrain)
+              mv3.allow1by1towers = true
+              b.pathfinder.setMovements(mv3)
+              self.log('🧱 目标在上方、头顶有空 —— 这次允许垫一格往上（只翻这一次）')
+              attempt = 0
+              continue
+            }
+          }
           // 阶梯走完还是没进展 —— 如实认输，**不再无限重试**
           const err = new Error(`脱困阶梯用完了（重算 ${repathCount} 次）还是走不动`)
           err.mcStuck = true

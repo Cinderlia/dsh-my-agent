@@ -228,7 +228,7 @@ export function feetOf (b) {
  * 返回 `{ ok, placed, walked, stopped, why, ... }`。
  * `stopped:true` + `why` 是**正常的收场方式**（用户要的就是"不行就停在这儿说清楚"）。
  */
-export async function bridgeAcross (self, { dir, count = 1, name = null, minHealth = BRIDGE_MIN_HEALTH, x = null, y = null, z = null } = {}, ctx = {}) {
+async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth = BRIDGE_MIN_HEALTH, x = null, y = null, z = null } = {}, ctx = {}) {
   const b = self.requireBot()
   const start = feetOf(b)
   /* 方向/格数：给了 dir 就用它；否则从目标格 (x,y,z) 反推（`mc_act{mode:"bridge"}` 走这条）。 */
@@ -366,5 +366,67 @@ export async function bridgeAcross (self, { dir, count = 1, name = null, minHeal
     ...(safety.risk ? { risk: safety.risk } : {}),
     ...(held !== held0 ? { held, heldBefore: held0 } : { held }),
     ...(placed.length === n ? { hint: '整条铺完了，人也走过来了。' } : {}),
+  }
+}
+
+/* ═══════════════ 收工把手换回来（用户 2026-10-19） ═══════════════ */
+
+/** 动手前手里的东西 —— 只在"有东西可还"时给（空手就是 null，不用还） */
+export function heldSnapshotOf (b) {
+  const it = b?.heldItem ?? null
+  return it?.name ? { name: it.name } : null
+}
+
+/**
+ * 把手换回 `snap` 那件（搭完桥切回之前的武器 / 镐子）。
+ *
+ * 只在"确实换了手、且那件还在背包里"时动手；**失败不抛错** —— 桥已经搭完了，
+ * 换不回来是件小事，如实说一句就行，不该把整次搭路判成失败。
+ * @returns {{ restored:boolean, now:string|null, why?:string }}
+ */
+export async function restoreHeldOf (b, snap) {
+  const now = b?.heldItem ?? null
+  if (!snap?.name) return { restored: false, now: now?.name ?? null }
+  if (now?.name === snap.name) return { restored: false, now: now.name }
+  let item = null
+  try { item = (b.inventory?.items?.() ?? []).find((i) => i?.name === snap.name) ?? null } catch { item = null }
+  if (!item) return { restored: false, now: now?.name ?? null, why: `背包里已经没有 ${snap.name} 了` }
+  try { await b.equip(item, 'hand') } catch (e) {
+    return { restored: false, now: b?.heldItem?.name ?? null, why: `换回 ${snap.name} 失败：${String(e?.message ?? e).slice(0, 60)}` }
+  }
+  const after = b?.heldItem?.name ?? null
+  return after === snap.name
+    ? { restored: true, now: after }
+    : { restored: false, now: after, why: `换回 ${snap.name} 之后手里是 ${after ?? '空'}` }
+}
+
+/**
+ * 搭路（`mc_act {mode:"bridge"}`）：铺完之后**把手换回来**。
+ *
+ * 🔴 为什么要有这一层（用户 2026-10-19 实机原话）：「搭路现在搭完后不会自动切回之前的武器」——
+ *    搭桥要拿方块、放方块会把方块 `equip` 到手上，铺完手里还攥着一摞圆石；
+ *    下一场架就拿着圆石挥，AI 也看不出"手被搭路改过"。
+ *    这里在**所有返回路径**上（成功 / 被拒 / 半路停 / 超时 / 抛错）统一还原，
+ *    而不是在每个 `return` 前各写一遍（那样迟早漏一个，见踩坑档案「收尾写在两处」那类）。
+ */
+export async function bridgeAcross (self, opts = {}, ctx = {}) {
+  const b = self.requireBot()
+  const keep = heldSnapshotOf(b)
+  let out = null
+  try {
+    out = await bridgeAcrossInner(self, opts, ctx)
+    return out
+  } finally {
+    if (keep) {
+      const r = await restoreHeldOf(b, keep)
+      if (out) {
+        if (r.restored) {
+          out.held = `${r.now}x${b?.heldItem?.count ?? 1}`
+          out.heldRestored = keep.name
+        } else if (out.held !== `${keep.name}x${b?.heldItem?.count ?? 1}` && r.why) {
+          out.heldRestoreWhy = r.why
+        }
+      }
+    }
   }
 }

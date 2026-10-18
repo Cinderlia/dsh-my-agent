@@ -480,6 +480,12 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
   const mem = { repositions: 0, equips: 0, lastEquipAt: 0, lastInRange: null, kites: 0, kiteBlocked: 0, kiteWhy: null }
   const actions = []
   const hurt = []
+  /** 开打时手里是什么（收工结果里对比着说，AI 才知道"手被换过"） */
+  const heldAtStart = b.heldItem?.name ?? null
+  /** 这一轮真的换上去的武器（回读确认过的，不是"我调过 equip"） */
+  const equippedTo = []
+  /** 换不上去的原因（有就写进结果的 `weaponWarn`，别让 AI 以为"它自己会换"） */
+  let equipFail = null
   let sawDamageAny = false
   let shieldsAny = 0
   let last = null
@@ -636,7 +642,18 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     /* ── 换武器 ── */
     if (step.action === 'equip') {
       if (!canEquip) { mem.equips = 99 /* 没能力就别再问了 */ } else {
-        try { await ctx.equipTo(step.name) } catch (e) { mem.equips = 99; moveErr = `换武器失败：${String(e?.message ?? e)}` }
+        const want = step.name
+        try {
+          await ctx.equipTo(want)
+          /* 🔴 只认**手上真的是那件**，不认"我调过 equip"（用户 2026-10-19：
+           *    "武器也自动切换我也没看到生效" —— 换装静默失败时，结果里必须说出来）。 */
+          const nowHeld = b.heldItem?.name ?? null
+          if (nowHeld === want) equippedTo.push(want)
+          else { mem.equips = 99; equipFail = `要换 ${want}，换完手里却是 ${nowHeld ?? '空手'} —— 没换上去` }
+        } catch (e) {
+          mem.equips = 99
+          equipFail = `换武器失败：${String(e?.message ?? e).slice(0, 80)}`
+        }
         mem.equips++
         mem.lastEquipAt = Date.now()
       }
@@ -775,7 +792,11 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
       : {}),
     ...(unreachable ? { unreachable: true } : {}),
     ...(moveErr ? { strategyError: moveErr } : {}),
-    ...(lastSnap?.weaponWarn ? { weaponWarn: lastSnap.weaponWarn } : {}),
+    /* 手里现在到底是什么 + 这一轮换过什么（用户 2026-10-19 要的"看得见"） */
+    held: b.heldItem ? `${b.heldItem.name}x${b.heldItem.count ?? 1}` : '空手',
+    ...(heldAtStart && heldAtStart !== (b.heldItem?.name ?? null) ? { heldBefore: `${heldAtStart}x1` } : {}),
+    ...(equippedTo.length ? { equipped: equippedTo } : {}),
+    ...(equipFail || lastSnap?.weaponWarn ? { weaponWarn: equipFail ?? lastSnap.weaponWarn } : {}),
     /* 有没有盾（含**副手 45 格**与盔甲槽 5..8）。如实给出来：AI 需要它判断"能不能进依赖盾牌的策略"，
      * 而这正是 2026-10-17 用户实机逮到的那个 bug 的现场（副手有盾却被判成没盾）。 */
     ...(typeof lastSnap?.hasShield === 'boolean' ? { shield: lastSnap.hasShield } : {}),

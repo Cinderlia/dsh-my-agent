@@ -445,7 +445,11 @@ export function chooseStrategy (s, mem = {}) {
    *    否则"刚开局、`now` 又是个小数字"时冷却恒不满足，换武器这条分支永远走不到
    *    （`check-core-attack` 的纯函数用例就是这么逮到它的：`now = 1000` ⇒ `1000 - 0 < 1500`）。 */
   const equipReady = lastEquipAt === 0 || (s.now - lastEquipAt) >= EQUIP_COOLDOWN_MS
-  if (s.weapon && equipReady && equips < 2) {
+  /* 🔴 `s.weapon.name` 必须是真的：`weaponChoiceOf` 在"武器快坏了"那条路上会回
+   *    `{ name: null, warn: ... }`（只报警告、不换）—— 以前这里只看 `s.weapon` 有没有值，
+   *    于是拿着 name=null 去 `equipTo(null)` ⇒ `equip()` 抛"要给 name" ⇒ `mem.equips = 99`，
+   *    **整场战斗再也不会换武器**（用户 2026-10-19："武器也自动切换我也没看到生效"）。 */
+  if (s.weapon?.name && equipReady && equips < 2) {
     return m('assess', 'equip', 'better-weapon', { name: s.weapon.name, why: s.weapon.why })
   }
 

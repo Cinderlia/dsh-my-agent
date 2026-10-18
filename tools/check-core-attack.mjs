@@ -1099,8 +1099,14 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     has(atkNo, 'heldPct: pctOfItem(heldItem),', '🔴 attack.mjs：把手里武器的剩余耐久喂给策略层')
     has(atkNo, 'pctOf: (n) => (bagPct.has(n) ? bagPct.get(n) : null),', '🔴 attack.mjs：背包里同名武器取**最好的一把**')
     has(atkNo, 'durabilityOf', 'attack.mjs 复用现成的 durabilityOf（不自己算耐久）')
-    has(atkNo, '...(lastSnap?.weaponWarn ? { weaponWarn: lastSnap.weaponWarn } : {}),',
-      '🔴 attack.mjs：武器快坏了要把话带出去（不然 AI 只看到"在打"）')
+    has(atkNo, "equipFail || lastSnap?.weaponWarn ? { weaponWarn: equipFail ?? lastSnap.weaponWarn } : {}",
+      '🔴 attack.mjs：武器快坏了 / 换不上去都要把话带出去（不然 AI 只看到"在打"）')
+    has(atkNo, "const nowHeld = b.heldItem?.name ?? null",
+      '🔴 attack.mjs：换完武器要**回读手里那件**再算数（用户 2026-10-19：自动切武器没看到生效）')
+    has(atkNo, "if (nowHeld === want) equippedTo.push(want)",
+      'attack.mjs：回读确认换上了才记进 equipped')
+    has(atkNo, "held: b.heldItem ? `${b.heldItem.name}x${b.heldItem.count ?? 1}` : '空手',",
+      'attack.mjs：结果里如实报"手里现在是什么"')
     /* 用户方案："没有盾牌或无法防御 ⇒ 不进入依赖盾牌的策略"。
     /* 用户 m01086 抱怨 4："副手有盾也不用"。现在只在**副手真握着盾**时举（hasShield 来自真实背包/装备）。
      * 所以断言改成两头：举盾入口只能走副手，且必须被 hasShield 和"有敌人"两道门夹住。 */
@@ -1310,6 +1316,57 @@ section('⑩ 威胁优先 / 换目标 / 举盾 / 血掉太快早收手 / 远程�
     ok(/priority: \{ type: 'string'/.test(idx), 'mc_act 参数里有 priority')
     ok(/aroundOf/.test(idx), 'mc_move 走完带 around（周围实体）')
     ok(/around: out\.slice\(0, 6\)/.test(idx), 'mc_move 结果里真有 around 字段')
+  }
+}
+
+/* ═══════════════ ⑳ 自动换武器：只认回读，换不上要说出来（2026-10-19 实机） ═══════════════ */
+section('⑳ 自动换武器：回读确认 + 换不上如实说 + name=null 不再空转')
+{
+  const { attack } = await import(new URL('../src/attack.mjs', import.meta.url))
+  const S = await import(new URL('../src/combat-strategy.mjs', import.meta.url))
+  const zombie = (id, z) => ent({ id, name: 'zombie', type: 'hostile', kind: 'Hostile mobs', pos: { x: 0, y: 64, z } })
+  const mkCtx = (onEquip) => {
+    const calls = { equip: [] }
+    const ctx = {
+      t: (p) => p, callLeft: () => 60_000, abortSignal: null, hasPvp: true,
+      moveTo: async () => {},
+      equipTo: async (n) => { calls.equip.push(n); await onEquip?.(n) },
+    }
+    return { ctx, calls }
+  }
+  {   /* 换不上（equipTo 什么都没做）⇒ 只试一次 + 结果里说实话 */
+    const f = mkFightBot([zombie('z1', 2)])
+    f.bot.heldItem = { name: 'stone_pickaxe', count: 1 }
+    f.bot.inventory = { items: () => [{ name: 'diamond_sword', count: 1 }] }
+    const { ctx, calls } = mkCtx()
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(calls.equip.length === 1 && calls.equip[0] === 'diamond_sword', '换不上时也**只试一次**（不每轮空转）', JSON.stringify(calls.equip))
+    ok(r.equipped === undefined, '没换上 ⇒ 结果里不写 equipped（不谎报）', JSON.stringify(r.equipped))
+    ok(/没换上去|换武器失败/.test(String(r.weaponWarn ?? '')), '🔴 换不上必须说出来（weaponWarn）', String(r.weaponWarn ?? '').slice(0, 60))
+    ok(r.held === 'stone_pickaxex1', '结果如实报手里还是镐', String(r.held))
+  }
+  {   /* 换上了（equipTo 真把东西塞到手上）⇒ equipped / heldBefore 都对 */
+    const f = mkFightBot([zombie('z1', 2)])
+    f.bot.heldItem = { name: 'stone_pickaxe', count: 1 }
+    f.bot.inventory = { items: () => [{ name: 'diamond_sword', count: 1 }] }
+    const { ctx } = mkCtx(async (n) => { f.bot.heldItem = { name: n, count: 1 } })
+    const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
+    ok(Array.isArray(r.equipped) && r.equipped[0] === 'diamond_sword', '🔴 换上了 ⇒ 结果里能看到 equipped', JSON.stringify(r.equipped))
+    ok(r.held === 'diamond_swordx1', '结果报手里的剑（看得见"生效了"）', String(r.held))
+    ok(r.heldBefore === 'stone_pickaxex1', '换之前手里是什么也留着（heldBefore）', String(r.heldBefore))
+    ok(r.weaponWarn === undefined, '换上了就不该有 weaponWarn', String(r.weaponWarn))
+  }
+  {   /* 策略层：`weapon.name` 是 null（只报警告）⇒ 不许再发 equip 步骤 */
+    const snap = {
+      targetGone: false, mustRetreat: false, health: 20, hurtDps: 0,
+      weapon: { name: null, warn: '手里 diamond_sword 只剩 5%，背包里没有备用的' },
+      now: 10_000, targetRanged: false, surrounded: false, rangedThreat: false,
+      shouldStopAdvancing: false, targetInRange: true, targetReachable: true,
+    }
+    const step = S.chooseStrategy(snap, {})
+    ok(step.action !== 'equip', '🔴 weapon.name 为 null 时不许发 equip（以前会 equipTo(null) ⇒ 整场不再换武器）', JSON.stringify(step))
+    const step2 = S.chooseStrategy({ ...snap, weapon: { name: 'diamond_sword', why: 'x' } }, {})
+    ok(step2.action === 'equip' && step2.name === 'diamond_sword', '真有名时才发 equip', JSON.stringify(step2))
   }
 }
 

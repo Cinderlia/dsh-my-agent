@@ -523,7 +523,10 @@ export class TaskRunner {
       .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0] ?? null
     if (cur) {
       cur.updatedAt = this.now()
-      if (total != null) cur.progress.total = Number(total)
+      /* 🔴 2026-10-19 实机（tasks.json 里 `goalSpec.count=10` 而 `progress.total=5`）：
+       * 同一条任务被"接着挖剩下的 5 个"又调了一次 `auto({ total: 5 })`，总目标被改小，
+       * 台账于是报 5/5 完成 —— 其实只挖了一半。总目标只能变大，不能被续做改小。 */
+      if (total != null) cur.progress.total = Math.max(Number(cur.progress.total ?? 0) || 0, Number(total) || 0)
       /* 又叫了一次 = 人还在管这件事：从"卡住/暂停/等条件"回到"进行中" */
       cur.status = 'running'
       this.save()

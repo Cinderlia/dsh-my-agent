@@ -1616,5 +1616,23 @@ section('⑰ preferDoors：挖墙要多付一笔，走门/绕路不付（2026-10
   ok(/digPenalty: preferDoors \? Number\(self\.cfg\.doorDigPenalty \?\? 8\) : 0/.test(plug), '惩罚值可配置（doorDigPenalty，关掉就是 0）')
 }
 
+/* ═══════════════ ⑱ 实机反馈（2026-10-19）：门没开透要补按、斜向挡路、上方目标允许垫一次 ═══════════════ */
+section('⑱ 门失败兜底 / 斜向障碍 / 上方目标垫柱兜底')
+{
+  const src = read('../src/movement.mjs')
+  const { obstacleAheadOf } = mod
+  /* 斜着拐弯：正前和正侧都空，只有对角那一格是石头 ⇒ 也要看见 */
+  const diag = mkCarveBot({ '1,63,0': 'stone', '0,63,1': 'stone', '1,63,1': 'stone', '1,64,1': 'stone' })
+  const d = obstacleAheadOf(diag, { x: 10, y: 64, z: 10 })
+  ok(d && d.x === 1 && d.z === 1 && d.name === 'stone', '对角线那格的石头也算"眼前挡路"', JSON.stringify(d))
+  /* 门没开透 ⇒ 补按一次再走（不再直接交给脱困阶梯） */
+  ok(/if \(sx && sz\) dirs\.push\(\[sx, sz\]\)/.test(src), 'carve/obstacle 都会看对角线方向')
+  ok(/if \(doorWalk && doorWalk\.passed !== true\)/.test(src), '门没过去时走兜底分支')
+  ok(/opened: Number\(opened\) \|\| 0/.test(src) && /retry: true/.test(src), '兜底里补按门并把结果记进 doorWalk.retry')
+  /* 上方目标、头顶为空 ⇒ 允许一次垫柱（否则 noTower 默认之下这类目标永远无解） */
+  ok(/let towerTried = 0/.test(src), '有"只翻一次"的垫柱标志')
+  ok(/allow1by1towers = true/.test(src) && /目标在上方、头顶有空/.test(src), '上方目标走不通时允许垫一格往上')
+}
+
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)
