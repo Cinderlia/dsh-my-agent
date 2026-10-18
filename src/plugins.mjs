@@ -507,13 +507,20 @@ export function patchDoorMoves (mv) {
        * 门由 `openNearbyDoor`（400ms 探一次、够得着就按）负责开 —— 规划里不需要这一步。 */
       m.toPlace = m.toPlace.filter((p) => !(p?.useOne && isDoor(doorAt(node, p))))
     }
+    /* 🔴 必须显式返回 true：`getNeighbors` 用 `filter((m) => clean(node, m))` 收集候选，
+     * 漏了这句 ⇒ 所有 move 都被当成 falsy 丢掉 ⇒ A* 无路 ⇒ 到处 `NoPath` 走不动。 */
+    return true
   }
   const origNeighbors = mv.getNeighbors
   if (typeof origNeighbors === 'function') {
     mv.getNeighbors = function (node) {
       const moves = origNeighbors.call(this, node)
       if (!Array.isArray(moves)) return moves
-      return moves.filter((m) => clean(node, m))
+      const kept = moves.filter((m) => clean(node, m))
+      /* 🔴 兜底：门保护不该把整个世界变成"无路可走"。
+       * 万一某个节点上所有候选都因为"得挖门旁边的方块"被作废，就退回未过滤的候选 ——
+       * 执行层 `guardDoorDig` 仍然不会真去挖门/门框，宁可交给脱困阶梯也不要凭空 NoPath。 */
+      return kept.length > 0 ? kept : moves
     }
     mv.__dshDoorPatched = true
     return mv

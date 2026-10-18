@@ -830,6 +830,47 @@ section('⑧′⁗ 卡住恢复：门"通不通"要看门现在的状态，不�
   ok(/export function doorOnRoute/.test(src2) && /const doorBlocking = doorOnRoute\(b, target\)/.test(src2),
     '🔴 卡住分支在补挖之前先查"路线上有没有门"')
   ok(/export function doorOnRoute/.test(src2) && /cells \+ 1/.test(src2), '扫描按当前移动方向、范围是 cells+1（不是门周围固定两格）')
+  {
+    /* 🔴 回归：patchDoorMoves 挂在 getNeighbors 上时必须**保留**与门无关的 move。
+     * 曾经 clean() 漏了 return true ⇒ 所有候选都被 filter 丢掉 ⇒ 到处 NoPath。 */
+    const { patchDoorMoves } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    const air = { name: 'air' }
+    const mv = {
+      getBlock: () => air,
+      getNeighbors () {
+        return [
+          { kind: 'walk', cost: 1, toBreak: [], toPlace: [] },
+          { kind: 'walk-with-dig', cost: 5, toBreak: [{ x: 1, y: 64, z: 0 }], toPlace: [] },
+        ]
+      },
+    }
+    patchDoorMoves(mv)
+    const got = mv.getNeighbors({ x: 0, y: 64, z: 0 })
+    ok(Array.isArray(got) && got.length === 2,
+      '🔴 getNeighbors 补丁保留所有与门无关的 move（漏 return true ⇒ 全局 NoPath）', JSON.stringify(got?.length))
+    ok(got?.[1]?.toBreak?.length === 1 && got[1].cost === 5, '普通方块的挖掘原样保留（cost 也不动）', JSON.stringify(got?.[1]))
+    /* 全部候选都被"门保护"作废时（极端：站在门框里四面都要挖门边），退回未过滤候选 ——
+     * 宁可让执行层拦住那次挖，也不要凭空 NoPath。 */
+    const door = { name: 'oak_door', getProperties: () => ({ open: false }) }
+    const mv2 = {
+      getBlock: (node, dx, dy, dz) => ((dx === 1 && dy === 0 && dz === 0) ? door : { name: 'stone' }),
+      getNeighbors () {
+        return [{ kind: 'walk', cost: 3, toBreak: [{ x: 1, y: 64, z: 0 }], toPlace: [] }]
+      },
+    }
+    patchDoorMoves(mv2)
+    const got2 = mv2.getNeighbors({ x: 0, y: 64, z: 0 })
+    ok(Array.isArray(got2) && got2.length === 1 && got2[0].toBreak.length === 0,
+      '🔴 门的 toBreak 照旧剔除（这一条不该被兜底改回）', JSON.stringify(got2))
+    const mv3 = {
+      getBlock: (node, dx, dy, dz) => ((dx === 1 && dy === 0 && dz === 0) ? { name: 'stone' } : { name: 'air' }),
+      getNeighbors () {
+        return [{ kind: 'walk', cost: 3, toBreak: [{ x: 1, y: 64, z: 0 }], toPlace: [] }]
+      },
+    }
+    patchDoorMoves(mv3)
+    ok(mv3.getNeighbors({ x: 0, y: 64, z: 0 }).length === 1, '兜底只在"全没了"时生效')
+  }
   const plug2 = read('../src/plugins.mjs')
   ok(/const isDoorSupport = \(node, p\)/.test(plug2) && /isDoorSupport\(node, p\)\) \{[\s\S]{0,160}?continue/.test(plug2),
     '🔴 规划层：门脚支撑块也剔出 toBreak 并退工钱')
