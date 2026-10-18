@@ -3073,8 +3073,9 @@ export function apply(ctx, rawConfig) {
       + '· bridge 搭路：朝 (x,y,z) 一格格铺（铺在脚下一层），每块等服务端确认才走；有坠落/岩浆风险就停；铺完把手换回原来的东西\n'
       + '· break  破坏 (x,y,z)：先自动换对的工具；换不上就拒绝\n'
       + '· use    使用方块或实体(who)：开门、按钮、拉杆、喂动物；都不给=用手上的东西\n'
-      + '· useitem 用手上的东西：扔眼睛/雪球/拉弓\n'
-      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就按 priority 挑（默认 threat 威胁最大 / nearest 最近 / weakest 血最少）。开打先换把趁手的（结果 held/equipped 报手上是什么）、举盾、给建议（不替你撤退）；kite 放风筝。约 10 秒\n'
+      + '· useitem 用手上的东西：扔眼睛/雪球\n'
+      + '· shoot 射箭：hawkeye 算弹道，自动换弓/拉满/放箭。水晶给 x/y/z，末影龙给 who:"ender_dragon"；count 连射 ≤5\n'
+      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给就按 priority 挑（默认 threat 威胁最大 / nearest 最近 / weakest 血最少）。开打先换把趁手的、举盾、给建议（不替你撤退）；kite 放风筝\n'
       + '· equip 装备(name)：护甲自动穿（盾→副手），其余拿到手上；to 指定格子\n'
       + '· enchant 附魔台：option 0-2；不给只报选项\n'
       + '· anvil 铁砧：combine(默认)/rename；item+name\n'
@@ -3089,7 +3090,9 @@ export function apply(ctx, rawConfig) {
       allowDangerous: { type: 'boolean', description: 'break：允许挖自己脚下的支撑（默认拦）' },
       name: { type: 'string', description: '方块或物品名（place/equip/toss/anvil/smithing 用）' },
       to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand/hand；只给 = 脱掉' },
-      count: { type: 'number', description: 'toss 丢几个（默认 1）' },
+      count: { type: 'number', description: 'toss 丢几个（默认 1）；shoot 连射几箭（默认 1，最多 5）' },
+      waitTime: { type: 'number', description: 'shoot 拉弓多久再放（默认 1200ms）' },
+      weapon: { type: 'string', description: 'shoot 用什么射（默认 bow；可 crossbow/trident）' },
       hold: { type: 'number', description: 'useitem 按住毫秒（拉弓 1000）' },
       approach: { type: 'boolean', description: 'toward 走近吗（默认 true）' },
       budgetMs: { type: 'number', description: 'toward 走近毫秒（默认 10000）' },
@@ -3120,13 +3123,17 @@ export function apply(ctx, rawConfig) {
           return withOutcome({ mode, ...(await bot.useBlock(args)) })
         }
         case 'useitem': return { mode, ...(await bot.useItem(args)) }
+        /* 射箭（用户 2026-10-19：「hawkeye 主要是水晶和末影龙」）—— 弹道在 `src\shoot.mjs`：
+         * 换弓回读 → 数箭 → hawkeye 算 yaw/pitch → 拉满 → 再瞄一次 → 放 → 数箭确认。
+         * 算不出来（落点误差 > 4 格）就如实报"太远/角度刁"，不瞎射。 */
+        case 'shoot':   return withOutcome({ mode, ...(await bot.shoot({ who: args.who, x: args.x, y: args.y, z: args.z, count: args.count, waitTime: args.waitTime, lead: args.lead, weapon: args.weapon })) })
         case 'attack':  return withOutcome({ mode, ...(await bot.attack(args)) })
         case 'equip':   return { mode, ...(await bot.equip({ name: args.name, to: args.to })) }
         case 'enchant': return { mode, ...(await bot.enchantTable({ option: args.option, item: args.item, x: args.x, y: args.y, z: args.z })) }
         case 'anvil':   return { mode, ...(await bot.anvilTable({ action: args.action, item: args.item, name: args.name, x: args.x, y: args.y, z: args.z })) }
         case 'smithing': return { mode, ...(await bot.smithingTable({ item: args.item, name: args.name, template: args.template, x: args.x, y: args.y, z: args.z })) }
         case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
-        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/attack/equip/enchant/anvil/smithing/toss）`)
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/shoot/attack/equip/enchant/anvil/smithing/toss）`)
       }
     },
   }))

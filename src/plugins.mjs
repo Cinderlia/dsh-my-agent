@@ -50,6 +50,10 @@ export const MC_DEPS = {
   tool: { pkg: 'mineflayer-tool', entry: 'lib/index.js', label: '换工具 mineflayer-tool（按方块挑最好的工具）' },
   pvp: { pkg: 'mineflayer-pvp', entry: 'lib/index.js', label: '打怪 mineflayer-pvp（追击 + 近战节奏）' },
   autoEat: { pkg: 'mineflayer-auto-eat', entry: 'dist/index.js', label: '自动吃 mineflayer-auto-eat' },
+  /* 射箭弹道（用户 2026-10-19：「hawkeye 主要是水晶和末影龙」）。
+   * 🔴 它的导出叫 `default`（`dist/index.js` 是 `exports.default = inject`），既不是 `plugin` 也不是
+   *    `loader` —— 所以这条要显式声明 `exports`，否则 `pickExport` 找不到函数、整个能力静默缺失。 */
+  hawkeye: { pkg: 'minecrafthawkeye', entry: 'dist/index.js', label: '射箭弹道 minecrafthawkeye（弓/弩/三叉戟的抛物线角度）', exports: ['default'] },
 }
 
 const DEP_OFF = /^(off|0|false|no|none)$/i
@@ -138,7 +142,15 @@ export async function loadMcDep (key, { log = null, logWarn = null, spec = null 
       }
       // 其余插件：入口就是 `bot.loadPlugin()` 要的那个函数
       // （collectblock/tool/pvp 的 CJS 导出叫 `plugin`，auto-eat 的 ESM 导出叫 `loader`）
-      const fn = pickExport(m, ['plugin', 'loader'])
+      let fn = pickExport(m, ['plugin', 'loader', ...(info.exports ?? [])])
+      /* 🔴 2026-10-19（minecrafthawkeye）：它写的是 `exports.default = inject`，Node 的 CJS→ESM
+       *   interop 会把**整个 `module.exports`** 当成 `m.default` ⇒ `m.default` 是
+       *   `{ default: inject, Vec2, Weapons, isEntity, weaponsProps }` 这个**对象**，不是函数。
+       *   以前只看一层，结果 `typeof fn === 'function'` 不成立 ⇒ 整个能力静默缺失。
+       *   这里往下剥最多三层，拿到真正的函数为止。 */
+      for (let i = 0; i < 3 && fn && typeof fn !== 'function'; i++) {
+        fn = fn.default ?? fn.plugin ?? fn.loader
+      }
       if (typeof fn === 'function') {
         _depCache.set(key, fn)
         log?.(`已找到现成的${info.label}（${where}）`)
@@ -662,7 +674,7 @@ export function guardDoorActivate (b) {
 export async function setupPlugins (self, { spec = null } = {}) {
   const b = self.bot
   if (!b) return { pathfinder: false }
-  const out = { pathfinder: false, collectBlock: false, tool: false, pvp: false, autoEat: false }
+  const out = { pathfinder: false, collectBlock: false, tool: false, pvp: false, autoEat: false, hawkeye: false }
   // 成功细节（"找到了哪个文件"）走 debug：依赖横幅原来每个连接重打一遍，占全日志 31.5%
   const log = (m) => self.logDebug(m)
   const logWarn = (m) => self.log(m)      // 候选不可用 / 形状不对：真出问题时要看得见
@@ -701,6 +713,16 @@ export async function setupPlugins (self, { spec = null } = {}) {
       out.pvp = typeof b.pvp?.attack === 'function'
     }
   } catch (e) { self.log('pvp 挂载失败：' + e.message) }
+
+  /* ③.5 射箭弹道（`mc_act {mode:"shoot"}` 用）。**每次射之前还会再 bind 一遍**
+   *      （`src\shoot.mjs`：它的 bot 是模块级单例，同进程连第二个号就会拿错坐标）。 */
+  try {
+    const fn = await loadMcDep('hawkeye', { log, logWarn })
+    if (fn) {
+      if (typeof b.hawkEye?.getMasterGrade !== 'function') fn(b)
+      out.hawkeye = typeof b.hawkEye?.getMasterGrade === 'function'
+    }
+  } catch (e) { self.log('hawkeye 挂载失败：' + e.message) }
 
   // ④ 饿了自动吃（**默认不开自动**：由 mc_auto 按自己的开关决定，免得两套逻辑抢）
   try {

@@ -57,6 +57,7 @@ import { breakBlock as breakBlockImpl, dig as digImpl } from './mining.mjs'
 import { placeRef, placeBlock as placeBlockImpl } from './place.mjs'
 import { bridgeAcross } from './bridge.mjs'
 import { attack } from './attack.mjs'
+import { shoot } from './shoot.mjs'
 import { runSequence } from './sequence.mjs'
 /* 路线图第 ④ 条第十八刀：「服务端到底认没认这次破坏」的判决监听搬到
  * `src/server-break.mjs`（`watchServerBreak` / `awaitServerBreak`）。下面留两个同名薄包装，
@@ -804,15 +805,9 @@ export class McBot extends EventEmitter {
   #placeCtx () { return { t: (p, kind, label) => this.#t(p, kind, label) } }
 
 
-  /**
-   * 挂一个"服务端到底认没认这次破坏"的监听 —— 实现在 `src\server-break.mjs`（`watchServerBreak`）。
-   *
-   * 🔴 要点（完整推导见模块头注释）：**`bot.blockAt()` 是客户端预测世界** ——
-   *    `digging.js` 的 `finishDigging()` 不看服务端认没认就把它写成 air，所以
-   *    "本地读到变空气"证明不了任何事；而服务端**拒绝**破坏时，还会把这个位置的
-   *    原方块用 `block_change` 发回来"复原"（旧代码把这个复原包也当成"服务端认了"）。
-   *    判据：只有"服务端说这块变空气"才算挖掉，"改成非空气"是复原，其余一律当没有证据。
-   */
+  /** 挂"服务端到底认没认这次破坏"的监听（`src\server-break.mjs` 的 `watchServerBreak`，完整推导在那个模块头）。
+   *  一句话：`bot.blockAt()` 是客户端预测，本地变 air 不算证据；服务端拒绝时还会用 `block_change`
+   *  把原方块发回来"复原"—— 只有"服务端说这块变 air"才算挖掉。 */
   #watchServerBreak (b, pos) { return watchServerBreak(b, pos) }
 
   /** 等**服务端的判决**（最多 `maxMs`，服务端说"这块变空气了"就提前收手）—— 实现在 `src\server-break.mjs`（`awaitServerBreak`）。 */
@@ -921,6 +916,11 @@ export class McBot extends EventEmitter {
       moveTo: async (pos, o = {}) => await this.walkTo(pos, o),
       equipTo: async (name) => await this.equip({ name }),
     })
+  }
+
+  /** 射箭：弹道交给现成的 `minecrafthawkeye`（水晶/末影龙怎么用、为什么每次重 bind，见 `src\shoot.mjs` 文件头） */
+  async shoot (opts = {}) {
+    return await shoot(this.requireBot(), opts, { t: (p, k, l) => this.#t(p, k, l), callLeft: () => this.callLeft(), log: (m) => this.logDebug(m) })
   }
 
   /** 丢弃手上的物品（`name` 给了就先换上那个）—— 实现在 `src\inventory.mjs`（`tossItem`） */

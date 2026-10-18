@@ -25,7 +25,7 @@ const only = onlyIdx >= 0 ? String(args[onlyIdx + 1] ?? '') : ''
 
 /** 跑的顺序：先核心，再工具，最后会话/日志这类横切的；上游的 check-core 与 selfcheck 放最后。 */
 const ORDER = [
-  'check-core-dig.mjs', 'check-core-digtime.mjs', 'check-core-place.mjs', 'check-core-entities.mjs', 'check-core-attack.mjs', 'check-core-useitem.mjs',
+  'check-core-dig.mjs', 'check-core-digtime.mjs', 'check-core-place.mjs', 'check-core-entities.mjs', 'check-core-attack.mjs', 'check-core-useitem.mjs', 'check-shoot.mjs',
   'check-core-swim.mjs', 'check-core-map.mjs', 'check-core-inventory.mjs', 'check-core-equip.mjs', 'check-core-evidence.mjs',
   'check-call-budget.mjs', 'check-token-budget.mjs', 'check-async-util.mjs', 'check-worker-pool.mjs', 'check-mc-pathfinder.mjs',
   'check-danger.mjs',

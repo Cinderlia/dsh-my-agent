@@ -23,7 +23,7 @@
 
 ```bash
 pnpm add github:blueziii/dsh-mc-agent
-pnpm add mineflayer-pathfinder mineflayer-collectblock mineflayer-tool mineflayer-pvp mineflayer-auto-eat
+pnpm add mineflayer-pathfinder mineflayer-collectblock mineflayer-tool mineflayer-pvp mineflayer-auto-eat minecrafthawkeye
 ```
 
 然后把 `"dsh-mc-agent"` 加进 DSH profile 的 `dsh.profile.bundles`，重启 DSH。

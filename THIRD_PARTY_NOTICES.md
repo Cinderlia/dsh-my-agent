@@ -26,6 +26,7 @@ dsh-mc-agent 自身以 **MIT** 发布（见 `LICENSE`）。它**不打包**任�
 | 组件 | 许可 | 说明 |
 | --- | --- | --- |
 | [`sharp`](https://github.com/lovell/sharp) | Apache-2.0 | **可选**：`mc_kit_image` 的 SVG→PNG 光栅化。没装也能用（地图出图走自带零依赖 PNG 编码器；`mc_kit_image` 会明确报"图像引擎不可用"） |
+| [`minecrafthawkeye`](https://github.com/minecraft-utils/minecraft-hawkeye) | ISC | **可选**（由部署方装进 `vendor\mc-deps`，与 mineflayer-pathfinder 同处）：`mc_act {mode:"shoot"}` 的射箭弹道。没装时射箭会明确报"没装 minecrafthawkeye"，其它能力照旧 |
 
 > 本包内的 `src/png.mjs` 是**自己写的零依赖 PNG 编码器**（`node:zlib` + 手写 CRC32），
 > 不引用任何第三方图像库。
