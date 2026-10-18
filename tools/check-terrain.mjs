@@ -316,7 +316,9 @@ section('⑥ 静态接线')
   ok(/#movements \(terrain = null\) \{ return movements\(this, \{ terrain \}\) \}/.test(core), '🔴 core.mjs 的 #movements 把地形透下去')
   ok(/movements: \(terrain\) => this\.#movements\(terrain\)/.test(core), '🔴 pathCtx 把地形参数透下去')
 
-  ok(/const terrain = classifyTerrainCached\(b\)/.test(movement), '🔴 movement.mjs 每次走路前分类一次（走缓存版）')
+  ok(/let terrain = classifyTerrainCached\(b\)/.test(movement), '🔴 movement.mjs 每次走路前分类一次（走缓存版；`let` 是为了脱困后局部重估）')
+  ok(/const fresh = classifyTerrainCached\(b\)[\s\S]{0,400}?terrain = fresh/.test(movement),
+    '🔴 脱困后按新地形重估一次（不再拿出发时的旧判断走到底）')
   ok(movement.indexOf('const terrain = classifyTerrainCached(b)') < movement.indexOf('ctx.movements(terrain)'), '分类发生在取 Movements 之前')
   ok(/const mv = ctx\.movements\(terrain\)/.test(movement), '把分类结果交给 ctx.movements')
   ok(/\[opts\.arrived \? 'terrainAtStart' : 'terrain'\]: terrain\.kind \}/.test(movement), '返回值里带上地形（平地/未知时不报）')

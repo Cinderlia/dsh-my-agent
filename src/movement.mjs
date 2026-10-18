@@ -430,7 +430,48 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
  * 这是唯一的移动实现：不再保留手写的按键、盲跳、挖方块或垫脚兜底。
  * ⚠️ 唯一的例外：**在水里**先交给 `#walkSwim`（A* 不把水当节点，见它的注释）。
  */
+/* ── 长路线续行（2026-10-18 审计 P1） ────────────────────────────────────────
+ * 一次 `mc_move` 只有 10 秒，长路必然要"再叫一次接着走"。但同一目标反反复复走、
+ * 每次只报"这一趟挪了几格"时，AI 看不出"我已经在这个目标上耗了三分钟" ——
+ * 于是原样重试第四次。
+ * 这里在 bot 上记一条**只读的路线账**：同一个目标（水平 3 格内、垂直 3 格内、90 秒内）
+ * 连着走就累计次数/累计位移/累计耗时；连着 3 趟、平均每趟不到半格，就在 `hint` 里
+ * 明说"别再原样重试"。**只记账，不改路线、不改目标** —— 怎么绕仍由 AI 决定。 */
+const ROUTE_TTL_MS = 90_000
+const ROUTE_SAME_R = 3
+
+export function routeTrack (self, target, info) {
+  const t = Date.now()
+  const prev = self._navRoute ?? null
+  const tx = Number(target?.x), tyTarget = Number(target?.y), tz = Number(target?.z)
+  const same = Boolean(prev) && t - prev.at < ROUTE_TTL_MS &&
+    Math.hypot(prev.target.x - tx, prev.target.z - tz) <= ROUTE_SAME_R &&
+    Math.abs(prev.target.y - tyTarget) <= ROUTE_SAME_R
+  const attempts = same ? prev.attempts + 1 : 1
+  const rd2 = (n) => Math.round(n * 100) / 100
+  const movedTotal = rd2((same ? prev.movedTotal : 0) + (Number(info?.moved) || 0))
+  const elapsedMs = (same ? prev.elapsedMs : 0) + (Number(info?.ms) || 0)
+  self._navRoute = { target: { x: tx, y: tyTarget, z: tz }, at: t, attempts, movedTotal, elapsedMs }
+  const route = { attempts, movedTotal, elapsedMs, sameTarget: same }
+  const stalled = attempts >= 3 && movedTotal < attempts * 0.5 && info?.arrived !== true
+  if (!stalled) return route
+  return {
+    ...route,
+    stalled: true,
+    hint: `**已经第 ${attempts} 次走同一个目标了**，累计只挪了 ${movedTotal} 格（${Math.round(elapsedMs / 1000)} 秒）—— 别再原样重试。`
+      + '先换做法：走不动就看 `blockedAhead` / `shaft`（头顶封着什么、四面哪边通），'
+      + '挖掉挡路那一格、换个 `intent`（`stand`/`interact`/`same-level`）、绕到另一侧，或者用 `mc_act {mode:"bridge"}` 搭过去。',
+  }
+}
+
 export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, intent = 'near' } = {}, ctx = {}) {
+  const info = await walkToOnce(self, target, { arrive, budget, noTower, intent }, ctx)
+  const route = routeTrack(self, target, info)
+  if (!route?.stalled) return { ...info, route }
+  return { ...info, route, hint: `${info.hint ? info.hint + '\n' : ''}${route.hint}` }
+}
+
+async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, intent = 'near' } = {}, ctx = {}) {
   const b = self.requireBot()
   // 🔴 在水里：A* 不把水当节点（见 #walkSwim 的注释），实机表现是"4 秒挪 1 格"。
   //    先直接游；上了岸、还有时间，再把剩下的路交给 pathfinder 走完。
@@ -1070,7 +1111,11 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   // 地形分类（导航 P2，用户 m02868 的"地形分类 + 路径评分"）：
   // **只换权重，不换算法** —— 台阶上把挖穿调便宜一点、沟边把垫方块调便宜一点、
   // 岩浆边一格都不许往下跳。看错了顶多走回原来的路，不会让机器人做危险动作。
-  const terrain = classifyTerrainCached(b)
+  /* 2026-10-18 审计 P1「地形局部重估」：这份只是**出发时**的看法；脱困/挖开台阶之后
+   * 世界已经变了，循环里会用 `classifyTerrainCached`（缓存键含脚下坐标，`blockUpdate` 会顶版本号）
+   * 再判一次，变了就按新地形重调权重。 */
+  let terrain = classifyTerrainCached(b)
+  let terrainReeval = 0
   const mv = ctx.movements(terrain)
   if (!mv) throw new Error('pathfinder 的 Movements 造不出来（插件没挂上？）')
   /* 🔴 2026-10-17（用户实机：逃跑时寻路器把方块垫在自己脚下往上爬，一路升到 y=57，越跑越远）：
@@ -1163,6 +1208,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     ...(terrain.kind === 'flat' || terrain.kind === 'unknown' ? {}
       : { [opts.arrived ? 'terrainAtStart' : 'terrain']: terrain.kind }),
     ...(repathCount ? { repathCount } : {}),
+    ...(terrainReeval ? { terrainReeval } : {}),
     ...(carved ? { carved } : {}),
     ...(pathThrash ? { pathThrash } : {}),
     ...(pathResetsTotal >= 2 ? { pathResets: pathResetsTotal, pathResetReasons: { ...resetReasons } } : {}),
@@ -1191,6 +1237,20 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         repathCount++
         self.log(`🔁 走不动了 → 第 ${attempt} 级脱困：${escapeTextOf(step)}（累计重算 ${repathCount} 次）`)
         await escapeMove(b, goal, step, ctx)
+        /* 地形局部重估（2026-10-18 审计 P1）：上一轮可能挖开了台阶/垫了方块/被浆果丛卡过 ——
+         * 世界变了，出发时那份地形判断就不再可靠。只重判脚下这一圈（缓存键含坐标），
+         * 类别真变了才重建 `Movements`，没有变化就完全不动。 */
+        const fresh = classifyTerrainCached(b)
+        if (fresh.kind !== terrain.kind && fresh.kind !== 'unknown') {
+          terrainReeval++
+          self.log(`🧭 脱困后地形变了：${terrain.text} → ${fresh.text}（按新地形重调权重）`)
+          terrain = fresh
+          const mv2 = ctx.movements(terrain)
+          if (mv2) {
+            if (noTower) mv2.allow1by1towers = false
+            b.pathfinder.setMovements(mv2)
+          }
+        }
       }
       pathResets = 0                               // 本轮重新数（脱困动作自己也会 reset 一次）
       const pfT0 = Date.now()

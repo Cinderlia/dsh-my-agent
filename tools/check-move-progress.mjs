@@ -29,7 +29,7 @@ const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 const mod = await import(new URL('../src/movement.mjs', import.meta.url))
 const {
   MOVE_SAMPLE_MS, MOVE_STUCK_MS, MOVE_BUSY_MAX_MS, MOVE_ESCAPES,
-  escapeStepOf, escapeTextOf, moveBusyNow, moveProgressWatcher, escapeMove, walkPathfinder,
+  escapeStepOf, escapeTextOf, moveBusyNow, moveProgressWatcher, escapeMove, walkPathfinder, routeTrack,
 } = mod
 
 let pass = 0
@@ -900,6 +900,51 @@ section('⑧‴ 失败结果"可操作"：眼前挡路的那格 + 泳也算三�
     '移动期间定时探门（收尾一定清掉定时器）')
   ok(/是\*\*门\*\*：.*mode:"use"/.test(src) && /别挖墙也别挖门/.test(src),
     '失败提示:门用"按开",不是"挖掉"')
+}
+section('⑬ 长路线续行 + 地形局部重估（2026-10-18 审计 P1）')
+{
+  /* 续行只记账（不改路线）：同一目标连续走时，累计次数/位移/耗时都报出来；
+   * 连走 3 趟、平均每趟不到半格 ⇒ hint 明说"别再原样重试"。 */
+  const self = {}
+  const tgt = { x: 10, y: 64, z: 10 }
+  const a = routeTrack(self, tgt, { moved: 0.6, ms: 9000, arrived: false })
+  ok(a.attempts === 1 && a.sameTarget === false && a.movedTotal === 0.6, '第一趟：attempts=1', JSON.stringify(a))
+  const b2 = routeTrack(self, { x: 10.5, y: 64.2, z: 10.4 }, { moved: 0.2, ms: 9000, arrived: false })
+  ok(b2.attempts === 2 && b2.sameTarget === true && b2.movedTotal === 0.8, '同一个目标（3 格内）第二趟累计', JSON.stringify(b2))
+  const c = routeTrack(self, tgt, { moved: 0.1, ms: 8000, arrived: false })
+  ok(c.attempts === 3 && c.stalled === true && c.movedTotal === 0.9,
+    '第三趟仍几乎没挪 ⇒ stalled（累计才 0.9 格）', JSON.stringify(c))
+  ok(/已经第 3 次走同一个目标/.test(c.hint ?? '') && /别再原样重试/.test(c.hint ?? ''),
+    '🔴 hint 点名"第 N 次 + 别再原样重试"', String(c.hint).slice(0, 70))
+  ok(/blockedAhead|shaft/.test(c.hint ?? '') && /intent/.test(c.hint ?? ''), 'hint 给出换做法的方向')
+  const d = routeTrack(self, { x: 30, y: 64, z: 10 }, { moved: 3, ms: 9000, arrived: false })
+  ok(d.attempts === 1 && d.sameTarget === false, '换了目标就重新计数', JSON.stringify(d))
+  // 隔了太久（>90s）不算同一条路
+  self._navRoute.at = Date.now() - 100_000
+  const e = routeTrack(self, { x: 30, y: 64, z: 10 }, { moved: 0.2, ms: 9000, arrived: false })
+  ok(e.attempts === 1, '超过 90 秒还没走到 ⇒ 当成新的一条路', JSON.stringify(e))
+  // 真到了就不算"卡在同一个目标上"
+  const self2 = {}
+  routeTrack(self2, tgt, { moved: 0.1, ms: 9000, arrived: false })
+  routeTrack(self2, tgt, { moved: 0.1, ms: 9000, arrived: false })
+  const f = routeTrack(self2, tgt, { moved: 0.1, ms: 3000, arrived: true })
+  ok(f.stalled !== true, '到点了就算这一趟成功了 —— 不劝"换做法"', JSON.stringify(f))
+  // 走得好好的（每趟都在靠近）也不打扰
+  const self3 = {}
+  routeTrack(self3, tgt, { moved: 2, ms: 9000 })
+  routeTrack(self3, tgt, { moved: 2, ms: 9000 })
+  const g = routeTrack(self3, tgt, { moved: 2, ms: 9000 })
+  ok(g.stalled !== true && g.movedTotal === 6, '每趟都挪 2 格 ⇒ 不算 stalled', JSON.stringify(g))
+}
+{
+  const src = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  ok(/export function routeTrack/.test(src), '续行账本导出（只读，不改路线）')
+  ok(/\{ \.\.\.info, route \}/.test(src), 'walkTo 把 route 挂到结果上')
+  ok(/let terrain = classifyTerrainCached\(b\)/.test(src) && /terrainReeval \? \{ terrainReeval \}/.test(src),
+    '地形重估计数（变了才报）')
+  ok(/const fresh = classifyTerrainCached\(b\)[\s\S]{0,400}?terrain = fresh/.test(src),
+    '🔴 脱困后真的重判地形并按新地形重设 Movements')
+  ok(/if \(noTower\) mv2\.allow1by1towers = false/.test(src), '重设 Movements 时 noTower 依旧生效（别把逃跑那条腿放回来）')
 }
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)
