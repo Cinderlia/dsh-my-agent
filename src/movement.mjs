@@ -1206,6 +1206,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
    * 一边走一边探身边有没有关着的门，够得着就按一下。只在移动期间跑，收尾必清。 */
   const doorTimer = setInterval(() => { openNearbyDoor(b).catch(() => {}) }, 400)
   doorTimer.unref?.()
+  const doorsAt0 = Number(b.__doorOpens ?? 0)
   /** 脱困次数（P0-1）与路径失效次数（P1）：>0 才报 —— 模型据此知道"这次走得磕磕绊绊"。
    *  外加地形分类（P2）：只有不是平地时才报（平地是默认，报了纯占地方）。
    *  `opts.arrived` —— **到达时**把出发时那份改名成 `terrainAtStart`。到了新位置还叫 `terrain`
@@ -1213,6 +1214,10 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   const moveInfo = (opts = {}) => ({
     ...(terrain.kind === 'flat' || terrain.kind === 'unknown' ? {}
       : { [opts.arrived ? 'terrainAtStart' : 'terrain']: terrain.kind }),
+    ...(() => {
+      const n = Number(b.__doorOpens ?? 0) - doorsAt0
+      return n > 0 ? { doorsOpened: n } : {}
+    })(),
     ...(repathCount ? { repathCount } : {}),
     ...(terrainReeval ? { terrainReeval } : {}),
     ...(carved ? { carved } : {}),
@@ -1287,6 +1292,14 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
            *     目标在 20 格外的台阶，照样卡在眼前这一格上。
            * 挖到了就重跑同一个 `goto`（不算一级脱困）。 */
           const carveAllowed = ctx.cfg?.walkCanDig !== false && ctx.cfg?.walkCarveStep !== false
+          /* 卡住时先按一下门（2026-10-18 实机：门关着，寻路不认 ⇒ 停 8 秒）。
+           * 便宜、只读、无副作用：附近没有门就是一个空扫描。 */
+          const doorOpened = await openNearbyDoor(b).catch(() => 0)
+          if (doorOpened > 0) {
+            self.log(`🚪 卡在门口 —— 按开了 ${doorOpened} 扇门，再试一次`)
+            attempt = Math.max(0, attempt - 1)   // 不算一级脱困：门开了原地就能继续走
+            continue
+          }
           if (carveAllowed && carveTries < MOVE_CARVE_TRIES) {
             const end = b.entity.position
             const dNow = Math.hypot(end.x - target.x, end.z - target.z)

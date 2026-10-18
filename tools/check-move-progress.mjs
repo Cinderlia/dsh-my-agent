@@ -1041,7 +1041,35 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     ok(!/mv\.openable\.add/.test(plug2), '🔴 门不再进 openable（否则又会出现 useOne-only 的 move）')
     ok(/openNearbyDoor/.test(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')), '开门改由 openNearbyDoor 定时器负责')
   }
+  {
+    // 🔴 寻路器要挖门 ⇒ 改成"按开"（AI 自己挖门不受影响）
+    const { guardDoorDig } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    let activated = 0
+    let dug = 0
+    const b = {
+      __inPathTick: false,
+      activateBlock: async () => { activated++ },
+      dig: async () => { dug++ },
+    }
+    ok(guardDoorDig(b) === true, '装上了"寻路要挖门 ⇒ 先按开"')
+    ok(guardDoorDig(b) === false, '重复安装不会套两层')
+    const closed = { name: 'oak_door', position: { x: 1, y: 64, z: 0 }, getProperties: () => ({ open: false }) }
+    const openDoor = { name: 'oak_door', position: { x: 2, y: 64, z: 0 }, getProperties: () => ({ open: true }) }
+    const iron = { name: 'iron_door', position: { x: 3, y: 64, z: 0 }, getProperties: () => ({ open: false }) }
+    b.__inPathTick = true
+    await b.dig(closed)
+    ok(activated === 1 && dug === 0, '🔴 寻路中遇到关着的木门 ⇒ 按开，不挖', `activated=${activated} dug=${dug}`)
+    await b.dig(openDoor)
+    ok(dug === 1 && activated === 1, '门本来就开着 ⇒ 不按（交给原 dig 判空）', `activated=${activated} dug=${dug}`)
+    await b.dig(iron)
+    ok(dug === 2 && activated === 1, '铁门按不开 ⇒ 照旧真的挖（能脱困）', `activated=${activated} dug=${dug}`)
+    b.__inPathTick = false
+    await b.dig(closed)
+    ok(dug === 3 && activated === 1, '🔴 AI 自己点名挖门（不在寻路 tick 里）⇒ 真的挖，不拦', `activated=${activated} dug=${dug}`)
+  }
   const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
+  ok(/guardDoorDig\(b/.test(plug), 'setupPlugins 里装了 door dig 守卫')
+  ok(/const prev = b\.__inPathTick/.test(plug), '寻路 tick 里打了 `__inPathTick` 标记（只有这段里的挖才换成开门）')
   ok(/export function patchDoorMoves/.test(plug) && /patchDoorMoves\(mv\)/.test(plug), 'movements() 里真的挂了这个补丁')
   ok(/guardDoorActivate\(b\)/.test(plug), 'setupPlugins 里装了"我们按开的门别被再按"')
   ok(/guardPathfinderRejections\(b/.test(plug), '🔴 setupPathfinder 里给 goto 的拒绝挂了 catch（否则 PathStopped 会炸宿主）')

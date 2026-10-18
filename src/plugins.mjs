@@ -196,6 +196,10 @@ export function guardPathfinderTicks (b, { log = null } = {}) {
   for (const fn of fns) {
     b.on('physicsTick', function (...args) {
       if (!b.entity?.position) return
+      /* 标记"这一段是寻路插件自己在跑"：只有它发起的挖方块才会被 `guardDoorDig` 换成"开门"。
+       * AI 自己调 `mc_dig`/`mc_act{break}` 走的是工具线程，不受影响。 */
+      const prev = b.__inPathTick
+      b.__inPathTick = true
       try {
         return fn.apply(this, args)
       } catch (e) {
@@ -205,10 +209,59 @@ export function guardPathfinderTicks (b, { log = null } = {}) {
           try { log?.(`寻路 tick 里抛错（已拦住，没让宿主崩）：${e?.stack ?? e?.message ?? e}`) } catch {}
         }
         try { b.pathfinder?.stop?.() } catch {}
+      } finally {
+        b.__inPathTick = prev
       }
     })
   }
   return fns.length
+}
+
+/**
+ * 寻路器要挖门时，**改成"把门按开"**（2026-10-18 实机第三次反馈："门还是不行，栅栏门可以"）。
+ *
+ * 现场：门前停 8 秒（`stuck`，只挪 1.56 格），再叫一次就把门挖了 —— 说明规划里门确实
+ * 带着"挖掉"的账，而 vendor 的开门分支（`useOne`）对门本身是坏的（踩坑 #172）。
+ * 与其和它的放置状态机较劲，不如在**执行层**拦一道：门/活板门/栅栏门被寻路器要求挖时，
+ * 先 `activateBlock` 按开；按开了就当"这一步完成了"，人直接走过去。
+ *
+ * 只拦**寻路器自己**发起的挖（`b.__inPathTick`）——AI 点名挖门照旧真的挖。
+ * 按不开的（铁门/被方块顶住）回落到真挖，至少能脱困。
+ */
+export function guardDoorDig (b, { log = null } = {}) {
+  if (!b || typeof b.dig !== 'function' || b.__dshGuardedDig) return false
+  const orig = b.dig.bind(b)
+  let lastLogAt = 0
+  const say = (m) => {
+    const now = Date.now()
+    if (now - lastLogAt < 15_000) return
+    lastLogAt = now
+    try { log?.(m) } catch {}
+  }
+  b.dig = function (block, ...rest) {
+    const nm = block?.name
+    const isDoor = typeof nm === 'string' && DOOR_BLOCK_RE.test(nm) && !IRON_DOOR_RE.test(nm)
+    if (!isDoor || !b.__inPathTick) return orig(block, ...rest)
+    return (async () => {
+      try {
+        const openNow = (() => { try { return block.getProperties?.().open === true } catch { return false } })()
+        if (!openNow && typeof b.activateBlock === 'function') {
+          await b.activateBlock(block)
+          if (b.__autoOpenedDoors instanceof Map) {
+            b.__autoOpenedDoors.set(`${block.position?.x},${block.position?.y},${block.position?.z}`, Date.now())
+          }
+          b.__doorOpens = (b.__doorOpens ?? 0) + 1
+          say(`🚪 寻路要挖 ${nm} —— 改成按开（${block.position?.x},${block.position?.y},${block.position?.z}）`)
+          return
+        }
+      } catch (e) {
+        say(`🚪 按开 ${nm} 失败（回落到挖）：${e?.message ?? e}`)
+      }
+      return orig(block, ...rest)
+    })()
+  }
+  b.__dshGuardedDig = true
+  return true
 }
 
 /**
@@ -459,6 +512,7 @@ export async function setupPlugins (self, { spec = null } = {}) {
   /* 门：① 规划时别挖门/别重复按（`patchDoorMoves`，在 `movements()` 里）；
    *     ② 执行时"我们刚按开的门"别被 vendor 的 useOne 再按回去（`guardDoorActivate`）。 */
   guardDoorActivate(b)
+  guardDoorDig(b, { log: (m) => self.log(m) })
   const mv = self.pfReady ? movements(self) : null
 
   // ① 走过去挖方块 / 捡掉落物（内部自己用 mineflayer-tool 换工具）
