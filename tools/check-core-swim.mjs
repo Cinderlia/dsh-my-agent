@@ -381,8 +381,8 @@ section('⑧ 静态接线：core / index 都在')
     'sequence.mjs 的 op 里有 swim（给坐标=游过去，不给=上浮）')
   // 🔴 水里不能用 pathfinder（它的 A* 明确拒绝水节点，见 #walkSwim 的注释）
   // 路线图第 ④ 条第三十六刀：`walkTo` / `#walkSwim` 的函数体已搬进 `src\movement.mjs`（core 只剩薄包装）。
-  ok(/export async function walkSwim \(self, target, \{ arrive = 1\.6, budget = self\.cfg\.moveBudgetMs \} = \{\}, ctx = \{\}\)/.test(movSrc), 'movement.mjs 有 walkSwim（直接游）')
-  ok(/if \(inWaterNow\(b\)\) \{\r?\n    const swim = await walkSwim\(self, target, \{ arrive, budget \}, ctx\)/.test(movSrc), 'walkTo 在水里先走 walkSwim（判据同 inWaterNow）')
+  ok(/export async function walkSwim \(self, target, \{ arrive = 1\.6, budget = self\.cfg\.moveBudgetMs, intent = 'near' \} = \{\}, ctx = \{\}\)/.test(movSrc), 'movement.mjs 有 walkSwim（直接游）')
+  ok(/if \(inWaterNow\(b\)\) \{\r?\n    const swim = await walkSwim\(self, target, \{ arrive, budget, intent \}, ctx\)/.test(movSrc), 'walkTo 在水里先走 walkSwim（判据同 inWaterNow）')
   ok(/return \{ \.\.\.rest, swam: true, swimMoved: swim\.moved, swimMs: swim\.ms \}/.test(movSrc), '上岸后交回 pathfinder（并标注 swam/swimMoved）')
   ok(/via: 'swim'/.test(movSrc), 'walkSwim 返回 via:swim')
   ok(/b\.setControlState\('forward', true\)/.test(movSrc) && /const wantJump = jumpOverride === null \? swimJumpWanted\(/.test(movSrc), 'walkSwim 按 forward，并按目标高度决定要不要上浮（不再死按 jump）')
@@ -404,7 +404,7 @@ section('⑧ 静态接线：core / index 都在')
   ok(/mode === 'swim'/.test(index), 'index.js 的 mc_move 认 swim')
   ok(/sess\.bot\.swimUp\(\{ hold: args\.budgetMs \}\)/.test(index), 'swim 不给坐标时把 budgetMs 当上浮时间')
   /* 2026-10-15：walkTo 的返回值现在过 `withOutcome(..., { expect: 'moved' })`（结果台账要判得动）。 */
-  ok(/sess\.bot\.walkTo\(\{ x: Number\(args\.x\), y: Number\(args\.y\), z: Number\(args\.z\) \}, \{ budget: callBudget\(args\.budgetMs\), noTower: args\.allowTower !== true \}\)/.test(index),
+  ok(/sess\.bot\.walkTo\(\{ x: Number\(args\.x\), y: Number\(args\.y\), z: Number\(args\.z\) \}, \{ budget: callBudget\(args\.budgetMs\), noTower: args\.allowTower !== true, intent: args\.intent \}\)/.test(index),
     'swim 给了坐标就游过去（walkTo 会自动走"直接游"；默认不许垫柱）')
   ok(/在水里会自动改成"直接游"/.test(index), 'mc_move 描述里写明"在水里自动直接游"')
   ok(/在水里（氧气/.test(index), 'mc_status 瘦身视图里带氧气')

@@ -229,6 +229,8 @@ export async function swimUp (self, { hold = 3_000 } = {}, ctx = {}) {
 export const SWIM_WINDOW_MS = 600          // 观测窗口（用户建议 500–750ms）
 export const SWIM_STALL_WINDOWS = 2        // 连续两个窗口没靠近才算"卡住"（别过度调整）
 export const SWIM_PROGRESS_EPS = 0.2       // 一个窗口至少靠近这么多格才算有进展
+/** 水流横向漂移的判定阈值（格/窗口）：超过它就反压一档方向键 */
+export const SWIM_DRIFT_EPS = 0.35
 export const SWIM_FIXUPS = 2               // 纠偏最多试两次，再不行就交给水下自救
 export const SWIM_MIN_AIR = 6              // 气低于这个数，不管目标在哪都先上浮
 export const SWIM_VERT_EPS = 0.6           // 目标比脚高/低这么多，才算"要去上一层/下一层"
@@ -251,7 +253,9 @@ export function swimJumpWanted (b, goal, me, air) {
   return true
 }
 
-export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs } = {}, ctx = {}) {
+export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, intent = 'near' } = {}, ctx = {}) {
+  const pre = intentOf(intent)
+  if (arrive === 1.6) arrive = pre.arrive
   const b = self.bot
   const goal = new Vec3(Number(target.x), Number(target.y), Number(target.z))
   const at = (p) => ({ x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) })
@@ -265,6 +269,7 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
     const leftMs = self.msLeft()
     const r = await ctx.walkPathfinder(goal, {
       arrive,
+      intent,
       budget: Math.max(0, Math.min(callBudget(budget), leftMs)),
       budgetAsked: callBudget(budget),
     })
@@ -287,6 +292,12 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
   let stallWins = 0
   let fixups = 0
   let jumpOverride = null       // 纠偏时强行指定一轮"按/不按 jump"
+  /* 2026-10-18 审计 P2-7：水流会把"直着游"推成斜的 —— 每个窗口量一次横向漂移，
+   * 反压一档方向键；漂了很久还没靠近，就如实说"水在推你"，别让 AI 以为是自己不努力。 */
+  let winFrom = start.clone?.() ?? start
+  let lastStrafe = null
+  let drift = null
+  let driftFixes = 0
   /* 🔴 只在"该不该按"**变了**的时候才写控制位：机器人默认就是没按 jump，
    *    每一轮都写一遍 `jump: false` 除了白发包，还会让"被抢占时不松别人的控制位"这条判据失灵
    *    （收尾那一轮写的 false 会被当成"抢了新移动者的控制位"）。 */
@@ -330,6 +341,22 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
        * "确认通道被堵住后，再调用现有水下恢复控制器" —— 这里 `break` 出去，
        * `walkTo` 看到 `stuck:true` 就会把这一趟交给 `recoverFromWater`（找出口那套）。 */
       if (Date.now() - winAt >= SWIM_WINDOW_MS) {
+        /* 上一轮的反压方向键只在那一轮有效 */
+        if (lastStrafe) { try { b.setControlState(lastStrafe, false) } catch {} ; lastStrafe = null }
+        /* 这一窗口实际挪了多少、横向偏了多少（垂直的不算：上浮下沉本来就该有） */
+        let mvx = 0, mvz = 0
+        try { mvx = sample.x - winFrom.x; mvz = sample.z - winFrom.z } catch {}
+        winFrom = sample.clone?.() ?? sample
+        const gx = goal.x - sample.x, gz = goal.z - sample.z
+        const gl = Math.hypot(gx, gz) || 1
+        const perp = (mvx * (-gz / gl) + mvz * (gx / gl))
+        if (Math.abs(perp) >= SWIM_DRIFT_EPS) {
+          drift = { x: r2(perp), z: r2(gl - Math.hypot(gx, gz)) }
+          driftFixes++
+          // 漂向哪边，就往反方向压一档（下一轮开头会松开）
+          lastStrafe = perp > 0 ? 'right' : 'left'
+          try { b.setControlState(lastStrafe, true) } catch {}
+        }
         const gained = winLeft - nowLeft
         winLeft = nowLeft
         winAt = Date.now()
@@ -355,6 +382,7 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
       if (!inWaterNow(b) && b.entity?.onGround) break
     }
   } finally {
+    if (lastStrafe) { try { b.setControlState(lastStrafe, false) } catch {} ; lastStrafe = null }
     // 只有"我还是最新那次移动"才允许松控制位（被抢占时松了会把正在走的那份一起停掉）
     if (self._moveGen === gen) ctx.releaseControls()
   }
@@ -387,10 +415,12 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
     reason,
     outOfWater,
     ...(fixups ? { fixups } : {}),
+    ...(driftFixes ? { drift, driftFixes } : {}),
     hint: outOfWater
       ? `已经上岸了（游了 ${moved} 格，离目标 ${left} 格）—— 再叫一次 mc_move 到同一个目标，它会自己走完。`
       : reason === 'swim-stuck'
         ? `还在水里，**这一段确实游不过去了**：连续 ${SWIM_STALL_WINDOWS} 个窗口离目标都没靠近，把上浮/下沉反过来试了 ${fixups} 次也没用（多半是撞墙、顶在天花板上，或者那边根本不通）。**别再往这个方向硬游** —— 换个方向/换个出口，或者先上岸绕过去。`
+          + (driftFixes >= 2 ? `（水流一直在横向推你：已经反压了 ${driftFixes} 次方向键 —— 能找到岸边就从岸上绕。）` : '')
         : `还在水里：游了 ${moved} 格（离目标 ${left} 格）—— 再叫一次 mc_move 往同一个目标游，会接着游。`,
   }
 }
@@ -400,13 +430,13 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
  * 这是唯一的移动实现：不再保留手写的按键、盲跳、挖方块或垫脚兜底。
  * ⚠️ 唯一的例外：**在水里**先交给 `#walkSwim`（A* 不把水当节点，见它的注释）。
  */
-export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true } = {}, ctx = {}) {
+export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, intent = 'near' } = {}, ctx = {}) {
   const b = self.requireBot()
   // 🔴 在水里：A* 不把水当节点（见 #walkSwim 的注释），实机表现是"4 秒挪 1 格"。
   //    先直接游；上了岸、还有时间，再把剩下的路交给 pathfinder 走完。
   //    ⚠️ 判据用 `#inWaterNow`：`entity.isInWater` 在泡水柱里会读出 undefined（实机踩过）。
   if (inWaterNow(b)) {
-    const swim = await walkSwim(self, target, { arrive, budget }, ctx)
+    const swim = await walkSwim(self, target, { arrive, budget, intent }, ctx)
     const canWalk = self.pfReady && typeof b.pathfinder?.goto === 'function'
     /* 🔴 用户点名的"水下寻路"就接在这里（2026-10-15）：**游不动了**（还泡在水里、没到目标）
      * 就交给恢复控制器 —— 它负责**找出口、选路线、复核进度**；
@@ -431,7 +461,7 @@ export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.mo
     if (swim.arrived || !swim.outOfWater || !canWalk) return swim
     const left = self.msLeft()
     if (left < 500) return swim
-    const rest = await ctx.walkPathfinder(target, { arrive, noTower, budget: Math.max(0, Math.min(callBudget(budget), left)), budgetAsked: callBudget(budget) })
+    const rest = await ctx.walkPathfinder(target, { arrive, noTower, intent, budget: Math.max(0, Math.min(callBudget(budget), left)), budgetAsked: callBudget(budget) })
     return { ...rest, swam: true, swimMoved: swim.moved, swimMs: swim.ms }
   }
   if (!self.pfReady || typeof b.pathfinder?.goto !== 'function') {
@@ -465,6 +495,7 @@ export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.mo
   return await ctx.walkPathfinder(target, {
     arrive,
     noTower,
+    intent,
     // 🔴 单次调用 ≤11 秒：预算收进 CALL_BUDGET_MS，且不超过本轮剩余时间。
     //    走不到不是失败，是"这一轮用完了"—— 再叫一次接着走。
     //    `msLeft()` 没设截止时刻时返回 CALL_MS（11000），用完时返回 0（别再 `||` 补 10 秒）。
@@ -576,6 +607,23 @@ export async function flyTo (self, x, y, z, { budget = CALL_BUDGET_MS } = {}, ct
  * 脱困阶梯三级（见 `MOVE_ESCAPES`）：重算路径 → 跳跃脱困 → 后退再寻路；三级用完还是
  * 没进展就明确报 `unreachable`，**不再无限重试**。
  */
+/* ── 2026-10-18 审计 P1-2：**导航意图** ────────────────────────────────
+ * "到"的标准本来就不止一种：站到那一格上 / 走到旁边够得着 / 跟目标同一层再说话。
+ * 以前只有一个 `arrive`，调用方只能瞎猜；猜小了走不到、猜大了报"到了"却用不了。
+ * 这里把四种意图的（到点多远、能接受多大高差）固定下来，`intent` 一路传到到达复核。
+ *   near       走到附近就算到（默认，兼容老行为）
+ *   stand      要站到那一格上（误差 0.8 格、高差 0.6）
+ *   interact   到"够得着"的位置（2.2 格内，允许高差 2.5 —— 开箱子/按按钮/砍树）
+ *   same-level 必须有同一层可站的地方（高差 ≤0.9，防止站在坑底/树顶说到了） */
+export const INTENTS = {
+  near: { arrive: 1.6, vertTol: 1.5 },
+  stand: { arrive: 0.8, vertTol: 0.6 },
+  interact: { arrive: 2.2, vertTol: 2.5 },
+  'same-level': { arrive: 1.6, vertTol: 0.9 },
+}
+/** 未知意图按 `near` 处理（不报错：模型写错一个词不该让整次移动失败）。 */
+export function intentOf (intent) { return INTENTS[intent] ?? INTENTS.near }
+
 export const MOVE_SAMPLE_MS = 600       // 采样间隔（用户建议 500–1000ms）
 export const MOVE_STUCK_MS = 2400       // 连续这么久"既没挪动也没靠近" ⇒ 卡住（用户建议 2–3 秒）
 export const MOVE_PROGRESS_EPS = 0.35   // 靠近这么多格才算"有进展"
@@ -597,6 +645,49 @@ export const MOVE_ESCAPES = ['repath', 'jump', 'backoff']
  *    挖开"挡在脚上/头顶"的那一格（只挖实心、非危险、底下有支撑的），然后重试同一个 `goto`。
  *    不改脱困阶梯的顺序（那是用户 2026-10-15 定的），只在阶梯**之前**补这一次。 */
 export const MOVE_CARVE_RADIUS = 4.5    // 离目标这么近还卡住，才值得动镐子（远处改看"眼前有没有挡路的"）
+/* ── 2026-10-18 实机：**门** ────────────────────────────────────────────────
+ * 用户原话："现在 move 遇到门不会开，会直接从墙挖进去"。
+ * 根因：vendor 的 `Movements.canOpenDoors` 默认 **false**（`movements.js:101`，
+ * 注释写着"Causes issues"），门在 A* 眼里就是实心方块；而 `canDig` 是 true ——
+ * 于是"挖墙过去"永远比"绕路"便宜，模型看到的就是"从墙里挖进去"。
+ * 分层修：
+ *   ① `canOpenDoors = true`（`src/plugins.mjs`）—— 让 A* **规划**穿门；
+ *   ② 执行层自己开门：走到门边上 `activateBlock` 一下（这份 vendor 的 `useOne`
+ *      只有规划、没有执行，指望不上）；
+ *   ③ 门的方块进 `CARVE_PROTECTED` —— 卡住时的那种"挖开挡路的"绝不砸门。 */
+export const DOOR_RE = /(_door|_trapdoor|_fence_gate)$/
+export const DOOR_OPEN_R = 2.6
+
+/**
+ * 把身边关着的门/栅栏门/活板门打开（只开、不管关；够不着就什么都不做）。
+ * @returns {Promise<number>} 这一轮真的按开了几扇
+ */
+export async function openNearbyDoor (b, radius = DOOR_OPEN_R) {
+  try {
+    const p = b?.entity?.position
+    if (!p || typeof b.activateBlock !== 'function' || typeof b.blockAt !== 'function') return 0
+    let opened = 0
+    const r = Math.ceil(radius)
+    const me = new Vec3(Math.floor(p.x), Math.floor(p.y), Math.floor(p.z))
+    for (let dx = -r; dx <= r; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -r; dz <= r; dz++) {
+          const pos = new Vec3(me.x + dx, me.y + dy, me.z + dz)
+          if (pos.distanceTo(me) > radius) continue
+          let blk = null
+          try { blk = b.blockAt(pos) } catch { continue }
+          if (!blk?.name || !DOOR_RE.test(blk.name)) continue
+          let isOpen = false
+          try { isOpen = blk.getProperties?.().open === true } catch {}
+          if (isOpen) continue
+          try { await b.activateBlock(blk); opened++ } catch {}
+        }
+      }
+    }
+    return opened
+  } catch { return 0 }
+}
+
 /* 🔴 2026-10-18 审计（报告 Bug 3）：自动补救挖的是**世界**，不能只凭"它挡路"就挖。
  *    箱子 / 各种矿石 / 工作台熔炉附魔台 / 刷怪笼 / 重生锚 …… 一律不碰：那些是 AI 的资源、
  *    容器或装置，挖掉是不可逆的损失。要让某类方块可挖，得由 AI 自己调 `mc_act{break}`，
@@ -608,7 +699,61 @@ export const CARVE_PROTECTED = new RegExp('(' + [
   '^anvil$', '^chipped_anvil$', '^damaged_anvil$', '_bed$', '^spawner$', '^trial_spawner$',
   '^vault$', '^beacon$', '^lectern$', '^brewing_stand$', '^cauldron$', '^hopper$',
   '^dispenser$', '^dropper$', '^respawn_anchor$', '^nether_portal$', '^end_portal',
+  '_door$', '_trapdoor$', '_fence_gate$',
 ].join('|') + ')')
+/**
+ * 2026-10-18 审计 P1-1：走不到的时候，把"竖井里到底有什么"一次给全。
+ *
+ * 以前 `unreachable` 只有一句"没路"，AI 得自己一步步 `mc_observe` / `mc_map` 去摸：
+ * 头顶是不是封死的、能不能跳、四面哪边通、背包里有没有能垫/能填的方块。
+ * 一次摸一格，一轮叫醒就烧掉好几个工具调用 —— 而这些都是走路层**本来就能读到**的。
+ *
+ * 只读、不动手：给事实 + 一句建议，挖不挖、垫不垫仍由 AI 决定。
+ * @returns {{headroom:number, ceiling:string|null, canJump:boolean,
+ *            sides:{n:string|null,e:string|null,s:string|null,w:string|null},
+ *            pillar:number, floor:string|null, hint:string}|null}
+ */
+export function shaftInfoOf (b, target) {
+  try {
+    const p = b?.entity?.position
+    if (!p) return null
+    const nameAt = (x, y, z) => {
+      try { return b.blockAt(new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)))?.name ?? null } catch { return null }
+    }
+    const solidAt = (x, y, z) => { const n = nameAt(x, y, z); return Boolean(n) && isSolidBlock(n) && !BRIDGE_FATAL.test(n) }
+    const feetY = Math.floor(p.y)
+    // 头顶净空：从脑袋上一格往上数，数到第一块实心为止（最多 6 格，够看出"能跳/堵死"）
+    let headroom = 0
+    let ceiling = null
+    for (let y = feetY + 2; y <= feetY + 8; y++) {
+      const n = nameAt(Math.floor(p.x), y, Math.floor(p.z))
+      if (n != null && isSolidBlock(n)) { ceiling = n; break }
+      headroom++
+    }
+    const dirs = [[0, -1, 'n'], [1, 0, 'e'], [0, 1, 's'], [-1, 0, 'w']]
+    const sides = {}
+    for (const [dx, dz, key] of dirs) {
+      const x = Math.floor(p.x) + dx, z = Math.floor(p.z) + dz
+      const feet = nameAt(x, feetY, z), head = nameAt(x, feetY + 1, z), floor = nameAt(x, feetY - 1, z)
+      const open = (!feet || isPassable(feet) || isLiquid(feet)) && (!head || isPassable(head) || isLiquid(head))
+      sides[key] = open ? (floor ?? 'air') : `${feet ?? '?'}`
+    }
+    // 背包里"可以拿来垫/填"的便宜方块（只在提示里用；真垫不垫由 AI 决定）
+    let pillar = 0
+    try {
+      for (const it of (b.inventory?.items?.() ?? [])) {
+        if (/(dirt|cobblestone|cobbled_deepslate|netherrack|sand|gravel|stone|planks)/.test(it?.name ?? '')) pillar += Number(it?.count) || 0
+      }
+    } catch { /* 没有背包就是 0 */ }
+    const floor = nameAt(Math.floor(p.x), feetY - 1, Math.floor(p.z))
+    const openSides = Object.entries(sides).filter(([, v]) => !/:/.test(v) && v !== '?').map(([k]) => k)
+    const hint = headroom === 0
+      ? `头上就是 **${ceiling ?? '实心'}**（y=${feetY + 2}）—— **跳不起来**，原地垫脚也不行。要么往 ${openSides.join('/') || '四面'} 挖出去，要么先挖开头顶那格。`
+      : `头顶有 ${headroom} 格净空${ceiling ? `（再往上是 **${ceiling}**）` : '（上面没扫到实心）'} —— ${headroom >= 1 ? '能跳' : '只能贴地爬'}；四面 ${openSides.length ? openSides.join('/') + ' 有路' : '全堵着'}${pillar ? `；背包里有 ${pillar} 个能垫的方块` : '；背包里没有能垫的方块'}。`
+    return { headroom, ceiling, canJump: headroom >= 1, sides, pillar, floor, hint }
+  } catch { return null }
+}
+
 export const MOVE_CARVE_CELLS = 2       // 一次最多往前看几格
 export const MOVE_CARVE_TRIES = 2       // 一次 walkPathfinder 里最多补挖几次
 
@@ -858,8 +1003,15 @@ export async function escapeMove (b, goal, step, ctx = {}) {
  * 返回值保持 `arrived / moved / remaining / stuck / hint` 结构；
  * 上层 `mc_move` 和自主层直接使用；额外带 `via:"pathfinder"` 便于排查。
  */
-export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null, noTower = true } = {}, ctx = {}) {
+export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null, noTower = true, intent = 'near' } = {}, ctx = {}) {
   const b = self.bot
+  /* 2026-10-18 审计 P1-2：意图决定"到"的标准（arrive / 允许高差） */
+  const pre = intentOf(intent)
+  const arriveUsed = arrive === 1.6 ? pre.arrive : arrive
+  const vertTol = pre.vertTol
+  /* 2026-10-18 审计 P1-3：规划耗时 / 实际移动耗时分开记（以前只有一个 ms，看不出"是在算路还是在挪腿"） */
+  let plannedAt = null
+
   const { goals, Movements } = self._pf
   const t0 = Date.now()
   const start = b.entity.position.clone()
@@ -914,7 +1066,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
    *    pathfinder 会一路垫方块往上爬（"搭路一直搭到空气上"）。收到底面再走。 */
   const ty = standableY(b, target.x, target.y, target.z)
   const goal = new goals.GoalNear(Math.floor(target.x), ty, Math.floor(target.z),
-    Math.max(0, Math.round(arrive - 0.6)))
+    Math.max(0, Math.round(arriveUsed - 0.6)))
   // 地形分类（导航 P2，用户 m02868 的"地形分类 + 路径评分"）：
   // **只换权重，不换算法** —— 台阶上把挖穿调便宜一点、沟边把垫方块调便宜一点、
   // 岩浆边一格都不许往下跳。看错了顶多走回原来的路，不会让机器人做危险动作。
@@ -960,6 +1112,8 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   }
   let emptyNoPath = false
   const onUpdate = (r) => {
+    /* 2026-10-18 审计 P1-3：第一次算出路径的时刻 —— 规划耗时 / 实际移动耗时从这里分开计 */
+    if (!plannedAt) plannedAt = Date.now()
     if (r?.status && r.status !== 'success') why = r.status
     /* 🔴 2026-10-08 审计③：A* 一个邻居都生成不出来时 `path = []`，vendor 的 `lib/goto.js:22-30`
      *    对**空路径**的 noPath 分支是"无错 resolve"（只有非空路径才 reject NoPath）⇒ 我们拿到
@@ -997,6 +1151,10 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   let carveTries = 0
   let carved = 0
   let watch = null
+  /* 执行层开门：规划已经允许穿门（canOpenDoors），但这份 vendor 的 `useOne` 没有执行者 ——
+   * 一边走一边探身边有没有关着的门，够得着就按一下。只在移动期间跑，收尾必清。 */
+  const doorTimer = setInterval(() => { openNearbyDoor(b).catch(() => {}) }, 400)
+  doorTimer.unref?.()
   /** 脱困次数（P0-1）与路径失效次数（P1）：>0 才报 —— 模型据此知道"这次走得磕磕绊绊"。
    *  外加地形分类（P2）：只有不是平地时才报（平地是默认，报了纯占地方）。
    *  `opts.arrived` —— **到达时**把出发时那份改名成 `terrainAtStart`。到了新位置还叫 `terrain`
@@ -1097,7 +1255,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
      * 水平仍用 `arrive + 1.0`（宽松，允许"到附近"）；垂直卡在 ±1.5 格（一步台阶以内）。 */
     const horiz = Math.hypot(end.x - target.x, end.z - target.z)
     const vert = end.y - ty
-    const vertBad = vert < -1.5 || vert > 1.5
+    const vertBad = vert < -vertTol || vert > vertTol
     /* 🔴 2026-10-18 审计（用户转来的报告 Bug 1）：判"到没到"**不能先看距离、后看"是不是我的目标"**。
      *    vendor 的 `goal_reached` 是全局事件，别人的移动到点会把我这次 goto 一起 resolve；
      *    只要人恰好落在宽松距离（`arrive + 1.0`）以内，旧代码就直接报 arrived，绕过了 mine 诊断。
@@ -1112,7 +1270,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     /* 站在目标点上（≤0.5 格）就不必再问 `isEnd`：GoalNear 的半径本来就允许这一圈。
      * 反过来，只要离得远、又不满足当前 goal，就一律先按"不是我的目标"处理。 */
     const onSpot = left <= 0.5 && !vertBad
-    if (!onSpot && (mine === false || left > arrive + 1.0 || vertBad)) {
+    if (!onSpot && (mine === false || left > arriveUsed + 1.0 || vertBad)) {
       // 🔴 先分清"插件真的早报"还是"别人的 goal_reached 把我这次 goto 一起 resolve 了"。
       //    vendor 的 lib/goto.js:60 监听的是 bot 上的**全局** `goal_reached`，`goalReached()`
       //    连事件带的 goal 参数都不看 ⇒ 自主层的逃跑/跟随同时在走时，**它**到点会顺手把
@@ -1144,7 +1302,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
        * 也不是"没路"。⚠️ 旧代码在这条路上会一路落进下面 `mine === false` 那条诊断：插件自己的
        * `GoalNear` 是**三维球**（半径 `round(arrive-0.6)`），人站在上层它当然不满足 ⇒ `mine` 为假，
        * 于是把"高度不对"说成"别人的锅"，模型就一直重叫同一个目标。 */
-      if (vertBad && horiz <= arrive + 1.0) {
+      if (vertBad && horiz <= arriveUsed + 1.0) {
         return {
           arrived: false, position: at(end), ms: Date.now() - t0,
           remaining: Number(left.toFixed(2)),
@@ -1192,6 +1350,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       via: 'pathfinder',
       ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(),
       ...moveInfo({ arrived: true }), ...arrivedTerrain(), ...fellInfo(end),
+      /* 2026-10-18 审计 P1-3：规划耗时（第一次算出路径）/ 实际移动耗时，分开报 ——
+       * "一直没动"到底是 A* 在算、还是腿在挪但被挡住，一眼能看出来。 */
+      timing: { planMs: plannedAt ? plannedAt - t0 : null, walkMs: plannedAt ? Date.now() - plannedAt : null, totalMs: Date.now() - t0 },
     }
   } catch (e) {
     if (e?.mcAborted) throw e
@@ -1262,6 +1423,8 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       reason: reasonOut,
       ...(dug ? { dug } : {}), ...(placed ? { pillared: placed } : {}), ...roadInfo(), ...moveInfo(), ...fellInfo(end),
       ...(blockedAhead ? { blockedAhead } : {}),
+      /* 2026-10-18 审计 P1-1：走不到时把"头顶/四面/能垫的方块"一次给全 */
+      ...((exhausted || e?.name === 'NoPath') && !preempted ? (() => { const sh = shaftInfoOf(b, target); return sh ? { shaft: sh } : {} })() : {}),
       hint: `${fellNote(end)}${nm}（从 ${startRemaining.toFixed(1)} 格变成 ${remaining.toFixed(1)} 格，挪了 ${moved} 格${vertNote(end)}）`
          // 地形那一句（导航 P2）：只在**真有用**的时候说 —— 沟要说"用 bridge"，
          // 危险地形要说"别走这边"，平地/未知不说（说了纯占地方）
@@ -1269,7 +1432,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
          + (blockedAhead && !preempted
            ? `—— 眼前挡路的是 **${blockedAhead.name}**（${blockedAhead.cell === 'feet' ? '齐脚那格' : '头顶那格'} `
              + `${blockedAhead.x},${blockedAhead.y},${blockedAhead.z}）：挖得动的话直接 `
-             + `\`mc_act {mode:"break", x:${blockedAhead.x}, y:${blockedAhead.y}, z:${blockedAhead.z}}\` 挖掉它，再叫 mc_move。`
+             + (DOOR_RE.test(blockedAhead.name)
+               ? `是**门**：\`mc_act {mode:"use", x:${blockedAhead.x}, y:${blockedAhead.y}, z:${blockedAhead.z}}\` 按开它（或走近再叫一次 mc_move，会自动开门），**别挖墙也别挖门**。`
+               : `\`mc_act {mode:"break", x:${blockedAhead.x}, y:${blockedAhead.y}, z:${blockedAhead.z}}\` 挖掉它，再叫 mc_move。`)
            : '')
          + (!preempted && terrain.kind === 'gap'
            ? `—— 你脚边是**${terrain.text}**（${terrain.note}）：别绕着试了，直接 \`mc_act {mode:"bridge"}\` 朝目标搭过去。`
@@ -1311,6 +1476,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     }
   } finally {
     // P0-1：采样器的定时器必须收掉 —— 留着会把进程钉住（也会在返回之后误判"卡住"）。
+    try { clearInterval(doorTimer) } catch {}
     try { watch?.stop() } catch {}
     for (const [ev, fn] of off) { try { b.removeListener?.(ev, fn) } catch {} }
     // 🔴 只有"我还是最新那次移动"才允许收尾（停 pathfinder + 松控制位）。

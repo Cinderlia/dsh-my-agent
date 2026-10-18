@@ -3011,12 +3011,14 @@ export function apply(ctx, rawConfig) {
       + '`mc_move` 会自动直接游（按住 forward+jump 浮在水面，实测 2 格/秒），上了岸再交回寻路。'
       + '**快淹死了就 `mode:"swim"` 不给坐标**（只上浮换气）：水挖不掉，别去 `mc_dig` 水。\n'
       + '🔴 **默认不原地垫 1×1 柱**（`allowTower:true` 才允许）—— 垫柱被服务端拒会直接摔下去，实机摔死过；'
-      + '要上高处请走斜台阶。默认只在路上垫台阶（`pillared` 会报 `pillaredWith`/`held`）。',
+      + '要上高处请走斜台阶。默认只在路上垫台阶（`pillared` 会报 `pillaredWith`/`held`）。'
+      + '🧭 `intent` 决定"到"的标准：near（默认，到附近）/ stand（站到那格上）/ interact（够得着即可，2.2 格）/ same-level（必须同一层）。',
     parameters: {
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       mode: { type: 'string', description: 'walk / fly / jump / swim（创造模式缺省 fly；jump 不需要坐标；swim 不给坐标就只上浮换气）' },
       budgetMs: { type: 'number', description: 'walk/swim 的最长时间（默认 10000，上限 10000）；swim 不给坐标时的上浮时间（默认 3000，上限 3000）' },
       allowTower: { type: 'boolean', description: '允许寻路时原地垫 1×1 柱往上爬（默认不许，容易摔死）' },
+      intent: { type: 'string', description: 'near（默认）/ stand / interact / same-level' },
     },
     output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
     timeoutMs: CALL_MS + 1_000,
@@ -3027,7 +3029,7 @@ export function apply(ctx, rawConfig) {
       if (mode === 'swim') {
         // 给了坐标 = 游过去（walkTo 在水里会自动走"直接游"那条）；没给 = 只上浮换气
         if (args.x !== undefined && args.y !== undefined && args.z !== undefined) {
-          return { ...withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true }), { expect: 'moved' }), ...aroundOf(sess) }
+          return { ...withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, intent: args.intent }), { expect: 'moved' }), ...aroundOf(sess) }
         }
         return { ...withOutcome(await sess.bot.swimUp({ hold: args.budgetMs }), { expect: 'moved' }), ...aroundOf(sess) }
       }
@@ -3040,7 +3042,7 @@ export function apply(ctx, rawConfig) {
       // 🔴 2026-10-08 审计⑤：fly 以前不传 budgetMs —— 写 budgetMs:2000 也照样跑满 10 秒
       if (use === 'fly') return { ...withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
       if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / fly / jump / swim）`)
-      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true }), { expect: 'moved' }), ...aroundOf(sess) }
+      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, intent: args.intent }), { expect: 'moved' }), ...aroundOf(sess) }
     },
   }))
 

@@ -214,6 +214,11 @@ export function movements (self, { terrain = null } = {}) {
   const mv = new Movements(b)
   // 地形档案（导航 P2）：先铺一套，再用下面那几行把"跟地形无关的"补上
   const profile = profileFor(terrain?.kind ?? 'unknown', self.cfg)
+  /* 2026-10-18 实机（用户："move 遇到门不会开，会直接从墙挖进去"）：
+   * vendor 默认 `canOpenDoors = false`（注释：Causes issues），门在 A* 眼里就是实心；
+   * 配上 canDig=true ⇒ "挖墙"永远比"绕路"便宜。规划允许穿门，执行由
+   * `src/movement.mjs` 的 `openNearbyDoor` 走到门边按一下。 */
+  mv.canOpenDoors = true
   mv.canDig = self.cfg.walkCanDig !== false        // 挡路的方块可以挖穿（不然掉坑里出不来）
   mv.allowSprinting = true
   mv.dontMineUnderFallingBlock = true

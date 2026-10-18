@@ -496,13 +496,13 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(/const onReset = \(reason\) => \{[\s\S]{0,120}?pathResets\+\+/.test(src), 'onReset 里真的在数')
   ok(/REASON_TEXT\[k\] \?\? k/.test(src), '报出去的理由也翻成人话（不漏内部字符串）')
   // ── P1：到达判定分两轴 ──
-  ok(/const vertBad = vert < -1\.5 \|\| vert > 1\.5/.test(src), '🔴 垂直窗口 ±1.5 格（一步台阶以内）')
-  ok(/if \(!onSpot && \(mine === false \|\| left > arrive \+ 1\.0 \|\| vertBad\)\)/.test(src), '🔴 高度不对也算"没到"（水平到了、人却在目标上下）')
+  ok(/const vertBad = vert < -vertTol \|\| vert > vertTol/.test(src), '🔴 垂直窗口按意图给（near ±1.5 / stand ±0.6）')
+  ok(/if \(!onSpot && \(mine === false \|\| left > arriveUsed \+ 1\.0 \|\| vertBad\)\)/.test(src), '🔴 高度不对也算"没到"（水平到了、人却在目标上下）')
   ok(/const onSpot = left <= 0\.5 && !vertBad/.test(src), '站在目标点上（≤0.5 格）直接算到（GoalNear 半径内的合理圈）')
   ok(src.indexOf('const mine = !fp') < src.indexOf('if (!onSpot && (mine === false || left > arrive'), '🔴 先判"是不是我的目标"，再看距离（别人到点不许误报成功）')
   ok(/horiz: Number\(horiz\.toFixed\(2\)\), vert: Number\(vert\.toFixed\(2\)\)/.test(src), '两个轴分开报给模型')
   ok(/高度不对/.test(src), 'hint 里点明是"高度不对"（不是"还差 N 格"）')
-  ok(/vertBad && horiz <= arrive \+ 1\.0/.test(src), '🔴 "站错层"要单独报（不然会被 `mine === false` 那条吞掉）')
+  ok(/vertBad && horiz <= arriveUsed \+ 1\.0/.test(src), '🔴 "站错层"要单独报（不然会被 `mine === false` 那条吞掉）')
   ok(src.indexOf('vertBad && horiz <= arrive + 1.0') < src.indexOf('emptyNoPath || mine === false'),
     '🔴 顺序：先报"站错层"，再报"别人的锅"（插件的 GoalNear 是三维球，人在上层它必然不满足）')
   ok(/Math\.max\(200, budget - \(Date\.now\(\) - t0\)\)/.test(src), '重试时用**剩余**预算（总时间仍以 budget 为界）')
@@ -540,7 +540,7 @@ section('⑨ noTower（逃跑时关掉"原地垫高"）')
   const src = read('../src/movement.mjs')
   ok(/if \(noTower\) mv\.allow1by1towers = false/.test(src), '🔴 关的是 allow1by1towers 这一个开关')
   ok(!/mv\.scafoldingBlocks = \[\]/.test(src), '🔴 绝不清空 scafoldingBlocks（那会把 1×1 柱子的 move 一起剪掉，掉坑里出不来）')
-  ok(/noTower = true \} = \{\}, ctx = \{\}\)/.test(src), 'walkTo 也接 noTower，且**默认 true**（不垫柱 —— 2026-10-18 实机：垫柱放错就摔死）')
+  ok(/noTower = true, intent = 'near' \} = \{\}, ctx = \{\}\)/.test(src), 'walkTo 也接 noTower，且**默认 true**（不垫柱 —— 2026-10-18 实机：垫柱放错就摔死）')
   /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高"）：战斗层**不再自己撤退**，
    *    所以"撤退要关掉垫脚"这条已经没有对象了 —— 反过来要守住"不许再出现撤退执行"。 */
   const atk = read('../src/attack.mjs')
@@ -799,6 +799,107 @@ section('⑧‴ 失败结果"可操作"：眼前挡路的那格 + 泳也算三�
   const src = read('../src/movement.mjs')
   ok(/movedHorizontal: r2\(Math\.hypot\(swimDx, swimDz\)\)/.test(src) && /movedVertical: swimDy/.test(src),
     '🔴 游泳也报三维分量（以前只有水平 moved）')
+}
+/* ── ⑪ 导航意图 / 规划-移动耗时拆分 / 竖井信息包 / 水流漂移（2026-10-18 审计 P1-P2） ── */
+{
+  const src = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  const { INTENTS, intentOf, shaftInfoOf } = mod
+  ok(INTENTS.near.arrive === 1.6 && INTENTS.stand.arrive === 0.8
+    && INTENTS.interact.arrive === 2.2 && INTENTS['same-level'].vertTol === 0.9,
+    '四种导航意图的"到"标准固定下来（near/stand/interact/same-level）')
+  ok(intentOf('nope') === INTENTS.near, '未知意图按 near 兜底（写错一个词不该让整次移动失败）')
+  ok(/const arriveUsed = arrive === 1\.6 \? pre\.arrive : arrive/.test(src)
+    && /const vertTol = pre\.vertTol/.test(src), '意图真的接到了到达复核（arriveUsed / vertTol）')
+
+  // 竖井：头顶当场封死
+  const b1 = mkCarveBot({ '0,66,0': 'stone' }, [0, 64, 0])
+  const sh1 = shaftInfoOf(b1, { x: 2, y: 64, z: 0 })
+  ok(sh1 && sh1.headroom === 0 && sh1.ceiling === 'stone' && sh1.canJump === false,
+    '头顶封死 ⇒ headroom 0、canJump false，并报出封着的是什么', JSON.stringify(sh1 && { h: sh1.headroom, c: sh1.ceiling }))
+  ok(sh1 && /跳不起来/.test(sh1.hint), '提示里明说"跳不起来，原地垫脚也不行"')
+
+  // 头顶 2 格净空、再往上是石头；东边能走、脚下有支撑
+  const b2 = mkCarveBot({ '0,68,0': 'stone', '1,64,0': 'air', '1,63,0': 'stone' }, [0, 64, 0])
+  b2.inventory = { items: () => [{ name: 'cobblestone', count: 7 }, { name: 'iron_sword', count: 1 }] }
+  const sh2 = shaftInfoOf(b2, { x: 2, y: 64, z: 0 })
+  ok(sh2 && sh2.headroom === 2 && sh2.ceiling === 'stone' && sh2.canJump === true,
+    '头顶按格数算净空（y=66/67 空、68 就是石头）', JSON.stringify(sh2 && { h: sh2.headroom, c: sh2.ceiling }))
+  ok(sh2 && sh2.pillar === 7, '背包里能垫的方块数只数便宜方块（圆石 7，铁剑不算）', JSON.stringify(sh2 && sh2.pillar))
+  ok(sh2 && sh2.sides.e === 'stone', '四面哪边有落脚地报出来（东边站脚那格底是石头）', JSON.stringify(sh2 && sh2.sides))
+  ok(sh2 && /能跳/.test(sh2.hint) && /垫/.test(sh2.hint), '提示同时说"能跳"和"有 N 个能垫的"')
+
+  // 走不到 + 不是被抢占 ⇒ 结果里带 shaft；被抢占不带
+  ok(/\(exhausted \|\| e\?\.name === 'NoPath'\) && !preempted \? \(\(\) => \{ const sh = shaftInfoOf/.test(src),
+    '🔴 只有真的走不到（卡死/没路）才给竖井信息包，被抢占/时间到不给')
+
+  // 规划 / 移动耗时拆分
+  ok(/let plannedAt = null/.test(src) && /if \(!plannedAt\) plannedAt = Date\.now\(\)/.test(src)
+    && /timing: \{ planMs: plannedAt \? plannedAt - t0 : null/.test(src),
+    '🔴 第一次算出路径的时刻单独记，结果里 planMs / walkMs 分开报')
+
+  // 水流漂移：只在水里、按窗口量、反压一档、真松开
+  ok(/export const SWIM_DRIFT_EPS = 0\.35/.test(src), '横向漂移有阈值（0.35 格/窗口）')
+  ok(/const perp = \(mvx \* \(-gz \/ gl\) \+ mvz \* \(gx \/ gl\)\)/.test(src),
+    '🔴 漂移按"垂直于目标方向"的分量算（不是总位移）')
+  ok(/lastStrafe = perp > 0 \? 'right' : 'left'/.test(src), '漂向哪边就往反方向压一档')
+  ok(/if \(lastStrafe\) \{ try \{ b\.setControlState\(lastStrafe, false\) \} catch \{\} ; lastStrafe = null \}/.test(src),
+    '🔴 反压键每轮先松开（不收就是把方向键焊死）')
+  ok(/\.\.\.\(driftFixes \? \{ drift, driftFixes \} : \{\}\)/.test(src) && /水流一直在横向推你/.test(src),
+    '结果与提示里都如实报"水在推你，压了几次"')
+
+  // 接线：mc_move 真的把 intent 传下去了
+  const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  ok((idx.match(/intent: args\.intent/g) ?? []).length >= 2 && /intent: \{ type: 'string'/.test(idx),
+    'mc_move 的 intent 参数接到了两条 walkTo 出口上')
+}
+/* ── ⑫ 门：规划允许穿门 + 执行层自己按开 + 卡住补救不砸门（2026-10-18 实机） ── */
+{
+  const src = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+  const { DOOR_RE, openNearbyDoor, CARVE_PROTECTED, carveStepAhead } = mod
+  ok(DOOR_RE.test('oak_door') && DOOR_RE.test('iron_trapdoor') && DOOR_RE.test('oak_fence_gate')
+    && !DOOR_RE.test('oak_planks'), '门/活板门/栅栏门都认得，木板不算')
+  const mkDoorBot = (open = false) => {
+    const seen = []
+    const b = {
+      entity: { position: new Vec3(0, 64, 0) },
+      blockAt (v) {
+        if (v.x === 1 && v.y === 64 && v.z === 0) {
+          return { name: 'oak_door', position: v, getProperties: () => ({ open }) }
+        }
+        return { name: 'air', position: v }
+      },
+      async activateBlock (blk) { seen.push(`${blk.position.x},${blk.position.y},${blk.position.z}`) },
+    }
+    return { b, seen }
+  }
+  {
+    const { b, seen } = mkDoorBot(false)
+    const n = await openNearbyDoor(b)
+    ok(n === 1 && seen.length === 1 && seen[0] === '1,64,0', '身边有关着的门 ⇒ 按一下（activateBlock）', JSON.stringify({ n, seen }))
+  }
+  {
+    const { b, seen } = mkDoorBot(true)
+    const n = await openNearbyDoor(b)
+    ok(n === 0 && seen.length === 0, '门已经开着 ⇒ 不再乱按')
+  }
+  ok(CARVE_PROTECTED.test('oak_door') && CARVE_PROTECTED.test('oak_fence_gate'),
+    '🔴 卡住时的"挖开挡路的"绝不砸门（门进保护名单）')
+  {
+    // 门口挡着：carveStepAhead 一格都不挖
+    const b = { ...mkCarveBot({ '1,64,0': 'oak_door', '1,63,0': 'stone' }) }
+    b.blockAt = (v) => (v.x === 1 && v.y === 64 && v.z === 0
+      ? { name: 'oak_door', position: v, getProperties: () => ({ open: false }) }
+      : { name: v.x === 1 && v.y === 63 ? 'stone' : 'air', position: v })
+    const n = await carveStepAhead(b, { x: 1, y: 64, z: 0 })
+    ok(n === 0 && b.dug.length === 0, '门挡在前面:不挖,交给"按开"', JSON.stringify({ n, dug: b.dug }))
+  }
+  ok(/mv\.canOpenDoors = true/.test(readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')),
+    '🔴 A* 规划允许穿门（vendor 默认 false ⇒ 只会挖墙）')
+  ok(/const doorTimer = setInterval\(\(\) => \{ openNearbyDoor\(b\)/.test(src)
+    && /try \{ clearInterval\(doorTimer\) \} catch \{\}/.test(src),
+    '移动期间定时探门（收尾一定清掉定时器）')
+  ok(/是\*\*门\*\*：.*mode:"use"/.test(src) && /别挖墙也别挖门/.test(src),
+    '失败提示:门用"按开",不是"挖掉"')
 }
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)
