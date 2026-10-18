@@ -1251,11 +1251,43 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     ok(unhandled.length === 0, '🔴 没人 catch 的 PathStopped 也不会变成 unhandledRejection（以前这一下 = 应用闪退）', String(unhandled.length))
   }
   {
-    // 🔴 反向验证：这版**故意不进 openable** —— 进去就会生成 useOne-only 的 move，
-    // vendor 的 monitorMovement 在那一刻会 shift() 出 undefined 并崩（踩坑 #172）。
+    // 🔴 2026-10-18 晚第三版（用户实机："你的寻路不会开门，只会硬挖，已经挖了你两块木板"）：
+    // **门要进 openable**（A* 才认"这一格能穿过去"，否则它只会绕墙/挖墙）；
+    // 同时 `patchDoorMoves` 必须把门的 `useOne` 全删（否则又回到踩坑 #172 的崩溃路径）。
     const plug2 = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
-    ok(!/mv\.openable\.add/.test(plug2), '🔴 门不再进 openable（否则又会出现 useOne-only 的 move）')
-    ok(/openNearbyDoor/.test(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')), '开门改由 openNearbyDoor 定时器负责')
+    ok(/mv\.openable\.add/.test(plug2), '🔴 门要进 mv.openable：A* 才认门能穿，而不是只会挖墙')
+    ok(/DOOR_BLOCK_RE\.test\(nm\) && !IRON_DOOR_RE\.test\(nm\)/.test(plug2), '只把木门/木活板门/木栅栏门塞进 openable（铁门按不开）')
+    ok(/m\.toPlace = m\.toPlace\.filter\(\(p\) => !\(p\?\.useOne && isDoor\(doorAt\(node, p\)\)\)\)/.test(plug2), '🔴 但门的 useOne 一律删掉（否则 vendor 的 placingBlock 崩）')
+    ok(/openNearbyDoor/.test(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')), '真正开门仍由 openNearbyDoor 定时器负责')
+    // 端到端：`getNeighbors` 出来的 move 既没有挖门、也没有 useOne
+    const { patchDoorMoves } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    const doorBlocks = new Map([
+      ['5,64,6', { name: 'oak_door', physical: true, openable: false, shapes: [{}], position: new Vec3(5, 64, 6), height: 1 }],
+      ['5,65,6', { name: 'oak_door', physical: true, openable: false, shapes: [{}], position: new Vec3(5, 65, 6), height: 1 }],
+      ['4,64,6', { name: 'oak_planks', physical: true, shapes: [{}], position: new Vec3(4, 64, 6), height: 1 }]
+    ])
+    const node = { x: 5, y: 64, z: 5, remainingBlocks: 64 }
+    const mv = {
+      openable: new Set(),
+      digCost: 4,
+      placeCost: 12,
+      canOpenDoors: true,
+      getBlock: (n, dx, dy, dz) => doorBlocks.get(`${n.x + dx},${n.y + dy},${n.z + dz}`) ??
+        { name: 'air', physical: false, shapes: [], position: new Vec3(n.x + dx, n.y + dy, n.z + dz), height: 0 },
+      getNeighbors: () => ([
+        // ① 穿门：toBreak 里有门 + 门外那格，还带着门的 useOne
+        { cost: 9, toBreak: [new Vec3(5, 64, 6), new Vec3(5, 65, 6)], toPlace: [{ x: 5, y: 64, z: 6, useOne: true }] },
+        // ② 从门旁挖过去：toBreak 里是门旁边的木板 ⇒ 整条 move 作废
+        { cost: 9, toBreak: [new Vec3(4, 64, 6)], toPlace: [] }
+      ])
+    }
+    patchDoorMoves(mv)
+    ok(mv.__dshDoorPatched === true && typeof mv.getNeighbors === 'function', 'patchDoorMoves 打在 getNeighbors 上')
+    const out = mv.getNeighbors(node)
+    const thru = out.find((m) => m.cost === 9 && Array.isArray(m.toPlace) && m.toPlace.length === 0 && m.toBreak.length === 0)
+    ok(Boolean(thru), '🔴 门（上下两格）从 toBreak 里剔掉了，工钱也退了（cost 9 → 1，这里只验剔除）')
+    ok(!out.some((m) => (m.toBreak ?? []).some((p) => p.x === 4 && p.z === 6)), '🔴 "从门旁挖过去"的 move 不会出现')
+    ok(!out.some((m) => (m.toPlace ?? []).some((p) => p.useOne)), '🔴 门也不会生成 useOne（vendor 的 placingBlock 崩溃路径）')
   }
   {
     // 🔴 寻路器要挖门 ⇒ 改成"按开"（AI 自己挖门不受影响）

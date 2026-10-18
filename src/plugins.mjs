@@ -556,14 +556,28 @@ export function movements (self, { terrain = null } = {}) {
    * 配上 canDig=true ⇒ "挖墙"永远比"绕路"便宜。规划允许穿门，执行由
    * `src/movement.mjs` 的 `openNearbyDoor` 走到门边按一下。 */
   mv.canOpenDoors = true
-  /* ⚠️ 2026-10-18 晚：**不要把门塞进 `mv.openable`**。
-   * 试过（上一版）——规划里会给门加一步 `useOne`，而 vendor 的
-   * `monitorMovement` 在"`useOne` 是最后一步"时会 `shift()` 出 undefined、
-   * `placing` 不复位 ⇒ 下一拍读 `placingBlock.y` 抛 TypeError（我们拦住后它停住寻路，
-   * 表现就是「卡在门口、原地不动、试三次都不走」）。
-   * 现在门一律**不进 `openable`**：规划里门仍算"可挖"，但 `patchDoorMoves` 把它从
-   * `toBreak` 删掉并退回挖门的工钱（= 穿门不额外花钱），执行时由 400ms 的
-   * `openNearbyDoor` 走到跟前按开。挖墙 vs 走门：门更便宜。 */
+  /* 门进 `mv.openable`（2026-10-18 晚第二版，用户实机："你屋里我寻路进不去，
+   * 我的寻路不会开门，只会硬挖，已经挖了你两块木板"）。
+   *
+   * 为什么这次敢开：`openable` 只影响**规划**里"这一格算不算实心"；
+   * `patchDoorMoves` 会把门那一步的 `useOne` **全部删掉**（见下），所以：
+   *   · A* 眼里门是能穿过去的（不再绕墙/挖墙），
+   *   · `toPlace` 永远是空的 ⇒ 不会触发 vendor 那个"`useOne` 是最后一步 ⇒
+   *     `shift()` 出 undefined ⇒ 读 `placingBlock.y` 抛 TypeError"的崩溃路径，
+   *   · 真正开门仍由 400ms 的 `openNearbyDoor` 负责（够得着才按，按过冷却）。
+   *
+   * vendor 自带的 `openable` 只收名字含 `gate` 的方块（门/活板门根本不在里面），
+   * 所以这里要自己把木门/木活板门/木栅栏门塞进去（铁门按不开，不算）。 */
+  try {
+    const B = b.registry?.blocksArray
+    if (Array.isArray(B)) {
+      for (const blk of B) {
+        const nm = String(blk?.name ?? '')
+        if (!DOOR_BLOCK_RE.test(nm) || IRON_DOOR_RE.test(nm)) continue
+        if (Number.isFinite(blk.id)) mv.openable.add(blk.id)
+      }
+    }
+  } catch {}
   mv.canDig = self.cfg.walkCanDig !== false        // 挡路的方块可以挖穿（不然掉坑里出不来）
   mv.allowSprinting = true
   mv.dontMineUnderFallingBlock = true

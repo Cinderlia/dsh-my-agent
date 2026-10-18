@@ -11,6 +11,22 @@
 
 ## [未发布]
 
+### 🚪 修复（寻路现在真能穿门：门重新进 `openable`，同时把门的 `useOne` 全删，2026-10-18）
+
+实机反馈（用户转 AI 的原话）：**"你屋里我寻路进不去，我的寻路不会开门，只会硬挖，已经挖了你两块木板。"**
+
+根因是上一层修法的副作用：前几版为了躲开 vendor 的崩溃路径，把门**排除**在 `mv.openable` 之外 —— 于是 A* 眼里门永远是一堵**实心墙**，"穿门"这条路根本不存在，它只能规划"从旁边挖过去"。把门旁边那格也保护上之后，规划干脆找不到门里那侧的路。
+
+现在的分工：
+
+- **规划层**：木门 / 木活板门 / 木栅栏门重新进 `mv.openable` ⇒ A* 认"这一格能穿过去"，代价比挖墙低，会主动选门（vendor 自己只收名字含 `gate` 的方块，门/活板门要我们自己加；铁门按不开，不加）。
+- **执行层**：`patchDoorMoves` 把门那一步的 `useOne` **全部删掉** ⇒ 不会再走到 vendor `monitorMovement` 里"`useOne` 是最后一步 ⇒ `shift()` 出 undefined ⇒ 读 `placingBlock.y` 抛 `TypeError`"的崩溃路径（那条路径会让我们接管后 `stop()` ⇒ 表现成"卡在门口"）。
+- **开门**：仍由 `openNearbyDoor`（400ms 探一次、够得着才按、按过有冷却）负责，够不着就先走到门边。
+
+顺带保留前几版的两条：门的**下方支撑**和**门旁那格**不许被寻路器挖（`guardDoorDig` 只拦"寻路器自己发起"的挖，AI 自己叫的挖不受影响）。
+
+回归（只跑移动相关）：`check-move-progress` 289/0 → **295/0**（新增：门进了 `openable`（木门/栅栏门/活板门，铁门不进）、门的 `useOne` 一律删、"从门旁挖过去"的 move 被作废、`getNeighbors` 端到端既无挖门也无 `useOne`）；`check-core-swim` 126/126、`check-call-budget` 176/176、`check-terrain` 137/0、`check-mc-pathfinder` 26/0、`check-module-load` 30/0。
+
 ### 🧭 修复（上一条门补丁把我自己弄"走不动了"：`clean()` 漏了 `return true`，A* 收到空候选表，2026-10-18）
 
 上一条把门补丁挂到 `getNeighbors()` 上时，`clean()` 对"与门无关的 move"没有显式 `return true` —— 于是 `filter((m) => clean(node, m))` 把它们全当成 falsy 丢掉 ⇒ A* 每个节点都没有候选 ⇒ **到处 `NoPath`、原地走不动**（`mc_move` 十几毫秒就返回 `reason:"NoPath"`，连往后挪一格都不行）。已修：
