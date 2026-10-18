@@ -955,6 +955,7 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     getBlock (node, dx, dy, dz) { return world[`${node.x + dx},${node.y + dy},${node.z + dz}`] ?? blk('air', false) },
     getMoveForward (node, dir, neighbors) {
       neighbors.push({
+        cost: 12,
         toBreak: [{ x: 1, y: 64, z: 0 }, { x: 2, y: 64, z: 0 }],
         toPlace: [{ x: 1, y: 64, z: 0, useOne: true }],
       })
@@ -1005,8 +1006,35 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     await b.activateBlock(openBlk)
     ok(calls === 3, '超过 12 秒就不再拦截（按正常交互处理）', String(calls))
   }
+  {
+    // 🔴 挖门的工钱也要退：只删 toBreak 不扣 cost，A* 仍觉得"挖门"和"走门"一样贵
+    const doorBlk = { name: 'oak_door', getProperties: () => ({ open: false }), digTime: () => 500 }
+    const mv = mkMv({ '1,64,0': doorBlk, '2,64,0': blk('stone', false) })
+    mv.digCost = 4
+    patchDoorMoves(mv)
+    const out = []
+    mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
+    const m = out[0]
+    // labor = (1 + 3*0.5) * 4 = 10 ⇒ 12 - 10 = 2
+    ok(m.cost === 2, '🔴 门不进 toBreak 时把挖门的 cost 也退掉（12 → 2）', String(m.cost))
+    ok(m.toBreak.length === 1 && m.toBreak[0].x === 2, '…石头照旧可挖', JSON.stringify(m.toBreak))
+  }
+  {
+    // vendor 的 openable 集合里没有门 ⇒ 自己补；铁门不补
+    const { doorBlockIds } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    const fake = { registry: { blocksArray: [
+      { name: 'oak_door', id: 190 }, { name: 'oak_fence_gate', id: 191 },
+      { name: 'iron_door', id: 192 }, { name: 'spruce_trapdoor', id: 193 }, { name: 'stone', id: 1 },
+    ] } }
+    const ids = doorBlockIds(fake)
+    ok(ids.length === 3 && ids.includes(190) && ids.includes(191) && ids.includes(193), '门 id 收齐（木门/栅栏门/活板门）', JSON.stringify(ids))
+    ok(!ids.includes(192), '铁门不收（按不开）', JSON.stringify(ids))
+    ok(doorBlockIds({}).length === 0, '没有 registry 时安全返回空')
+  }
   const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
   ok(/export function patchDoorMoves/.test(plug) && /patchDoorMoves\(mv\)/.test(plug), 'movements() 里真的挂了这个补丁')
+  ok(/for \(const id of doorBlockIds\(b\)\) mv\.openable\.add\(id\)/.test(plug), '🔴 门真的进了 openable（否则门在 A* 眼里还是实心）')
+  ok(/export function doorBlockIds/.test(plug), 'doorBlockIds 是导出的（可测）')
   ok(/guardDoorActivate\(b\)/.test(plug), 'setupPlugins 里装了"我们按开的门别被再按"')
   ok(/__autoOpenedDoors instanceof Map/.test(readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')),
     '定时器按开门时记账（供上面的守卫用）')

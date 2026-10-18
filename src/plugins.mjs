@@ -213,6 +213,24 @@ export const DOOR_BLOCK_RE = /_(door|trapdoor|fence_gate)$/
 const IRON_DOOR_RE = /^iron_(door|trapdoor)$/
 
 /**
+ * 能"按开"的门的方块 id（木门 / 木栅栏门 / 木活板门；铁的不算）。
+ *
+ * 为什么自己算：vendor 只把名字里带 `gate` 的塞进 `mv.openable`
+ * （`movements.js:97-101`），**door 根本不在里面** —— `getMoveForward` 里
+ * `canOpenDoors && blockC.openable` 那个分支对门永远 false，门被当实心，
+ * 走 `safeOrBreak(blockC)`（= 挖掉）。2026-10-18「它选了更便宜的墙」就是这里：
+ * 挖墙和挖门的账一样，没理由走门。
+ */
+export function doorBlockIds (b) {
+  const arr = b?.registry?.blocksArray
+  if (!Array.isArray(arr)) return []
+  return arr
+    .filter((x) => x && typeof x.name === 'string' && DOOR_BLOCK_RE.test(x.name) && !IRON_DOOR_RE.test(x.name))
+    .map((x) => x.id)
+    .filter((id) => Number.isFinite(id))
+}
+
+/**
  * 给 vendor 的 `Movements` 打两个补丁（**只影响规划出来的那条 move**，不改 A*）：
  *
  * ① **别把门算进 `toBreak`**：vendor 的 `getMoveForward` 先
@@ -230,6 +248,17 @@ export function patchDoorMoves (mv) {
   }
   const isDoor = (blk) => Boolean(blk?.name && DOOR_BLOCK_RE.test(blk.name) && !IRON_DOOR_RE.test(blk.name))
   const isOpen = (blk) => { try { return blk?.getProperties?.()?.open === true } catch { return false } }
+  /* 把"挖这扇门"的工钱退掉：vendor 的 safeOrBreak 已经把它算进 `m.cost` 了，
+   * 只在 toBreak 里删位置而不扣钱，A* 仍然觉得"挖门"和"走门"一样贵 ⇒ 还是选墙。
+   * 公式照 `movements.js:290-298`（laborCost = (1 + 3*digTime/1000) * digCost）。 */
+  const laborOf = (blk) => {
+    try {
+      if (!Number.isFinite(mv.digCost) || typeof blk?.digTime !== 'function') return 0
+      const tool = mv.bot?.pathfinder?.bestHarvestTool?.(blk)
+      const digTime = blk.digTime(tool?.type ?? null, false, false, false, [], {}) || 0
+      return (1 + 3 * digTime / 1000) * mv.digCost
+    } catch { return 0 }
+  }
   const wrap = (name) => {
     const orig = mv[name]
     if (typeof orig !== 'function') return
@@ -241,7 +270,16 @@ export function patchDoorMoves (mv) {
         const m = neighbors[i]
         if (!m) continue
         if (Array.isArray(m.toBreak) && m.toBreak.length) {
-          m.toBreak = m.toBreak.filter((p) => !isDoor(doorAt(node, p)))
+          const kept = []
+          for (const p of m.toBreak) {
+            const blk = doorAt(node, p)
+            if (isDoor(blk)) {
+              m.cost = Math.max(0, (Number(m.cost) || 0) - laborOf(blk))
+              continue
+            }
+            kept.push(p)
+          }
+          m.toBreak = kept
         }
         if (Array.isArray(m.toPlace) && m.toPlace.length) {
           m.toPlace = m.toPlace.filter((p) => {
@@ -272,6 +310,10 @@ export function movements (self, { terrain = null } = {}) {
    * 配上 canDig=true ⇒ "挖墙"永远比"绕路"便宜。规划允许穿门，执行由
    * `src/movement.mjs` 的 `openNearbyDoor` 走到门边按一下。 */
   mv.canOpenDoors = true
+  /* 🔴 光把 canOpenDoors 打开**不够**：vendor 自己搭 `openable` 时只收名字带 `gate` 的
+   * （`movements.js:97-101`），木门根本不在集合里 ⇒ 门在规划里仍是"实心、要挖"。
+   * 2026-10-18「它选了更便宜的墙」= 这一条没补。 */
+  for (const id of doorBlockIds(b)) mv.openable.add(id)
   mv.canDig = self.cfg.walkCanDig !== false        // 挡路的方块可以挖穿（不然掉坑里出不来）
   mv.allowSprinting = true
   mv.dontMineUnderFallingBlock = true
