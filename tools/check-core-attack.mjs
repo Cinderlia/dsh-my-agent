@@ -589,7 +589,7 @@ section('⑦ 战斗策略层 —— 威胁排序 / 换武器 / 状态机 / 结�
   const S = await import(new URL('../src/combat-strategy.mjs', import.meta.url))
   const {
     threatOf, rankTargets, weaponScoreOf, weaponChoiceOf, isShield, hurtRateOf,
-    assessCombat, chooseStrategy, combatOutcomeOf, retreatPointOf, approachPointOf,
+    assessCombat, chooseStrategy, combatOutcomeOf, approachPointOf,
   } = S
 
   /* 威胁分：不是"是不是敌对"一个判据 */
@@ -887,24 +887,22 @@ section('⑦ 战斗策略层 —— 威胁排序 / 换武器 / 状态机 / 结�
   }
 
   /* 结局（机器可读，判据全是证据） */
-  ok(combatOutcomeOf({ killed: true, retreated: true }) === 'killed', '结局：打死优先于其它')
+  ok(combatOutcomeOf({ killed: true, aborted: true }) === 'killed', '结局：打死优先于其它')
   ok(combatOutcomeOf({ aborted: true, sawDamage: true }) === 'aborted', '结局：被打断优先于"打到了"')
-  ok(combatOutcomeOf({ retreated: true }) === 'retreated', '结局：主动撤退')
   ok(combatOutcomeOf({ unreachable: true }) === 'unreachable', '结局：够不着')
   ok(combatOutcomeOf({ sawDamage: true }) === 'damaged', '结局：打到了但没打死')
   ok(combatOutcomeOf({ timedOut: true }) === 'timeout', '结局：这一轮时间到了')
   ok(combatOutcomeOf({ gone: true }) === 'unknown', '结局：目标不见了但没证据 ⇒ unknown（不许猜）')
   ok(combatOutcomeOf({}) === 'unknown', '结局：什么证据都没有 ⇒ unknown')
-  ok(S.COMBAT_OUTCOMES.includes(combatOutcomeOf({ killed: true })) && S.COMBAT_OUTCOMES.length === 7,
-    '结局：只在这七个词里取值（用户方案里点名的那七个）', S.COMBAT_OUTCOMES.join(','))
+  /* 🔴 2026-10-20 审计：`retreated` 已删（策略层没有否决权，攻击循环永远不会自己撤），
+   *    所以是**六个**词了。这里改成"只在这六个词里取值"，并钉住 retreated 不在其中。 */
+  ok(S.COMBAT_OUTCOMES.includes(combatOutcomeOf({ killed: true })) && S.COMBAT_OUTCOMES.length === 6,
+    '结局：只在这六个词里取值（retreated 已删）', S.COMBAT_OUTCOMES.join(','))
+  ok(!S.COMBAT_OUTCOMES.includes('retreated') && S.COMBAT_OUTCOME_TEXT.retreated === undefined,
+    '🔴 结局表里没有 `retreated`（2026-10-20 审计：那一路是死分支）', S.COMBAT_OUTCOMES.join(','))
 
-  /* 几何：撤退点 / 找位点 */
+  /* 几何：找位点（`retreatPointOf` 2026-10-20 精简时删掉了 —— 生产零调用，死代码） */
   {
-    const pt = retreatPointOf({ x: 0, y: 64, z: 0 }, { x: 0, z: 5 }, 10)
-    ok(pt && pt.z < 0 && Math.abs(pt.z + 10) < 0.01, '撤退点：往**背离**目标的方向走（目标在 +z ⇒ 我往 -z）', JSON.stringify(pt))
-    const same = retreatPointOf({ x: 0, y: 64, z: 0 }, { x: 0, z: 0 }, 10)
-    ok(same && Number.isFinite(same.x), '🔴 撤退点：和目标重合也要给个点（回 null 会让"撤退"变成原地不动）', JSON.stringify(same))
-    ok(retreatPointOf({ x: NaN, y: 64, z: 0 }, { x: 0, z: 5 }) === null, '撤退点：坐标读不到 ⇒ null（不许编）')
     const ap = approachPointOf({ x: 0, y: 64, z: 0 }, { x: 0, y: 64, z: 10 }, 3)
     ok(ap && Math.abs(ap.z - 3) < 0.01, '找位点：朝目标走 step 格', JSON.stringify(ap))
     ok(approachPointOf({ x: 0, y: 64, z: 0 }, { x: 0, y: 64, z: 0 }, 3) === null, '找位点：重合 ⇒ null')
@@ -937,7 +935,7 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     f.bot.health = 4
     const { ctx, calls } = mkCtx()
     const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
-    ok(r.combat !== 'retreated' && r.retreated !== true, '🔴 血 4 也不许自己撤（AI 叫的打就是命令）', JSON.stringify({ combat: r.combat }))
+    ok(r.combat !== 'retreated' && r.retreated === undefined, '🔴 血 4 也不许自己撤（AI 叫的打就是命令），结果里也不再带 retreated 字段', JSON.stringify({ combat: r.combat }))
     ok(calls.move.length === 0, '🔴 血 4 也不再往反方向走（要撤是 AI 自己叫 mc_move）', String(calls.move.length))
     ok(r.strategy === 'engage' && r.reason === 'hold-line', '🔴 结果里写明"这一轮我没改道"', JSON.stringify({ s: r.strategy, r: r.reason }))
     ok(Array.isArray(r.advice) && r.advice.some((a) => a.action === 'retreat' && a.reason === 'low-health'),
@@ -949,7 +947,7 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     f.bot.health = 4
     const { ctx } = mkCtx({ noMove: true })
     const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
-    ok(r.retreated !== true && !/没给我移动能力/.test(String(r.strategyError)), '没给移动能力也不会"假装撤"（本来就不撤了）', String(r.strategyError))
+    ok(r.retreated === undefined && !/没给我移动能力/.test(String(r.strategyError)), '没给移动能力也不会"假装撤"（本来就不撤了）', String(r.strategyError))
     ok(Array.isArray(r.advice) && r.advice.length > 0, '没移动能力 ⇒ 建议照样带出去', JSON.stringify(r.advice))
   }
   {   /* 被围 ⇒ 只给建议，手不停 */
@@ -957,7 +955,7 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     const { ctx, calls } = mkCtx()
     const r = await attack(f.bot, { who: 'zombie', budget: 400 }, ctx)
     ok(r.strategy === 'engage' && calls.move.length === 0, '🔴 三只怪围着也不自己拉开（只建议）', JSON.stringify({ s: r.strategy, moves: calls.move.length }))
-    ok(r.combat !== 'retreated', '被围不再产生 retreated 结局')
+    ok(r.combat !== 'retreated' && r.retreated === undefined, '被围不再产生 retreated 结局，结果里也没有 retreated 字段')
     ok(r.advice?.some((a) => a.action === 'defend' && a.reason === 'surrounded'), '建议里说"被围了，建议拉开距离"', JSON.stringify(r.advice))
   }
   {   /* 换武器：空手 + 背包有剑 */
@@ -1047,16 +1045,18 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     const { outcomeOf } = await import(new URL('../src/task-runner.mjs', import.meta.url))
     const { combatOutcomeOf } = await import(new URL('../src/combat-strategy.mjs', import.meta.url))
     const map = {
-      killed: 'confirmed', damaged: 'unknown', retreated: 'confirmed',
+      killed: 'confirmed', damaged: 'unknown',
       unreachable: 'failed', aborted: 'unknown', timeout: 'unknown', unknown: 'unknown',
     }
     for (const [c, want] of Object.entries(map)) {
       ok(outcomeOf({ combat: c, killed: false }) === want,
         `outcomeOf 把 combat:"${c}" 翻成 "${want}"`, String(outcomeOf({ combat: c, killed: false })))
     }
-    /* 撤退时 note 里常带"走不过去/够不着" —— 那不能被文本正则判成失败 */
-    ok(outcomeOf({ combat: 'retreated', note: '想撤，但够不着安全点' }) === 'confirmed',
-      '🔴 撤退带"够不着"字样的 note，也仍然是"做到了"（文本正则不许抢先）')
+    /* 🔴 2026-10-20 审计：`retreated` 结局已删（策略层没有否决权，永远撤不了）——
+     *    以前这里有一条"撤退带'够不着'的 note 也仍是做到了"的断言，随之作废。
+     *    但"combat 优先于文本正则"这条规则本身还要钉住：用 `killed` + 带失败字样的 note 验。 */
+    ok(outcomeOf({ combat: 'killed', note: '够不着，走不过去' }) === 'confirmed',
+      '🔴 combat 结论优先于 note 里的"够不着/走不过去"（文本正则不许抢先）')
     /* 没给 combat 时，统一结局照旧按证据判（战斗层不许污染别的工具） */
     ok(outcomeOf({ arrived: true }) === 'confirmed', '别的工具不带 combat 时判据完全不受影响')
     /* 🔴 审计（2026-10-18）：返回值语义与判定器脱节的三处，逐条钉住 */

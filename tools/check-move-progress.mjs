@@ -468,7 +468,7 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(/if \(e\?\.mcStuck\)[\s\S]{0,1400}?attempt\+\+[\s\S]{0,200}?continue/.test(src), '采样器判卡 ⇒ 补救没戏就进下一轮脱困')
   ok(/await carveStepAhead\(b, target, \{ ignoreRange: true \}\)/.test(src) && /carveTries < MOVE_CARVE_TRIES/.test(src),
     '🔴 阶梯之前先试"挖开挡路的台阶"（2026-10-18 实机；审计后改成看眼前障碍）')
-  ok(/const carveAllowed = ctx\.cfg\?\.[\s\S]{0,120}?walkCarveStep !== false/.test(src),
+  ok(/const carveAllowed = !noDig && ctx\.cfg\?\.walkCanDig !== false && ctx\.cfg\?\.walkCarveStep !== false/.test(src),
     '🔴 自动挖台阶服从 walkCanDig / walkCarveStep（不许绕过配置）')
   ok(/export const CARVE_PROTECTED = new RegExp/.test(src), '容器/矿石/装置有保护名单（不替 AI 挖掉）')
   ok(/export function obstacleAheadOf/.test(src) && /obstacleAheadOf\(b, target\)/.test(src),
@@ -541,7 +541,7 @@ section('⑨ noTower（逃跑时关掉"原地垫高"）')
   const src = read('../src/movement.mjs')
   ok(/if \(noTower\) mv\.allow1by1towers = false/.test(src), '🔴 关的是 allow1by1towers 这一个开关')
   ok(!/mv\.scafoldingBlocks = \[\]/.test(src), '🔴 绝不清空 scafoldingBlocks（那会把 1×1 柱子的 move 一起剪掉，掉坑里出不来）')
-  ok(/noTower = true, intent = 'near' \} = \{\}, ctx = \{\}\)/.test(src), 'walkTo 也接 noTower，且**默认 true**（不垫柱 —— 2026-10-18 实机：垫柱放错就摔死）')
+  ok(/noTower = true, intent = 'near', waterRecover, noDig = false \} = \{\}, ctx = \{\}\)/.test(src), 'walkTo 也接 noTower，且**默认 true**（不垫柱 —— 2026-10-18 实机：垫柱放错就摔死）')
   /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高"）：战斗层**不再自己撤退**，
    *    所以"撤退要关掉垫脚"这条已经没有对象了 —— 反过来要守住"不许再出现撤退执行"。 */
   const atk = read('../src/attack.mjs')

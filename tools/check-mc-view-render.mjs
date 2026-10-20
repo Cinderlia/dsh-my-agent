@@ -13,7 +13,7 @@ const { makeSkin } = await import(new URL('../extensions/mc_skin.mjs', import.me
 const outDir = mkdtempSync(join(tmpdir(), 'mc-view-render-'))
 const {
   cameraBasis, renderView, compassOf, castRay, colorOf, ruleOf, isAirName, isWaterName, isLavaName,
-  isGlassName, isEmissiveName, entityStyle, entityBoxOf, entityParts, selfTest, VIEW_DEFAULTS,
+  entityStyle, entityBoxOf, entityParts, selfTest, VIEW_DEFAULTS,
 } = render
 
 let pass = 0
@@ -131,8 +131,6 @@ console.log('— 5. 调色板 / 贴图规则 / 方块名判定 —')
   ok(JSON.stringify(colorOf(null)) === JSON.stringify([150, 150, 150]), '未知 → 灰')
   ok(typeof ruleOf('oak_planks').pattern === 'string', 'ruleOf 带 pattern（程序化贴图）', ruleOf('oak_planks').pattern)
   ok(ruleOf('grass_block').side !== undefined && ruleOf('grass_block').sidePattern === 'dirt', 'grass_block 有侧面专用规则（草皮+泥土）')
-  ok(isGlassName('glass') === true && isGlassName('stone') === false, 'isGlassName')
-  ok(isEmissiveName('glowstone') === true && isEmissiveName('stone') === false, 'isEmissiveName')
   ok(isAirName('air') && isAirName('cave_air') && isAirName('void_air') && !isAirName('water'), 'isAirName')
   ok(isWaterName('water') && !isWaterName('lava') && isLavaName('lava'), 'isWaterName / isLavaName')
 }

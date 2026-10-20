@@ -134,62 +134,6 @@ export async function waitUntil (cond, {
 }
 
 /**
- * 「等一个**真事件**」—— 不是轮询判据，而是挂在 emitter 上等它自己响。
- *
- * 与 `waitUntil` 的分工：**能等到事件就别轮询**。
- * 轮询的代价是"最坏要等一个 `pollMs` 才发现"，而且每个 tick 都要跑一次判据；
- * 事件是服务端/插件**主动推**过来的，一响就到。
- * 两者都收在这儿，是为了让"等"这件事**只有一个出处**（用户点名的异步方案 ②）。
- *
- * 语义：
- *   - `filter(value)` 返回假 ⇒ **不消费这次事件**，继续等（用于"同一事件名但不是我关心的那个"）
- *   - 到点 ⇒ `{ok:false, reason:'timeout'}`；已中止 / 等的时候中止 ⇒ `{ok:false, reason:'aborted'}`
- *   - **一定要清理监听器和定时器**（包括提前 resolve 的那条路）
- *
- * ⚠️ 定时器**故意不 unref**（同 `withTimeout` 的理由）：unref 掉会让"只有它在等"时
- *    进程直接退出、超时永不触发。
- * ⚠️ emitter 上如果没有 `on`/`once`（假件），直接回 `{ok:false, reason:'no-emitter'}`，不抛。
- *
- * @returns {Promise<{ok:boolean, reason:'event'|'timeout'|'aborted'|'no-emitter', waitedMs:number, value:any, label:string}>}
- */
-export function waitForEvent (emitter, event, {
-  ms = 0, signal = null, filter = null, label = '', now = () => Date.now(),
-} = {}) {
-  const t0 = now()
-  return new Promise((resolve) => {
-    let done = false
-    let timer = null
-    const finish = (v) => {
-      if (done) return
-      done = true
-      if (timer) clearTimeout(timer)
-      try { emitter?.off?.(event, onEvent) ?? emitter?.removeListener?.(event, onEvent) } catch {}
-      try { signal?.removeEventListener?.('abort', onAbort) } catch {}
-      resolve(v)
-    }
-    const onEvent = (value) => {
-      if (filter && !filter(value)) return
-      finish({ ok: true, reason: 'event', waitedMs: now() - t0, value, label })
-    }
-    const onAbort = () => finish({ ok: false, reason: 'aborted', waitedMs: now() - t0, value: undefined, label })
-
-    if (!emitter || typeof emitter.on !== 'function') {
-      return resolve({ ok: false, reason: 'no-emitter', waitedMs: 0, value: undefined, label })
-    }
-    if (signal?.aborted) return resolve({ ok: false, reason: 'aborted', waitedMs: 0, value: undefined, label })
-
-    emitter.on(event, onEvent)
-    if (signal?.addEventListener) signal.addEventListener('abort', onAbort, { once: true })
-    const wait = Math.max(0, Number(ms) || 0)
-    /* `ms <= 0` 不挂定时器 —— 那表示"只当场等一次事件循环"，而不是"等 0 毫秒就放弃"。
-     * 调用方真要"不等"，就不该调这个函数。 */
-    if (wait > 0) {
-      timer = setTimeout(() => finish({ ok: false, reason: 'timeout', waitedMs: now() - t0, value: undefined, label }), wait)
-    }
-  })
-}
-
-/**
  * 「我这边的世界和服务端对不上」时该怎么劝 —— **绝不劝模型去 `mc_connect {force:true}`**。
  *
  * 🔴 2026-10-15 实机定论（用户原话 m00002："现在看一下为什么ai老是退出游戏"）：

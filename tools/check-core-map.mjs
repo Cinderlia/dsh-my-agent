@@ -58,7 +58,7 @@ const Vec3 = req('vec3')
 const { McBot, glyphOf } = await import(new URL('../src/core.mjs', import.meta.url))
 /* 2026-10-15：`mc_map` 默认改成"脚下方块那一层" —— 新函数直接从 map-render.mjs 取
  *（工具层就是这么 import 的，没经过 core.mjs 的薄包装）。 */
-const { floorMapOf, floorCell, floorKeyOf, gridToWorld, worldToGrid, hazardCellsOf, navSummaryOf,
+const { floorMapOf, floorCell, floorKeyOf, gridToWorld, hazardCellsOf, navSummaryOf,
   columnOf, columnText, columnKindOf, parseXZ } =
   await import(new URL('../src/map-render.mjs', import.meta.url))
 
@@ -315,13 +315,9 @@ try {
     ok(tl.x === 2 && tl.z === -15, '左上角 = (cx-R, cz-R)', JSON.stringify(tl))
     ok(gridToWorld(m.radius, m.radius + 1, m).x === 11, '列 +1 ⇒ x +1（东）')
     ok(gridToWorld(m.radius + 1, m.radius, m).z === -6, '行 +1 ⇒ z +1（南）')
-    const g = worldToGrid(11, -6, m)
-    ok(g.row === m.radius + 1 && g.col === m.radius + 1, 'worldToGrid 是 gridToWorld 的逆')
     // 抽稀步长变了，坐标也要跟着变 —— 所以一律走 gridToWorld，别自己乘
     const m2 = { ...m, cellSize: 2 }
     ok(gridToWorld(0, 1, m2).x === m2.originX + 2, 'cellSize=2（glyphStep=2）时列 +1 ⇒ x +2')
-    const g2 = worldToGrid(m2.originX + 4, m2.originZ + 6, m2)
-    ok(g2.col === 2 && g2.row === 3, 'worldToGrid 认 cellSize')
     ok(m.bounds.minX === m.originX && m.bounds.maxX === m.originX + m.radius * 2 - 1,
       'bounds 与 origin/cellSize 自洽')
   }

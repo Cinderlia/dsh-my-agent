@@ -82,6 +82,19 @@ export const DEFAULT_CONFIG = {
     allowOtherTools: [],
     /** 是否把 mc_admin_* 也放进白名单（默认 false = 隐藏；隐藏之外 guard 仍会硬拒） */
     hideAdminTools: true,
+    /**
+     * 是否把**配套插件**的工具放进白名单（默认 **true**）。
+     *
+     * 🔴 用户 2026-10-19：「MC 模式这个会话的工具集里默认缺了 ACP 那一族。这个可以做成默认打开吗，
+     *    让用户装完就能用压缩等插件」—— 白名单以前把这些一起挡在门外：装了 billion-context
+     *    却用不了 `compress` / `decompress` / `search_context` / `acp_status` / `acp_cache`，
+     *    MC 会话（尤其是打末影龙那种长跑局）聊着聊着就撑爆上下文。
+     *
+     * 这里列的是一组**名字**（不是包名）：宿主没装 / 没挂同名工具时，`restrict({allow})` 会把
+     * 不认识的名字过滤掉（见 index.js 的 applyAllow），不会让整次白名单作废。
+     * 想收紧就把它设成 false（或把某个名字从 `MC_COMPANION_TOOLS` 里去掉）。
+     */
+    allowCompanionTools: true,
   },
   /**
    * `mcModePresets` 里哪些算 **MC+ 变体**（在 MC 模式基础上开放标准模式全部工具）。
@@ -103,6 +116,15 @@ export const DEFAULT_CONFIG = {
   memoryPerSession: false,
   /** 「MC设置 → 指令白名单」页的开关：允许所有服务器指令（默认关 = 只放行白名单里的） */
   allowAllCommands: false,
+  /**
+   * 长动作（`mc_sequence` / `mc_build` / `mc_dig`）遇到危险时**打不打断**。
+   *
+   * `false`（默认）= **只提醒不打断**（用户 2026-10-19：「不要打断只提醒」）：
+   * 险情写成一行 `⚠️ … —— 只提醒，没打断`放进结果的 `warnings`，动作照跑完这一轮（≤11 秒）；
+   * 停下来处理由反射层（`mc_auto`）的叫醒决定。
+   * `true` = 旧行为：立刻带进度退出，结果里给 `interrupted: 'danger'` + `stoppedAt`。
+   */
+  stopOnDanger: false,
   /* 注：`injectDshMcAgentAgentsMd` / `injectWorkspaceAgentsMd` / `rulesFollowVersion` 三个提示词
    * 开关 2026-10-03 起**按工作区**存（`<记忆根>/config.json`，见 src/wsconfig.mjs），不再在这里。
    * 旧全局值只作迁移 seed 用一次 —— 见 `PluginConfig.legacyPromptSwitches()`。 */
@@ -694,7 +716,7 @@ function validate (top, rest, value) {
     if (value !== null && typeof value !== 'string') throw new Error('memoryDir 必须是字符串（绝对路径）或 null')
     return
   }
-  if (top === 'allowAllCommands' || top === 'ensureMcPreset' || top === 'expressEnabled' || top === 'memoryPerSession') {
+  if (top === 'allowAllCommands' || top === 'ensureMcPreset' || top === 'expressEnabled' || top === 'memoryPerSession' || top === 'stopOnDanger') {
     if (typeof value !== 'boolean') throw new Error(`${top} 必须是 true/false`)
     return
   }

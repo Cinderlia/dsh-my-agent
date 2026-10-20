@@ -44,6 +44,7 @@ import { clamp } from './mc_util.mjs'
 import { BRIDGE_FATAL } from '../src/bridge.mjs'
 import { isSolidBlock, isPassable, NON_SUFFOCATING, SOFT_ROOF } from '../src/block-names.mjs'
 import { hostilityOf } from '../src/entity-names.mjs'
+import { breathNear, BREATH_NEAR_R, fireballNear, FIREBALL_NEAR_R } from '../src/danger.mjs'
 import { floorMapOf, hazardCellsOf } from '../src/map-render.mjs'
 import { recoverFromWater, waterReportText } from '../src/water-recovery.mjs'
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
@@ -126,7 +127,7 @@ export const AUTO_DEFAULTS = {
    */
   creeperFlee: true,
 
-  /** 水下自救（自己搜出口、游上去）。`ai-led` 默认不接管；显式 true 才做 */
+  /** 水下自救（自己搜出口、游上去）。**默认开**，可关（用户 2026-10-19：「要让 ai 能开关」「要默认开」） */
   waterRecover: true,
 
   /** 自保叫醒时**先停下手里的事**（默认开）。用户 2026-10-14 任务驱动第三步：
@@ -152,11 +153,10 @@ const RANGES = {
 
 /** 三档模式各自的行为默认值（用户 2026-10-18 拍板：默认 ai-led） */
 const MODE_DEFAULTS = {
-  'ai-led': { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: false, creeperFlee: false, waterRecover: false },
+  'ai-led': { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: false, creeperFlee: false, waterRecover: true },
   balanced: { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: true, creeperFlee: true, waterRecover: true },
   legacy: { lookAround: true, autoEat: true, pickup: true, wearArmor: true, follow: true, avoidReact: true, creeperFlee: true, waterRecover: true },
 }
-export const AUTO_MODES = Object.keys(MODE_DEFAULTS)
 
 /** 任务停滞判定（毫秒）：台账 90 秒没变化就算"卡住了" */
 const TASK_STALL_MS = 90_000
@@ -187,6 +187,8 @@ const URGENT_RADIUS = 4
 const CREEPER_FLEE_R = 4
 /** 后退多久（毫秒）：0.7 秒 ≈ 2~3 格，够出爆发中心，又不至于把 AI 的任务意图带偏 */
 const CREEPER_FLEE_MS = 700
+/** 两次龙息提醒之间至少隔多久（毫秒）—— 云会飘、会散，5 秒一次够用，别刷屏 */
+const BREATH_WAKE_GAP_MS = 5000
 /** 两次苦力怕后退之间至少隔多久（毫秒） */
 const CREEPER_FLEE_GAP_MS = 8_000
 /** 憋气叫醒的最短间隔（毫秒）：氧气见底后每秒都在掉血，等 15 秒太久，所以比 DANGER_WAKE_GAP_MS 短 */
@@ -669,7 +671,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
   const EVENT_TTL_MS = 120_000
   const EVENT_MAX = 40
   const EVENT_PRIORITY = {
-    drowning: 100, suffocate: 95, creeper: 90, damage: 85,
+    drowning: 100, suffocate: 95, fireball: 94, breath: 93, creeper: 90, damage: 85,
     interrupt: 60, task_stalled: 50, player_request: 45, threat: 30, idle: 0,
   }
   const READ_ONLY_RE = /^mc_(observe|map|scan|status|inventory|entities|events|diag|capabilities|kit_memory|watch|sessions|accounts|ping)$/
@@ -1092,9 +1094,9 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
   const wakeForDanger = (s, sess, cfg, t, info) => {
     const agent = s.agent
     if (!agent || typeof agent.steer !== 'function') return 'none'
-    const { threat = null, foes = [], health = 20, ranged = false, hurt = false, blind = false,
+    const { threat = null, foes = [], health = 20, ranged = false, hurt = false, blind = false, ball = null,
       drown = false, air = null, submerged = false, subSec = 0, gap = DANGER_WAKE_GAP_MS,
-      waterRecover = false, fell = null, fellFrom = null, suffocate = null } = info ?? {}
+      waterRecover = false, fell = null, fellFrom = null, suffocate = null, breath = null } = info ?? {}
     if (t - num(s.lastDangerWakeAt, 0) < gap) return 'throttled'
     /* 🔴 危险叫醒用**自己的**配额（2026-10-18 审计）：和空闲叫醒共用一份时，
      *    空闲空转能把 120 次烧光，真有怪时反而不叫。 */
@@ -1113,7 +1115,65 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const stopLine = stopped === null
       ? ''
       : `⏸ 我已经先把手里的活停下了（寻路 / 采集 / 控制位都松开了${stopped}）—— 现在你说了算。`
-    if (drown) {
+    if (ball) {
+      /* 火球还在飞（`dragon_fireball`）：**落地才会变成上面那团云**，所以现在躲还来得及。 */
+      const esc = ball.escape
+      L.push(`【自保：龙息火球飞过来了｜血 ${Math.round(health)}/20】`)
+      L.push('')
+      L.push(`**这不是被打** —— 是末影龙吐的**火球**（\`dragon_fireball\`）：落到地上/碰到方块就炸成一团龙息云`
+        + '（半径 3 格，站进去每 0.5 秒掉 4 点血）。**它现在还在飞，躲得掉。**')
+      /* 用户 2026-10-19：「火球 26.5 格（24, 72, 8）这里可以改成落点吗」——
+       *   报"它现在在哪"没用（我躲的是它要砸的地方），所以这里报**预测落点**：
+       *   云就长在落点上，AI 只需要知道"落点离我几格、要不要挪"。 */
+      L.push(`威胁：火球 **${ball.distance} 格**`
+        + (ball.impact
+          ? `，${ball.impact.approx ? '掠过点约' : '落点'} **(${ball.impact.x}, ${ball.impact.y}, ${ball.impact.z})**`
+            + (ball.impact.distanceToMe != null ? `（离我 ${ball.impact.distanceToMe} 格${ball.impact.hitsMe ? ' —— **就是砸我脚下**' : ''}）` : '')
+          : `（它现在在 ${ball.position.x}, ${ball.position.y}, ${ball.position.z}，落点算不出来）`)
+        + (ball.inbound === true ? '，**正朝我这边飞**' : ball.inbound === false ? '，暂时没朝我飞' : '，方向读不到')
+        + (ball.etaSec != null && ball.inbound ? `，**约 ${ball.etaSec} 秒到**` : ''))
+      if (stopLine) L.push(stopLine)
+      L.push(`我：血 ${Math.round(health)}/20，手上 ${held}，在 ${me ? `(${Math.round(me.x)}, ${Math.round(me.y)}, ${Math.round(me.z)})` : '?'}`)
+      L.push('')
+      L.push('**下一步你来定**（我这次只把手里的事停了，没自己跑）：')
+      if (esc) {
+        L.push(`· 横向挪开（首选，火球走直线）：\`mc_move {"x":${esc.x},"y":${Math.floor(me?.y ?? 64)},"z":${esc.z}}\`（侧移 5 格）`)
+      }
+      L.push('· 或者**躲到方块后面**：\`mc_build\` 在它和我之间垒两格，或钻到柱子/墙后面（挡住就不炸成云）')
+      if (ball.impact?.hitsMe) {
+        L.push('· 🔴 **落点就在我脚下**：原地不动必被云罩住 —— **立刻**走开（横向 5 格就够），或垫两格往上')
+      } else if (ball.impact?.distanceToMe != null) {
+        L.push(`· 落点离我 ${ball.impact.distanceToMe} 格：**不站在落点附近就没事**，不用瞎跑；顺手往侧面挪几步更保险`)
+      }
+      L.push('· 血少先吃；**别站着射箭** —— 火球 1 秒就到，箭打不掉它')
+      L.push('选一个**直接做**，不用问我。')
+    } else if (breath) {
+      /* 🔴 2026-10-19 用户：「现在不会躲龙息，检测到龙息应该提醒」。
+       *    它既不是"被打"（不进云不掉血）、也不是"窒息/溺水"，以前整个报险分支都够不着它 ——
+       *    末地那趟我就是站着不动被熏死的（血 20 → 0 只要几秒）。这里给它一条**专属**报法，
+       *    并且第一句就给"往哪跑"的坐标，别让 AI 再去 observe 猜。 */
+      const esc = breath.escape
+      L.push(`【自保：龙息云贴上来了｜血 ${Math.round(health)}/20】`)
+      L.push('')
+      L.push(`**这不是被打，也不是憋气** —— 是**末影龙的龙息云**（\`area_effect_cloud\`）：`
+        + `一团贴着地面的紫雾，半径约 3 格，**站在里面每 0.5 秒掉 4 点血**，20 血也就十来秒。`)
+      L.push(`威胁：龙息云 **${breath.distance} 格**（云心 ${breath.position.x}, ${breath.position.y}, ${breath.position.z}）`
+        + (breath.distance <= 3 ? ' —— **你已经站进去了**' : ''))
+      if (stopLine) L.push(stopLine)
+      L.push(`我：血 ${Math.round(health)}/20，手上 ${held}，在 ${me ? `(${Math.round(me.x)}, ${Math.round(me.y)}, ${Math.round(me.z)})` : '?'}`)
+      L.push('')
+      L.push('**下一步你来定**（我这次只把手里的事停了，没自己跑）：')
+      if (esc) {
+        L.push(`· 跑出云外（首选）：\`mc_move {"x":${esc.x},"y":${Math.floor(me?.y ?? 64)},"z":${esc.z}}\``
+          + `（背离云心 ${esc.blocks} 格；跑不动就改走斜的）`)
+      } else {
+        L.push('· 先往外跑：\`mc_move\` 到离云心 10 格以外的落脚点')
+      }
+      L.push('· 没路跑就**往上垫两格**（云贴地、不往上涨）：\`mc_move {"allowTower":true,...}\` 或先 \`mc_jump\` 脱开')
+      L.push('· **千万别站在云里射箭/砍龙** —— 箭还没到，血先掉光；先离开、再从 20 格外观望')
+      L.push('· 血 < 10 就先吃东西（\`mc_act {"mode":"equip","name":"cooked_beef"}\` + \`useitem\`），边跑边吃')
+      L.push('选一个**直接做**，不用问我。')
+    } else if (drown) {
       /* 憋气（溺水）：**必须和"被打"分开报**。以前这种"掉血但看不到怪"会被当成远程怪隔墙射，
        * AI 于是跑去找一个不存在的敌人，人还在水里继续沉 —— 用户 2026-10-07："现在容易被淹死"。 */
       L.push(air == null
@@ -1225,7 +1285,11 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         content: [{ type: 'text', text: L.join('\n') }],
         source: {
           kind: 'plugin:dsh-mc-agent', form: 'notice',
-          summary: suffocate
+          summary: ball
+            ? `MC 自保：龙息火球在 ${ball.distance} 格${ball.inbound ? '（朝我飞）' : ''}`
+            : breath
+            ? `MC 自保：龙息云在 ${breath.distance} 格`
+            : suffocate
             ? `MC 自保：头卡在方块里（${suffocate.name}）`
             : drown
               ? `MC 自保：快淹死了（${air == null ? '头在水下' : `氧气 ${air}/20`}）`
@@ -1244,7 +1308,11 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       beginDecision(s, evs, t)
       for (const e of evs) e.state = 'sent'
       s.stats.dangerWakes++
-      logLine(suffocate
+      logLine(ball
+        ? `mc_auto：龙息火球 ${ball.distance} 格${ball.inbound ? '（朝我飞来）' : ''}，血 ${Math.round(health)}/20 → 已叫醒 AI 侧移`
+        : breath
+        ? `mc_auto：龙息云 ${breath.distance} 格，血 ${Math.round(health)}/20 → 已叫醒 AI 躲开`
+        : suffocate
         ? `mc_auto：头卡在方块里（${suffocate.name} @ ${suffocate.x}, ${suffocate.y}, ${suffocate.z}，氧气 ${air ?? '?'}/20）→ 已叫醒 AI`
         : drown
         ? `mc_auto：在水里憋气（${air == null ? `头在水下 ${subSec || '?'} 秒` : `氧气 ${air}/20`}，血 ${Math.round(health)}/20）→ 已叫醒 AI 上浮`
@@ -1400,7 +1468,9 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         s.shieldOffAt = t + CREEPER_FLEE_MS
       }
     } catch { /* 举盾失败不影响跑 */ }
-    try { b.lookAt(spot) } catch { /* 只是朝向 */ }
+    /* 🔴 2026-10-20 审计：`lookAt` 不带 force 时，物理循环不发 look 包就永远不 settle
+     *    （站着不动/刚死时 early return）—— 这里没 await，于是留下一个永远挂着的 promise。 */
+    try { b.lookAt(spot, true) } catch { /* 只是朝向 */ }
     holdCtl(sess, 'forward', CREEPER_FLEE_MS, () => { try { b.setControlState('forward', false) } catch { /* 忽略 */ } })
     s.lastCreeperFleeAt = t
     s.stats.creeperFlees = num(s.stats.creeperFlees, 0) + 1
@@ -1573,6 +1643,47 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
      *   · 远程怪（骷髅/掠夺者/女巫…）到 RANGED_NEAR_RADIUS 格 —— 它们从十几格外就开火，
      *     但**得看得见我才算**（中间有墙/树就暂时不算，否则隔墙的骷髅会一直神经质地报警）。
      */
+    /* 🔴 2026-10-19 实机：**创造 / 旁观模式根本不会掉血**，8 格内站着 slime 也伤不到我 ——
+     *    以前照样每隔几秒叫醒一次（一晚上七十多次"slime 贴上来了"），把真正有用的信息全淹了，
+     *    AI 还得一条条回"创造模式不掉血"。这两种模式直接不报警。 */
+    if (b.game?.gameMode === 'creative' || b.game?.gameMode === 'spectator') return
+    /* 🔴 2026-10-19 用户：「现在不会躲龙息，检测到龙息应该提醒」。
+     *    龙息云（`area_effect_cloud`）不是敌对实体、不蹭不痛，所以以前整套报险逻辑对它毫无反应 ——
+     *    末地那趟我就是站在云里被熏死的（20 血 → 0 只要几秒）。这里**先查它**：
+     *    6 格内就提醒，已经在 3 格内（=踩进去）就直接返回，别的都不重要了。 */
+    /* 火球（还在飞的那颗 `dragon_fireball`）比云更早 —— 用户 2026-10-19 追问：
+     *    「只能落地的才能检测到吗」。云是它落地/碰撞后才生成的，只盯云 = 只在"已经晚了"时报。 */
+    const ball = fireballNear(b, FIREBALL_NEAR_R)
+    if (ball) {
+      if (t - num(s.lastBallWakeAt, 0) >= BREATH_WAKE_GAP_MS) {
+        s.lastBallWakeAt = t
+        s.stats.alerts++
+        pushAutoEvent(s, 'fireball', `ball:${ball.position.x},${ball.position.y},${ball.position.z}`,
+          { distance: ball.distance, inbound: ball.inbound, health: Math.round(health) })
+        if (t - num(s.lastBallLoggedAt, 0) > 30_000) {
+          s.lastBallLoggedAt = t
+          logLine(`mc_auto：龙息火球 ${ball.distance} 格${ball.inbound ? '（朝我飞来）' : ''} → 叫醒 AI 侧移`)
+        }
+        wakeForDanger(s, sess, cfg, t, { health, ball })
+      }
+    }
+
+    const breath = breathNear(b, BREATH_NEAR_R)
+    if (breath) {
+      if (t - num(s.lastBreathWakeAt, 0) >= BREATH_WAKE_GAP_MS) {
+        s.lastBreathWakeAt = t
+        s.stats.alerts++
+        pushAutoEvent(s, 'breath', `cloud:${breath.position.x},${breath.position.y},${breath.position.z}`,
+          { distance: breath.distance, health: Math.round(health), escape: breath.escape })
+        if (t - num(s.lastBreathLoggedAt, 0) > 30_000) {
+          s.lastBreathLoggedAt = t
+          logLine(`mc_auto：龙息云 ${breath.distance} 格 → 叫醒 AI 躲开（往 ${breath.escape?.x},${breath.escape?.z} 跑）`)
+        }
+        wakeForDanger(s, sess, cfg, t, { health, breath })
+      }
+      if (breath.distance <= 3) return      // 脚下就是云：别再排别的险情
+    }
+
     const foes = hostilesNear(b, RANGED_NEAR_RADIUS).filter((f) => {
       if (f.distance <= 8) return true
       if (!RANGED.test(f.name)) return false
@@ -1987,10 +2098,15 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     }
     if (s.offlineSince === true) { s.offlineSince = false; s.lastToolAt = t }
     // 被攻击的判据：只认"挨打的是我自己"（entityHurt 对每个受伤实体都会发）
-    if (!s.hooked) {
+    /* 🔴 2026-10-20 审计（真 bug）：以前只靠"某一 tick 看见 `!bot.online`"来复位 `hooked`。
+     *    断线→重连如果发生在两次 tick 之间（窗口短于 500ms），这个 tick 根本看不到离线，
+     *    `hooked` 仍是 true，可新 bot 对象上**从来没挂过 `entityHurt`** ⇒ 挨打判据从此失效。
+     *    改成认**对象身份**：挂的 bot 不是当前这个就重挂。 */
+    if (!s.hooked || s.hookedBot !== sess?.bot?.bot) {
       const b0 = sess?.bot?.bot
       if (typeof b0?.on === 'function') {
         s.hooked = true
+        s.hookedBot = b0
         try {
           b0.on('entityHurt', (e) => {
             try {
@@ -2160,12 +2276,11 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
   const toolSpec = () => ({
     name: 'mc_auto',
     description: '🤖 **自主层**（让它像正常玩家）：不传参数 = 看状态。\n'
-      + '**模式**（`set {"mode":"ai-led"|"balanced"|"legacy"}`，默认 `ai-led`）：\n'
-      + '· `ai-led`：AI 决策。反射层只**监测事件 + 叫醒 + 记录决策**，不替它吃/捡/穿/跟/环顾，连保命后退也不做。\n'
-      + '· `balanced`：AI 决策，保留几乎不可逆的紧急保命（危险方块后退、苦力怕后撤、水下自救）。\n'
-      + '· `legacy`：旧的自动行为全开。\n'
-      + '**事件层**：溺水/窒息/苦力怕/挨打/动作被打断/任务停滞 → 按优先级入队、去重；叫醒时只给事实，'
-      + '每个动作都记一条决策审计（观察版本 → 动作 → 结果 → 下一次观察）。\n'
+      + '**模式**（`set {"mode":"ai-led"|"balanced"|"legacy"}`，默认 `ai-led`）：'
+      + '`ai-led` = AI 决策，反射层只监测事件/叫醒/记决策，不替它吃捡穿跟，连保命后退也不做；'
+      + '`balanced` = AI 决策 + 几乎不可逆的紧急保命（危险方块后退、苦力怕后撤、水下自救）；'
+      + '`legacy` = 旧的自动行为全开。\n'
+      + '**事件层**：溺水/窒息/苦力怕/挨打/被打断/停滞 → 按优先级入队去重，叫醒只给事实，每个动作记一条决策审计。\n'
       + `**空闲层**：闲 ${AUTO_DEFAULTS.idleWakeSec} 秒叫醒（每小时 ${AUTO_DEFAULTS.idleWakeMaxPerHour} 次；没动作 ⇒ 间隔翻倍，封顶 30 分钟），45s 没动手补一条"别问，直接做"。\n`
       + '用法：`status`（默认）｜`off` 关反射层（🔴 **不是全停**：空闲叫醒还开，要 `set {"idleWake":false}`；`avoid` 独立开关）｜`on` 全开｜'
       + '`stay` 站定｜`follow`+who 跟随｜`wake` 立刻叫醒一次｜`set`+patch 改参数（落 `.dsh-mc-agent/auto.json`）。\n'

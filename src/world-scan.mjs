@@ -20,19 +20,24 @@ import { Vec3 } from 'vec3'
 import { isAir, cropStageOf } from './block-names.mjs'
 import { entityNameOf, HOSTILE_RE, RANGED_RE, hostilityOf } from './entity-names.mjs'
 
-export function scanAround (b, { radius = 16, height = 4, name = null, limit = 10 } = {}) {
+export function scanAround (b, { radius = 16, height = 4, name = null, limit = 10, y = null } = {}) {
   /* 半径默认 16 = **1 区块**（2026-10-13 用户要求，先定 32 后改回 16）：一次扫 33×33 格，
    * 找树 / 找矿 / 找水源够用，又不至于每次调用都查几万格。上限 48 留给显式传大半径的场合。 */
   const R = Math.min(Math.max(radius, 1), 48)
   const H = Math.min(Math.max(height, 0), 16)
   const c = b.entity.position.floored()
+  /* 🔴 2026-10-19（用户在末地亲眼看着我一层层挖）：竖向窗口是**以我的脚底为中心**的 ±H，
+   *    可我站在 y=72 时怎么扫都扫不到 y=94 的头 —— 当时我连着判了三次"没有要塞/没建上"，
+   *    全是这个原因，白挖了两轮。所以给一个 `y`：**指定竖向中心**（不用先把自己 tp 上去）。 */
+  const rawY = y === null || y === undefined || y === '' ? null : Number(y)
+  const cy = rawY !== null && Number.isFinite(rawY) ? Math.trunc(rawY) : c.y
   const counts = new Map()
   const found = []
   let unloaded = 0
   for (let dx = -R; dx <= R; dx++) {
     for (let dz = -R; dz <= R; dz++) {
       for (let dy = -H; dy <= H; dy++) {
-        const pos = new Vec3(c.x + dx, c.y + dy, c.z + dz)
+        const pos = new Vec3(c.x + dx, cy + dy, c.z + dz)
         const blk = b.blockAt(pos)
         if (!blk) { unloaded++; continue }
         if (isAir(blk.name)) continue
@@ -68,6 +73,9 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
       found: top.map((f) => f.pos),
       total: found.length, unloaded,
       nearest: found.length ? found[0].pos : null,
+      /* 竖向窗口的**真实中心**（给了 `y` 就是那个 y，没给就是我的脚底）——
+       * 让人一眼看出"这一扫覆盖的是哪一层"，别再拿它当"整座山都没有"的证据 */
+      center: { x: c.x, y: cy, z: c.z }, height: H,
       /* 一句话结论（作物才有）：让 AI 一眼看到"能收几株"，不用自己数 blocks[] */
       ...(crops.length
         ? { cropSummary: `🌾 ${name}：${crops.filter((c) => c.ripe).length}/${crops.length} 已成熟（ripe=true 就能收，其余再等等；age/maxAge 见每一条）` }
@@ -87,7 +95,7 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
     }
   }
   return {
-    center: { x: c.x, y: c.y, z: c.z }, radius: R, height: H, unloaded,
+    center: { x: c.x, y: cy, z: c.z }, radius: R, height: H, unloaded,
     counts: [...counts.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 25).map(([n, v]) => ({ name: n, count: v })),
   }
 }

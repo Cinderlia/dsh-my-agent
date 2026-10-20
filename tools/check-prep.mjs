@@ -185,7 +185,7 @@ section('⑩ 静态：mc_act 接了 prep')
   ok(/import \{ prepCheck \} from '\.\/src\/prep\.mjs'/.test(idx), 'index.js 导入了 prepCheck', '')
   ok(/case 'prep':\s+return withOutcome\(\{ mode, \.\.\.\(prepCheck\(bot\.requireBot\(\)/.test(idx), 'case prep 走 requireBot + prepCheck', '')
   ok(/· prep\s+出发前自查/.test(idx), 'mc_act 描述里有 prep 一行', '')
-  ok(/for: \{ type: 'string', description: 'prep 查哪一趟/.test(idx), '参数表有 for', '')
+  ok(/for: \{ type: 'string', description: 'prep 查哪/.test(idx), '参数表有 for', '')
   ok(/smithing\/prep\/toss/.test(idx), '未知 mode 的提示里带上 prep', '')
 }
 

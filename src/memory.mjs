@@ -34,6 +34,9 @@ import { join, resolve, dirname, sep, posix, extname, basename } from 'node:path
 import { isProtectedName, protectedWriteError } from './protected.mjs'
 
 const MAX_FILES = 2000
+/* 🔴 2026-10-20 审计（用户："减少 token 消耗"）：目录树是**每个会话都整表注入**的，
+ *    而 `list()` 最多能返回 MAX_FILES 条 —— 记忆攒多了，光目录就能吃掉几千字。 */
+const TREE_MAX_ROWS = 60
 const MAX_TEXT_BYTES = 256 * 1024          // 文本写入上限
 const MAX_BLOB_BYTES = 16 * 1024 * 1024    // 任意文件（含图片）存入上限
 const GLOBAL_DIR = '_global'
@@ -278,14 +281,22 @@ export class MemoryStore {
     }
     const order = [...groups.keys()].sort((a, b) => (a === GLOBAL_DIR ? -1 : b === GLOBAL_DIR ? 1 : a.localeCompare(b)))
     const lines = ['| 文件 | 类型 | 最后更新 | 提示 |', '| --- | --- | --- | --- |']
+    /* 只列前 TREE_MAX_ROWS 行；剩下的报个数（要看就用 search/read 点名） */
+    let shown = 0
+    let skipped = 0
     for (const g of order) {
-      lines.push(`| **${g === GLOBAL_DIR ? '_global（通用）' : g}** | | | |`)
+      let header = false
       for (const f of groups.get(g)) {
+        if (shown >= TREE_MAX_ROWS) { skipped++; continue }
+        if (!header) { lines.push(`| **${g === GLOBAL_DIR ? '_global（通用）' : g}** | | | |`); header = true }
         const when = new Date(f.mtime).toISOString().slice(5, 16).replace('T', ' ')
-        lines.push(`| \`${f.rel}\` | ${f.kind} | ${when} | ${f.summary || '—'} |`)
+        const tip = String(f.summary || '—').slice(0, 40)
+        lines.push(`| \`${f.rel}\` | ${f.kind} | ${when} | ${tip} |`)
+        shown++
       }
     }
-    lines.push('', `_共 ${files.length} 个文件_`)
+    lines.push('', `_共 ${files.length} 个文件`
+      + `${skipped ? `（只列了前 ${shown} 个，其余 ${skipped} 个用 search/read 点名）` : ''}_`)
     return lines.join('\n')
   }
 

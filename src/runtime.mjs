@@ -71,6 +71,16 @@ export function reportError (self, e) {
  * @param {{releaseControls?: Function}} [ctx] - 私有件：松控制位
  */
 export function withBudget (self, promise, kind, label = kind, ctx = {}) {
+  /* 🔴 真 mineflayer 有一批动作是**同步 void** 方法（`activateItem` / `deactivateItem` /
+   *    `stopDigging` / `releaseControls`）：**返回 undefined**，没有任何可等的东西。
+   *    以前这里直接把传进来的值丢给 `raceAbort` → 它内部 `promise.then(...)` ⇒
+   *    `TypeError: Cannot read properties of undefined (reading 'then')`，
+   *    而且是在**动作已经发出之后**才炸（2026-10-19 实机射箭踩到：卡在"拉弓"那一步，
+   *    弓已经拉起来了、箭没放，整个调用报一句看不懂的错）。
+   *    自检里的假 bot 一律写成 `async`（返回 promise）⇒ 73/0 全绿也测不出来。
+   *    所以**在这里**统一兜住：不是 thenable 就当"已同步完成"，包成已 resolve 的 promise。
+   *    （同步方法**抛错**不会走到这儿 —— 那在调用点就抛了，属于调用方的问题。） */
+  const p = promise && typeof promise.then === 'function' ? promise : Promise.resolve(promise)
   const want = Number(self.cfg.timeouts?.[kind] ?? TIMEOUTS[kind] ?? 10_000) || 10_000
   // 🔴 上限两道：① 单次操作自己的超时；② 本轮工具调用的 11 秒 + 剩余时间
   const ms = Math.max(0, Math.min(want, CALL_MS, self.msLeft()))
@@ -83,12 +93,15 @@ export function withBudget (self, promise, kind, label = kind, ctx = {}) {
         + '（剩下的下次再叫一次接着做）'),
       { mcTimeout: true, mcCallOver: true }))
   }
-  const raced = raceAbort(promise, self.abortSignal, label)
+  const raced = raceAbort(p, self.abortSignal, label)
   return withTimeout(raced, ms, label).catch((e) => {
+    /* 🔴 2026-10-20 审计：以前**只有**超时/中断才松控制位；其它 rejection（`equip` 报
+     *    "No item"、`walkTo` 抛 NoPath、`dig` 抛"流体挖不掉"…）会带着"还按着前进键"的状态
+     *    逃出去，下一个动作一进来就是失控的。异常路径上一律松手（成功路径不动）。 */
+    ctx.releaseControls?.()
     if (e?.mcTimeout || e?.mcAborted) {
       self.stats.timeouts++
       self.lastTimeout = { kind, label, at: Date.now(), aborted: Boolean(e.mcAborted) }
-      ctx.releaseControls?.()
       // 文案（2026-10-06）：`ms` 是"这一轮还剩多少预算"，不是这个操作自己的超时值 ——
       // 到点打"超时（323ms）"看着像"323ms 就超时了"，其实是这一轮的 11 秒用完了。
       const over = self.msLeft() <= 400

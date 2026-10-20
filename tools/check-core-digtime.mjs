@@ -207,6 +207,43 @@ section('⑤ 边界')
   ok(mc.patchDigTime(fake) === false, '重复 patchDigTime 返回 false（不叠加）')
 }
 
+// ── ⑥ 上游崩：手上那件的 `enchants` 不是数组（2026-10-19 实机：mc_dig 直接崩）──────────────
+section('⑥ 上游崩：`enchantments.concat is not a function`')
+{
+  /** 复刻 mineflayer `lib/plugins/digging.js:230-244` 那两行（原样，不设防） */
+  const crashyDigTime = (bot) => {
+    bot.digTime = (block) => {
+      const held = bot.heldItem
+      let enchantments = []
+      if (held) enchantments = held.enchants                    // ← 上游：可能是 undefined / 对象
+      const helmet = bot.inventory.slots[5] ?? null
+      if (helmet) enchantments = enchantments.concat(helmet.enchants)   // ← 于是这里崩
+      return block.digTime(held?.type ?? null, false, false, false, enchantments, bot.entity?.effects ?? {})
+    }
+  }
+  const badShapes = [
+    ['undefined', undefined],
+    ['对象', { infinity: 1 }],
+    ['null', null],
+  ]
+  for (const [label, bad] of badShapes) {
+    const bot = mkBot({ held: 'diamond_pickaxe' })
+    bot.heldItem.enchants = bad
+    bot.inventory.slots[5] = { type: itemId('diamond_helmet'), name: 'diamond_helmet', enchants: [{ name: 'aqua_affinity', lvl: 1 }] }
+    crashyDigTime(bot)
+    // ① 没打补丁 ⇒ 必须复现上游那个崩（证明坑是真的）
+    let rawErr = null
+    try { bot.digTime(blockOf('iron_ore')) } catch (e) { rawErr = e }
+    ok(/concat/.test(String(rawErr?.message ?? '')), `未打补丁 ⇒ 复现上游崩（enchants=${label}）`, rawErr ? String(rawErr.message).slice(0, 48) : '没崩')
+    // ② 打补丁 ⇒ 规整成数组，不崩，还照旧给出挖掘时间
+    mkMc(bot).patchDigTime(bot)
+    let got = null; let err = null
+    try { got = bot.digTime(blockOf('iron_ore')) } catch (e) { err = e }
+    ok(!err && Number.isFinite(got) && got > 0 && got < 5000, `打补丁后不崩、照给时间（enchants=${label}）`, err ? String(err.message).slice(0, 48) : String(got))
+    ok(Array.isArray(bot.heldItem.enchants), `手上那件的 enchants 被规整成数组（enchants=${label}）`, JSON.stringify(bot.heldItem.enchants))
+  }
+}
+
 rmSync(TMP, { recursive: true, force: true })
 console.log(`\n${fail === 0 ? '✓ 全部通过' : '✗ 有失败'}：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

@@ -100,7 +100,7 @@ section('⑤ 六条路线图的关键件都还在')
   ok(/image: \{ type: 'boolean'/.test(obs) && /capturedAt: nowMs/.test(obs) && /uncertainties: uncertain/.test(obs),
     '① 统一感知：image:false + capturedAt + uncertainties')
   const tr = readFileSync(new URL('src/task-runner.mjs', ROOT), 'utf8')
-  ok(/export class TaskRunner/.test(tr) && /export function outcomeOf/.test(tr) && /export const OUTCOMES/.test(tr),
+  ok(/export class TaskRunner/.test(tr) && /export function outcomeOf/.test(tr) && /export const OUTCOME_LABEL/.test(tr),
     '③⑥ 任务状态机 + 三态结局')
   const mem = readFileSync(new URL('src/memory.mjs', ROOT), 'utf8')
   ok(/world\.md/.test(mem) && /lessons\.md/.test(mem) && /tasks\.md/.test(mem), '⑤ 四类记忆')

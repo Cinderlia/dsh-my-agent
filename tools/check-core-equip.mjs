@@ -274,6 +274,8 @@ const buildSrc = stripComments(await (await import('node:fs/promises')).readFile
     'dig-speed 有 patchDigTime / bestToolFor')
   ok(/export function digToolKindOf \(name\) \{/.test(dsSrc) && /export function digToolSpeedOf \(reg, itemType\) \{/.test(dsSrc),
     'dig-speed 有 digToolKindOf / digToolSpeedOf')
+  ok(/ms === best\.ms && durLeftOf\(it\) > durLeftOf\(best\.item\)/.test(dsSrc),
+    '🔴 速度打平时选耐久多的那把（2026-10-19 实机：背包里两把石镐，总用快坏的 19/131，满耐久那把闲置）')
   ok(/from '\.\/dig-speed\.mjs'/.test(coreSrc), 'core 确实从 dig-speed.mjs 导入（别只搬不接）')
   ok(!/#digMsFor \(b|#fixDigMs \(b|#digToolKindOf \(|#digToolSpeedOf \(|#bestToolFor \(b|#patchDigTime \(b/.test(coreSrc),
     'core 里没有残留的挖掘速度私有方法定义')

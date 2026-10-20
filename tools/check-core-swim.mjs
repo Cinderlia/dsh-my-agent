@@ -163,7 +163,7 @@ section('⑤ 预算钳制 —— hold 上限 3 秒；这一轮时间不够就少
   const a = mkBot({ inWater: true, air: 3 })
   const mcA = mkMc(a.bot)
   const rA = await mcA.swimUp({ hold: 99_999 })
-  ok(rA.heldMs <= 3400, 'hold:99999 也只按 3 秒（上限）', `${rA.heldMs}ms`)
+  ok(rA.heldMs <= 10_400, 'hold:99999 也只按 10 秒（上限；2026-10-19 用户：swim 得真能动）', `${rA.heldMs}ms`)
 
   const b = mkBot({ inWater: true, air: 3 })
   const mcB = mkMc(b.bot)
@@ -372,7 +372,7 @@ section('⑧ 静态接线：core / index 都在')
     'swimUp 领 _moveGen 号、被接管就让位')
   ok(/if \(self\._moveGen === gen\) \{ try \{ b\.setControlState\('jump', false\) \}/.test(movSrc), 'swimUp 只在还是自己时松 jump')
   ok(!/Math\.max\(200, Math\.min\(Number\(hold\)/.test(movSrc), '预算归零时不再白送 200ms')
-  ok(/Number\.isFinite\(Number\(hold\)\) \? Number\(hold\) : 3_000/.test(movSrc), 'hold:0 不再被当成 3000')
+  ok(/Number\.isFinite\(Number\(hold\)\) \? Number\(hold\) : 9_000/.test(movSrc), 'hold:0 不再被当成 9000（默认值只给 NaN）')
   /* 第三十五刀接线：core 那边只剩薄包装，私有 `#beginMove` 靠 `ctx.bumpGen` 递进去（迁移规矩第 28 条）。 */
   ok(/from '\.\/movement\.mjs'/.test(core), 'core：movement 从 movement.mjs 导入')
   ok(/async jump \(\) \{ return await jumpImpl\(this, \{ bumpGen: \(\) => this\.#beginMove\(\) \}\) \}/.test(core), 'core 的 jump 是薄包装')
@@ -404,15 +404,15 @@ section('⑧ 静态接线：core / index 都在')
   ok(!/if \(!b\.entity\.isInWater\) return false/.test(stSrc), 'status().submerged 不再先要求 entity.isInWater（泡水柱时它会漏报）')
 
   ok(/mode === 'swim'/.test(index), 'index.js 的 mc_move 认 swim')
-  ok(/sess\.bot\.swimUp\(\{ hold: args\.budgetMs \}\)/.test(index), 'swim 不给坐标时把 budgetMs 当上浮时间')
+  ok(/sess\.bot\.swimUp\(\{ hold: callBudget\(args\.budgetMs \?\? 9_000\) \}\)/.test(index), 'swim 不给坐标时把 budgetMs 当上浮时间（默认 9 秒）')
   /* 2026-10-15：walkTo 的返回值现在过 `withOutcome(..., { expect: 'moved' })`（结果台账要判得动）。 */
-  ok(/sess\.bot\.walkTo\(\{ x: Number\(args\.x\), y: Number\(args\.y\), z: Number\(args\.z\) \}, \{ budget: callBudget\(args\.budgetMs\), noTower: args\.allowTower !== true, intent: args\.intent \}\)/.test(index),
-    'swim 给了坐标就游过去（walkTo 会自动走"直接游"；默认不许垫柱）')
+  ok(/sess\.bot\.walkTo\(\{ x: Number\(args\.x\), y: Number\(args\.y\), z: Number\(args\.z\) \}, \{ budget: callBudget\(args\.budgetMs\), noTower: args\.allowTower !== true, noDig, intent: args\.intent, waterRecover: typeof args\.waterRecover === 'boolean' \? args\.waterRecover : undefined \}\)/.test(index),
+    'swim 给了坐标就游过去（walkTo 会自动走"直接游"；默认不许垫柱；自救开关透传）')
   ok(/在水里会自动改成"直接游"/.test(index), 'mc_move 描述里写明"在水里自动直接游"')
   ok(/在水里（氧气/.test(index), 'mc_status 瘦身视图里带氧气')
   ok(/头在水下/.test(index), 'mc_status 读不到氧气时也说清"头在水下"')
   ok(/mode="swim"/.test(index), 'mc_move 描述里写了 swim')
-  ok(/walk \/ fly \/ jump \/ swim/.test(index), 'mode 说明里有 swim')
+  ok(/walk \/ walk-nodig \/ fly \/ jump \/ swim/.test(index), 'mode 说明里有 swim（外加不破坏方块的 walk-nodig）')
 
   const auto = strip(readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8'))
   ok(/const DROWN_WAKE_GAP_MS = 6_000/.test(auto), 'mc_auto 有憋气叫醒间隔')

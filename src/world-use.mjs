@@ -27,7 +27,7 @@ import { sleep, waitUntil } from './async-util.mjs'
  *    拆分时（第二十/二十七刀）漏掉的。 */
 import { callBudget } from './budget.mjs'
 import { aimAt } from './camera.mjs'
-import { CONTAINER_RE, TOGGLE_RE, cropStageOf } from './block-names.mjs'
+import { CONTAINER_RE, TOGGLE_RE, cropStageOf, isEntityItem } from './block-names.mjs'
 import { entityNameOf, pickEntity } from './entity-names.mjs'
 import { heldText, equipDestOf } from './inventory.mjs'
 
@@ -92,10 +92,22 @@ export async function useBlock (b, { x, y, z, who = null } = {}, ctx = {}) {
       await sleep(120)
       const w = b.currentWindow
       if (w && w !== b.inventory && w !== win0) {
-        return {
+        const out = {
           usedBlock: blk.name, at, opened: w.type,
           ...(typeof w.containerItems === 'function' ? { slots: w.containerItems().length } : {}),
         }
+        /* 🔴 2026-10-19 实机（真 bug）：原来这里**直接 return，窗口一直开着** —— 实测对合成台
+         * `mc_act {mode:"use"}` 之后，`mc_diag only=crafting` 恒报 `open: {type:"crafting"}`，
+         * 那次调用的 outcome 还变成了 `unknown`（"时间到了/被打断，服务器可能已经做了"）。
+         * 开着的窗口还会挡住后面的 mc_craft / mc_chest / mc_furnace（它们各自要先 closeWindow）。
+         * 这个工具本来就**没有**"在窗口里操作"的能力（合成走 mc_craft、存取走 mc_chest），
+         * 所以"确认能打开"之后立刻关掉，并把结论说清楚。 */
+        try {
+          await t(Promise.resolve(b.closeWindow(w)), 'act', `关掉 ${blk.name}`)
+          out.closed = true
+        } catch { out.closed = false }
+        out.note = `${blk.name} 的界面确实能打开（已经顺手关掉了 —— 要合成用 mc_craft，要存取用 mc_chest，要烧炼用 mc_furnace）`
+        return out
       }
     }
     return {
@@ -184,6 +196,12 @@ export async function useItem (b, { hold = 0 } = {}, ctx = {}) {
     if (after >= item.count && item.name !== 'bow' && item.name !== 'crossbow') {
       out.note = `手上还是 ${after} 个（没少）—— 这一下可能没真用出去（服务端不回执这类动作，用 mc_inventory 复核）`
     }
+  }
+  /* 🔴 船 / 矿车 / 刷怪蛋 / 盔甲架：**对着空气用**是发不出来的（服务端要"对着某一格用" + 一个
+   *    补发的 `use_item`，见 `place_entity.js`）。别让模型以为"再按一次就好"。 */
+  if (isEntityItem(item.name) && after != null && after >= item.count) {
+    out.note = [out.note, `${item.name} 这类东西**不能靠"对着空气用"放** —— 用 mc_act {mode:"place", name:"${item.name}", x, y, z}（船放水面上、矿车放铁轨上；别对着自己脚下）`]
+      .filter(Boolean).join('；')
   }
   if (want > ms) {
     out.note = [out.note, `这一轮剩下的时间不够按住 ${want}ms（只按了 ${ms}ms）—— 过一会儿再叫一次 mc_act{useitem} 补`].filter(Boolean).join('；')

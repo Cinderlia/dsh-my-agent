@@ -149,25 +149,24 @@ export async function apply (api) {
 
   ctx.tools.register(asTool({
     name: 'mc_observe',
-    description: '👁 **第一人称视角**：从我眼睛（眼高 1.62）朝我正在看的方向渲染截图，直接内联给你看，并附**三段式感知**：'
+    description: '👁 **第一人称视角**：从我眼睛（眼高 1.62）朝正在看的方向渲染截图，直接内联给你看，并附**三段式感知**：'
       + '① **我看到**（图里数出来的：像素占比、谁在哪一侧、准星压着什么、手里拿什么）；'
-      + '② **程序检测到**（游戏数据：坐标/朝向/独立射线打到的方块/半径内实体带坐标·距离·血量/脚下）；'
+      + '② **程序检测到**（坐标/朝向/独立射线打到的方块/半径内实体带坐标·距离·血量/脚下）；'
       + '③ **不确定**（客户端预测的方块世界、没加载的区块、读不到的血量 —— **别把推测当事实**）。'
       + '两套眼睛对不上时点名（以程序射线为准）。\n'
-      + '图里：**玩家（人形，正版皮肤就贴真的）· 怪物（敌对红/被动黄）· 掉落物（黑描边）**、右下角手上的东西。\n'
+      + '图里：玩家（真皮肤）· 怪物（红=敌对/黄=被动）· 掉落物（黑描边）· 暗紫=区块没加载；右下角是手上的东西。\n'
       + (gateEnabled
-        ? '🔴 **硬规则：动手之前必须先看一眼**。动作类工具（' + [...gated].join(' / ')
+        ? '🔴 **动手之前必须先看一眼**。动作类工具（' + [...gated].join(' / ')
           + '）手上没有够新的图会被**直接拒绝**'
           + `（让你先调 mc_observe）。看一眼后最多连着做 ${maxActions} 个动作${spanText}，超了再看一次。\n`
           + '嫌紧可以改（立即生效）：写 `.dsh-mc-agent/view.json`，如 {"maxActions":8} 或 {"gate":false}。\n'
         : '👁 **什么时候看，你自己定**：只读查询（mc_status / mc_inventory / '
-          + 'mc_scan…）不用看；**动手前先看一眼**最划算 —— 挖/放/拆/建、走路、找路找东西、'
-          + '确认玩家或怪在哪、看不清、被卡住；一张图够做一段动作；'
+          + 'mc_scan…）不用看；**动手前先看一眼**最划算 —— 挖/放/拆/建、走路找路、'
+          + '确认玩家或怪在哪、看不清、被卡住；一张图够做一段；'
           + '环境变了（走远/天黑/挨打）就再看一眼。\n')
       + (gateEnabled
         ? ''
         : '（想变回强制模式：写 `.dsh-mc-agent/view.json` 的 {"gate":true}。）\n')
-      + '图里：暗紫色块=区块没加载。\n'
       + `🔴 要让他看到：\`out:"\\.dsh-mc-agent/${EXPRESS_DIR}/<子目录>/view.png"\` 写进发布区，`
       + '再用 `mc_kit_express` 取；默认落 `.dsh-mc-agent/' + OUT_DIR + '/`（不对外）。',
     parameters: {
@@ -462,6 +461,18 @@ export async function apply (api) {
             try { prog = sess.bot.entities(distance, { kind: 'all', limit: 16 }) } catch (err) { prog = { error: err?.message ?? String(err) } }
           }
         }
+        /* 🔴 2026-10-19 用户点的坑"读不到末影龙血量"：龙/凋灵的血**不在实体元数据里**
+         *    （`entitiesNear()` 对它恒为 null），只在 Boss Bar 包里 ⇒ 这里单独读一份，
+         *    否则"敌对 ender_dragon"那行永远没有血量，AI 只能靠问用户。 */
+        const bosses = (() => {
+          try { return sess.bot?.readBossBars?.() ?? [] } catch { return [] }
+        })()
+        const bossText = bosses.length ? bosses.map((x) => {
+          const name = x.title || 'Boss'
+          if (x.percent == null) return `${name}（读不到血量）`
+          return x.hp == null ? `${name} ${x.pct}%` : `${name} ${x.pct}% ≈ ${x.hp}/${x.maxHp} 血`
+        }).join('；') : ''
+
         // ② 独立射线：prismarine-world 自带的 `raycast`（和渲染内核那份 `castRay` 是两套实现，互相印证）
         //    🔴 2026-10-08 实机抓到的第二个 bug：`RaycastIterator` 内部用的是 `pos.plus()` /
         //    `dir.scaled()` / `pos.floored()` ⇒ **必须喂真 Vec3**；传 `{x,y,z}` 会报
@@ -491,6 +502,11 @@ export async function apply (api) {
             if (x.health != null) bits.push(`血 ${x.health}`)
             if (x.neutral) bits.push('中立（惹了才打）')
             if (x.ranged) bits.push('远程')
+            /* 🔴 2026-10-19 用户：「检测到龙息应该提醒」。龙息云不是"生物"也不是"怪"，
+             *    混在实体列表里一行 `生物 area_effect_cloud` 等于没说 —— 这里点名它有多疼。 */
+            if (/^area_effect_cloud$/i.test(String(x.name ?? ''))) {
+              bits.push('⚠️ 龙息云：站进去每 0.5 秒掉 4 点血，先跑开再管别的')
+            }
             return bits.join(' · ')
           }
           const groups = new Map()
@@ -565,6 +581,7 @@ export async function apply (api) {
               : `   · ${distance} 格内实体：敌对 ${prog?.counts?.hostile ?? 0} ｜ 中立 ${prog?.counts?.neutral ?? 0} ｜ 玩家 ${prog?.counts?.player ?? 0} ｜ 其它 ${prog?.counts?.other ?? 0}`
                 + (entLines.length ? ` —— ${entLines.join(' ｜ ')}` : '（一只都没有）')
                 + (prog && prog.total > prog.list.length ? `（还有 ${prog.total - prog.list.length} 个没列出来）` : ''),
+          ...(bossText ? [`   · 🗡 **Boss 血条**：${bossText}（龙/凋灵的血只在血条里，\`实体\` 那行读不到它）`] : []),
           `   · 生命 ${out.health ?? '?'} · 饥饿 ${out.food ?? '?'}`
             + (out.air != null ? ` · 氧气 ${out.air}` : '') + (out.submerged ? '（头在水下）' : '')
             + ` · 模式 ${out.gamemode ?? '?'} · 手持 ${out.held ?? '空手'}`,
@@ -584,6 +601,7 @@ export async function apply (api) {
           health: out.health, food: out.food, air: out.air, submerged: out.submerged,
           heldItem: out.held, gamemode: out.gamemode, inventory: inv, equipment,
           targetBlock: ray, visibleEntities: prog?.list ?? null,
+          bossBars: bosses,
           image: wantImage ? { width, height, bytes: png.length, renderMs } : null,
           uncertain,
           uncertainties: uncertain, // 别名（路线图里写的是 uncertainties）

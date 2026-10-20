@@ -189,8 +189,6 @@ export function colorOf (name) {
 export const isAirName = (n) => n === 'air' || n === 'cave_air' || n === 'void_air'
 export const isWaterName = (n) => typeof n === 'string' && /water/.test(n)
 export const isLavaName = (n) => n === 'lava'
-export const isGlassName = (n) => ruleOf(n).glass === true
-export const isEmissiveName = (n) => ruleOf(n).emissive === true
 
 /** 面 + 局部坐标 → 该像素的**未打光**颜色（含程序化贴图） */
 export function patternPixel (rule, axis, step, u, v, bx, by, bz) {

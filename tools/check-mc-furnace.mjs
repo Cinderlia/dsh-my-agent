@@ -6,7 +6,7 @@
  *   ④ 燃料：只认真燃料、按"浪费最少"挑、指定燃料、排除产物本身、不够时的兜底
  *   ⑤ 找熔炉：坐标指定、半径搜索（🔴 必须用**方块 id**，不是物品 id）、背包里有没有
  *   ⑥ waitForOutput：烧完 / 输入空了 / 没燃料 / 能补燃料 / 超时
- *   ⑦ 端到端 execute：附近有熔炉、没有就自己放、都没有→让人做、缺料、缺燃料、
+ *   ⑦ 端到端 execute：附近有熔炉、没有就报缺（不替 AI 放）、缺料、缺燃料、
  *      list、dryRun、takeOnly、槽里是别的东西→拒绝、开不了熔炉→报错
  * 不连 MC、不需要 DSH。**必须在包目录里跑**（core.mjs 要真 import 到 mineflayer）。
  * 跑法：cd <profile>/node_modules/dsh-mc-agent && node tools/check-mc-furnace.mjs
@@ -261,7 +261,7 @@ console.log('— ① 工具注册 —')
   ok(typeof spec.execute === 'function', '有 execute')
   ok(spec.timeoutMs > 0 && spec.timeoutMs <= 12_000, 'timeoutMs 是合理正数', String(spec.timeoutMs))
   ok(spec.timeoutMs >= 11_000 && spec.timeoutMs <= 12_000, 'timeoutMs 压在 12 秒内（单次调用 ≤11 秒 + 1 秒余量）', String(spec.timeoutMs))
-  for (const k of ['name', 'count', 'fuel', 'x', 'y', 'z', 'radius', 'placeFurnace', 'takeOnly', 'maxWaitSec', 'list', 'dryRun']) {
+  for (const k of ['name', 'count', 'fuel', 'x', 'y', 'z', 'radius', 'takeOnly', 'maxWaitSec', 'list', 'dryRun']) {
     ok(Boolean(spec.parameters[k]), `parameters.${k} 存在`)
   }
   ok(spec.parameters.name.type === 'string', 'parameters.name 是 string')
@@ -565,53 +565,14 @@ console.log('— ⑦ 端到端 execute —')
     ok(mc.placeCalls.length === 0, '附近有熔炉就不用自己放')
     ok(r.text.includes('背包里现在有'), '报告里写了背包数量')
   }
-  /* 附近没有熔炉，但背包里有 → 自己放 */
+  /* 附近没有熔炉，但背包里有 → 也不自己放（用户 2026-10-19：「把自动放的功能去掉」） */
   {
     const fake = mkBot({ raw_iron: 2, coal: 1, furnace: 1 })
-    const win = mkWin({ cook: true, outId: idOf('iron_ingot') })
-    fake.bot.openFurnace = async () => win
     const mc = mkMc(fake)
     const r = await run({ name: 'raw_iron', count: 2 }, { mc })
-    ok(mc.placeCalls.length === 1 && mc.placeCalls[0].name === 'furnace', '附近没有就自己放一个熔炉', JSON.stringify(mc.placeCalls))
-    ok(r.text.includes('我把背包里的 furnace 放到'), '报告里说明自己放了熔炉', r.text.replace(/\n/g, ' | '))
-    ok(r.text.includes('这一轮收到'), '放完接着烧成功', r.text.replace(/\n/g, ' | '))
-    ok(fake.world.map.get(`${mc.placeCalls[0].x},${mc.placeCalls[0].y},${mc.placeCalls[0].z}`) === 'furnace', '熔炉真的进了假世界')
-  }
-  /* 没有熔炉、背包里也没有 → 让人去做 */
-  {
-    const fake = mkBot({ raw_iron: 2, coal: 1 })
-    const mc = mkMc(fake)
-    const r = await run({ name: 'raw_iron' }, { mc })
-    ok(r.text.includes('没有熔炉'), '没有熔炉就直说', r.text.replace(/\n/g, ' | '))
-    ok(r.text.includes('mc_craft {name:"furnace"}'), '告诉怎么做一个熔炉', r.text.replace(/\n/g, ' | '))
-    ok(mc.placeCalls.length === 0, '没得放就不放')
-  }
-  /* placeFurnace:false → 不放 */
-  {
-    const fake = mkBot({ raw_iron: 2, coal: 1, furnace: 1 })
-    const mc = mkMc(fake)
-    const r = await run({ name: 'raw_iron', placeFurnace: false }, { mc })
-    ok(mc.placeCalls.length === 0, 'placeFurnace:false 就不放熔炉')
-    ok(r.text.includes('没有熔炉'), '还是如实说没有熔炉', r.text.replace(/\n/g, ' | '))
-  }
-  /* 放熔炉失败 → 如实报告（试了 3 个点位都不行） */
-  {
-    const fake = mkBot({ raw_iron: 2, coal: 1, furnace: 1 })
-    const mc = mkMc(fake, { placeFails: true })
-    const r = await run({ name: 'raw_iron' }, { mc })
-    ok(/想放熔炉，试了 3 个点位都没成功/.test(r.text) && r.text.includes('假服务器拒了放置'), '放熔炉全失败要说清试了几个点位、为什么', r.text.replace(/\n/g, ' | '))
-    ok(mc.placeCalls.length === 3, '一个点位被拒就换下一个，最多试 3 个', `placeCalls=${JSON.stringify(mc.placeCalls)}`)
-  }
-  /* 第一个点位被拒 → 换下一个点位再放，成功（实机 2026-10-08 见过） */
-  {
-    const fake = mkBot({ raw_iron: 2, coal: 1, furnace: 1 })
-    const mc = mkMc(fake, { placeFailsFirst: 1 })
-    const r = await run({ name: 'raw_iron' }, { mc })
-    ok(mc.placeCalls.length === 2, '第一个点位被拒后换了个点位重试', `placeCalls=${JSON.stringify(mc.placeCalls)}`)
-    const a = mc.placeCalls[0]
-    const b = mc.placeCalls[1]
-    ok(a && b && (a.x !== b.x || a.z !== b.z), '换的确实是**另一个**点位', JSON.stringify(mc.placeCalls))
-    ok(/前 1 个点位服务端没收/.test(r.text), '如实说明"前 N 个点位服务端没收"', r.text.replace(/\n/g, ' | '))
+    ok(mc.placeCalls.length === 0, '🔴 附近没有也不自己放熔炉（用户 2026-10-19）', JSON.stringify(mc.placeCalls))
+    ok(r.text.includes('我不替你放'), '报告里说清"我不替你放"', r.text.replace(/\n/g, ' | '))
+    ok(r.text.includes('mc_act') && r.text.includes('place'), '教它自己 mc_act place 放熔炉', r.text.replace(/\n/g, ' | '))
   }
   /* 缺料：没有 raw_iron */
   {
@@ -646,9 +607,9 @@ console.log('— ⑦ 端到端 execute —')
     ok(r.text.includes('背包里现在能烧的') && r.text.includes('raw_iron'), 'list 列出能烧的', r.text.replace(/\n/g, ' | ').slice(0, 120))
     ok(!r.text.includes('熔炼完成'), 'list 不真烧')
   }
-  /* dryRun:true —— 不放、不开、不烧 */
+  /* dryRun:true —— 不放、不开、不烧（附近有真熔炉，不然现在只会报"缺熔炉"） */
   {
-    const fake = mkBot({ raw_iron: 3, coal: 2, furnace: 1 })
+    const fake = mkBot({ raw_iron: 3, coal: 2, furnace: 1 }, { world: mkWorld({ '2,1,0': 'furnace' }) })
     const win = mkWin({ cook: true })
     fake.bot.openFurnace = async () => win
     const mc = mkMc(fake)
@@ -661,7 +622,7 @@ console.log('— ⑦ 端到端 execute —')
   }
   /* dryRun 缺料也要提醒 */
   {
-    const fake = mkBot({ coal: 2, furnace: 1 })
+    const fake = mkBot({ coal: 2, furnace: 1 }, { world: mkWorld({ '2,1,0': 'furnace' }) })
     const mc = mkMc(fake)
     const r = await run({ name: 'raw_iron', dryRun: true }, { mc })
     ok(r.text.includes('一个 raw_iron 都没有'), 'dryRun 缺料也提醒', r.text.replace(/\n/g, ' | '))
@@ -996,7 +957,7 @@ console.log('— ⑨ 该补料就补料、取货要等背包、背包满不许�
     fake.bot.openFurnace = async () => win
     const mc = mkMc(fake)
     const r = await run({ name: 'raw_iron', count: 2 }, { mc })
-    ok(mc.placeCalls.length === 1, '没给坐标 ⇒ 照旧自己放熔炉', JSON.stringify(mc.placeCalls))
+    ok(mc.placeCalls.length === 0, '🔴 没给坐标也不自己放熔炉（用户 2026-10-19）', JSON.stringify(mc.placeCalls))
   }
   /* 🔴 2026-10-16（用户 m11195 采纳的 F2）：熔炉的整个设计就是"装好料就走、过会儿回来取"，
    *    空位是这条流程的**硬前置** —— 而 `free === 1` 时以前**什么都不说**，AI 高高兴兴再叫一次，

@@ -21,7 +21,7 @@ const stripComments = (s) => String(s).replace(/\/\*[\s\S]*?\*\//g, '').replace(
 
 const W = await import(new URL('../src/water-navigation.mjs', import.meta.url))
 const {
-  WATER_RADIUS, WATER_UP, WATER_DOWN, WATER_MAX_NODES, WATER_KINDS, WATER_KIND_TEXT,
+  WATER_RADIUS, WATER_UP, WATER_DOWN, WATER_MAX_NODES, WATER_KIND_TEXT,
   nameAt, cellKindAt, swimmableAt, breathableAt, standableAt, hazardNear,
   waterExitSearch, feetOfBot, inWaterAt, waterSummaryOf,
 } = W
@@ -101,7 +101,7 @@ section('① 单格判据：水 / 空气 / 挡路 / 没加载，四者不能混'
   ok(inWaterAt(b, { x: 0, y: 60, z: 0 }) === true, '脚那格是水 ⇒ 在水里')
   ok(inWaterAt(b, { x: 0, y: 59, z: 0 }) === true, '头那格是水 ⇒ 也算在水里')
   ok(inWaterAt(b, { x: 8, y: 60, z: 8 }) === false, '都不是水 ⇒ 不在水里')
-  ok(WATER_KINDS.join(',') === 'dry,breath,passage', '三类出口的顺序就是优先级 dry > breath > passage')
+  ok(Object.keys(WATER_KIND_TEXT).join(',') === 'dry,breath,passage', '三类出口的顺序就是优先级 dry > breath > passage（`WATER_KINDS` 2026-10-20 精简时删了）')
   ok(WATER_RADIUS === 8 && WATER_UP === 8 && WATER_DOWN === 8, '第一版的搜索范围就是水平 8 / 上下 8（用户给的初值）', `${WATER_RADIUS}/${WATER_UP}/${WATER_DOWN}`)
   ok(Object.keys(WATER_KIND_TEXT).length === 3, '三类都有中文说法（要给 AI 看人话）')
 }

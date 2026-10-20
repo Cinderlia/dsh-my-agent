@@ -92,7 +92,7 @@ function specsOf (src, file) {
     let open = -1
     if (src[i + MARK.length] === '{') open = i + MARK.length
     else {
-      const m = /const toolSpec = [^\n]*?\(\{\n/.exec(src)
+      const m = /const toolSpec = [^\n]*?\(\{[ \t]*\r?\n/.exec(src)
       if (m) open = src.indexOf('{', m.index + m[0].lastIndexOf('{'))
     }
     const blk = open === -1 ? null : blockAt(src, open)
@@ -168,8 +168,12 @@ const idxBlock = (name) => {
 }
 
 ok(/const statusLean = \(sess, s, w\) => \{/.test(INDEX), 'mc_status 的默认视图是**拼文本**（不是回对象）')
-ok(/return \{ text: statusLean\(sess, s, sess\.watchdog\?\.status\(\) \?\? null\) \}/.test(INDEX),
+ok(/return \{ text: statusLean\(sess, s, w\) \}/.test(INDEX),
   'mc_status 默认路径把文本包成 `{ text }`')
+/* 🔴 2026-10-20 审计（用户："减少 token 消耗"）：`verbose:true` 以前回裸对象 ⇒ 宿主
+ *    pretty-print JSON（18 字段 + modeView + chat 上百行）。现在也必须给 `text`。 */
+ok(/const mv = sess\.modeView\(\)/.test(INDEX) && /return \{ \.\.\.s, \.\.\.mv, recentChat: chat, text: lines\.join\('\\n'\) \}/.test(INDEX),
+  '🔴 mc_status verbose 也走文本（不再让宿主 pretty-print JSON）')
 
 /* `mc_entities` 已于 2026-10-08 并进 `mc_observe` 的三段式感知（② 程序检测到）——
  * 实体排布（怪/玩家一只一行、"其它"按名字合并、默认只列 16 个）搬到了 mc_observe 里，这里改盯那一份。 */

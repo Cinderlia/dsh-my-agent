@@ -36,11 +36,9 @@
   "files": [
     "index.js",
     "client.js",
-    "selfcheck.mjs",
     "cordis.patch.yml",
     "presets",
     "src",
-    "tools",
     "extensions",
     "locale",
     "README.md",

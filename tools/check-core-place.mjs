@@ -365,5 +365,55 @@ section('⑧ 目标格 = 自己站的那一格 —— 必须跳起来放（pilla
   ok(/if \(isOwnCell\) await ctx\.t\(placeWhileJumping/.test(placeSrc2), '自己占着的那一格走 placeWhileJumping')
 }
 
+
+  /* ⑥ 船 / 矿车 / 刷怪蛋 / 盔甲架 = **实体**，不是方块（2026-10-20 用户报的「船放不出来」）
+   *   mineflayer 的 `place_entity.js`：先 `_genericPlace()` 告诉服务端"对着哪一格用"，
+   *   **再补发一个 `use_item` 包**，最后等 `entitySpawn`。少发那个包 ⇒ 服务端当"空手右键"。 */
+  section('⑥ 实体物品（船/矿车/刷怪蛋）走 placeEntityItem，不再当方块放')
+  {
+    const { isEntityItem } = await import('../src/block-names.mjs')
+    ok(isEntityItem('oak_boat'), 'oak_boat 是实体物品')
+    ok(isEntityItem('birch_chest_boat'), '带箱子的船是实体物品')
+    ok(isEntityItem('minecart'), '矿车是实体物品')
+    ok(isEntityItem('zombie_spawn_egg'), '刷怪蛋是实体物品')
+    ok(!isEntityItem('cobblestone'), '圆石不是实体物品')
+    ok(!isEntityItem('oak_door'), '门不是实体物品（它是方块）')
+    const { placeEntityItem } = await import('../src/place.mjs')
+    const calls = []
+    const writes = []
+    const mkEnt = (id, x) => ({ id, name: 'oak_boat', position: { x, y: -60, z: 0.5, distanceTo: (p) => Math.hypot(x - p.x, -60 - p.y, 0.5 - p.z) } })
+    const mkBot = (spawn) => {
+      const b = {
+        entity: { position: { x: 0.5, y: -60, z: 0.5, distanceTo: () => 3 }, eyeHeight: 1.62 },
+        game: { gameMode: 'survival' },
+        heldItem: { name: 'oak_boat', count: 1 },
+        inventory: { items: () => [{ name: 'oak_boat', count: 1, slot: 36 }] },
+        entities: {},
+        blockAt: () => ({ name: 'water', boundingBox: 'empty' }),
+        equip: async () => { calls.push('equip') },
+        _genericPlace: async () => { calls.push('genericPlace'); if (spawn) b.entities[9] = mkEnt(9, 3.5) },
+        _client: { write: (n, p) => writes.push([n, p]) },
+        supportFeature: () => true,
+        lookAt: async () => {},
+      }
+      return b
+    }
+    const self = (b) => ({ requireBot: () => b, giveItem: async () => {} })
+    const ctx2 = { t: (p) => p }
+    const r1 = await placeEntityItem(self(mkBot(true)), { x: 3, y: -60, z: 0 }, ctx2)
+    ok(calls.includes('genericPlace'), '先「对着这一格用」（服务端靠它算落点）')
+    ok(!writes.some(([n]) => n === 'use_item'), '**不**补发 use_item（现代协议缺 sequence/rotation，写残了会被踢）')
+    ok(r1.placed === true && r1.entity === 'oak_boat', '放了之后复核到船实体（placed:true）', JSON.stringify(r1.at ?? {}))
+    ok(/mode:"use"/.test(String(r1.hint ?? '')), '提示怎么上船')
+    writes.length = 0
+    const r2 = await placeEntityItem(self(mkBot(false)), { x: 3, y: -60, z: 0 }, ctx2)
+    ok(r2.placed === false, '实体没出现 ⇒ placed:false（不许报假成功）')
+    ok(/没看到新实体/.test(String(r2.hint ?? '')), '并说清"没看到新实体"的常见原因')
+    const placeSrc3 = readFileSync(new URL('../src/place.mjs', import.meta.url), 'utf8')
+    ok(/if \(want && isEntityItem\(want\)\)/.test(placeSrc3), 'placeBlock 先把实体物品分流出去')
+    ok(!/^\s*b\._client\.write\('use_item'/m.test(placeSrc3), 'place.mjs 里没有 use_item 那半包（踩坑 #216）')
+    const useSrc = readFileSync(new URL('../src/world-use.mjs', import.meta.url), 'utf8')
+    ok(/isEntityItem\(item\.name\)/.test(useSrc), 'useitem 对船/蛋会提示改用 place（别让人以为再按一次就好）')
+  }
 console.log(`\n${fail === 0 ? '✓ 全部通过' : '✗ 有失败'}：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

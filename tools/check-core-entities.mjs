@@ -273,7 +273,7 @@ section('⑨ 静态检查（实体工具已并进 mc_observe 感知块、不看�
    * 另外补两条"确实接上了"的断言 —— 否则"搬走 + 忘 import"这种错也能绿。 */
   const scanSrc = readFileSync(new URL('../src/world-scan.mjs', import.meta.url), 'utf8')
   ok(/export function entitiesNear \(b, radius = 24, \{ kind = 'all', limit = 40 \} = \{\}\)/.test(scanSrc), 'world-scan.mjs 里有 entitiesNear(b, radius, {kind, limit}) 默认值')
-  ok(/export function scanAround \(b, \{ radius = 16, height = 4, name = null, limit = 10 \} = \{\}\)/.test(scanSrc), 'world-scan.mjs 里有 scanAround(b, {radius, height, name, limit}) 默认值（半径默认 16 = 1 区块）')
+  ok(/export function scanAround \(b, \{ radius = 16, height = 4, name = null, limit = 10, y = null \} = \{\}\)/.test(scanSrc), 'world-scan.mjs 里有 scanAround(b, {radius, height, name, limit, y}) 默认值（半径默认 16 = 1 区块；y = 竖向窗口中心）')
   ok(/const R = Math\.min\(Math\.max\(radius, 1\), 48\)/.test(scanSrc), 'scanAround 的半径上限是 48')
   ok(/^import \{ scanAround, entitiesNear \} from '\.\/world-scan\.mjs'$/m.test(core), 'core.mjs 确实从 world-scan.mjs 导入（别只搬不接）')
   ok(/entities \(radius = 24, opts = \{\}\) \{ return entitiesNear\(this\.requireBot\(\), radius, opts\) \}/.test(core), 'entities 是薄包装（照样先 requireBot）')

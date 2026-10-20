@@ -168,7 +168,7 @@ section('③ useBlock（方块）—— 容器看窗口开没开、门看状态�
   const mc = mkMc(bot)
   const r = await mc.useBlock({ x: 1, y: 64, z: 0 })
   ok(r.opened === 'minecraft:chest' && r.slots === 3, '窗口开了 ⇒ 报 opened + 槽位数', JSON.stringify(r))
-  ok(!r.note, '成功时不该带"没法确认"的 note')
+  ok(!r.note || !/没法确认|不确定|可能没|未确认/.test(r.note), '成功时不该带"没法确认"的 note', r.note)
 
   // 容器：窗口没弹（服务端没认）
   const chest2 = mkBlock('chest')
@@ -286,7 +286,10 @@ const useSrc = strip(readFileSync(new URL('../src/world-use.mjs', import.meta.ur
    *    `src\place.mjs` 了（`core.mjs` 里一处都没有 ⇒ 旧断言 `lookLines.length > 0` 一直红着）。 */
   const lookLines = ['../src/movement.mjs', '../src/place.mjs', '../src/camera.mjs', '../src/world-use.mjs']
     .flatMap((f) => strip(readFileSync(new URL(f, import.meta.url), 'utf8')).split('\n'))
-    .filter((l) => /b\.lookAt\(/.test(l))
+    /* 🔴 2026-10-20 审计：原来没排掉注释行 —— `camera.mjs` 里那句
+     *    「不用 `b.lookAt(...)`」的**注释**也被当成调用点，于是这条断言永远红着。
+     *    注释里提到函数名是正常的，不该算调用。 */
+    .filter((l) => /b\.lookAt\(/.test(l) && !/^\s*(\*|\/\/|\/\*)/.test(l))
   ok(lookLines.length > 0 && lookLines.every((l) => /, true\)/.test(l)),
     'b.lookAt(...) 一律带 force=true（不带会在"站着不动/骑乘/刚死"时挂住）',
     lookLines.map((l) => l.trim().slice(0, 34)).join(' | '))

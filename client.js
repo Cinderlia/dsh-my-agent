@@ -115,6 +115,16 @@ window.__ModuleLoader__.load({
 /* 新会话页那个按钮是插进 hero 行、贴在模式芯片右边的（那一行 gap:2px，这里再给点间距） */
 [data-dsh-mc-agent-mc-settings]{margin-left:6px;}
 [data-slot="conversation.session.header.actions"] [data-wc-btn]:first-child{margin-left:8px;}
+/* 「MC设置」有新版本时的红点（用户 2026-10-20）：不占布局，只在按钮右上角点一下 */
+[data-wc-btn][data-wc-update]{position:relative;}
+[data-wc-btn][data-wc-update]::after{content:'';position:absolute;top:2px;right:2px;width:7px;height:7px;
+  border-radius:50%;background:var(--dsw-alias-state-error-primary,#e5484d);pointer-events:none;
+  box-shadow:0 0 0 2px var(--dsw-alias-bg-base,rgba(0,0,0,.55));}
+/* 「更新」页给 CHANGELOG / git 输出用的等宽块 */
+[data-wc-log]{margin:8px 0 0;padding:8px 10px;max-height:220px;overflow:auto;border-radius:8px;
+  background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.1));white-space:pre-wrap;
+  word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:11px;line-height:17px;color:var(--dsw-alias-label-secondary);}
 
 /* ── 模态框 ────────────────────────────────────────────────────────────── */
 [data-wc-overlay]{position:fixed;inset:0;z-index:1000;background:var(--dsw-alias-bg-mask-1,rgba(0,0,0,.45));
@@ -854,6 +864,46 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         : undefined
     }
 
+    /* ── 更新红点（用户 2026-10-20）：三个「MC设置」入口共用一份状态 ──────────
+     * 这里只缓存"有没有新版本"这一个布尔（后端本来就有 10 分钟缓存，这层再挡一次，
+     * 免得三个入口各查一遍）。查不到 / 不是 git 仓库 ⇒ 一律当"没有"，绝不打扰。
+     * 🔴 红点 = 按钮上的 `data-wc-update` 属性，样式是 `::after` 画的一个绝对定位点
+     *    （见文件顶部 CSS），所以**纯 DOM 注入的 hero 按钮也能用**。 */
+    const UPDATE_BADGE_TTL_MS = 10 * 60 * 1000
+    const updateBadge = { at: 0, behind: 0, inflight: null, listeners: new Set() }
+
+    function updateBadgeRefresh (force = false) {
+      if (!force && updateBadge.inflight === null && Date.now() - updateBadge.at < UPDATE_BADGE_TTL_MS) {
+        return Promise.resolve(updateBadge.behind > 0)
+      }
+      if (updateBadge.inflight) return updateBadge.inflight
+      updateBadge.inflight = apiGet('/api/mc/update' + (force ? '?force=1' : ''))
+        .then((r) => { updateBadge.behind = Number(r?.behind ?? 0) || 0 })
+        .catch(() => { updateBadge.behind = 0 })
+        .then(() => {
+          updateBadge.at = Date.now()
+          updateBadge.inflight = null
+          for (const fn of updateBadge.listeners) {
+            try { fn(updateBadge.behind > 0) } catch (e) { /* 订阅者自己炸了不影响别人 */ }
+          }
+          return updateBadge.behind > 0
+        })
+      return updateBadge.inflight
+    }
+
+    /** `active` = 这个入口现在显示不显示；不显示就别去查（非 MC 会话别白轮询）。 */
+    function useUpdateBadge (active) {
+      const [on, setOn] = React.useState(() => updateBadge.behind > 0)
+      React.useEffect(() => {
+        if (!active) return undefined
+        updateBadge.listeners.add(setOn)
+        setOn(updateBadge.behind > 0)
+        updateBadgeRefresh(false)
+        return () => { updateBadge.listeners.delete(setOn) }
+      }, [active])
+      return active === true && on
+    }
+
     /**
      * 标题条上的「MC设置」按钮（order 45，落在状态条左边）。
      * 只在**已有会话**里出现；新会话页那个是下面 `McSettingsDockEntry`。
@@ -868,6 +918,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
     function McSettingsEntry(props) {
       const show = useMcSettingsGate(props, false)
       const wsCwd = useWorkspaceCwd(props)
+      const hasUpdate = useUpdateBadge(show)
       if (!show) return null
 
       return React.createElement(
@@ -878,7 +929,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           'data-wc-btn': '',
           'data-wc-icon': '',
           'data-wc-mc-settings': '',
-          title: 'MC设置：账户、提示词与指令白名单',
+          ...(hasUpdate ? { 'data-wc-update': '' } : {}),
+          title: hasUpdate ? 'MC设置：账户、提示词与指令白名单（有新版本）' : 'MC设置：账户、提示词与指令白名单',
           'aria-label': 'MC设置',
           onClick: openSettings,
         }, IconSettingsOutlineRegular ? React.createElement(IconSettingsOutlineRegular, { size: 16 }) : 'MC设置'),
@@ -948,6 +1000,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
     function McSettingsDetailEntry(props) {
       const subject = props?.subject
       const [open, setOpen] = React.useState(false)
+      const hasUpdate = useUpdateBadge(true)
       if (subject?.kind !== 'bundle' || subject?.pkg?.name !== DETAIL_BUNDLE_NAME) return null
       return React.createElement(
         React.Fragment,
@@ -956,7 +1009,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           type: 'button',
           'data-wc-btn': '',
           'data-wc-mc-settings-detail': '',
-          title: '设置：账户、提示词与指令白名单',
+          ...(hasUpdate ? { 'data-wc-update': '' } : {}),
+          title: hasUpdate ? '设置：账户、提示词与指令白名单（有新版本）' : '设置：账户、提示词与指令白名单',
           onClick: () => setOpen(true),
         },
           // 图标与原生「卸载」按钮同款（同为 DSH 图标集的 13px Regular；见文件头图标约定）
@@ -1029,6 +1083,11 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           const off = typeof s.getDisabled === 'function' && s.getDisabled() === true
           btn.disabled = off
           btn.title = off ? (s.disabledTitle ?? s.title) : s.title
+          // 有新版本的角标：纯 DOM 按钮拿不到 React，只能改属性让 CSS `::after` 去画
+          if (typeof s.getBadge === 'function') {
+            if (s.getBadge() === true) btn.setAttribute('data-wc-update', '')
+            else btn.removeAttribute('data-wc-update')
+          }
         }
         refresh()
         return { btn, attr: s.attr, refresh, iconRoot }
@@ -1150,6 +1209,10 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const wsReadyRef = React.useRef(wsReady)
       wsReadyRef.current = wsReady
       const ctlRef = React.useRef(null)
+      const hasUpdate = useUpdateBadge(show)
+      // DOM 按钮只在 mount 时建一次，所以把"最新"的红点状态放 ref 里让 refresh() 读
+      const hasUpdateRef = React.useRef(hasUpdate)
+      hasUpdateRef.current = hasUpdate
 
       React.useEffect(() => {
         if (!show) return undefined
@@ -1167,7 +1230,8 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           },
           {
             attr: HERO_BTN_ATTR, label: 'MC设置', title: 'MC设置：账户、提示词与指令白名单',
-            icon: IconSettingsOutlineRegular, iconOnly: true, disabledTitle: '请先选择工作区', getDisabled: isOff, onClick: guard(openSettings),
+            icon: IconSettingsOutlineRegular, iconOnly: true, disabledTitle: '请先选择工作区',
+            getDisabled: isOff, getBadge: () => hasUpdateRef.current === true, onClick: guard(openSettings),
           },
         ])
         ctlRef.current = ctl
@@ -1175,7 +1239,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       }, [show])
 
       // 工作区就绪状态一变就刷新禁用态（不重建 DOM、不重挂按钮）
-      React.useEffect(() => { if (ctlRef.current) ctlRef.current.refresh() }, [wsReady, show])
+      React.useEffect(() => { if (ctlRef.current) ctlRef.current.refresh() }, [wsReady, show, hasUpdate])
 
       if (!show) return null
       return React.createElement(
@@ -2097,109 +2161,72 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       )
     }
 
-    /* ------------------------------------------------------------ 页 4：文件分享 */
+    /* ------------------------------------------------------------ 页 4：记忆 */
 
     /**
-     * 「文件分享」页（用户 2026-09-17 定）：两种模式 + 在线 base + 清除分享数据。
-     *   关闭（默认）/ 在线 —— 决定 `mc_kit_express` 回什么、以及那条服务开不开：
-     *     · 关闭：AI 只会把**绝对路径**告诉用户（服务不开）；
-     *     · 在线：回 `base + 路径` 的**完整 URL**（只有这个模式开服务，图能直接在对话里显示）。
+     * 「记忆」页（用户 2026-10-20 定）：把原来的「文件分享」整页换掉，分享的开关/base/清除
+     * 全部下线。这一页只回答三件事：
+     *   ① 这个会话的记忆**存在哪个目录**（`lessons.md` / `world.md` / `README.md` …）；
+     *   ② 目录里**现在有哪些文件**（多大、什么时候改的）；
+     *   ③ 一键**用系统文件管理器打开**那个目录（点某个文件 = 在里面选中它）。
+     * 🔴 路径全部由服务端推导（`GET /api/mc/memory`），前端不拼也不传路径。
      */
-    function SharePane(props) {
-      const {
-        on, base, share, busyKey, hasWorkspace, cfgOk,
-        onToggle, onSaveBase, onUseCurrent, onClear,
-      } = props
+    function MemoryPane(props) {
+      const { info, busyKey, hasWorkspace, onOpen } = props
       const busy = busyKey !== null
-      const [baseText, setBaseText] = React.useState(base ?? '')
-      const [confirmClear, setConfirmClear] = React.useState(false)
-      React.useEffect(() => { setBaseText(base ?? '') }, [base])
-
-      const baseBusy = busyKey === 'share:base'
-      const clearBusy = busyKey === 'share:clear'
-      const dirty = (baseText ?? '') !== (base ?? '')
-      // 🔴 报告第 2 条：配置没读出来 ⇒ `base` 是 ''，存下去会把已配好的地址抹掉。
-      const cfgBad = cfgOk === false
+      const openBusy = busyKey === 'memory:open'
+      const files = Array.isArray(info?.files) ? info.files : []
+      const dirs = Array.isArray(info?.dirs) ? info.dirs : []
+      const perSession = info?.memoryPerSession === true
+      /* 标准四件套点名（用户 2026-10-20：「包括 lessons.md、world.md」）：没建也照实说没建 */
+      const KNOWN_FILES = ['README.md', 'world.md', 'lessons.md', 'tasks.md']
+      const missing = KNOWN_FILES.filter((n) => !files.some((f) => f.name === n))
 
       return React.createElement(
         'div',
-        { 'data-wc-pane-page': 'share' },
+        { 'data-wc-pane-page': 'memory' },
         React.createElement('div', { 'data-wc-sec': '' },
-          React.createElement('div', { 'data-wc-h': '' }, '文件分享'),
-          // 只有"开 / 关"（2026-10-04 用户定：不再有"模式"，在线是**唯一**方式）
-          React.createElement(Switch, {
-            label: '启用文件分享',
-            desc: on
-              ? '回完整 URL：图片可以直接在对话里显示'
-              : '不分享：AI 只会告诉你文件的绝对路径，让你自己打开',
-            disabled: busy,
-            on: on === true,
-            onToggle: (next) => onToggle(next),
-          }),
-        ),
-        // base 只在「开启」时可用：关闭时**禁用**（但保留可见，别让人以为设置消失了）
-        React.createElement('div', { 'data-wc-sec': '' },
-          React.createElement('div', { 'data-wc-h': '' }, 'base 地址'),
-          cfgBad
-            ? React.createElement('div', { 'data-wc-warnnote': '' },
-              '配置没读出来，base 内容不可信 —— 「保存 base」已禁用（现在保存会把服务端已配好的地址抹掉）。关掉再打开这个窗口重试。')
-            : null,
-          React.createElement('div', { 'data-wc-field': '' },
-            React.createElement('input', {
-              'data-wc-in': '', value: baseText, spellCheck: false, disabled: busy || !on,
-              placeholder: 'https://example.com（可以带路径前缀）',
-              onChange: (e) => setBaseText(e.target.value),
-            }),
-          ),
-          React.createElement('p', { ...(on && !base ? { 'data-wc-hint': '', 'data-wc-dirty': '' } : { 'data-wc-hint': '' }) },
-            !on
-              ? '开启文件分享后才能设置 base。'
-              : (!base ? '还没填 base：AI 暂时只能让你去设置。' : '填你访问这台 DSH 用的地址。')),
+          React.createElement('div', { 'data-wc-h': '' }, '记忆目录'),
+          React.createElement('p', { 'data-wc-hint': '' },
+            info?.dir
+              ? `目录：${info.dir}`
+              : (hasWorkspace ? '目录：读取中…' : '还没有工作区，记忆目录读不出来。')),
+          React.createElement('p', { 'data-wc-hint': '' },
+            perSession
+              ? '按会话分开存：这里只是本会话那一份，换个会话就是另一个目录。'
+              : '所有会话共用这一份（要分开存，把配置项 memoryPerSession 设成 true）。'),
           React.createElement('div', { 'data-wc-acts': '' },
             React.createElement('button', {
               type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
-              disabled: busy || !on || !dirty || cfgBad,
-              title: cfgBad ? '配置没读出来，先别保存' : '',
-              onClick: () => onSaveBase(baseText.trim()),
-            }, baseBusy ? '保存中…' : '保存 base'),
-            React.createElement('button', {
-              type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '',
-              disabled: busy || !on, title: '用你现在访问这个页面的地址填好并保存',
-              onClick: onUseCurrent,
-            }, '获取当前')),
+              disabled: busy || !info?.dir,
+              title: '在资源管理器 / 访达里打开这个目录',
+              onClick: () => onOpen(null),
+            }, openBusy ? '打开中…' : '打开文件所在位置')),
         ),
-        hasWorkspace ? React.createElement('div', { 'data-wc-sec': '' },
-          React.createElement('div', { 'data-wc-h': '' }, '分享数据', h(WsMark)),
-          React.createElement('p', { 'data-wc-hint': '' },
-            share?.dir
-              ? `目录：${share.dir}${share.exists ? `　（${share.files} 个文件 / ${fmtBytes(share.bytes)}）` : '　（还没有这个目录）'}`
-              : '目录：读取中…'),
-          // 清除与分享模式无关：关闭模式下也一样能清（不然关掉分享就没法收拾旧文件）
-          React.createElement('div', { 'data-wc-acts': '' },
-            confirmClear
-              ? [
-                React.createElement('button', {
-                  key: 'yes', type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-danger': '',
-                  disabled: busy, title: '再点一次确认',
-                  onClick: () => { setConfirmClear(false); onClear() },
-                }, clearBusy ? '清除中…' : '确认清除'),
-                React.createElement('button', {
-                  key: 'no', type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: busy,
-                  onClick: () => setConfirmClear(false),
-                }, '取消'),
-              ]
-              : React.createElement('button', {
-                type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-danger': '',
+        React.createElement('div', { 'data-wc-sec': '' },
+          React.createElement('div', { 'data-wc-h': '' }, '记忆文件'),
+          files.length === 0
+            ? React.createElement('p', { 'data-wc-hint': '' },
+              info?.exists === false ? '这个目录还没建出来（AI 第一次用记忆时才建）。' : '目录里还没有文件。')
+            : React.createElement('div', { 'data-wc-acts': '' },
+              files.map((f) => React.createElement('button', {
+                key: 'f:' + f.name,
+                type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '',
                 disabled: busy,
-                title: '删掉上面那个目录里的所有文件',
-                onClick: () => setConfirmClear(true),
-              }, '清除分享数据')),
-          // ⚠️ 这里是 HTML（React 文本节点），不是 markdown —— 别再用 `**` 当粗体（用户指出过一次）
+                title: `${f.name}${f.bytes != null ? `　${fmtBytes(f.bytes)}` : ''}　（点它 = 在文件夹里选中这个文件）`,
+                onClick: () => onOpen(f.name),
+              }, `${f.name}${f.bytes != null ? `　${fmtBytes(f.bytes)}` : ''}`))),
+          missing.length > 0
+            ? React.createElement('p', { 'data-wc-hint': '' },
+              `还没建：${missing.join('、')}（AI 第一次往里写才会建出来）`)
+            : null,
+          dirs.length > 0
+            ? React.createElement('p', { 'data-wc-hint': '' },
+              `子目录：${dirs.map((d) => d.name).join('、')}（点「打开文件所在位置」就能进去看）`)
+            : null,
           React.createElement('p', { 'data-wc-hint': '' },
-            '「清除分享数据」会把上面那个目录里的文件',
-            React.createElement('strong', {}, '全部删掉'),
-            '，不可撤销。'),
-        ) : null,
+            '记忆是 AI 跨会话攒下来的东西（踩过的坑、世界事实、任务记录）；它随时会往里写，这里只是让你看得到、找得到。'),
+        ),
         !hasWorkspace ? h(WsNeedHint) : null,
       )
     }
@@ -2212,11 +2239,93 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       return `${(v / 1024 / 1024).toFixed(1)} MB`
     }
 
+    /* ------------------------------------------------------------ 页 5：更新 */
+
+    /**
+     * 「更新」页（用户 2026-10-20）：这个插件是 `link:<源码目录>` 装的、npm 上没有包，
+     * 所以"新版本" = git 远端（**优先 gitee**，github 兜底）比本地多出来的提交。
+     * 这一页只回答四件事：现在是什么版本 / 有没有新版 / 新版加了什么 / 一键拉取。
+     * 🔴 拉完**必须重启 DSH** 才生效（插件在启动时加载），页面上明确写出来。
+     */
+    function UpdatePane (props) {
+      const { info, busyKey, onCheck, onApply } = props
+      const busy = busyKey !== null
+      const behind = Number(info?.behind ?? 0) || 0
+      const dirty = Number(info?.dirty ?? 0) || 0
+      const commits = Array.isArray(info?.commits) ? info.commits : []
+      const rows = [
+        ['当前版本', `${info?.currentVersion ?? '—'}${info?.currentCommit ? `（${info.currentCommit}）` : ''}`],
+        ['更新源', info?.source ? `${info.source} / ${info.branch ?? '?'}` : '—'],
+        ['远端最新', behind > 0 ? `${info?.latestVersion ?? '—'}（${info?.latestCommit ?? '—'}）` : '与本地一致'],
+      ]
+      return h('div', { 'data-wc-pane-page': 'update' },
+        h('div', { 'data-wc-sec': '' },
+          h('div', { 'data-wc-h': '' }, '版本'),
+          rows.map(([k, v]) => h('p', { 'data-wc-hint': '', key: 'row:' + k },
+            h('strong', null, `${k}：`), v)),
+          behind > 0
+            ? h('p', { 'data-wc-hint': '' },
+              h('strong', null, `有新版本：落后 ${behind} 个提交`), ' —— 点「立即更新」拉取。')
+            : h('p', { 'data-wc-hint': '' },
+              info == null ? '还没查过。' : (info.ready === false ? '查不到新版本（原因见下）。' : '已经是最新版。')),
+          info?.ready === false && info?.reason
+            ? h('p', { 'data-wc-hint': '', 'data-wc-dirty': '' }, info.reason)
+            : null,
+          dirty > 0
+            ? h('p', { 'data-wc-hint': '' },
+              `本地有 ${dirty} 个未提交改动 —— git 会拒绝在改到一半时快进合并，`
+              + '先提交或 stash 再来点更新。')
+            : null,
+          h('div', { 'data-wc-acts': '' },
+            h('button', {
+              type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', disabled: busy,
+              onClick: () => onCheck(),
+            }, busyKey === 'update:check' ? '检查中…' : '检查更新'),
+            h('button', {
+              type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
+              disabled: busy || behind === 0 || info?.canPull !== true,
+              title: behind === 0
+                ? '已经是最新'
+                : (info?.canPull === true ? '用 git pull --ff-only 拉取' : '现在不能拉（见上面那条原因）'),
+              onClick: () => onApply(),
+            }, busyKey === 'update:apply' ? '更新中…' : '立即更新')),
+          h('p', { 'data-wc-hint': '' },
+            '更新完**要重启 DSH** 才生效：插件是启动时加载的，光刷新页面不算。'),
+        ),
+        h('div', { 'data-wc-sec': '' },
+          h('div', { 'data-wc-h': '' }, '新版加了什么'),
+          behind === 0
+            ? h('p', { 'data-wc-hint': '' }, '没有新提交可看。')
+            : h(React.Fragment, null,
+              commits.length
+                ? h('div', { 'data-wc-acts': '' }, commits.map((c) => h('span', {
+                  key: 'c:' + c.hash, 'data-wc-tag': '', title: c.hash,
+                }, `${c.hash} ${c.subject}`)))
+                : null,
+              info?.changelog
+                ? h('div', { 'data-wc-log': '' }, info.changelog)
+                : h('p', { 'data-wc-hint': '' }, '这几个提交没改 CHANGELOG.md，看上面的提交标题。')),
+        ),
+        h('div', { 'data-wc-sec': '' },
+          h('div', { 'data-wc-h': '' }, '它是怎么工作的'),
+          h('p', { 'data-wc-hint': '' },
+            '「新版本」只可能来自 git 远端：这个插件是 link 安装的（源码就在工作目录里），'
+            + 'npm 上没有这个包。'),
+          h('p', { 'data-wc-hint': '' },
+            '更新只用 git pull --ff-only（快进合并、不产生 merge commit）；有冲突或本地改动时'
+            + '直接把 git 的原话报给你，**不会偷偷 stash**。'),
+          h('p', { 'data-wc-hint': '' },
+            '检查结果缓存 10 分钟；有新版本时三个「MC设置」入口的右上角都会有个红点。'),
+        ),
+      )
+    }
+
     const TABS = [
       { id: 'accounts', label: '账户' },
       { id: 'whitelist', label: '指令白名单' },
       { id: 'prompt', label: '提示词' },
-      { id: 'share', label: '文件分享' },
+      { id: 'memory', label: '记忆' },
+      { id: 'update', label: '更新' },
     ]
 
     /* ==================================================================
@@ -2502,7 +2611,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
        * 🔴 2026-10-15 审计（报告第 2 条）：`/api/mc/config` **读成功过没有**。
        *    config 分支的 `.catch` 只 `setError` 就吞掉了 rejection ⇒ `Promise.all` 恒 resolve
        *    ⇒ `.then(() => setLoaded(true))` 恒执行，页面看起来"加载好了"，但
-       *    `wlList` / `shareBase` 还是初始空值。这时改白名单会发
+       *    `wlList` 还是初始空值。这时改白名单会发
        *    `commandWhitelist: [...]`（只有刚拨的那一条）—— **把服务端真实配置覆盖掉**。
        *    所以：读失败 ⇒ `cfgOk = false` ⇒ 所有"会把配置写小"的入口禁用、调用也硬拒。
        */
@@ -2529,10 +2638,9 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const [followVersion, setFollowVersion] = React.useState(true)
       const [rulesVersion, setRulesVersion] = React.useState(null)
       const [pluginVersion, setPluginVersion] = React.useState('')
-      // 「文件分享」：模式（off 关闭 / online 在线）+ base + 发布区现状
-      const [shareOn, setShareOn] = React.useState(false)
-      const [shareBase, setShareBase] = React.useState('')
-      const [shareInfo, setShareInfo] = React.useState(null)
+      // 「记忆」：这个会话的记忆目录 + 里面有哪些文件（用户 2026-10-20，原来的「文件分享」整页换掉）
+      const [memInfo, setMemInfo] = React.useState(null)
+      const [upd, setUpd] = React.useState(null)
       const [wsPath, setWsPath] = React.useState('')
       const [wsExists, setWsExists] = React.useState(false)
       // 本提示词那个文件（RULES.md）在不在 —— 给名字加"缺失"样式用
@@ -2587,6 +2695,10 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         setLoading(true)
         setLoadError('')
         setCfgOk(false)                       // 每次重读都先当作"没读到"，成功了再翻 true
+        // 更新检查：**不依赖工作区**，也**不阻塞**其它读取 —— 第一次要真去 git fetch，
+        // 网络慢的时候别把整个设置页卡在转圈上。失败就当"没有新版"。
+        apiGet('/api/mc/update').then((u) => { setUpd(u ?? null) }, () => { setUpd(null) })
+
         return Promise.all([
           apiGet(withSid('/api/mc/accounts')).then((a) => {
             setAccounts(Array.isArray(a.accounts) ? a.accounts : [])
@@ -2604,12 +2716,10 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             setAllowAll(c.allowAllCommands === true)
             setInjectWc(c.injectDshMcAgentAgentsMd !== false)
             setInjectWs(c.injectWorkspaceAgentsMd === true)
-            setShareOn(c.expressEnabled === true)
-            setShareBase(String(c.expressBase ?? ''))
-            // 发布区是**按工作区**的：没有工作区时那个接口直接 400，别去碰它。
-            if (!hasWs) { setShareInfo(null); return null }
-            return apiGet(withSid('/api/mc/express')).then((s) => {
-              setShareInfo(s ?? null)
+            // 记忆目录是**按工作区**的：没有工作区时那个接口直接 400，别去碰它。
+            if (!hasWs) { setMemInfo(null); return null }
+            return apiGet(withSid('/api/mc/memory')).then((m) => {
+              setMemInfo(m ?? null)
             }).catch((e) => { setError(errorText(e)) })
           }).catch((e) => {
             // 🔴 报告第 2 条：这里**必须**留下"读失败"的痕迹（以前只有 setError，
@@ -2863,58 +2973,40 @@ select[data-wc-in]{appearance:none;padding-right:22px;
           .then((ok) => { if (!ok) setFollowVersion(prev); return ok })
       }, [run, followVersion])
 
-      /* ── 页 4：文件分享 ──
-       * 开关**一拨就存**（同"允许所有指令"那个开关：错了回滚）；base 走「保存」按钮；
-       * 「获取当前」= 用**你现在访问这个页面的地址**填好并保存；
-       * 🔴 **开启**而 base 还没设时，自动做一次"获取当前"（不然开启当场没用）；
-       * 但**不去调就不写**：不开、不点按钮，base 永远保持原样。
-       * 清除分享数据**必须确认**（不可撤销）。
-       * ⚠️ 输入框的文本状态在 SharePane 内部（`baseText`），这里**不能**去 setBaseText：
-       *    保存完 `load()` 会刷新 `shareBase`，pane 的 useEffect（+ key 变化）会自己同步回输入框。 */
-      /** 向服务端要「当前地址」：把浏览器**自己正在用的** origin 一起报上去（最精准）。 */
-      const fetchCurrentBase = React.useCallback(() => {
-        const here = (typeof location !== 'undefined' && location.origin) ? location.origin : ''
-        const q = here ? '&clientOrigin=' + encodeURIComponent(here) : ''
-        return apiGet(withSid('/api/mc/express') + q).then((s) => String(s?.currentBase ?? ''))
-      }, [withSid])
+      /* ── 页 4：记忆 ──
+       * 用户 2026-10-20：原来这页是「文件分享」（开关 / base / 获取当前 / 清除分享数据），
+       * 现在**整页换成「记忆」**，分享那套一律下线 —— 这里只剩一个只读查询 + 一个"打开文件夹"。
+       * 打开是服务端动作（浏览器拿不到本地路径），所以走 `POST /api/mc/memory/open`。
+       * `name` 给了就在文件夹里**选中**那个文件；不给就打开目录本身。 */
+      /* ── 页 5：更新 ──
+       * 用户 2026-10-20：加一个更新页 —— 显示新版加了什么 + 更新按钮。
+       * 「检查更新」强制刷新（`?force=1` 绕过后端 10 分钟缓存）；「立即更新」只走
+       * `POST /api/mc/update/apply`（git pull --ff-only），拉不动就把 git 的原话显示出来。 */
+      const updateCheck = React.useCallback(() =>
+        run('update:check',
+          () => apiGet('/api/mc/update?force=1')
+            .then((u) => { setUpd(u ?? null); return updateBadgeRefresh(true) }),
+          '检查完了'),
+      [run])
 
-      const toggleShare = React.useCallback((next) => {
-        const prev = shareOn
-        if (next === prev) return Promise.resolve(true)
-        setShareOn(next)                                             // 乐观更新
-        // 开启且还没 base → 顺手把当前地址一起保存（一次动作，别让用户自己去找地址）
-        const autoBase = next === true && !shareBase
-        return run('share:on', () => (autoBase
-          ? fetchCurrentBase().then((cur) => apiPatch(withSid('/api/mc/config'),
-            cur ? { expressEnabled: true, expressBase: cur } : { expressEnabled: true }))
-          : apiPatch(withSid('/api/mc/config'), { expressEnabled: next })),
-        next
-          ? (autoBase ? '文件分享已开启，base 用当前地址填好了' : '文件分享：已开启')
-          : '文件分享：已关闭')
-          .then((ok) => { if (!ok) setShareOn(prev); return ok })    // 失败回滚
-      }, [run, shareOn, shareBase, fetchCurrentBase])
-
-      const saveShareBase = React.useCallback((text) => {
-        // 🔴 报告第 2 条：同 `saveWhitelist` —— 配置没读出来时 `shareBase` 是 ''，
-        //    存下去等于把已经配好的分享地址抹掉。
-        if (!cfgOk) {
-          setError('配置没读出来，先别保存 base —— 现在保存会把服务端已配好的地址抹掉。'
-            + '先关掉再打开这个窗口重试。')
+      const updateApply = React.useCallback(() => {
+        if (!window.confirm('把插件更新到最新版？\n\n会用 git pull --ff-only 拉取，拉完需要重启 DSH 才生效。')) {
           return Promise.resolve(false)
         }
-        return run('share:base', () => apiPatch(withSid('/api/mc/config'), { expressBase: String(text ?? '') }),
-          'base 已保存')
-      }, [run, cfgOk])
+        return run('update:apply',
+          () => apiPost('/api/mc/update/apply')
+            .then((r) => {
+              setUpd(null)
+              return updateBadgeRefresh(true).then(() => r)
+            }),
+          '已更新：重启 DSH 才生效')
+      }, [run])
 
-      /** 「获取当前」：填进输入框并立即保存（拿不到就明确报错，别存一个空值） */
-      const useCurrentBase = React.useCallback(() =>
-        run('share:base', () => fetchCurrentBase().then((cur) => {
-          if (!cur) throw new Error('拿不到当前地址：请手动填写（例如 http://127.0.0.1:14640）')
-          return apiPatch(withSid('/api/mc/config'), { expressBase: cur })
-        }), '已用当前地址填好'), [run, fetchCurrentBase])
-
-      const clearShare = React.useCallback(() =>
-        run('share:clear', () => apiDelete(withSid('/api/mc/express')), '分享数据已清除'), [run])
+      const openMemoryLocation = React.useCallback((name) =>
+        run('memory:open',
+          () => apiPost(withSid('/api/mc/memory/open'), name ? { name: String(name) } : {}),
+          name ? `已在文件夹里选中 ${name}` : '已打开记忆目录'),
+      [run, withSid])
 
       if (!open) return null
 
@@ -2937,12 +3029,16 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             onDfText: setDfText, onDfSave: saveDefaultMd, onDfReset: resetDefaultMd,
             onInjectWc: toggleInjectWc, onInjectWs: toggleInjectWs, onFollowVersion: toggleFollowVersion,
           })
-          : (tab === 'share'
-            ? React.createElement(SharePane, {
-              key: 'share:' + (shareOn ? 'on' : 'off') + ':' + shareBase,
-              on: shareOn, base: shareBase, share: shareInfo, busyKey, hasWorkspace, cfgOk,
-              onToggle: toggleShare, onSaveBase: saveShareBase, onUseCurrent: useCurrentBase, onClear: clearShare,
+          : (tab === 'memory'
+            ? React.createElement(MemoryPane, {
+              key: 'memory:' + (memInfo?.dir ?? '') + ':' + (memInfo?.files?.length ?? 0),
+              info: memInfo, busyKey, hasWorkspace, onOpen: openMemoryLocation,
             })
+            : (tab === 'update'
+              ? React.createElement(UpdatePane, {
+                key: 'update:' + (upd?.checkedAt ?? 0) + ':' + (upd?.behind ?? 0),
+                info: upd, busyKey, onCheck: updateCheck, onApply: updateApply,
+              })
             : React.createElement(AccountsPane, {
             accounts, servers, defaultAccount, busyKey,
             onPatch: patchAccount, onDelete: deleteAccount,
@@ -2950,7 +3046,7 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             onRemoveServer: removeServer,
             onMsaStart: msaStart, onMsaPoll: msaPoll, onReload: reloadAccounts,
             onRefreshAll: () => refreshAllAccounts(accounts),
-          })))
+          }))))
 
       // 头部显示的工作区名（仅"有工作区"时显示）：注册表 title → 回退路径尾段；default-workspace 给中文名
       const wsDisplayName = hasWorkspace

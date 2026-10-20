@@ -242,5 +242,35 @@ section('5. getMoveDiagonal()：斜切拐角被禁（这才是实机真正的病
   ok(nb2.length === 1, '拐角空着时斜着走照旧允许（没把正常的斜走改坏）')
 }
 
+
+/* ─────────── 6. 「不破坏方块」的走路模式（noDig / walk-nodig）─────────── */
+section('6. mc_move 的 noDig / walk-nodig：走路一格都不挖')
+
+/* 用户 2026-10-20：「move 加一个不破坏方块的模式」。这条链路跨两个文件：
+ *   index.js（mc_move 的参数与分发）→ src/movement.mjs（walkTo/walkToOnce/walkPathfinder 把
+ *   `canDig` 关掉、并且不许走"卡住就挖开台阶"那条补救）。
+ * 这里做**契约检查**（各自该有的那一句必须在），不重跑寻路 —— 真行为由实机验证。 */
+const mcIndexSrc = readFileSync(join(HERE, '..', 'index.js'), 'utf8')
+const mvSrc = readFileSync(join(HERE, '..', 'src', 'movement.mjs'), 'utf8')
+const countOf = (hay, needle) => hay.split(needle).length - 1
+
+ok(/noDig: \{ type: 'boolean'/.test(mcIndexSrc), 'mc_move 有 noDig 参数')
+ok(/walk \/ walk-nodig \/ fly/.test(mcIndexSrc) && /mode === 'walk-nodig'/.test(mcIndexSrc), 'mc_move 认 mode:"walk-nodig"（参数说明 + 分发）')
+ok(/const noDig = mode === 'walk-nodig' \? true : args\.noDig !== false/.test(mcIndexSrc),
+  '默认不挖：只有显式 noDig:false 才允许挖（mode:"walk-nodig" 恒为 true）')
+const seqSrc = readFileSync(join(HERE, '..', 'src', 'sequence.mjs'), 'utf8')
+ok(/noDig: s\.noDig !== false/.test(seqSrc), 'mc_sequence 的 move 步骤默认也不挖（和 mc_move 一致）')
+ok(countOf(mcIndexSrc, 'noDig, intent: args.intent') === 2,
+  'noDig 传进了两条 walkTo（walk 与「swim 给坐标」那条）', String(countOf(mcIndexSrc, 'noDig, intent: args.intent')))
+ok(countOf(mvSrc, 'noDig = false } = {}, ctx = {})') === 3,
+  'walkTo / walkToOnce / walkPathfinder 三个函数都收 noDig', String(countOf(mvSrc, 'noDig = false } = {}, ctx = {})')))
+ok(countOf(mvSrc, 'if (noDig) mv') === 3,
+  '三处新建 Movements 都关掉 canDig（出厂 / 垫柱 / 地形重估）', String(countOf(mvSrc, 'if (noDig) mv')))
+ok(/const carveAllowed = !noDig &&/.test(mvSrc), '卡住时"挖开台阶"的补救也因 noDig 关掉')
+/* 🔴 2026-10-20：goal-reached-elsewhere（别人的 goal_reached 把我这次 goto 一起 resolve）要自己重试一次，
+ *   实机撞到过两次「同一目标第一次秒返回、第二次才走」。只重试这一个 reason，且要有剩余预算。 */
+ok(/info\.reason === 'goal-reached-elsewhere'/.test(mvSrc) && /retriedElsewhere: true/.test(mvSrc),
+  'walkTo 对 goal-reached-elsewhere 自动重试一次（不靠 AI 手动再叫）')
+
 console.log(`\n${fail === 0 ? '✓ 全部通过' : '✗ 有失败项'}：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

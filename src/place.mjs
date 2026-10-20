@@ -20,7 +20,7 @@ import vec3pkg from 'vec3'
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 
 import { sleep } from './async-util.mjs'
-import { isAir, isLiquid, canPlaceInto } from './block-names.mjs'
+import { isAir, isLiquid, canPlaceInto, isEntityItem } from './block-names.mjs'
 import { pickPlaceItem, isFullBlockItem } from './place-items.mjs'
 import { heldText } from './inventory.mjs'
 import { standableY } from './movement.mjs'
@@ -107,6 +107,11 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
   const b = self.requireBot()
   const pos = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z))
   const want = name ? String(name) : null
+  /* 🔴 船 / 矿车 / 刷怪蛋 / 盔甲架 是**实体**，不是方块 —— 走 mineflayer 的 placeEntity 那套
+   *    （见下面 `placeEntityItem`）。旧代码一律当方块放，服务端收到的是"对着水右键放方块"，
+   *    永远不成：2026-10-20 实机在生存和创造下各试了 3 次，`/execute if entity @e[type=oak_boat]`
+   *    一次都没命中。 */
+  if (want && isEntityItem(want)) return await placeEntityItem(self, { x: pos.x, y: pos.y, z: pos.z, name: want }, ctx)
   // 选方块：指定名字就给那个；没指定就**只挑整方块**（旧版直接 items[0]，见 pickPlaceItem 注释）
   const pick = () => pickPlaceItem(b, want)
   let item = pick()
@@ -254,7 +259,15 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
   // 🔴 必须**验证**：旧版不管成没成都是 `placed: item.name` → 真机被投诉的"报假成功"
   //    （mc_build 说 placed，mc_scan 复查一格没放下）
   const now = b.blockAt(pos)?.name ?? null
-  const ok = now === item.name
+  /* 🔴 2026-10-19（用户实机：连插两个火把，两次都回「❌ 动作失败 / 服务端可能拒了这次放置」，
+   *    但 `now` 明明写着 `wall_torch` —— 火把**好端端贴在墙上**了）：
+   *    这里原先死比 `now === item.name`。可**方块名会带变体**：火把贴墙变 `wall_torch`
+   *    （灵魂火把变 `soul_wall_torch`），告示牌/旗帜也有同类朝向变体。
+   *    判据必须是"**同一种方块**"，不是"同一个字符串" —— 两边都去掉 `wall_` 再比。
+   *    跟踩坑 199（`outcomeOf` 白名单漏 `opened`/`toggled`）是同一类错：
+   *    **判成功要认变体，别认字面**。 */
+  const normName = (s) => String(s ?? '').replace(/wall_/g, '')
+  const ok = Boolean(now) && (now === item.name || normName(now) === normName(item.name))
   return {
     placed: ok ? item.name : false,
     requested: item.name,
@@ -268,5 +281,124 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
         + '（领地保护 / 权限 / 反作弊 / 失步）。不要当成放成功了。'
         + (isOwnCell ? '（这一格是我自己站的地方，已经跳过再放 —— 还是没成，说明不是"占着"的问题）' : ''),
     }),
+  }
+}
+
+/* ---------------------------------------------------------------- 实体物品（船 / 矿车 / 蛋 / 盔甲架） */
+
+
+/**
+ * 放一个**实体**物品（船 / 矿车 / 刷怪蛋 / 盔甲架 / 末影水晶）。
+ *
+ * 🔴 为什么不能用 `placeBlock` / `activateBlock`（2026-10-20 实机踩的）：
+ *    mineflayer 的 `lib/plugins/place_entity.js` 写得很清楚 —— 放船时它先 `_genericPlace()`
+ *    （发 `use_item_on`/`block_place`：告诉服务端"我对着这一格用了"，服务端拿这个包判断
+ *    **该往哪放实体**），**然后再补发一个 `use_item` 包**（`useItemWithOwnPacket` 特性，
+ *    1.19+ 都是），最后监听 `entitySpawn` 确认。少发后面那个 `use_item`，服务端就当"空手右键"，
+ *    什么都不会生成 —— 正好是用户报的"放不出来"。
+ * @returns `{placed, entity, at, name, held}`；没生成就 `{placed:false, hint}`（不抛，好让模型看懂）
+ */
+export async function placeEntityItem (self, { x, y, z, name = null } = {}, ctx = {}) {
+  const b = self.requireBot()
+  const t = ctx.t ?? ((p) => p)
+  const pos = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z))
+  const want = name ? String(name) : (b.heldItem?.name ?? null)
+  if (!want) throw new Error('没说放什么，手上也是空的 —— 给 name（如 oak_boat / minecart / zombie_spawn_egg）')
+  if (!isEntityItem(want)) {
+    throw new Error(`${want} 不是"放下去变实体"的东西（船 / 矿车 / 刷怪蛋 / 盔甲架 / 末影水晶才是）—— 放方块用 mc_build 或 mc_act{mode:"place"} 的方块路径`)
+  }
+  const findAll = (n) => {
+    try { return b.inventory.items().filter((i) => i.name === n) } catch { return [] }
+  }
+  if (!findAll(want).length && b.game?.gameMode === 'creative') {
+    await self.giveItem({ name: want })
+    await sleep(120)
+  }
+  const item = findAll(want)[0] ?? null
+  if (!item) {
+    throw new Error(`背包里没有 ${want}（生存模式要先合成/捡一个：船 = 5 个木板）`)
+  }
+  if (b.heldItem?.name !== want) {
+    await t(Promise.resolve(b.equip(item, 'hand')), 'act', `把 ${want} 拿到手上`)
+    await sleep(100)
+  }
+  /* 参考方块 = 目标格本身（水里 / 空气里都能点），朝向取"上面"：船就浮在这一格的水面上。
+   * 目标格不是水、下面是水/陆地也行 —— 服务端按"点到的这一格 + 这个面"算落点。 */
+  let ref = b.blockAt(pos) ?? b.blockAt(pos.offset(0, -1, 0))
+  if (!ref) throw new Error(`${pos.x},${pos.y},${pos.z} 未加载 —— 先走过去或 mc_scan 看一眼`)
+  /* 🔴 2026-10-20 实机：给的是"水面**上方**那一格"（空气）时，`blockAt(pos)` 拿到的是 air 方块，
+   *    `block_place` 对着空气发 ⇒ 服务端直接忽略（不报错、也不生成）。玩家瞄准的永远是水面本身。
+   *    所以参考格是空气就往下摸最多 3 格，摸到水/地面为止。 */
+  const isAirName = (nm) => /^(air|cave_air|void_air)$/.test(String(nm ?? ''))
+  if (isAirName(ref?.name)) {
+    for (let dy = 1; dy <= 3; dy++) {
+      const below = b.blockAt(pos.offset(0, -dy, 0))
+      if (below && !isAirName(below.name)) { ref = below; break }
+    }
+  }
+  const before = new Set(Object.keys(b.entities ?? {}).map(String))
+  const face = new Vec3(0, 1, 0)
+  /* ① 先"对着这一格用"（服务端靠它算落点） ② 再补 `use_item`（船/矿车必须补，见上面的注释） */
+  try {
+    if (typeof b._genericPlace === 'function') {
+      await t(Promise.resolve(b._genericPlace(ref, face, {})), 'act', `对着 ${ref.name} 用 ${want}`)
+    } else {
+      await t(Promise.resolve(b.activateBlock(ref)), 'act', `对着 ${ref.name} 用 ${want}`)
+    }
+  } catch (e) {
+    return { placed: false, name: want, at: { x: pos.x, y: pos.y, z: pos.z }, hint: `放的时候服务端/上游报错：${e?.message ?? e}` }
+  }
+  /* 🔴 **不要**补发 `use_item`（2026-10-20 实机踩的，两次被踢）：mineflayer 的 `place_entity.js` 里为船
+   *    补发了 `bot._client.write('use_item', { hand })`，但那是老协议的形状 —— 这个服（1.21.10 /
+   *    protocol 773，minecraft-data 的 `packet_play_use_item` = `hand + sequence:varint + rotation:vec2f`）
+   *    少了 `sequence`/`rotation`。protodef 是"边写边抛"，只写了一半就异常 ⇒ 那条包在流里是**残的**，
+   *    服务端读到脏字节，同一秒还能勉强活，几十秒后 `disconnect.timeout` 掉线（实机两次都是"放完船就掉"）。
+   *    对照：刷怪蛋走同一条 `_genericPlace`（只发 block_place）一来就放出来了 ⇒ 现代协议下**一个
+   *    block_place 就够**，别画蛇添足。 */
+  /* 复核：新出现的实体里，4 格内、名字像不像 */
+  const KEY = /boat|raft|minecart|armor_stand|armorstand|end_crystal|ender_crystal/i
+  const fresh = () => Object.values(b.entities ?? {}).filter((e) => e && e !== b.entity && !before.has(String(e.id)))
+  let hit = null
+  const waitSpawn = async (ms) => {
+    const t0 = Date.now()
+    while (Date.now() - t0 < ms) {
+      const cands = fresh().filter((e) => {
+        try { return e.position.distanceTo(pos) <= 4 } catch { return false }
+      })
+      hit = cands.find((e) => KEY.test(String(e.name ?? ''))) ?? cands[0] ?? null
+      if (hit) return hit
+      await sleep(80)
+    }
+    return null
+  }
+  let via = 'block_place'
+  await waitSpawn(700)
+  /* ② 还不行就再用一次"手上的东西"：`bot.activateItem()` 自己会拼出正确形状的 `use_item`
+   *    （`inventory.js:134`：`{hand, sequence, rotation}`）。用户 2026-10-20 说过「用 useitem 其实也能放」，
+   *    而我们自己的 `mc_act {mode:"useitem"}` 实测没放出来 —— 两条路都试一遍，谁成就报谁。 */
+  if (!hit) {
+    try {
+      await t(Promise.resolve(b.activateItem()), 'act', `用手上的 ${want} 试一次`)
+      via = 'use_item'
+    } catch (e) {
+      /* 记下但不打断：下面统一报"两条都没成" */
+      via = `block_place + use_item(${String(e?.message ?? e)})`
+    }
+    await waitSpawn(800)
+  }
+  if (!hit) {
+    return {
+      placed: false, name: want, at: { x: pos.x, y: pos.y, z: pos.z }, held: heldText(b),
+      sent: via,
+      hint: `${via} 都发了，但 1.5 秒内**没看到新实体** —— 常见原因：离得远（要 4.5 格内、眼睛看得见）、`
+        + `目标格被占（船要放水里/水边，别对着自己脚下）、或者服务端把这次放置吞了。`
+        + `先 mc_move 到水边换个点位再试，别对着同一点反复发。`,
+    }
+  }
+  return {
+    placed: true, name: want, entity: String(hit.name ?? ''),
+    at: { x: Math.round(hit.position.x * 10) / 10, y: Math.round(hit.position.y * 10) / 10, z: Math.round(hit.position.z * 10) / 10 },
+    held: heldText(b),
+    hint: /boat|raft/i.test(String(hit.name ?? '')) ? '上船用 mc_act {mode:"use", who:"oak_boat"}' : undefined,
   }
 }

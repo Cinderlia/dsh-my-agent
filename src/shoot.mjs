@@ -32,6 +32,7 @@ import { sleep } from './async-util.mjs'
 import { heldSnapshotOf, restoreHeldOf } from './bridge.mjs'
 import { entityNameOf, pickEntity } from './entity-names.mjs'
 import { loadMcDep } from './plugins.mjs'
+import { arrowSpeedFor, solveArrowLead } from './ballistics.mjs'
 
 /** 能当箭用的物品（`tipped_arrow` 也算；`arrow` 是常态） */
 const ARROW_RE = /^(arrow|spectral_arrow|tipped_arrow)$/i
@@ -43,6 +44,97 @@ const MIN_DRAW_MS = 1_050
 const LOOK_SETTLE_MS = 40
 /** 默认等多久再放（拉满再放） */
 const DEFAULT_DRAW_MS = 1_200
+/** 拉满之后**端着等**的最长时间（用户 2026-10-19：「能不能弓蓄力，然后等高命中率，再射」） */
+const HOLD_MAX_MS = 1_500
+/** 端着等的时候多久重解一次弹道（`gradeOf` 自己还要采一次速度，实际步长更大） */
+const HOLD_POLL_MS = 60
+/** 哪些目标才"拉满端着等" —— **只给末影龙**开（用户 2026-10-19：「只在打末影龙生效」）。
+ *  龙一直在绕圈飞、解出来的弹道到撒手那一刻多半已经作废；普通怪/玩家站着不动，
+ *  端着等只会白拖时间，所以不开。 */
+const HOLD_FOR_RE = /^ender_dragon$/i
+
+/**
+ * 末影龙**落地（perched）时免疫投射物** —— 实机 2026-10-20 验证（Bluezi 提醒 + 实测）：
+ *   龙停在祭坛 (0,61,0)、我在 3 格内、aimError 0.16、`arrowEntity:true`（箭确实射出去了），
+ *   但 `/data get entity @e[type=ender_dragon,limit=1] Health` 前后都是 121.25 ⇒ **0 伤害**。
+ *   飞着打同一支箭是 2.5 血（200 血的龙 ⇒ 一箭只掉 1.25% 血条）。
+ * ⇒ 龙趴着的时候别射：白费箭，还会把"命中率"统计带歪。等它起飞（y 回到 70 上下）再打，
+ *   或者换近战上去砍（落地那几秒本来就是砍它的窗口）。
+ * 判据用**位置**（比 metadata 槽位稳）：末影龙只在中央祭坛落地，x/z 贴近原点、y 掉到 65 以下。
+ */
+export const PERCH_MIN_Y = 68
+export const PERCH_MAX_HORIZ = 16
+export const isDragonPerched = (e) => {
+  const p = e?.position
+  if (!p) return false
+  const x = Number(p.x)
+  const z = Number(p.z)
+  const y = Number(p.y)
+  if (![x, z, y].every(Number.isFinite)) return false
+  return Math.hypot(x, z) < PERCH_MAX_HORIZ && y < PERCH_MIN_Y
+}
+
+/**
+ * 打末影龙的**默认射程上限**（格）。
+ * 实机 2026-10-20：24.4 格 aimError 0.19 打空、26.5 格 0.03 打中、43 / 46.5 格 0.19 全空。
+ * 2026-10-19 那批：命中的都 ≤ 25 格，26.5 / 30.1 / 34.2 格全空 —— 箭飞 0.6~1 秒，龙已经拐弯。
+ * ⇒ 只给末影龙自动套这个闸（别的目标不套）；调用方显式给了 `maxDist` 就以调用方为准。
+ */
+export const DRAGON_MAX_DIST = 25
+/** 仰角超过这个度数就算"高抛解"——实机验证高抛解不可靠，见 `gradeOf` 里的注释
+ *  （用户 2026-10-19「优先平射」）。45° 以下当平射直接采用。 */
+export const LOW_ARC_MAX_DEG = 45
+
+/**
+ * 瞄哪儿 —— hawkeye 的默认是**包围盒顶面**：`target.position + (0, target.height, 0)`
+ * （`minecrafthawkeye/dist/hawkEyeEquations.js:35`：`targetPosition = target.position.offset(0, targetHeight, 0)`）。
+ *
+ * 🔴 用户 2026-10-19 真机点评：「弓现在使用是不是不够好…你往上搭高一点就不准了，瞄准的是翅膀那里，
+ *    但碰撞箱在下面」。末影龙 `height=8` ⇒ hawkeye 瞄的是 `y+8`，那是**翅膀上方**；
+ *    箭真正能命中的是下面那截身体（实机确认过：Bluezi 在公屏喊「准了一点」都是我把枪口压低之后）。
+ *
+ * 所以这里给一个**瞄点高度**（相对 `entity.position.y` 的格数，覆盖 hawkeye 的默认顶面），
+ * 再包成一个 hawkeye 认的"实体"（`isEntity` 的判据是 `'type' in e`，所以纯对象就行）。
+ */
+export const BIG_MOB_MIN_HEIGHT = 4          // ≥ 这个高度算"大个子"（末影龙 8 / 凋灵 3.5+ / 恶魂 4 / 铁傀儡 2.7 不在此列）
+export const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v))
+
+/**
+ * `aim` 参数 → 瞄点高度（相对实体 position 的格数）；`null` = 用 hawkeye 默认（顶面）。
+ *
+ * 🔴 2026-10-20（用户：「把 auto body 和其他精简掉」）：**字符串名全删了，只剩数字**。
+ *    理由（实测对账）：打末影龙时 `shoot_auto` 和 `shoot_body` 算出来**完全一样**（`8 × 0.35 = 2.8`）；
+ *    `shoot_low` 的 0.9 写成 `aim:0.9` 就行；`shoot_top` 只是"老行为"，而老行为正是瞄到翅膀上方那个不准的。
+ *    三个名字没带来任何信息，还让 `shoot_auto` / `shoot-auto` / `auto` 三种写法互相兼容 —— 干脆删掉。
+ *
+ * - **不给 `aim`**（默认）：大个子（`height ≥ 4`）按 `height * 0.35` 夹到 `[1.2, 3]` —— 打身体，不打翅膀；
+ *   其余实体一律瞄**碰撞箱中心**（`height * 0.5`）。
+ *   🔴 2026-10-20（用户：「鸡打不中」）：以前小怪走 hawkeye 默认的**顶面**，而顶面就是碰撞箱的最上沿 ——
+ *   鸡只有 0.7 高、半高 0.35，落点只要低 0.2 格就从**底下**钻过去了。瞄中心后上下各留半格余量。
+ * - **给数字**：直接按这个格数瞄（负数是往下瞄）。打水晶时 `aim:2` 就是"瞄中心上方 2 格"，越过柱顶边缘。
+ *   字符串形式的数字（`"2"`）也收 —— MCP 那边参数常常是字符串。
+ * - 给了看不懂的东西（老写法 `"shoot_auto"` 之类）⇒ **退回默认行为**，不会悄悄变差。
+ */
+export function aimHeightFor ({ entity = false, height = 0 } = {}, aim = null) {
+  const h = Number(height) || 0
+  /* 大个子（龙）打身体；其余实体瞄碰撞箱中心（顶面是最上沿，小个子太容易擦过去）。 */
+  const bodyAim = () => {
+    if (!entity || !(h > 0)) return null
+    return h >= BIG_MOB_MIN_HEIGHT ? clamp(h * 0.35, 1.2, 3) : h * 0.5
+  }
+  if (aim === null || aim === undefined) return bodyAim()
+  const s = String(aim).trim()
+  if (s === '') return bodyAim()
+  const n = Number(s)
+  return Number.isFinite(n) ? n : bodyAim()
+}
+
+/** 把"瞄点高度"包成 hawkeye 认的目标（`'type' in e` 即为实体；`height` 只影响它算瞄点的那个偏移）。 */
+export function aimProxyFor (obj, height) {
+  if (height == null) return obj
+  const pos = obj?.position ?? obj
+  return { type: String(obj?.type ?? obj?.name ?? 'mob'), position: pos, height: Number(height) || 0 }
+}
 
 /** 背包里还有几支箭（给"到底射出去没有"当证据） */
 export const arrowsIn = (b) => {
@@ -57,21 +149,64 @@ export const infiniteArrows = (b) => String(b?.game?.gameMode ?? b?.player?.game
 /**
  * 弓带无限附魔（Infinity）—— 生存模式下**也不耗箭**，所以"箭数掉了"不能再当证据。
  *
- * prismarine-item 两种形状都见过：`enchants`（数组，`{name,lvl}`）和 `enchantsByName`（对象）。
- * 都不认识就按"没有"算（宁可多等 600ms 判失败，也不能把真射出去的箭判成没射）。
+ * 🔴 2026-10-19 实机栽过：明明已经把龙射到半血（用户在场确认「中了」），工具却回
+ *    `arrowsUsed:0 / outcome:"failed" / why:"箭数没变——服务端没认这次放箭"`，
+ *    连射当场停掉。原因是**附魔的字段形状一代一个样**：
+ *      · 1.12：`enchants: [{ name:'infinity', lvl:1 }]`
+ *      · 1.16+：`enchantsByName: { infinity: 1 }`
+ *      · 1.20.5+（本服 1.21.9）：走**物品组件** `componentMap.get('enchantments').data`，
+ *        里面的字段可能叫 `id` / `type` / `enchantment`，等级可能叫 `lvl` / `level`
+ *    ⇒ 老代码只认 `{name,lvl}`，一个都没命中，于是"无限弓"被当成"没射出去"。
+ *
+ * 这里**不认字段名**：把附魔的容器整个序列化，看里面有没有 `infinity`。
+ * 认不出就当"没有"——宁可多等 600ms 判失败，也不能把真射出去的箭判成没射。
  */
-export const infinityBow = (b) => {
-  const it = b?.heldItem
-  if (!it) return false
-  const has = (e) => /infinity/i.test(String(e?.name ?? e?.id ?? '')) && Number(e?.lvl ?? e?.level ?? 1) >= 1
-  if (Array.isArray(it.enchants) && it.enchants.some(has)) return true
-  const byName = it.enchantsByName
-  if (byName && typeof byName === 'object') {
-    if (Object.values(byName).some(has)) return true
-    if (has({ name: 'infinity', lvl: byName.infinity })) return true
-  }
+export const itemHasInfinity = (it) => {
+  if (!it || typeof it !== 'object') return false
+  const hasInf = (v) => { try { return /infinity/i.test(JSON.stringify(v)) } catch { return false } }
+  try { if (it.enchants != null && hasInf(it.enchants)) return true } catch {}
+  try {
+    const byName = it.enchantsByName
+    if (byName && typeof byName === 'object') {
+      if (Object.prototype.hasOwnProperty.call(byName, 'infinity')) return true
+      if (hasInf(byName)) return true
+    }
+  } catch {}
+  try {
+    const cm = it.componentMap
+    if (cm && typeof cm.get === 'function') {
+      const comp = (typeof cm.has === 'function' && cm.has('enchantments')) ? cm.get('enchantments') : null
+      if (comp && hasInf(comp?.data ?? comp)) return true
+    }
+  } catch {}
+  try { if (it.nbt && hasInf(it.nbt)) return true } catch {}
   return false
 }
+
+/** 手里那把弓是不是无限的（见 `itemHasInfinity` 的形状说明） */
+export const infinityBow = (b) => itemHasInfinity(b?.heldItem)
+
+/**
+ * 附近箭矢实体的 id 集合 —— **旁证**：无限弓 / 创造模式下箭数不变，
+ * 但"天上多了一支新的箭"这件事骗不了人（2026-10-19 补上，见文件头坑 ⑥）。
+ *
+ * 半径给 24：箭速 30~60 格/秒，判失败前最多等 600ms，那时它已经在 20 格外了。
+ */
+const arrowEntityIdsNear = (b, radius = 24) => {
+  const out = new Set()
+  let me = null
+  try { me = b?.entity?.position ?? null } catch {}
+  try {
+    for (const e of Object.values(b?.entities ?? {})) {
+      if (!e?.position) continue
+      if (!/arrow/i.test(String(e.name ?? e.displayName ?? ''))) continue
+      if (me && typeof e.position.distanceTo === 'function' && e.position.distanceTo(me) > radius) continue
+      out.add(e.id)
+    }
+  } catch {}
+  return out
+}
+
 
 /**
  * 放完箭等"服务端把这箭记上"（箭数掉 1）—— 最多 600ms，掉下来就立刻回。
@@ -140,7 +275,7 @@ const holdWeapon = async (b, weapon) => {
 async function shootInner (b, args = {}, ctx = {}) {
   const {
     who = null, x, y, z, count = 1, waitTime = DEFAULT_DRAW_MS, lead = true,
-    weapon = 'bow', radius = 48, budget = 8_000,
+    weapon = 'bow', radius = 48, budget = 8_000, aim = null, maxDist = null,
   } = args ?? {}
   const t = ctx.t ?? (async (p) => await p)
   const callLeft = ctx.callLeft ?? (() => budget)
@@ -186,9 +321,16 @@ async function shootInner (b, args = {}, ctx = {}) {
   }
 
   /* ④ 弹道：真 hawkeye（每次重新 bind，见文件头坑 ②）或注入的假弹道 */
+  /* 兜底弹道要知道"这一箭有多快" ⇒ 先按 waitTime 估一个拉弓时长（循环里真正的 `drawMs`
+   * 还会被剩余预算夹一次，那点差别对弹道影响很小，不值得为它重解）。 */
+  const estDrawMs = Math.max(MIN_DRAW_MS, Math.min(Number(waitTime) || DEFAULT_DRAW_MS, 20_000))
   const gradeOf = async (target) => {
     const speed = target.entity ? await speedOf(target.obj, { lead }) : new Vec3(0, 0, 0)
-    if (typeof ctx.grade === 'function') return ctx.grade(target.obj, speed, String(weapon))
+    /* 瞄点：hawkeye 默认瞄包围盒**顶面**（`position + (0, height, 0)`）——末影龙 height=8 ⇒ 翅膀上方。
+     * `aimHeightFor` 把大个子压到身体高度；坐标目标（水晶）可以用数字往上抬。 */
+    const aimH = aimHeightFor({ entity: target.entity, height: target.obj?.height ?? 0 }, aim)
+    const aimed = aimProxyFor(target.obj, aimH)
+    if (typeof ctx.grade === 'function') return ctx.grade(aimed, speed, String(weapon))
     const bind = await loadMcDep('hawkeye', { log: (m) => ctx.log?.(m), logWarn: (m) => ctx.log?.(m) })
     if (!bind) {
       throw new Error('没装 minecrafthawkeye（`vendor/mc-deps` 里缺这个包）—— 弹道算不出来，不瞎射')
@@ -197,21 +339,108 @@ async function shootInner (b, args = {}, ctx = {}) {
     if (typeof b.hawkEye?.getMasterGrade !== 'function') {
       throw new Error('hawkeye 挂上了但没给 getMasterGrade —— 版本不对，别射了')
     }
-    return b.hawkEye.getMasterGrade(target.obj, speed, String(weapon))
+    const grade = b.hawkEye.getMasterGrade(aimed, speed, String(weapon))
+    /* 🔴 2026-10-20（用户：「怎么感觉射不准」「鸡打不中」）：hawkeye 在**近距离**只有约 0.5 格的格点精度
+     *    —— 实机：4 格外的 NoAI 鸡，它报落点误差 0.50，直接被 0.4 的闸拦死，一箭没放。
+     *    所以自己也解一条（`ballistics.mjs`，0.5° 步长、无偏），**落点误差更小就用自己那条**。
+     *    实测同一批目标：hawkeye 0.50 → 自己 0.01（鸡 4 格）、0.09 → 0.01（僵尸 9 格）。 */
+    const fbBest = fallbackGrade(aimed, speed)
+    const gErr0 = Number(grade?.nearestDistance)
+    const fbErr0 = Number(fbBest?.nearestDistance)
+    if (grade && Number.isFinite(gErr0) && Math.abs(Number(grade.pitch) || 0) * 180 / Math.PI <= LOW_ARC_MAX_DEG) {
+      /* 两边都是平射解：挑落点更准的（差 0.02 以内算打平，保留 hawkeye 的原解） */
+      return (Number.isFinite(fbErr0) && fbErr0 + 0.02 < gErr0) ? fbBest : grade
+    }
+    if (grade) {
+      /* 🔴 用户 2026-10-19「优先平射」：hawkeye 在同一段距离上常常给出**高抛解**
+       *    （实机 22 格的静止末影水晶给了 pitch 83.5°，箭打短 4 格；19.7 格给 3.9° 一发就中）。
+       *    所以只要它给的仰角超过 LOW_ARC_MAX_DEG，就用自己那套解一条平射的比一比，
+       *    误差不比它差太多（≤ +0.5 格）就用平射。 */
+      const gdeg = Math.abs(Number(grade.pitch) || 0) * 180 / Math.PI
+      if (gdeg <= LOW_ARC_MAX_DEG) return grade
+      const low = fallbackGrade(aimed, speed, { preferLow: true })
+      const gErr = Number.isFinite(Number(grade.nearestDistance)) ? Number(grade.nearestDistance) : 4
+      if (low && Number(low.nearestDistance) <= gErr + 0.5) return { ...low, preferLow: true }
+      return grade
+    }
+    /* 🔴 2026-10-19（用户：「要它在空中射中」「在低上往上射」）：hawkeye 解不出来时不能就此放弃。
+     *    实机：站在地面（y≈63）往 y≈85 的龙射，仰角 40°~70°，hawkeye 一律返回 undefined
+     *    （提示「算不出弹道：目标 31.1 格、角度也刁」）—— "低处往高处打"整条路被堵死。
+     *    兜底：用 `ballistics.mjs` 自己按箭的运动模型暴力扫仰角（带提前量）。 */
+    return fallbackGrade(aimed, speed)
+  }
+
+  /** hawkeye 没有解时的兜底弹道（`ballistics.mjs`）—— 返回形状和 hawkeye 的 grade 对齐 */
+  const fallbackGrade = (aimed, speed, { preferLow = false } = {}) => {
+    const me = b.entity?.position
+    const p = aimed?.position ?? aimed
+    if (!me || !p) return null
+    const from = new Vec3(me.x, me.y + Number(b.entity?.eyeHeight ?? 1.62), me.z)
+    const to = new Vec3(p.x, p.y + Number(aimed?.height ?? 0), p.z)
+    const sol = solveArrowLead({ from, to, vel: speed, speed: arrowSpeedFor(estDrawMs), preferLow })
+    if (!sol) return null
+    return {
+      yaw: sol.yaw,
+      pitch: sol.pitch,
+      nearestDistance: sol.err,
+      grade: sol.deg,
+      ballistics: true,
+      flyTicks: sol.ticks,
+      lead: sol.lead,
+    }
   }
 
   const shots = []
   let fired = 0
   let why = null
   let lastTarget = null
+  let sawNewArrow = false       // 有过"箭数没变但天上多了一支新箭"的证据 ⇒ 算真射出去了
 
   for (let i = 1; i <= n; i++) {
     const target = findTarget()
     lastTarget = target
+    /* 🔴 用户 2026-10-19「maxDist可以改，那个不是你测出来的吗」——
+     *    实机数据：打末影龙**命中的都 ≤ 25 格**（15.5 / 16.3 / 22.3 / 23.3 格），
+     *    26.5 / 30.1 / 34.2 格那几发全空（箭飞 0.6~1 秒，龙已经拐弯）。
+     *    所以给一个"太远就不射"的闸：它不是"判得中不中"，是**干脆不给这一箭**。
+     *    默认关（null）—— 你自己按场合给数（打龙用 25）。 */
+    const isDragon = HOLD_FOR_RE.test(String(target.obj?.name ?? ''))
+    /* 龙落地 = 免疫投射物（见 `isDragonPerched` 的实测）⇒ 一箭都别射，等它起飞或换近战 */
+    if (isDragon && target.entity && isDragonPerched(target.obj)) {
+      why = '末影龙落地了（停在祭坛上）—— **落地时它免疫投射物**，射了也是 0 伤害。'
+        + '等它起飞再射（升到 y≈70 以上），或者直接换剑上去砍'
+      break
+    }
+    /* 没显式给 maxDist 时，末影龙自动套 DRAGON_MAX_DIST（实机命中距离分布，见常量注释） */
+    const capRaw = Number(maxDist)
+    const cap = (Number.isFinite(capRaw) && capRaw > 0)
+      ? capRaw
+      : (isDragon ? DRAGON_MAX_DIST : null)
+    if (cap != null && target.dist != null && target.dist > cap) {
+      why = `目标 ${target.dist.toFixed(1)} 格，超过 maxDist=${cap} 格 —— **这一箭没射**（走进去，或等它飞近）`
+      break
+    }
+    const aimH = aimHeightFor({ entity: target.entity, height: target.obj?.height ?? 0 }, aim)
     const grade = await gradeOf(target)
     if (!grade) {
       why = `算不出弹道：目标 ${target.dist != null ? target.dist.toFixed(1) + ' 格' : '太远'}、角度也刁 —— `
         + 'hawkeye 要求落点误差 ≤ 4 格，靠近一点或换个高度再射'
+      break
+    }
+    /* 🔴 2026-10-19（用户实机「尽量不空就行」）：解出来的弹道**离目标太远**就别放箭了。
+     *    实机证据：打末影龙时有一箭 `aimError: 1.18`（弹道离它 1.18 格），那一箭果然空了；
+     *    而命中的几箭 aimError 都在 0.01~0.39。hawkeye 只在误差 > 4 格时才返回 undefined，
+     *    1~4 格这一段它会照样给出解、我们也照样射 —— 白费箭，还让人以为"弓不准"。
+     *    阈值可用 `ctx.maxAimError` 覆盖（自检里用得到）。
+     *    🔴 2026-10-19 实机统计（打末影龙，力量 V 弓、创造不耗箭）：**命中**的 18 箭 aimError
+     *    落在 0.02~0.36；**打空**的 6 箭落在 0.43~0.60 ⇒ 0.6 这道闸太松，改成默认 **0.4**。
+     *    **活的目标不在这道闸里拦**（下面"端着等"会等到准了再放）—— 见 `canHold`。 */
+    const maxErr = Number(ctx?.maxAimError ?? 0.4)
+    const aimErr = Number(grade.nearestDistance ?? 0)
+    const canHold = Boolean(target.entity && lead && HOLD_FOR_RE.test(String(target.obj?.name ?? '')))
+    if (!canHold && Number.isFinite(maxErr) && maxErr > 0 && aimErr > maxErr) {
+      why = `这一箭会空：弹道离目标 ${aimErr.toFixed(2)} 格（我要求 ≤ ${maxErr} 格）—— `
+        + '靠近点、等它慢下来，或者换个能站高/站低的位置再射'
       break
     }
     if (callLeft() < MIN_DRAW_MS + 600) { why = '这一轮时间不够拉满弓了（要 ≥ 1 秒）'; break }
@@ -221,38 +450,95 @@ async function shootInner (b, args = {}, ctx = {}) {
     await t(b.activateItem(), 'use', '拉弓')
     const drawMs = Math.max(Number(ctx.minDrawMs ?? MIN_DRAW_MS), Math.min(Number(waitTime) || DEFAULT_DRAW_MS, callLeft() - 500))
     await sleep(drawMs)
-    if (target.entity && lead) {
-      const again = await gradeOf(target)
-      if (again) await b.look(again.yaw, again.pitch, true)
+    /* 🔴 2026-10-19（用户实机：「能不能弓蓄力，然后等高命中率，再射」）：
+       以前是"拉满 → 重解一次弹道 → 立刻放"。可目标一直在动，解出来那一刻是准的，
+       放出去时它已经拐弯了 —— 实机打末影龙时一轮十几箭全空。
+       现在**拉满之后先端着别放**：弓拉满就一直满（端着不掉力量），每 `HOLD_POLL_MS`
+       重解一次弹道，等到"这一箭离目标 ≤ maxAimError（默认 0.4 格）"再撒手；
+       最多端 `HOLD_MAX_MS`；到点还不准就**不放**（用户 2026-10-19：「等不到不放」）。
+       `gradeOf` 自己会采一次目标速度（~100ms），所以轮询实际步长比 HOLD_POLL_MS 大。 */
+    let heldMs = null
+    if (canHold) {
+      const holdMax = Math.max(0, Number(ctx?.holdMaxMs ?? HOLD_MAX_MS))
+      const goodErr = Number.isFinite(maxErr) && maxErr > 0 ? maxErr : 0.4
+      const tHold = Date.now()
+      let g = await gradeOf(target)
+      if (g) await b.look(g.yaw, g.pitch, true)
+      while (g && Number(g.nearestDistance ?? 9) > goodErr
+             && Date.now() - tHold < holdMax && callLeft() > 400) {
+        await sleep(HOLD_POLL_MS)
+        const g2 = await gradeOf(target)
+        if (!g2) continue
+        g = g2
+        await b.look(g.yaw, g.pitch, true)
+      }
+      heldMs = Date.now() - tHold
+      const stillBad = !(g && Number(g.nearestDistance ?? 9) <= goodErr)
+      /* 🔴 2026-10-19（用户：「等不到不放」）：端到上限还是不准 ⇒ **这一箭不放**。
+       *    弓已经拉满了，想收回只能用原版那条路：**切快捷栏 = 取消拉弓、不发射**
+       *    （`deactivateItem` 是"撒手"，在 Minecraft 里就等于放箭，所以不能拿它取消）。
+       *    没 `setQuickBarSlot` 的假 bot 就干脆不撒手 —— 少一发也不影响判定。 */
+      if (stillBad) {
+        try {
+          if (typeof b.setQuickBarSlot === 'function') b.setQuickBarSlot((Number(b.quickBarSlot ?? 0) + 1) % 9)
+        } catch {}
+        /* 🔴 2026-10-20 审计：`g` 为 null 时这里会印出"最近还差 **NaN** 格" ——
+         *    对 AI 来说那是一句没法用的乱码。算不出来就直说算不出来。 */
+        const gap = g?.nearestDistance
+        why = `端着等了 ${(heldMs / 1000).toFixed(1)} 秒也没等到准的弹道（`
+          + (gap == null ? '最后连弹道都算不出来（目标丢了/被挡住）' : `最近还差 ${Number(gap).toFixed(2)} 格 > ${goodErr}`)
+          + '）'
+          + ' —— **这一箭没放**，箭没白扔。换个位置（同高/贴到 15 格内）或等它慢下来再射'
+        break
+      }
     }
     await sleep(LOOK_SETTLE_MS)
+    /* 放箭**之前**记下附近已有的箭（地上躺着的、别人射的）——放完新冒出来的那支才是我的 */
+    const arrowsSeenBefore = arrowEntityIdsNear(b)
     await t(b.deactivateItem(), 'use', '放箭')
     const after = await arrowsAfterRelease(b, arrowsBefore, noConsume, ctx.pollMs)
     const used = arrowsBefore - after
+    /* 🔴 箭数没变时的**旁证**：天上多了一支新箭 ⇒ 这一箭确实射出去了。
+     *    无限弓的附魔形状认不出来时（见 `itemHasInfinity` 的说明），全靠这一条兜底，
+     *    否则会出现"明明射中了、工具却说没射出去"的假失败，连射当场停掉。 */
+    const newArrow = (() => {
+      if (used > 0) return false
+      try { for (const id of arrowEntityIdsNear(b)) if (!arrowsSeenBefore.has(id)) return true } catch {}
+      return false
+    })()
     const blockedPos = grade.blockInTrayect?.position ?? null
     shots.push({
       n: i,
       yawDeg: Number((grade.yaw * 180 / Math.PI).toFixed(1)),
       pitchDeg: Number((grade.pitch * 180 / Math.PI).toFixed(1)),
       grade: Number(Number(grade.grade ?? 0).toFixed(1)),
-      aimError: Number(Number(grade.nearestDistance ?? 0).toFixed(2)),
+      /* 🔴 2026-10-20 审计：原来 `?? 0` 会把"算不出误差"写成 **0 = 完美命中**。 */
+      aimError: grade.nearestDistance == null ? null : Number(Number(grade.nearestDistance).toFixed(2)),
       dist: target.dist != null ? Number(target.dist.toFixed(1)) : null,
       blocked: blockedPos ? (b.blockAt?.(blockedPos)?.name ?? '?') : null,
       ...(blockedPos ? { blockedAt: [blockedPos.x, blockedPos.y, blockedPos.z] } : {}),
       arrowsUsed: Math.max(0, used),
+      ...(aimH == null ? {} : { aimY: Number(Number(aimH).toFixed(2)) }),
+      ...(heldMs == null ? {} : { heldMs }),
+      ...(grade.ballistics ? { ballistics: true } : {}),
+      ...(newArrow ? { arrowEntity: true } : {}),
     })
     fired++
-    if (!noConsume && used <= 0) { why = '箭数没变 —— 服务端没认这次放箭（可能没拉满/被拒），别接着射'; break }
+    if (newArrow) sawNewArrow = true
+    if (!noConsume && used <= 0 && !newArrow) { why = '箭数没变、天上也没多出箭 —— 服务端没认这次放箭（可能没拉满/被拒），别接着射'; break }
   }
 
   const arrowsAfter = arrowsIn(b)
-  const ok = fired > 0 && (noConsume || arrowsBefore > arrowsAfter)
+  /* 判"射出去了"的三条证据，任一成立即可：创造模式/无限弓（不耗箭）、箭数掉了、
+   * 或者天上多了一支新箭（无限附魔形状认不出来时的兜底） */
+  const ok = fired > 0 && (noConsume || sawNewArrow || arrowsBefore > arrowsAfter)
   return {
     ok,
     weapon: String(weapon),
     held,
     ...(equipped ? { equipped: true } : {}),
     ...(creative ? { creative: true } : {}),
+    ...(noConsume ? { noConsume: true } : {}),
     ...(lastTarget
       ? {
           target: {

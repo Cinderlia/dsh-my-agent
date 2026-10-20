@@ -21,10 +21,10 @@ import vec3pkg from 'vec3'
 
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 const {
-  TERRAIN_RADIUS, TERRAIN_UP, TERRAIN_DOWN, TERRAIN_KINDS, TERRAIN_TEXT,
-  TERRAIN_PROFILES, TERRAIN_DEFAULTS, TERRAIN_CFG_KEYS, TERRAIN_CACHE_MS,
+  TERRAIN_RADIUS, TERRAIN_UP, TERRAIN_DOWN, TERRAIN_TEXT,
+  TERRAIN_PROFILES, TERRAIN_CFG_KEYS, TERRAIN_CACHE_MS,
   columnAt, columnGlyph, classifyTerrain, classifyTerrainCached,
-  terrainCacheStats, terrainCacheClear, profileFor, applyProfile,
+  terrainCacheStats, profileFor, applyProfile,
 } = await import(new URL('../src/terrain.mjs', import.meta.url))
 
 let pass = 0
@@ -139,7 +139,7 @@ section('③ classifyTerrain：六类 + 优先级 + 最少证据量')
   ok(flat.kind === 'flat', '一片平地 ⇒ flat', flat.kind)
   ok(flat.columns > 0 && flat.unloaded === 0 && flat.hazards === 0, '平地：柱子都量到了、没有危险', JSON.stringify(flat))
   ok(flat.worstDrop === 0 && flat.maxStep === 0 && flat.ups === 0 && flat.downs === 0, '平地：没有任何高差')
-  ok(TERRAIN_KINDS.includes('flat') && TERRAIN_TEXT.flat === '平地', 'flat 在种类表里且有人话名字')
+  ok(TERRAIN_TEXT.flat === '平地' && !!TERRAIN_PROFILES.flat, 'flat 在种类表里且有人话名字')
   ok(String(flat.glyph).includes('@'), '俯视图里标出了自己站的那一格 @')
   ok(String(flat.glyph).split('\n').length === TERRAIN_RADIUS * 2 + 1, '俯视图是 (2r+1) 行', String(String(flat.glyph).split('\n').length))
 
@@ -254,10 +254,11 @@ section('④ profileFor：每一类一套权重，用户配置优先')
   ok(profileFor('steps').cost.digCost < profileFor('flat').cost.digCost, '台阶：挖穿比绕远便宜')
   ok(profileFor('drops').cost.maxDropDown < profileFor('flat').cost.maxDropDown, '落差：允许往下跳的格数收窄')
   ok(profileFor('narrow').cost.digCost > profileFor('flat').cost.digCost, '窄道：挖更贵（挖了容易把自己埋了）')
-  for (const k of TERRAIN_KINDS) ok(profileFor(k).kind === k, `${k} 有自己的一套档案`)
+  for (const k of Object.keys(TERRAIN_PROFILES)) ok(profileFor(k).kind === k, `${k} 有自己的一套档案`)
 
   ok(profileFor('胡说八道').kind === 'unknown', '不认识的类名 ⇒ 退回 unknown')
-  ok(JSON.stringify(TERRAIN_DEFAULTS) === JSON.stringify(TERRAIN_PROFILES.unknown), 'TERRAIN_DEFAULTS 就是 unknown 那套')
+  ok(typeof TERRAIN_PROFILES.unknown === 'object' && TERRAIN_PROFILES.unknown !== null,
+    '不认识的类名那套档案在（`TERRAIN_DEFAULTS` 2026-10-20 精简时删了：它就是 `TERRAIN_PROFILES.unknown` 的别名）')
 
   // 用户配置优先
   const o1 = profileFor('hazard', { walkMaxDropDown: 8 })
@@ -376,9 +377,7 @@ section('⑧ 导航缓存：没挪窝、世界没变 ⇒ 不重扫')
   ok(classifyTerrainCached(bot).cached === false, 'chunkDidLoad 也算世界变了')
 
   ok(classifyTerrainCached(bot, { now: () => Date.now() + 60_000 }).cached === false, '🔴 过了 TTL ⇒ 重扫（兜底）')
-  ok(terrainCacheClear(bot) === true, '手动清缓存返回 true')
-  ok(classifyTerrainCached(bot).cached === false, '清过之后第一次一定重扫')
-  ok(terrainCacheClear({}) === false, '没缓存过的对象清它 ⇒ false')
+  ok(terrainCacheStats(bot).scans >= 1, '缓存统计能读（`terrainCacheClear` 2026-10-20 精简时删了：生产零调用）')
 
   // unknown 不缓存
   const dead = { blockAt: () => null, entity: { position: new Vec3(0.5, 64, 0.5) }, on: () => {} }

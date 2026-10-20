@@ -605,6 +605,16 @@ export function movements (self, { terrain = null } = {}) {
    * （`movements.js:233` 的 `b.safe`），上游只放了 fire/cobweb/web/lava ——
    * 把仙人掌 / 细雪 / 甜浆果丛 / 岩浆块 / 营火补上，A* 会主动绕开。 */
   for (const id of avoidBlockIds(b)) mv.blocksToAvoid.add(id)
+  /* 🔴 2026-10-19 用户：「还有把末影传送门视为危险方块」——
+   *    `blocksToAvoid` 是"这格**能不能站**"（`movements.js:233`），里面一旦混进传送门，
+   *    A* 就永不生成"站进门里"的节点，人只会在门外打转（末地/下界都进不去）。
+   *    传送门是**目的地**不是危险：这里显式剔除（上游目前没加，纯属兜底 —— 免得哪天
+   *    有人看名字顺手把 `_portal` 塞进 `avoidBlockIds()`）。清理逻辑本身由
+   *    `src/movement.mjs` 的 `PORTAL_RE` 一处说了算。 */
+  for (const nm of ['end_portal', 'end_gateway', 'nether_portal']) {
+    const id = b?.registry?.blocksByName?.[nm]?.id
+    if (typeof id === 'number') mv.blocksToAvoid.delete(id)
+  }
   // 垫方块（pathfinder 的 scaffolding）：上游默认 `placeCost = 1`，比挖一格（4）还便宜 4 倍
   // ⇒ A* 有得垫就垫，下坡时表现为"横向往行进方向垫方块"（`movements.js:372-385` 的
   // `getMoveForward`：斜前方下面那格是空气就计划 toPlace）。平地上调高到 12，让它变成最后手段：

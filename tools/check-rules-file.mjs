@@ -531,7 +531,9 @@ section('⑨ 指令白名单页改成"列出全部指令 + 每条一个开关"')
     ok(!COMMANDS_THAT_MOVE_ME.has('say') && !COMMANDS_THAT_MOVE_ME.has('time'),
       '说话/改时间不算挪人（不然每次说话都打断移动）')
     ok(idx.includes('COMMANDS_THAT_MOVE_ME'), 'index.js 引了这份名单')
-    ok(/if \(COMMANDS_THAT_MOVE_ME\.has\(name\)\)[\s\S]{0,160}?interruptMove\(/.test(idx),
+    /* 2026-10-19：`mc_command` 改成支持多行后，判断也变成 `names.some((n) => COMMANDS_THAT_MOVE_ME.has(n))`
+     * —— 多行里只要有一条会挪人就得打断（比原来只看单条更严），断言跟着放宽形状、不放松要求。 */
+    ok(/COMMANDS_THAT_MOVE_ME\.has\([\s\S]{0,260}?interruptMove\(/.test(idx),
       '🔴 发完 /tp 就 interruptMove（否则在飞的 mc_move 会继续朝旧目标走）')
   }
 

@@ -19,7 +19,7 @@ import vec3pkg from 'vec3'
 import { isAir } from './block-names.mjs'
 import { heldText, countOf } from './inventory.mjs'
 import { callSecText } from './budget.mjs'
-import { dangerNow, dangerText, healthOf } from './danger.mjs'
+import { dangerNow, dangerText, dangerNotice, healthOf, noticeKey } from './danger.mjs'
 
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 /**
@@ -57,9 +57,19 @@ export async function build (self, { x1, y1, z1, x2, y2, z2, name = null, max = 
    *    这一轮走完才轮得到 AI。搭高的时候最容易招怪（站在柱子上、没掩体），所以每放一块查一次。 */
   const hp0 = healthOf(b)
   let danger = null
+  /* 🔴 2026-10-19 用户：「不要打断只提醒」—— 搭高时最容易招怪（站在柱子上、没掩体），
+   *    但一挨打就带进度退出，等于每挨一巴掌就白搭一轮。默认改成只记一句、接着放；
+   *    想恢复旧行为把 config.stopOnDanger 设成 true。 */
+  const stopOnDanger = self.cfg?.stopOnDanger === true
+  const notices = []
+  const noticed = new Set()
   for (const p of pts) {
-    danger = dangerNow(b, { hp0 })
-    if (danger) break
+    const d = dangerNow(b, { hp0 })
+    if (d) {
+      if (stopOnDanger) { danger = d; break }
+      const k = noticeKey(d)
+      if (!noticed.has(k)) { noticed.add(k); notices.push(dangerNotice(d)) }
+    }
     if (deadline - Date.now() < 300) break
     done++
     const at = `${p.x},${p.y},${p.z}`
@@ -96,6 +106,7 @@ export async function build (self, { x1, y1, z1, x2, y2, z2, name = null, max = 
     ...(used ? { used } : {}),
     ...(held !== held0 ? { held, heldBefore: held0 } : { held }),
     ...(left > 0 ? { remaining: left } : {}),
+    ...(notices.length ? { warnings: notices } : {}),
     ...(danger ? { interrupted: 'danger', danger: { ...danger, text: dangerText(danger) } } : {}),
     ...(noBudget && ok.length === 0 ? { noBudget: true, callLeftMs } : {}),
     ...(danger

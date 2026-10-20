@@ -386,7 +386,11 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     }
     const gone = !b.entities?.[target.id] || target.isValid === false
     const killed = gone && sawDamage
-    const inRange = Boolean(b.pvp?.wasInRange)
+    /* 🔴 2026-10-19 实机：`b.pvp.wasInRange` 在多数版本里**根本不存在**（读出来永远 undefined）
+     *    ⇒ "够不够得着"永远判成 false。实测 slime 从 16 血被打到 6.9 血（确实贴着打到了），
+     *    结果却报"追了 1.2 秒还没进到攻击距离"+ 整轮 `outcome: failed` / `combat: unreachable`。
+     *    目标**掉过血**就是"进过攻击距离"的铁证（它不会隔空掉血），拿它兜底。 */
+    const inRange = Boolean(b.pvp?.wasInRange) || sawDamage
     const hpAfter = gone ? (killed ? 0 : null) : entityHealth(b, target)
     const waitedMs = Date.now() - t0
     if (gone && !killed && !pvpErr) {
@@ -463,11 +467,15 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     const pickup = killed ? dropHint(b) : null
     const inRange = distOf(target) <= 4.5
     eatBack(ae)
+    /* 🔴 2026-10-20 审计（真 bug）：下面原来两次 spread `note`，后一个会把前一个**整个盖掉**
+     *    —— `gone && !killed` 那句"别当成打死了"在挨打时永远看不到。合成一条。 */
+    const notes = []
+    if (gone && !killed) notes.push('目标不见了，但**没读到过它掉血** —— 说不清是我打死的还是它走远/区块卸载了（别当成打死了）')
+    if (hardHurt) notes.push(`这一轮挨了 ${(hpStart - Number(b.health)).toFixed(0)} 点伤害 —— 血掉太快，提前收手`)
     return {
       attacked: label, distance: d, swings, killed, gone, health: b.health,
-      ...(gone && !killed ? { note: '目标不见了，但**没读到过它掉血** —— 说不清是我打死的还是它走远/区块卸载了（别当成打死了）' } : {}),
+      ...(notes.length ? { note: notes.join('；') } : {}),
       ...(pickup ? { pickup } : {}),
-      ...(hardHurt ? { note: `这一轮挨了 ${(hpStart - Number(b.health)).toFixed(0)} 点伤害 —— 血掉太快，提前收手` } : {}),
       _sawDamage: sawDamage2, _inRange: inRange, _gone: gone, _killed: killed, _hardHurt: hardHurt,
     }
   }

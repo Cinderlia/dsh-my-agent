@@ -24,7 +24,7 @@
 
 import { CALL_BUDGET_MS, callBudget } from './budget.mjs'
 import { sleep, raceAbort } from './async-util.mjs'
-import { dangerNow, dangerText, healthOf } from './danger.mjs'
+import { dangerNow, dangerText, dangerNotice, healthOf, noticeKey } from './danger.mjs'
 
 /**
  * 这一步**到底成没成**（报告 H3，2026-10-13）。
@@ -116,15 +116,26 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
    *    实机 12 个 break 挖竖井，骷髅跟下来一路射，AI 要等这 10 秒过完才知道。
    *    循环开始时记一次血，之后每步之间问一次 `dangerNow()`（判据保守，见 `src/danger.mjs`）。 */
   const hp0 = healthOf(self.bot)
+  /* 🔴 2026-10-19 用户：「不要打断只提醒」—— 默认**不再**因为险情把整串动作交回去：
+   *    险情只写进 `warnings`（每轮 ≤11 秒，跑完这一轮再说），停下来处理由反射层叫醒决定。
+   *    想恢复旧行为（一挨打就带进度退出、给 `interrupted:'danger'`）把 config.stopOnDanger 设成 true。 */
+  const stopOnDanger = self.cfg?.stopOnDanger === true
+  const notices = []
+  const noticed = new Set()
   for (let i = 0; i < steps.length; i++) {
     /* 🔴 2026-10-08 第四份审计报告 ⑪：这两支以前会为**根本没执行**的那步 push 一条 `ok:false`
      *    ⇒ 汇总里 `succeeded + failed + remaining > requested`（模型据此以为"那步做失败了"）。
      *    现在只记 `next`（那步没做，重发时从它开始），不写 results。 */
     if (self.abortSignal?.aborted) { aborted = true; next = i; break }
-    /* 挨打了 / 有怪贴脸 ⇒ **立刻**把控制权还回去（这一步没做，重发时从它开始）。
-     * 放在预算检查**之前**：预算还有 8 秒也不该继续挖 —— 怪已经站到你脸上了。 */
-    danger = dangerNow(self.bot, { hp0 })
-    if (danger) { next = i; break }
+    /* 挨打了 / 有怪贴脸 / 龙息（云或火球）：
+     *   · `stopOnDanger`（默认 false）⇒ 立刻把控制权还回去（这一步没做，重发时从它开始）；
+     *   · 否则只记一句提醒，接着跑（同一种险情一次调用只提醒一次）。 */
+    const d = dangerNow(self.bot, { hp0 })
+    if (d) {
+      if (stopOnDanger) { danger = d; next = i; break }
+      const k = noticeKey(d)
+      if (!noticed.has(k)) { noticed.add(k); notices.push(dangerNotice(d)) }
+    }
     if (Date.now() - t0 > bd) { next = i; break }
     const step = steps[i] ?? {}
     try {
@@ -177,6 +188,9 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
     /* 这次调用**自己没分到时间** ⇒ 明说（`bd` 也一并给出来，别让模型猜）。
      * 与"时间用完了"是两件事：那一种是"做了一部分、时间到了"，这一种是"一步都没做"。 */
     ...(noBudget ? { noBudget: true, budgetMs: bd } : {}),
+    /* 只提醒时（默认）：险情在这儿，`interrupted` 不会出现 —— 活已经跑完了。
+     * 每一条都是一句现成的话，直接给模型看，不用它自己去拼。 */
+    ...(notices.length ? { warnings: notices } : {}),
     /* 挨打退出：`interrupted:'danger'` 是个**能直接判**的字段（不用去啃 hint 的自然语言）。
      * `results` 里保留已经做完的那几步 —— 前功没有尽弃，AI 从 `stoppedAt` 接着发就行。 */
     ...(danger ? { interrupted: 'danger', danger: { ...danger, text: dText } } : {}),
@@ -246,7 +260,8 @@ export async function runStep (self, s) {
       // 🔴 2026-10-08 审计⑤：fly 以前**不传 budgetMs** —— AI 写 `budgetMs:2000` 想飞一小段，
       //    实际跑满 callBudget 的 10 秒，把整串步骤的预算全吃掉。
       if (mode === 'fly') return { ...(await self.flyTo(target.x, target.y, target.z, { budget: callBudget(s.budgetMs) })), mode }
-      return { ...(await self.walkTo(target, { budget: callBudget(s.budgetMs) })), mode }
+      // 用户 2026-10-20：走路**默认不挖方块**（和 mc_move 一致）—— 要挖得在步骤里写 `noDig:false`
+      return { ...(await self.walkTo(target, { budget: callBudget(s.budgetMs), noDig: s.noDig !== false })), mode }
     }
     case 'look':    return self.lookAt(s)
     // 'toward' 要与 mc_act{mode:"toward"} 语义一致：**看向并走近**（只 lookAt 是错的）

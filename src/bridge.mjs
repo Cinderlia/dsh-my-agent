@@ -268,6 +268,11 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
 
   const placed = []
   const skipped = []
+  /* 🔴 2026-10-19 实机：在**本来就是实地**的地方搭路（超平坦最常见），要铺的那层是实心 ⇒ 走 `skipped`
+   *    分支；而"该站的那一格"(deck.y+1) 又被别的方块占着 ⇒ walkTo 只能把人放到 deck.y+2。
+   *    人明明已经在同一列上，高度差是地形造成的 —— 以前这里判死"没走到"，整趟报 failed。
+   *    这些格单独记下来，结果里如实说"站到了它上面一层"，不算没走。 */
+  const stoodAbove = []
   let walked = 0
   const deadline = Date.now() + self.callLeft()
   /** 收场：任何一处对不上都从这里出去，**绝不继续往下铺** */
@@ -346,9 +351,15 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
       return stop(`铺好了 (${at})，但**没走过去**（${moveErr}）——停在原地，不硬挤`, { stepTarget: stepTo })
     }
     const after = feetOf(b)
-    if (after.x !== stepTo.x || after.z !== stepTo.z || after.y !== stepTo.y) {
+    /* 「该站的那格被占着 ⇒ 人站到了它上面一层」——同一列、高一格、且那格真是实心，才认 */
+    const upper = after.x === stepTo.x && after.z === stepTo.z && after.y === stepTo.y + 1
+      ? b.blockAt(new Vec3(stepTo.x, stepTo.y, stepTo.z))
+      : null
+    const onTop = Boolean(upper?.name && isSolidBlock(upper.name))
+    if ((after.x !== stepTo.x || after.z !== stepTo.z || after.y !== stepTo.y) && !onTop) {
       return stop(`铺好了 (${at})，但人站在 (${after.x},${after.y},${after.z})、没到 (${stepTo.x},${stepTo.y},${stepTo.z})——**不按"走过去了"算**`, { stepTarget: stepTo, nowAt: after })
     }
+    if (onTop) stoodAbove.push(`${stepTo.x},${stepTo.y},${stepTo.z}:${upper.name}`)
     const floorNow = b.blockAt(new Vec3(after.x, after.y - 1, after.z))
     if (!floorNow || !isSolidBlock(floorNow.name)) {
       return stop(`走到 (${after.x},${after.y},${after.z}) 之后脚下是 ${floorNow?.name ?? '未加载'}——**支撑没了**，别再往前`)
@@ -363,6 +374,7 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
     placed: placed.length, walked,
     ...(placed.length ? { placedAt: placed.slice(0, 8) } : {}),
     ...(skipped.length ? { skipped: skipped.length, skippedWhy: `这 ${skipped.length} 格本来就有方块（不是空档），没重铺：${skipped.slice(0, 3).join('、')}` } : {}),
+    ...(stoodAbove.length ? { stoodAbove: stoodAbove.length, stoodAboveWhy: `有 ${stoodAbove.length} 格「该站的位置」被方块占着，人站到了它上面一层（${stoodAbove.slice(0, 3).join('、')}）—— 同一列，算走到了` } : {}),
     ...(safety.risk ? { risk: safety.risk } : {}),
     ...(held !== held0 ? { held, heldBefore: held0 } : { held }),
     ...(placed.length === n ? { hint: '整条铺完了，人也走过来了。' } : {}),
@@ -374,7 +386,12 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
 /** 动手前手里的东西 —— 只在"有东西可还"时给（空手就是 null，不用还） */
 export function heldSnapshotOf (b) {
   const it = b?.heldItem ?? null
-  return it?.name ? { name: it.name } : null
+  if (!it?.name) return null
+  /* 🔴 2026-10-20 审计：快照里补上**选中槽位**。`shoot` 取消拉弓是靠
+   *    `setQuickBarSlot((slot+1)%9)` 做的（切槽 = 取消拉弓且不发射），只记名字的话
+   *    还原时 `equip(item,'hand')` 会塞进**当前**选中槽 ⇒ 选中槽偏移一格、两格物品互换。 */
+  const slot = Number(b?.quickBarSlot)
+  return { name: it.name, ...(Number.isInteger(slot) && slot >= 0 && slot < 9 ? { slot } : {}) }
 }
 
 /**
@@ -385,6 +402,11 @@ export function heldSnapshotOf (b) {
  * @returns {{ restored:boolean, now:string|null, why?:string }}
  */
 export async function restoreHeldOf (b, snap) {
+  /* 先还原**选中槽位**（`shoot` 取消拉弓时切过一格）—— 必须在下面那些 early return 之前，
+   * 否则"手里已经是那件了"会提前返回，槽位永远偏移着。 */
+  if (Number.isInteger(snap?.slot) && b?.quickBarSlot !== snap.slot && typeof b.setQuickBarSlot === 'function') {
+    try { b.setQuickBarSlot(snap.slot) } catch { /* 假 bot / 不支持：跳过 */ }
+  }
   const now = b?.heldItem ?? null
   if (!snap?.name) return { restored: false, now: now?.name ?? null }
   if (now?.name === snap.name) return { restored: false, now: now.name }

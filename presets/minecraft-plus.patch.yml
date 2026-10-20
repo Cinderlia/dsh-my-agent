@@ -21,7 +21,9 @@
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              suffix: Your working directory is {{cwd}}.
+              # 不要写 {{cwd}}：宿主新版 dsh-persona 只注册 {{provider}} / {{model}}
+              # 两个提示词变量，工作目录已由宿主自己的 runtime-context 段落提供。
+              # 写了未注册的变量 → 选 MC+ 时整会话启动失败（unknown prompt variable）。
               prefix: '你在一台真实的 Minecraft Java 版服务器里扮演一名玩家：你的"身体"是一台无头机器人，能观察世界、移动、挖掘和建造。'
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'

@@ -40,8 +40,6 @@ export const TERRAIN_MIN_STEPS = 3
 export const TERRAIN_MIN_DROPS = 3
 export const TERRAIN_MIN_GAPS = 1
 
-export const TERRAIN_KINDS = ['flat', 'steps', 'drops', 'gap', 'hazard', 'narrow', 'unknown']
-
 export const TERRAIN_TEXT = {
   flat: '平地',
   steps: '台阶',
@@ -80,9 +78,6 @@ export const TERRAIN_PROFILES = {
   // 判不出来（区块没加载 / 没 bot）：退回平地那套
   unknown: { maxDropDown: 3, liquidCost: 4, digCost: 4, placeCost: 12, allowParkour: false },
 }
-
-/** 没有地形信息时用的默认档案（= 平地那套 = 改动前的全局值）。 */
-export const TERRAIN_DEFAULTS = TERRAIN_PROFILES.unknown
 
 /** 档案字段 → 用户配置键（`profileFor` 用它们判断"用户是不是显式设过"）。 */
 export const TERRAIN_CFG_KEYS = {
@@ -282,17 +277,6 @@ function cacheOf (b) {
 export function terrainCacheStats (b) {
   const e = cacheOf(b)
   return { hits: e.hits, misses: e.misses, scans: e.scans, version: e.version }
-}
-
-/** 手动让缓存失效（世界变了但没发事件时用得上）。 */
-export function terrainCacheClear (b) {
-  const e = _terrainCache.get(b)
-  if (!e) return false
-  e.version++
-  e.last = null
-  e.lastKey = ''
-  e.lastVersion = -1
-  return true
 }
 
 /**

@@ -24,9 +24,6 @@ import { join, dirname, basename } from 'node:path'
 let defaultLogFile = null
 /** 由 core.mjs 在定义完 `DEFAULTS` 之后调一次 */
 export function setDefaultLogFile (file) { defaultLogFile = file ? String(file) : null }
-/** 当前默认落点（没注入过就是 null ⇒ 那几行不落盘，和"文件建不出来"一样静默） */
-export function defaultLogFilePath () { return defaultLogFile }
-
 /* ── 日志基建：本地时间 + 级别 + 进程内去重 + 轮转（2026-10-06 用户"日志优化"）───────
  * 起因（实测 1455 行主日志）：59.7% 是启动噪声 —— 依赖横幅**每个连接重打一遍**、
  * 账户/归档/记忆播种每会话重打一遍；时间戳是 UTC（比本地早 8 小时、跨天看不出是哪天）；

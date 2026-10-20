@@ -101,9 +101,6 @@ export function caveCell (b, x, cy, z, slab) {
  * `caveCell` —— 那会把地板本身当成墙，整张图全是 `#`。
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** 地板层视图的默认参数（`layer` 缺省 = 我脚底下那层 = `feetY - 1`） */
-export const FLOOR_DEFAULTS = { radius: 32, depth: 4 }
-
 /**
  * 从 `fromY` 往下最多 `depth` 格，找第一块**能当地板**的实心方块，返回它的 y。
  * 找不到（下面全是空气/液体，或区块没加载）**一律回 null** —— 未知就是未知，不猜。
@@ -275,14 +272,6 @@ export function gridToWorld (row, col, map) {
   return {
     x: Number(map?.originX ?? 0) + Number(col) * size,
     z: Number(map?.originZ ?? 0) + Number(row) * size,
-  }
-}
-
-export function worldToGrid (x, z, map) {
-  const size = Number(map?.cellSize) || 1
-  return {
-    row: Math.round((Number(z) - Number(map?.originZ ?? 0)) / size),
-    col: Math.round((Number(x) - Number(map?.originX ?? 0)) / size),
   }
 }
 

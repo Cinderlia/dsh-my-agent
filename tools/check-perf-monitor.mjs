@@ -279,7 +279,8 @@ section('④ 静态接线')
   ok(/only: \{ type: 'string'/.test(idx), '🔴 mc_diag 支持 only（只取需要的几节）')
   ok(/const ONLY_GROUPS = \{/.test(idx) && /state: \['physicsEnabled'/.test(idx),
     '🔴 only 有分组表（state/perf/crafting/scheduler/watching/prompt/terrain/workers/connection）')
-  ok(/if \(!asked\.length\) return full/.test(idx), '🔴 不传 only ⇒ 原样全给（老调用行为一个字都没变）')
+  ok(/if \(!asked\.length \|\| asked\.includes\('all'\)\)/.test(idx) && /def\.availableSections = Object\.keys\(ONLY_GROUPS\)/.test(idx),
+    '🔴 不传 only ⇒ 只给 state+connection（2026-10-20 收窄；`only:"all"` 恢复全给）')
   ok(/picked\.unknownSections = unknown/.test(idx), '🔴 认不出的节名放进 unknownSections（不静默丢）')
   ok(/const keep = new Set\(\['online', 'version', 'position', 'mode'\]\)/.test(idx),
     '🔴 点名分节时仍**永远**带 online/version/position/mode（不然任何结论都没法落地）')

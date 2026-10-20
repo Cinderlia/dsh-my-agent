@@ -587,7 +587,9 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
 
   // ① 氧气 5/20 + 在水里：叫醒；文案必须写清"这不是被打"，并给出上浮办法
   //    （用户 2026-10-07："现在容易被淹死" —— 旧版把它当成远程怪隔墙射，AI 跑去找一个不存在的敌人）
-  const h = setup({ world: { inWater: true, air: 5, submerged: true, health: 18 }, patch: { lookAround: false } })
+  /* 🔴 2026-10-19 用户：「水下自救要让 ai 能开关」+「不要自动到干燥方块」——
+   *    所以这一组测的是**显式打开**时的行为（`waterRecover: true`），默认是关的。 */
+  const h = setup({ world: { inWater: true, air: 5, submerged: true, health: 18 }, patch: { lookAround: false, waterRecover: true } })
   h.tick(h.at(1000))
   await flush()
   ok('憋气 → 叫醒 AI（steer 一次）', h.agent.steers.length === 1, String(h.agent.steers.length))
@@ -617,7 +619,7 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
     h.state().stats.alerts === 1 && h.state().stats.dangerWakes === 1, JSON.stringify(h.state().stats))
 
   // ② 氧气 ≤ 4（马上要掉血）：只按住 jump 抬一下，仍然不横向移动、照旧叫醒
-  const g = setup({ world: { inWater: true, air: 3, submerged: true, health: 16 }, patch: { lookAround: false } })
+  const g = setup({ world: { inWater: true, air: 3, submerged: true, health: 16 }, patch: { lookAround: false, waterRecover: true } })
   g.tick(g.at(1000))
   await flush()
   ok('氧气 ≤4：按住 jump 抬一下（保命动作，和"脚下是岩浆"同类）', jumped(g) >= 1, JSON.stringify(g.w.calls.controls))
@@ -694,7 +696,7 @@ section('3.6 在水里憋气（氧气见底）→ 叫醒 AI 上浮（不是"挨�
     JSON.stringify({ w: sub0.w.walks.length, a: sub0.w.calls.attacks.length }))
 
   // ⑨ 头在水下 + 刚掉血（溺水掉血就是这样）→ 立刻叫醒，不用等 10 秒；同时只按一下 jump
-  const subHurt = setup({ world: { inWater: true, air: null, submerged: true, health: 17 }, patch: { lookAround: false } })
+  const subHurt = setup({ world: { inWater: true, air: null, submerged: true, health: 17 }, patch: { lookAround: false, waterRecover: true } })
   subHurt.state().lastHealth = 19
   subHurt.tick(subHurt.at(1000))
   await flush()
@@ -1372,7 +1374,7 @@ section('12. 事件 / 决策审计 / 三种模式（2026-10-18 用户方案 P0+P
   ok('ai-led：不环顾/不吃/不捡/不穿/不跟/不保命',
     b0.mode === 'ai-led' && b0.lookAround === false && b0.autoEat === false && b0.pickup === false
     && b0.wearArmor === false && b0.follow === false && b0.avoidReact === false
-    && b0.creeperFlee === false && b0.waterRecover === false, JSON.stringify(b0))
+    && b0.creeperFlee === false && b0.waterRecover === true, JSON.stringify(b0))
 
   h.auto.setConfig(h.agent, { autoEat: true }, { persist: false })
   const b1 = h.auto.behaviorOf(h.cfg())
@@ -1380,7 +1382,7 @@ section('12. 事件 / 决策审计 / 三种模式（2026-10-18 用户方案 P0+P
 
   h.auto.setConfig(h.agent, { mode: 'legacy' }, { persist: false })
   const b2 = h.auto.behaviorOf(h.cfg())
-  ok('legacy 全开', b2.lookAround && b2.autoEat && b2.pickup && b2.wearArmor && b2.avoidReact && b2.creeperFlee && b2.waterRecover, JSON.stringify(b2))
+  ok('legacy 全开（含 waterRecover：2026-10-19 用户「要默认开」，但可以用 mc_auto set 关掉）', b2.lookAround && b2.autoEat && b2.pickup && b2.wearArmor && b2.avoidReact && b2.creeperFlee && b2.waterRecover, JSON.stringify(b2))
   h.auto.setConfig(h.agent, { pickup: false }, { persist: false })
   ok('显式 pickup:false 覆盖 legacy', h.auto.behaviorOf(h.cfg()).pickup === false)
 
@@ -1428,6 +1430,39 @@ section('12. 事件 / 决策审计 / 三种模式（2026-10-18 用户方案 P0+P
   ok('step 里有事件叫醒与任务停滞', /eventWake\(s, sess, cfg, t\)/.test(src) && /task_stalled/.test(src))
   ok('提示词要求一次只做一个动作', /只做一个动作/.test(src) && /一次只走一步/.test(src))
   ok('工具描述写了三档模式与默认 ai-led', /ai-led/.test(src) && /默认 `ai-led`/.test(src))
+}
+
+section('创造 / 旁观模式不自行报警（2026-10-19 实机：一晚上七十多次"slime 贴上来了"）')
+{
+  const autoSrc = readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8')
+  ok('🔴 威胁检测入口对创造/旁观模式直接返回（不掉血的模式不该叫醒）',
+    /if \(b\.game\?\.gameMode === 'creative' \|\| b\.game\?\.gameMode === 'spectator'\) return/.test(autoSrc))
+}
+
+section('龙息云提醒（2026-10-19 用户：「现在不会躲龙息，检测到龙息应该提醒」）')
+{
+  const autoSrc = readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8')
+  ok('import 了 danger.mjs 的 breathNear / fireballNear',
+    /import \{ breathNear, BREATH_NEAR_R, fireballNear, FIREBALL_NEAR_R \} from '\.\.\/src\/danger\.mjs'/.test(autoSrc))
+  ok('火球检测排在龙息云之前（火球还在飞 ⇒ 落地才变云）',
+    autoSrc.indexOf('const ball = fireballNear(b, FIREBALL_NEAR_R)') > 0
+    && autoSrc.indexOf('const ball = fireballNear(b, FIREBALL_NEAR_R)') < autoSrc.indexOf('const breath = breathNear(b, BREATH_NEAR_R)'))
+  ok('有专属叫醒分支"龙息火球飞过来了"', /自保：龙息火球飞过来了/.test(autoSrc))
+  ok('火球文案给侧移坐标 + "躲到方块后面"', /横向挪开（首选，火球走直线）/.test(autoSrc) && /躲到方块后面/.test(autoSrc))
+  ok('事件 kind=fireball 入队', /pushAutoEvent\(s, 'fireball'/.test(autoSrc))
+  ok('事件优先级 fireball 高于 breath', /fireball: 94, breath: 93/.test(autoSrc))
+  ok('steer 的 summary 能认出 fireball', /summary: ball/.test(autoSrc))
+  ok('每 tick 先查龙息（排在威胁清单之前）',
+    autoSrc.indexOf('const breath = breathNear(b, BREATH_NEAR_R)') > 0
+    && autoSrc.indexOf('const breath = breathNear(b, BREATH_NEAR_R)') < autoSrc.indexOf('const foes = hostilesNear(b, RANGED_NEAR_RADIUS)'))
+  ok('踩进云里（<=3 格）直接 return，不排别的险情', /if \(breath\.distance <= 3\) return/.test(autoSrc))
+  ok('有专属节流常量 BREATH_WAKE_GAP_MS', /const BREATH_WAKE_GAP_MS = \d+/.test(autoSrc))
+  ok('事件入队 kind=breath（决策审计里能看到）', /pushAutoEvent\(s, 'breath'/.test(autoSrc))
+  ok("事件优先级表里有 breath（比 creeper 高、比 drowning 低）", /breath: 93/.test(autoSrc))
+  ok('叫醒文案有专属分支（不是混在"被打"里）', /自保：龙息云贴上来了/.test(autoSrc))
+  ok('叫醒文案给出"往哪跑"的 mc_move 坐标', /跑出云外（首选）/.test(autoSrc))
+  ok('文案里带上"往上垫两格"这条退路（云贴地）', /云贴地、不往上涨/.test(autoSrc))
+  ok('steer 的 summary 能认出 breath', autoSrc.includes('summary: ball') && autoSrc.includes('MC 自保：龙息云在'))
 }
 
 /* ───────────────────────── 汇总 ───────────────────────── */

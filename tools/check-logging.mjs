@@ -166,6 +166,10 @@ const plugSrc = readFileSync(new URL('src/plugins.mjs', root), 'utf8')
   const connSrc = readFileSync(new URL('src/connection.mjs', root), 'utf8')
 const runSrc = readFileSync(new URL('src/runtime.mjs', root), 'utf8')
   const idxSrc = readFileSync(new URL('index.js', root), 'utf8')
+  /* 🔴 2026-10-20：提示词注入 / 通知台账 / 记忆播种那 666 行搬进了 `src/inject.mjs`，
+   * 原先只扫 `index.js` 的断言（logDebug 降级处数、logOnce 只打一次）会跟着漏 —— 两份合起来扫。 */
+  const injSrc = readFileSync(new URL('src/inject.mjs', root), 'utf8')
+  const idxAll = idxSrc + '\n' + injSrc
   const scSrc = readFileSync(new URL('selfcheck.mjs', root), 'utf8')
   ok(!/toISOString\(\)\.slice\(11, 19\)/.test(coreSrc) && !/toISOString\(\)\.slice\(11, 19\)/.test(logSrc),
     'core.mjs / log.mjs 里都没有 UTC 时分秒写法')
@@ -190,8 +194,8 @@ const runSrc = readFileSync(new URL('src/runtime.mjs', root), 'utf8')
 
   ok(/logDebug, logOnce, logLevel/.test(idxSrc), 'index.js 从 core 引入 logDebug/logOnce/logLevel')
   ok(/v\$\{PLUGIN_VERSION\}：配置/.test(idxSrc), '启动配置行带**版本号**（以前日志里分不出是哪份代码）')
-  ok(count(idxSrc, 'logDebug(') >= 8, 'index.js 里 ≥8 处降级成 logDebug', String(count(idxSrc, 'logDebug(')))
-  ok(/logOnce\('no-host-createUserMessage'/.test(idxSrc), '「拿不到宿主 createUserMessage」只打一次（原来 22 遍）')
+  ok(count(idxAll, 'logDebug(') >= 8, 'index.js + src/inject.mjs 里 ≥8 处降级成 logDebug', String(count(idxAll, 'logDebug(')))
+  ok(/logOnce\('no-host-createUserMessage'/.test(idxAll), '「拿不到宿主 createUserMessage」只打一次（原来 22 遍）')
   ok(/const extLogLine = \(m\) =>/.test(idxSrc) && /logLine: extLogLine/.test(idxSrc),
     '扩展拿到的 logLine 会按内容去重（各扩展的「已加载」行）')
   ok(/logDebug\(`扩展已加载：/.test(idxSrc), '「扩展已加载」降级成 debug')
@@ -201,7 +205,7 @@ const runSrc = readFileSync(new URL('src/runtime.mjs', root), 'utf8')
     [/logLine\(`非 MC 模式：mc \/ mc_kit 工具已从可见面摘掉/, '非 MC 模式'],
     [/logLine\(`MC 模式：工具白名单已生效/, 'MC 模式白名单'],
     [/logLine\(`新会话记忆已从基根播种/, '记忆播种'],
-  ]) ok(!re.test(idxSrc), `「${label}」已不在 info 级别`)
+  ]) ok(!re.test(idxAll), `「${label}」已不在 info 级别`)
 
   ok(/writeFileSync\(process\.env\.MC_LOG, ''\)/.test(scSrc), 'selfcheck 会截断自己的日志（不再无限追加到 1.2 MB）')
 }

@@ -298,21 +298,34 @@ section('⑤ runSequence() —— 到点停下并给出 stoppedAt / remaining / 
   ok(r2.stoppedAt === undefined && r2.remaining === undefined, '没到点就不给 stoppedAt（别让模型白重发）', JSON.stringify({ stoppedAt: r2.stoppedAt }))
 }
 
-/* ─────────── ⑤b 危险信号：挨打就带进度退出（`src/danger.mjs`） ─────────── */
-section('⑤b 长循环挨打就退出 —— interrupted:"danger" + stoppedAt（用户 2026-10-17「延迟很大」）')
+/* ─────────── ⑤b 危险信号：默认**只提醒不打断**（用户 2026-10-19「不要打断只提醒」） ─────────── */
+section('⑤b 长循环遇险：默认只提醒（warnings），stopOnDanger:true 才带进度退出')
 {
-  /* ① 怪贴脸 ⇒ **第 0 步之前**就退出（一步都不做），且能直接判（不用啃自然语言） */
+  /* ① 默认：怪贴脸 ⇒ 活照跑完，结果里多一句 warnings；**没有** interrupted */
   const fake = mkBot({ mobs: [{ name: 'zombie', at: [2, 64, 0] }] })
   const mc = mkMc(fake)
   const r = await mc.runSequence([{ op: 'wait', sec: 0 }, { op: 'wait', sec: 0 }])
-  ok(r.interrupted === 'danger', '有怪贴脸 ⇒ interrupted:"danger"（机器可读）', JSON.stringify(r.interrupted))
+  ok(r.interrupted === undefined, '默认不中断（没有 interrupted）', JSON.stringify(r.interrupted))
+  ok(r.stoppedAt === undefined && r.succeeded === 2, '两步都跑完了（不是停在半路）', JSON.stringify({ stoppedAt: r.stoppedAt, succeeded: r.succeeded }))
+  ok(Array.isArray(r.warnings) && r.warnings.length === 1 && /zombie/.test(r.warnings[0]), 'warnings 里说清是谁贴上来的', JSON.stringify(r.warnings))
+  ok(/只提醒/.test(r.warnings[0]) && /没打断/.test(r.warnings[0]), 'warnings 明说「只提醒，没打断」')
+  ok(r.danger === undefined, '不出现 danger 字段（那是旧行为）')
+}
+{
+  /* ② 想恢复旧行为：`stopOnDanger: true` ⇒ 第 0 步之前就退出（一步都不做） */
+  const fake = mkBot({ mobs: [{ name: 'zombie', at: [2, 64, 0] }] })
+  const mc = mkMc(fake)
+  mc.cfg.stopOnDanger = true
+  const r = await mc.runSequence([{ op: 'wait', sec: 0 }, { op: 'wait', sec: 0 }])
+  ok(r.interrupted === 'danger', 'stopOnDanger:true ⇒ interrupted:"danger"（机器可读）', JSON.stringify(r.interrupted))
   ok(r.stoppedAt === 0 && r.succeeded === 0, '第 0 步之前就退出（stoppedAt=0、succeeded=0）', JSON.stringify({ stoppedAt: r.stoppedAt, succeeded: r.succeeded }))
   ok(r.danger?.kind === 'hostile' && r.danger?.name === 'zombie', 'danger 里带怪的名字', JSON.stringify(r.danger))
   ok(/zombie/.test(r.hint ?? '') && /attack/.test(r.hint ?? ''), 'hint 说清"先打掉它"', String(r.hint).slice(0, 90))
   ok(!/时间/.test(r.hint ?? ''), 'hint **不说**"时间不够"（两件事不能混）', String(r.hint).slice(0, 90))
+  ok(r.warnings === undefined, '旧行为下不出 warnings')
 }
 {
-  /* ② 掉血 ⇒ 做完第 0 步、第 1 步之前退出（**进度不丢**） */
+  /* ③ 掉血：默认也要跑完（不再因为"血少了"把活交回来），血量差额照样写进提醒 */
   const fake = mkBot()
   const mc = mkMc(fake)
   const orig = fake.bot.setControlState
@@ -322,34 +335,45 @@ section('⑤b 长循环挨打就退出 —— interrupted:"danger" + stoppedAt�
     return orig(k, v)
   }
   const r = await mc.runSequence([{ op: 'jump' }, { op: 'jump' }, { op: 'jump' }])
-  ok(r.interrupted === 'danger' && r.danger?.kind === 'hurt', '掉血 ⇒ kind=hurt', JSON.stringify(r.danger))
-  ok(r.danger?.hp0 === 20 && r.danger?.health === 16, '把 20 → 16 如实带上', JSON.stringify(r.danger))
-  ok(r.stoppedAt === 1 && r.succeeded === 1, '第 0 步做完了才退（进度不丢）', JSON.stringify({ stoppedAt: r.stoppedAt, succeeded: r.succeeded }))
-  ok(/从第 2 步往后发/.test(r.hint ?? ''), 'hint 说清从第几步接着发', String(r.hint).slice(0, 110))
+  ok(r.interrupted === undefined && r.succeeded === 3, '掉血也把三步跑完', JSON.stringify({ succeeded: r.succeeded, interrupted: r.interrupted }))
+  ok(String(r.warnings?.[0] ?? '').includes('正在挨打'), 'warnings 说清在挨打', JSON.stringify(r.warnings))
+  ok(String(r.warnings?.[0] ?? '').includes('20') && String(r.warnings?.[0] ?? '').includes('16'), '把 20 → 16 如实带上', String(r.warnings?.[0] ?? ''))
 }
 {
-  /* ③ 8 格外的怪**不算** —— 不能把"挖 12 格"砍成 12 次调用（那正是要修的病） */
+  /* ④ 8 格外的怪**不算** —— 不能把"挖 12 格"砍成 12 次调用（那正是要修的病） */
   const fake = mkBot({ mobs: [{ name: 'zombie', at: [8, 64, 0] }] })
   const mc = mkMc(fake)
   const r = await mc.runSequence([{ op: 'wait', sec: 0 }, { op: 'wait', sec: 0 }])
-  ok(r.interrupted === undefined && r.stoppedAt === undefined, '8 格外的僵尸 ⇒ 不打断', JSON.stringify({ interrupted: r.interrupted, stoppedAt: r.stoppedAt }))
+  ok(r.interrupted === undefined && r.stoppedAt === undefined && r.warnings === undefined, '8 格外的僵尸 ⇒ 既不打断也不提醒', JSON.stringify({ interrupted: r.interrupted, warnings: r.warnings }))
 }
 {
-  /* ④ 危险检查排在**预算检查之前**：时间还剩很多，但怪在脸上 ⇒ 照样退 */
+  /* ⑤ 危险检查仍在**预算检查之前**：时间还剩很多，但怪在脸上 ⇒ 开了开关照样退 */
   const fake = mkBot({ mobs: [{ name: 'skeleton', at: [1, 64, 0] }] })
   const mc = mkMc(fake)
+  mc.cfg.stopOnDanger = true
   mc.setCallDeadline(11_000)
   const r = await mc.runSequence([{ op: 'wait', sec: 0 }, { op: 'wait', sec: 0 }])
-  ok(r.interrupted === 'danger', '预算充足也照样为危险退出', JSON.stringify({ interrupted: r.interrupted }))
+  ok(r.interrupted === 'danger', '预算充足也照样为危险退出（开关打开时）', JSON.stringify({ interrupted: r.interrupted }))
 }
 {
-  /* ⑤ mc_build 一样：挨打就带进度退出 */
+  /* ⑥ mc_build：默认挨打照样放完这一格，只在结果里留一句 */
   const box = { x1: 0, y1: 64, z1: 0, x2: 0, y2: 64, z2: 0, name: 'stone' }
   const fake = mkBot({ mobs: [{ name: 'zombie', at: [2, 64, 0] }] })
   const mc = mkMc(fake)
   mc.placeBlock = async (o) => { fake.calls.place.push(o); return { placed: true } }
   const r = await mc.build(box)
-  ok(r.interrupted === 'danger', 'mc_build 挨打也带 interrupted:"danger"', JSON.stringify(r.interrupted))
+  ok(r.interrupted === undefined && r.placed === 1, '默认：这一格照样放上去', JSON.stringify({ placed: r.placed, interrupted: r.interrupted }))
+  ok(Array.isArray(r.warnings) && r.warnings.length === 1, '结果里带一句 warnings', JSON.stringify(r.warnings))
+}
+{
+  /* ⑦ mc_build：开了开关 ⇒ 一块都不放，直接带 interrupted 回来 */
+  const box = { x1: 0, y1: 64, z1: 0, x2: 0, y2: 64, z2: 0, name: 'stone' }
+  const fake = mkBot({ mobs: [{ name: 'zombie', at: [2, 64, 0] }] })
+  const mc = mkMc(fake)
+  mc.cfg.stopOnDanger = true
+  mc.placeBlock = async (o) => { fake.calls.place.push(o); return { placed: true } }
+  const r = await mc.build(box)
+  ok(r.interrupted === 'danger', 'stopOnDanger:true ⇒ mc_build 带 interrupted:"danger"', JSON.stringify(r.interrupted))
   ok(r.placed === 0, '一块都没放（第 0 格之前就退了）', String(r.placed))
   ok(fake.calls.place.length === 0, '真的一个 placeBlock 都没发', String(fake.calls.place.length))
 }

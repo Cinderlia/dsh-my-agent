@@ -28,6 +28,8 @@ const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 const {
   DANGER_HOSTILE_R, DANGER_HP_LOST,
   healthOf, nearestHostile, dangerNow, dangerText,
+  breathNear, breathText, BREATH_NEAR_R, BREATH_RE,
+  fireballNear, fireballText, FIREBALL_NEAR_R, FIREBALL_RE, predictImpact,
 } = await import(new URL('../src/danger.mjs', import.meta.url))
 
 let pass = 0
@@ -47,6 +49,7 @@ const fakeBot = ({ at = [0, 64, 0], health = 20, mobs = [] } = {}) => ({
     kind: m.kind,
     type: m.type ?? 'mob',
     position: new Vec3(m.at[0], m.at[1], m.at[2]),
+    ...(m.velocity ? { velocity: new Vec3(m.velocity[0], m.velocity[1], m.velocity[2]) } : {}),
   }])),
 })
 
@@ -95,13 +98,18 @@ section('②′ 中立怪：不主动打我 = 不是威胁（2026-10-18 审计�
 {
   /* 末影人 / 猪灵 / 狼 / 铁傀儡 在 `HOSTILE_RE` 里，但**默认中立**。
    * 以前它们一走到 3 格内就 `nearestHostile` 非 null ⇒ 长循环被砍断、任务被暂停，
-   * 而 `mc_act{attack}` 又不打它们（`hostilityOf` 口径相反）。现在只在**它正打我**时才算。 */
+   * 而 `mc_act{attack}` 又不打它们（`hostilityOf` 口径相反）。现在只认 `hostile`。 */
   const calm = fakeBot({ mobs: [{ name: 'enderman', at: [1, 64, 0] }] })
   calm.entities[1].target = null
   ok(nearestHostile(calm, 3) === null, '末影人站着不动 ⇒ 不算威胁')
+  /* 🔴 2026-10-20 审计：原来这里断言「末影人 target === 我 ⇒ 算威胁」，可
+   *    **prismarine-entity 根本没有 `target` 字段** —— 假 bot 里有，真机上永远 undefined，
+   *    这条断言等于在保护一段死代码。真"它在打我"的判据是**掉血**（见 ③ 的 hurt），
+   *    所以现在断言的是"就算给它塞个 target，也不靠它判"（中立怪不按 proximity 算威胁）。 */
   const angry = fakeBot({ mobs: [{ name: 'enderman', at: [1, 64, 0] }] })
   angry.entities[1].target = angry.entity
-  ok(nearestHostile(angry, 3)?.name === 'enderman', '末影人正盯着我打 ⇒ 算威胁')
+  ok(nearestHostile(angry, 3) === null,
+    '🔴 中立怪只看 `target` 是死代码（真机没这个字段）⇒ 它贴脸也不算威胁，交给掉血判据')
   const zombie = fakeBot({ mobs: [{ name: 'zombie', at: [1, 64, 0] }] })
   zombie.entities[1].target = null
   ok(nearestHostile(zombie, 3)?.name === 'zombie', '僵尸天然敌对 ⇒ 不管它盯不盯我都算')
@@ -164,7 +172,7 @@ for (const [file, label] of [
   ok(/interrupted: 'danger'/.test(src), 'sequence：结果里有 interrupted:\'danger\'（能直接判，不用啃自然语言）')
   ok(/const hp0 = healthOf\(self\.bot\)/.test(src), 'sequence：hp0 在循环**外面**记一次')
   /* 🔴 顺序断言：危险检查必须在预算检查**之前** —— 否则"预算还有 8 秒"会先 break，怪就白来了 */
-  const iDanger = src.indexOf('danger = dangerNow(self.bot, { hp0 })')
+  const iDanger = src.search(/dangerNow\(self\.bot, \{ hp0 \}\)/)
   const iBudget = src.indexOf('if (Date.now() - t0 > bd)')
   ok(iDanger > 0 && iBudget > 0 && iDanger < iBudget, 'sequence：危险检查排在预算检查之前', `danger@${iDanger} budget@${iBudget}`)
   ok(/steps 从第 \$\{next \+ 1\} 步往后发/.test(src), 'sequence：hint 告诉 AI 从哪一步接着发（不白挖前面那几步）')
@@ -172,16 +180,138 @@ for (const [file, label] of [
 {
   const src = read('../src/build.mjs')
   ok(/interrupted: 'danger'/.test(src), 'build：结果里有 interrupted:\'danger\'')
-  const iDanger = src.indexOf('danger = dangerNow(b, { hp0 })')
+  const iDanger = src.search(/dangerNow\(b, \{ hp0 \}\)/)
   const iDead = src.indexOf('if (deadline - Date.now() < 300) break')
   ok(iDanger > 0 && iDead > 0 && iDanger < iDead, 'build：危险检查排在预算检查之前')
 }
 {
   const src = read('../src/mining.mjs')
-  const iDanger = src.indexOf('danger = dangerNow(b, { hp0 })')
+  const iDanger = src.search(/dangerNow\(b, \{ hp0 \}\)/)
   const iLeft = src.indexOf('const left = leftOf()')
   ok(iDanger > 0 && iLeft > 0 && iDanger < iLeft, 'mining：危险检查排在预算检查之前')
   ok(/先别挖了/.test(src), 'mining：收工时如实说"先别挖了"')
+}
+
+section('⑥ 龙息云：踩进去每 0.5 秒掉 4 点血（用户 2026-10-19「检测到龙息应该提醒」）')
+{
+  /* 为什么单独一条：`area_effect_cloud` **不是敌对实体**（`nearestHostile` 看不见它），
+   * 不进去也不掉血 —— 以前的整套报险逻辑对它零反应，末地那趟就是站在云里被熏死的。 */
+  ok(BREATH_RE.test('area_effect_cloud') && !BREATH_RE.test('enderman'), 'BREATH_RE 只认 area_effect_cloud')
+  ok(BREATH_NEAR_R === 6, '提醒半径 6 格（云半径 3 + 一步退路）', String(BREATH_NEAR_R))
+
+  const cloud = fakeBot({ at: [0, 64, 0], mobs: [{ name: 'area_effect_cloud', at: [4, 64, 0] }] })
+  const c = breathNear(cloud)
+  ok(c && c.distance === 4, '4 格外的云 ⇒ 报 distance 4', JSON.stringify(c?.distance))
+  ok(c?.escape?.dx === -1 && c?.escape?.dz === 0, 'escape 是背离云心的水平单位向量（云在东边 ⇒ 往西跑）', JSON.stringify(c?.escape))
+  ok(/龙息云在 4 格/.test(breathText(c) ?? ''), 'breathText 一句话说清"几格、往哪跑"', String(breathText(c)))
+  ok(c?.escape?.blocks >= 8 && c?.escape?.blocks > c.distance, '跑的距离 ≥ 8 且跑出云外', String(c?.escape?.blocks))
+  ok(c?.escape?.x === -c.escape.blocks, '落点坐标 = 我 + 方向 × 格数', JSON.stringify([c?.escape?.x, c?.escape?.z]))
+
+  const far = fakeBot({ at: [0, 64, 0], mobs: [{ name: 'area_effect_cloud', at: [7, 64, 0] }] })
+  ok(breathNear(far) === null, '7 格（> 6）不报 —— 别为远处的云神经质地叫醒')
+  ok(breathNear({ entity: { position: new Vec3(0, 64, 0) } }) === null, '没有 entities ⇒ null，不炸')
+  ok(breathNear({ entity: { position: new Vec3(0, 64, 0) }, entities: { 1: { name: 'area_effect_cloud' } } }) === null,
+    '云没有 position ⇒ 跳过，不炸')
+
+  const onMe = fakeBot({ at: [0, 64, 0], mobs: [{ name: 'area_effect_cloud', at: [0, 64, 0] }] })
+  const om = breathNear(onMe)
+  ok(om && Math.hypot(om.escape.dx, om.escape.dz) > 0.99, '云心就在脚下：escape 仍是有效的单位向量（不会 0/0）', JSON.stringify(om?.escape))
+
+  /* 掉血 vs 龙息 vs 有怪：龙息要排在"有怪贴脸"前面（已经在掉血了，怪还没打到） */
+  const both = fakeBot({ at: [0, 64, 0], mobs: [
+    { name: 'area_effect_cloud', at: [3, 64, 0] },
+    { name: 'zombie', at: [1, 64, 0] },
+  ] })
+  const d = dangerNow(both)
+  ok(d?.kind === 'breath', '龙息 + 僵尸贴脸 ⇒ 先报龙息', JSON.stringify(d?.kind))
+  ok(/龙息/.test(dangerText(d) ?? ''), 'dangerText 说"龙息"', String(dangerText(d)))
+  ok(/跑 \d+ 格/.test(dangerText(d) ?? ''), 'dangerText 带上"往哪跑几格"', String(dangerText(d)))
+}
+
+section('⑦ 龙息火球（还在飞的那颗）：比云早几秒报警（用户 2026-10-19「只能落地的才能检测到吗」）')
+{
+  /* 为什么要有它：飞到半路的是 `dragon_fireball`（projectile），**落地/碰撞后才生成**
+   * `area_effect_cloud`。只盯云 = 只在"已经晚了"的那一刻报警。 */
+  ok(FIREBALL_RE.test('dragon_fireball') && !FIREBALL_RE.test('area_effect_cloud'), 'FIREBALL_RE 只认 dragon_fireball')
+  ok(FIREBALL_NEAR_R === 32, '火球提醒半径 32 格（用户 2026-10-19 指定，要留出决策时间）', String(FIREBALL_NEAR_R))
+
+  const toward = fakeBot({ at: [0, 64, 0], mobs: [{ name: 'dragon_fireball', at: [8, 64, 0], velocity: [-1, 0, 0] }] })
+  const f = fireballNear(toward)
+  ok(f && f.distance === 8, '8 格外的火球 ⇒ distance 8', JSON.stringify(f?.distance))
+  ok(f?.inbound === true, '速度朝我 ⇒ inbound true（能分辨"朝我飞"和"路过"）', JSON.stringify(f?.inbound))
+  ok(f?.escape?.dx === -1 && Math.hypot(f.escape.dx, f.escape.dz) > 0.99, '侧移方向是背离火球的单位向量', JSON.stringify(f?.escape))
+  ok(/龙息火球在 8 格/.test(fireballText(f) ?? ''), 'fireballText 一句话说清', String(fireballText(f)))
+
+  const away = fakeBot({ at: [0, 64, 0], mobs: [{ name: 'dragon_fireball', at: [8, 64, 0], velocity: [1, 0, 0] }] })
+  ok(fireballNear(away)?.inbound === false, '速度背离我 ⇒ inbound false', JSON.stringify(fireballNear(away)?.inbound))
+  const noVel = fakeBot({ at: [0, 64, 0], mobs: [{ name: 'dragon_fireball', at: [8, 64, 0] }] })
+  ok(fireballNear(noVel)?.inbound === null, '读不到速度 ⇒ inbound null（不瞎猜）', JSON.stringify(fireballNear(noVel)?.inbound))
+
+  ok(fireballNear(fakeBot({ at: [0, 64, 0], mobs: [{ name: 'dragon_fireball', at: [32, 64, 0] }] }))?.distance === 32,
+    '32 格边界仍在提醒范围内（用户要的半径）')
+  ok(fireballNear(fakeBot({ at: [0, 64, 0], mobs: [{ name: 'dragon_fireball', at: [33, 64, 0] }] })) === null,
+    '33 格（> 32）不报')
+  /* 火球和云同时在场：火球更早 ⇒ 先报火球；云和僵尸同时：先报云 */
+  const bothHaz = fakeBot({ at: [0, 64, 0], mobs: [
+    { name: 'area_effect_cloud', at: [3, 64, 0] },
+    { name: 'dragon_fireball', at: [9, 64, 2] },
+    { name: 'zombie', at: [1, 64, 0] },
+  ] })
+  ok(dangerNow(bothHaz)?.kind === 'fireball', '火球 + 云 + 僵尸 ⇒ 先报火球', JSON.stringify(dangerNow(bothHaz)?.kind))
+  ok(/火球/.test(dangerText(dangerNow(bothHaz)) ?? ''), 'dangerText 说"火球"', String(dangerText(dangerNow(bothHaz))))
+}
+
+section('⑧ 火球落点预测（用户 2026-10-19「这里可以改成落点吗」）')
+{
+  /* 报"它现在在哪"没用 —— 云长在落点上，AI 只需要知道"落点离我几格、要不要挪"。 */
+  const Vec = Vec3
+  /** 造一个"只有某几格是实心"的世界：keys 形如 'x,y,z' */
+  const solidAt = (keys) => (p) => {
+    const k = `${p.x},${p.y},${p.z}`
+    return keys.has(k)
+      ? { name: 'end_stone', position: new Vec(p.x, p.y, p.z), boundingBox: 'block' }
+      : { name: 'air', position: new Vec(p.x, p.y, p.z), boundingBox: 'empty' }
+  }
+  const pos = new Vec(0, 65, 0)
+  const vel = new Vec(1, 0, 0)   // 朝 +x 直飞
+
+  const imp = predictImpact({ blockAt: solidAt(new Set(['12,65,0'])), entity: { position: new Vec(0, 64, 0) } }, pos, vel)
+  ok(imp && imp.x === 12 && imp.z === 0, '撞到 x=12 的墙 ⇒ 落点 (12, ·, 0)', JSON.stringify(imp))
+  ok(imp?.y === 66, '落点报**墙上方那一层**（云长在落点上面）', String(imp?.y))
+  ok(imp?.blocks > 11 && imp?.blocks <= 12, '落点距离 ≈ 12（沿速度方向推进的格数）', String(imp?.blocks))
+  ok(imp?.distanceToMe === 12 && imp?.hitsMe === false, '离我 12 格 ⇒ hitsMe false', JSON.stringify([imp?.distanceToMe, imp?.hitsMe]))
+
+  const close = predictImpact({ blockAt: solidAt(new Set(['2,65,0'])), entity: { position: new Vec(0, 64, 0) } }, pos, vel)
+  ok(close?.hitsMe === true, '落点离我 2 格（< 云半径 3.5）⇒ hitsMe true', JSON.stringify([close?.distanceToMe, close?.hitsMe]))
+
+  ok(predictImpact({}, pos, vel) === null, '没有 blockAt ⇒ null（不瞎猜落点）')
+  ok(predictImpact({ blockAt: () => null, entity: { position: new Vec(0, 64, 0) } }, pos, new Vec(0, 0, 0)) === null, '速度 0 ⇒ null')
+  ok(predictImpact({ blockAt: () => null, entity: { position: new Vec(0, 64, 0) } }, pos, vel) === null,
+    '一路没有实心方块（读不到区块）⇒ null，不会假装算出了落点')
+
+  /* 接进 fireballNear：文案里报落点而不是"它现在在哪" */
+  const bot = {
+    entity: { position: new Vec(0, 64, 0) },
+    blockAt: solidAt(new Set(['20,70,0'])),
+    entities: { 1: { name: 'dragon_fireball', position: new Vec(8, 70, 0), velocity: new Vec(1, 0, 0) } },
+  }
+  const f = fireballNear(bot)
+  ok(f?.impact?.x === 20, 'fireballNear 带上 impact（落点 x=20）', JSON.stringify(f?.impact))
+  const txt = fireballText(f) ?? ''
+  ok(/落点 \(20, 0\)/.test(txt), 'fireballText 报落点坐标', txt)
+  ok(/离我 20 格/.test(txt), 'fireballText 报"落点离我几格"', txt)
+
+  /* 一路没撞到方块（末地大片空/未加载）：退化成"离我最近的掠过点"，标 approx */
+  const open = {
+    entity: { position: new Vec(0, 64, 0) },
+    blockAt: () => null,
+    entities: { 1: { name: 'dragon_fireball', position: new Vec(30, 64, 0), velocity: new Vec(-1, 0, 0) } },
+  }
+  const g = fireballNear(open)
+  ok(g?.impact?.approx === true, '撞不到方块时给"掠过点"（approx:true）', JSON.stringify(g?.impact))
+  ok(g?.impact?.distanceToMe === 0 && g?.impact?.hitsMe === true, '正对我飞 ⇒ 掠过点就在我身上（hitsMe true）',
+    JSON.stringify([g?.impact?.distanceToMe, g?.impact?.hitsMe]))
+  ok(/掠过点约/.test(fireballText(g) ?? ''), '文案写"掠过点约"而不是假装是落点', String(fireballText(g)))
 }
 
 console.log(`\n${'─'.repeat(50)}\ncheck-danger：pass=${pass} fail=${fail}`)

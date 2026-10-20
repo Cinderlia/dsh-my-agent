@@ -135,14 +135,6 @@ export function catalogNames () {
   return out
 }
 
-/** 目录里有没有这个名字（大小写不敏感；**剥掉前导 `/`**，和 `commandAllowed()` 同款规矩）。 */
-export function inCatalog (name) {
-  const n = String(name ?? '').trim().replace(/^\//, '').toLowerCase()
-  if (!n) return false
-  for (const g of COMMAND_GROUPS) for (const it of g.items) if (it.name === n) return true
-  return false
-}
-
 /**
  * 这些指令会**把机器人挪走**（或者可能挪走）。
  *
@@ -157,3 +149,48 @@ export function inCatalog (name) {
 export const COMMANDS_THAT_MOVE_ME = new Set([
   'tp', 'teleport', 'spreadplayers', 'execute',
 ])
+
+/** 一次 `mc_command` 最多代发几条（再多就像刷屏，原版服务端有指令频率限制） */
+export const MAX_COMMANDS_PER_CALL = 32
+
+/**
+ * 把 `mc_command` 的入参拆成**一条一条**的指令（多行 = 多条）。
+ *
+ * 🔴 为什么必须拆：聊天包里的换行符会被服务端当场判成非法字符，
+ *    回 `multiplayer.disconnect.illegal_characters` **把人踢下线**。
+ *    2026-10-19 实机：把 10 条 `/fill` 拼成一个多行字符串发出去，人直接掉线，
+ *    整个建造任务作废。所以多行不是"写错了"，而是**必须支持**的用法 —— 在这里拆开，
+ *    由工具层逐条发（间隔 120ms）。
+ *
+ * 只做"拆 + 校验格式"，**不管白名单**（白名单是配置的事，调用方逐条判）：
+ *   · 空行丢掉（`\r\n` 也认）；
+ *   · 每条必须以 `/` 开头；
+ *   · 超过 `max` 条直接拒（不静默截断 —— 静默截断会让人以为全发完了）。
+ *
+ * @param {string} raw
+ * @param {{max?: number}} [opts]
+ * @returns {string[]} 拆好、去过首尾空白的指令（至少 1 条，否则抛）
+ */
+export function splitCommands (raw, { max = MAX_COMMANDS_PER_CALL } = {}) {
+  const lines = String(raw ?? '')
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (!lines.length) throw new Error('没给指令（要给以 / 开头的完整指令）')
+  if (lines.length > max) {
+    throw new Error(`一次最多 ${max} 条（给了 ${lines.length} 条）—— 分几次发，别一口气刷屏`)
+  }
+  for (const [i, line] of lines.entries()) {
+    if (!line.startsWith('/')) throw new Error(`第 ${i + 1} 条不是以 / 开头：${line.slice(0, 40)}`)
+    /* 单条里**不许**再夹换行以外的控制字符（制表符、`\u0000`…）——同样会被判非法字符 */
+    if (/[\u0000-\u001f\u007f]/.test(line)) {
+      throw new Error(`第 ${i + 1} 条里有控制字符（制表符之类）—— 服务端会判成 illegal_characters 把我踢了`)
+    }
+  }
+  return lines
+}
+
+/** 一条指令的名字（剥掉前导 `/`，取第一个词，小写）—— 白名单判定用 */
+export function commandNameOf (line) {
+  return String(line ?? '').trim().replace(/^\//, '').split(/\s+/)[0].toLowerCase()
+}

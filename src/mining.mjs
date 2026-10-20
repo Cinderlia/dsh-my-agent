@@ -27,7 +27,7 @@ import { digMsFor } from './dig-speed.mjs'
 import { blockReachOf, slowDigWhy, stateNameOf, dropHint } from './world-observer.mjs'
 import { classifyRestore } from './server-break.mjs'
 import { callBudget, callSecText } from './budget.mjs'
-import { dangerNow, dangerText, healthOf } from './danger.mjs'
+import { dangerNow, dangerText, dangerNotice, healthOf, noticeKey } from './danger.mjs'
 
 /* 「挖到刚好够合成就不挖了」—— 收工时补一句（用户 2026-10-13 报的毛病）。
  *
@@ -305,7 +305,11 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
   const b = self.requireBot()
   const out = []
   const held0 = heldText(b)
-  const n = Math.min(Math.max(count, 1), 16)
+  /* 🔴 2026-10-19 实机：**只给 pos 又给 count>1** 时，第二格开始 `want` 取的是
+   *    `blockAt(pos).name` —— 而那格刚被挖空，读回来是 `air`，于是 `findBlocks` 抓一堆**空气**
+   *    当目标（返回里就成了"（12,-60,28）已经不在了"那样的话）。
+   *    指定坐标的语义本来就是"挖这一格"，count 在这里没有意义 ⇒ 直接按 1 处理。 */
+  const n = Math.min(Math.max(pos ? 1 : count, 1), 16)
   /* 水/岩浆是**流体**，挖不掉（`mc_dig water` 只会白花一次调用，日志里留一条
    * "破坏 water 这一轮的时间用完了"）。淹死时的正确动作是**上浮换气**，不是挖水。 */
   const fluid = name ?? (pos ? b.blockAt(new Vec3(pos.x, pos.y, pos.z))?.name : null)
@@ -330,8 +334,11 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
       targets.push(one)
       continue
     }
-    const want = name ?? (pos ? b.blockAt(new Vec3(pos.x, pos.y, pos.z))?.name : null)
-    if (!want) throw new Error('需要 name 或 pos')
+    /* 走到这里一定是"按 name 找"：只给 pos 的在上面的 `i === 0` 分支就 continue 了，
+     * 而给了 pos 时 `n` 已经压成 1，不会有第二格。以前这里会回退去读 pos 那格的方块名，
+     * 读到的是**刚挖空的 `air`** —— 于是抓一堆空气当目标（见上面 `n` 那段注释）。 */
+    if (!name) throw new Error('需要 name 或 pos')
+    const want = name
     const found = typeof b.findBlocks === 'function'
       // ⚠️ mineflayer 4.39 的 findBlocks 返回的是**坐标**（{x,y,z}），不是方块对象
       //    （blocks.js:212 里 findBlock 才是 blockAt(blocks[0])）——所以要自己转回方块
@@ -414,7 +421,8 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
    *    实机那次：12 个 break 挖竖井 → 骷髅跟下来一路射 → AI 要等 10 秒过完才知道
    *    （日志里 `mc_auto：zombie 贴上来 → 已叫醒 AI` 比这条调用结束早 5 秒）。
    *    挖矿是最容易招怪的场景（挖穿到洞穴、没插火把），所以每个目标之前查一次。 */
-  let danger = null
+  const stopOnDanger = self.cfg?.stopOnDanger === true
+  const noticed = new Set()
   const hp0 = healthOf(b)
   {
     /* 🔴 2026-10-08 审计④：`interruptMove()` 以前是**死代码**（定义了没人调），而文档说 mc_dig 靠它抢占。
@@ -427,11 +435,22 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
       seen++
       /* 挨打了 / 有怪贴脸 ⇒ **立刻**把控制权还回去（这个目标没挖）。放在预算检查**之前**：
        * 还剩 8 秒也不该继续挖 —— 怪已经站到脸上了。 */
-      danger = dangerNow(b, { hp0 })
+      const danger = dangerNow(b, { hp0 })
       if (danger) {
-        out.push(`⚠️ ${dangerText(danger)} —— 先别挖了（挖到 ${okCount}/${targets.length}），`
-          + '`mc_act {mode:"attack"}` 打掉它，或者 `mc_move` 躲开；安全了再叫一次 mc_dig')
-        break
+        /* 🔴 2026-10-19 用户：「不要打断只提醒」—— 默认**不再**因为险情收工：
+         *    挖竖井那种活一停就得重来一遍（还要重新看脚下是不是 air），
+         *    而险情本身由反射层（`mc_auto`）的叫醒去处理。这里只留一句话。
+         *    想恢复旧行为（立刻停手）把 config.stopOnDanger 设成 true。 */
+        if (stopOnDanger) {
+          out.push(`⚠️ ${dangerText(danger)} —— 先别挖了（挖到 ${okCount}/${targets.length}），`
+            + '`mc_act {mode:"attack"}` 打掉它，或者 `mc_move` 躲开；安全了再叫一次 mc_dig')
+          break
+        }
+        const k = noticeKey(danger)
+        if (!noticed.has(k)) {
+          noticed.add(k)
+          out.push(`${dangerNotice(danger)}（挖到 ${okCount}/${targets.length}）`)
+        }
       }
       // 🔴 单次调用 ≤11 秒：到点就带着已经挖到的结果返回，剩下的下次再叫
       const left = leftOf()

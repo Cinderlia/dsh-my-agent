@@ -341,7 +341,7 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   console.log(`  ${!/of\s+agentPresetsSvc\?\.list\?\.\(\)/.test(idx) ? '✅' : '❌'} 🔴 没有把 async list() 丢进 for...of（旧写法必挂，且被 catch 吞成"没人引用"）`)
   console.log(`  ${/探"本部署有哪些 preset 工具包"失败/.test(idx) && /一个随附 preset 的组成都没扫到/.test(idx) ? '✅' : '❌'} 探针失败 / 一个 preset 都没扫到时**记一行日志**（判据失效不许伪装成"确实没有"）`)
   // 发布区（用户 2026-09-17 定稿：`/api/dsh-mc-agent/express/<工作区 uuid>/…`，自己一条前缀路由）
-  console.log(`  ${/const outDir = outRootOf\(memoryRootFor/.test(idx) ? '✅' : '❌'} mc_kit_image 默认输出 .dsh-mc-agent/.out/（**不对外**）`)
+  console.log(`  ${/const outDir = outRootOf\((memoryRootFor|memRoot)/.test(idx) ? '✅' : '❌'} mc_kit_image 默认输出记忆根下的 .out/（**不对外**）`)
   console.log(`  ${/\.dsh-mc-agent\/\$\{OUT_DIR\}\/mc-map-/.test(idx) ? '✅' : '❌'} mc_map 默认也落 .out/，并支持 out: 写进发布区`)
   console.log(`  ${/const serveSharedFile = \(req, res, hit\)/.test(idx) && /path: '\/api\/dsh-mc-agent'/.test(idx) && /isTrustedRequest\(req\.headers/.test(idx) ? '✅' : '❌'} 🔴 发布区有自己的前缀路由 /api/dsh-mc-agent（自己过信任栅栏）`)
   console.log(`  ${/const workspaceIdOfCwd = \(cwd\)/.test(idx) && /workspaceCwdById/.test(idx) ? '✅' : '❌'} 🔴 地址用**工作区 uuid**（查宿主 workspaceRegistry，不再用目录名）`)
@@ -599,6 +599,7 @@ console.log('\n--- 看门狗 v2 ---')
     console.log(`  ${/await waitForEvents\(/.test(idxSrc2) && /interrupted = r\.interrupted/.test(idxSrc2) && /等待被打断/.test(idxSrc2) ? '✅' : '❌'} mc_events 用抽出来的等待逻辑，并把"被打断"告诉 AI`)
     console.log(`  ${/this\.sess\?\.interruptWait\?\./.test(wdSrc2) ? '✅' : '❌'} 🔴 看门狗在**所有**注入前都打断等待（一个口子覆盖唤醒/关闭通知/补提醒/心跳）`)
     console.log(`  ${/被传送 \/ 捡物 \/ 其他玩家上下线不在这里/.test(idxSrc2) ? '✅' : '❌'} 工具描述不再谎称"含被传送/捡物/上下线"（那些只在 mc_watch log 里）`)
+    console.log(`  ${/waitSec \?\? 0\), 0\), 5\)/.test(idxSrc2) && !/waitSec \?\? 0\), 0\), 10\)/.test(idxSrc2) ? '✅' : '❌'} mc_events 的 waitSec 上限是 5 秒（用户 2026-10-19：等太久了）`)
   }
 
   // 非法配置项要清晰报错
@@ -1618,7 +1619,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
      *    我们曾写死 `prefix` ⇒ 老环境自动建的 preset 加载失败（`$text missing required value`）
      *    → MC 模式直接切不进去。现在的规矩：**键名跟着源 preset**、只改值、不加键不删键。 */
     const OLD_MINIMAL = ['# old minimal', '- id: persona', "  name: '@deepseek-ai/dsh-persona'", '  config:', '    text: |', '      You are a helpful software engineer assistant.', ''].join('\n')
-    const NEW_MINIMAL = ['# new minimal', '- id: persona', "  name: '@deepseek-ai/dsh-persona'", '  config:', '    prefix: You are a helpful software engineer assistant.', '    suffix: Your working directory is {{cwd}}.', '    complete: true', '    includeRuntimeContext: false', ''].join('\n')
+    const NEW_MINIMAL = ['# new minimal', '- id: persona', "  name: '@deepseek-ai/dsh-persona'", '  config:', '    prefix: You are a helpful software engineer assistant.', '    suffix: Extra guidance.', '    complete: true', '    includeRuntimeContext: false', ''].join('\n')
     console.log(`  ${C.personaTextKeyOf(OLD_MINIMAL) === 'text' && C.personaTextKeyOf(NEW_MINIMAL) === 'prefix' ? '✅' : '❌'} 🔴 认得出两种版本的键名：老版 text / 新版 prefix`)
     const pOld = C.patchPersonaInComposition(OLD_MINIMAL, 'MC 人设', { key: C.personaTextKeyOf(OLD_MINIMAL) })
     const pNew = C.patchPersonaInComposition(NEW_MINIMAL, 'MC 人设', { key: C.personaTextKeyOf(NEW_MINIMAL) })
@@ -1626,7 +1627,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${!/complete|includeRuntimeContext/.test(pOld ?? '') ? '✅' : '❌'} 老版 schema 里没有的键，我们一个都不加（complete / includeRuntimeContext）`)
     console.log(`  ${/^\s+prefix: \|-$/m.test(pNew ?? '') && /MC 人设/.test(pNew ?? '') && !/^\s+text:/m.test(pNew ?? '') ? '✅' : '❌'} 新版（prefix）：用 prefix 写正文，**不塞 text**`)
     console.log(`  ${/complete: false/.test(pNew ?? '') && /includeRuntimeContext: true/.test(pNew ?? '') ? '✅' : '❌'} 新版里只**改值**：complete→false、includeRuntimeContext→true（键保留）`)
-    console.log(`  ${/suffix: Your working directory/.test(pNew ?? '') ? '✅' : '❌'} 别的键（suffix）原样保留`)
+    console.log(`  ${/suffix: Extra guidance\./.test(pNew ?? '') ? '✅' : '❌'} 别的键（suffix）原样保留`)
     // 跨版本"自修"：一份用 prefix 写坏的老环境 preset + 源 preset 用 text → 按源的键修好
     const broken = C.patchPersonaInComposition(NEW_MINIMAL, '修好的人设', { key: 'text' })
     console.log(`  ${/^\s+text: \|-$/m.test(broken ?? '') && !/^\s+prefix:/m.test(broken ?? '') && /修好的人设/.test(broken ?? '') ? '✅' : '❌'} 🔴 跨版本自修：把写坏的 prefix 那份按**源的键**改成 text（启动自检走的就是这条）`)
@@ -1741,6 +1742,14 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${mcNeeds.every((n) => mcSrc.includes(n)) ? '✅' : '❌'} MC模式组成含 persona/tool-fs/tool-jobs/present/compaction`)
     const plusNeeds = ['@deepseek-ai/dsh-persona', '@deepseek-ai/dsh-agent-instructions', '@deepseek-ai/dsh-tool-pwsh', '@deepseek-ai/dsh-tool-bash', '@deepseek-ai/dsh-tool-fs-search', '@deepseek-ai/dsh-skill-filesystem', '@deepseek-ai/dsh-plan-mode', '@deepseek-ai/dsh-tool-subagent', '@deepseek-ai/dsh-tool-web', '@deepseek-ai/dsh-plugin-manager/tools']
     console.log(`  ${plusNeeds.every((n) => plusSrc.includes(n)) ? '✅' : '❌'} MC+模式组成 = 标准模式全表（persona 除外）：${plusNeeds.filter((n) => !plusSrc.includes(n)).join(', ') || '无缺'}`)
+    /* 🔴 2026-10-19 真机报错：`unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix";
+     *    registered variables: provider, model` —— 选 MC+ 直接起不来会话。
+     *    根因：MC+ 的 preset 是旧版官方 standard 的手抄副本，persona 里带着 `suffix: … {{cwd}}`；
+     *    新版宿主只注册 provider / model 两个提示词变量，工作目录改由 runtime-context 段提供。 */
+    const presetBody = (s) => String(s).replace(/^\s*#.*$/gm, '')
+    const personaVars = [...(presetBody(mcSrc) + presetBody(plusSrc)).matchAll(/\{\{([A-Za-z0-9_.-]+)\}\}/g)].map((m) => m[1])
+    const badVars = personaVars.filter((v) => v !== 'provider' && v !== 'model')
+    console.log(`  ${badVars.length === 0 ? '✅' : '❌'} 🔴 preset 只引用宿主注册的提示词变量（provider / model），不出现 {{cwd}} 之类：${badVars.length ? badVars.join(', ') : '无越界'}`)
     // 🔴 2026-10-08：注释里本来就会出现插件名与记忆目录名（改名后 `.dsh-mc-agent/` 与插件名同形），
     //    判据必须只看**声明本身** ⇒ 先剥掉整行注释，否则注释里的名字会把这条断言打红。
     const ymlBody = (s) => String(s).replace(/^\s*#.*$/gm, '')
@@ -1986,6 +1995,9 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     'present',
     'pwsh', 'subagent', 'workflow', 'web_search', 'todo_write', 'ask_user_question',
     'serve_deploy', 'serve_list', 'goal_write',
+    /* 🔴 用户 2026-10-19：配套插件（billion-context）的 ACP 族要在场 —— MC 模式的
+     *    白名单默认放行它们，这里把它们算进"这台宿主认识的名字"，才能断言真的放行了。 */
+    'compress', 'decompress', 'search_context', 'acp_status', 'acp_cache', 'acp_read_original_image',
   ])
   const makeAgentCtx = (preset) => {
     const base = {}
@@ -2169,6 +2181,16 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${allowList && allowList.every((n) => !n.startsWith('mc_admin_')) ? '✅' : '❌'} 管理工具不在白名单里（hideAdminTools 默认 true）`)
   console.log(`  ${allowList && ['read', 'write', 'edit', 'read_image'].every((n) => allowList.includes(n)) ? '✅' : '❌'} 在场的文件工具在白名单里（路径由 guard 限在 .dsh-mc-agent/）`)
   console.log(`  ${allowList && allowList.includes('present') ? '✅' : '❌'} present 也在白名单里（显式文件交付：卡片 + 可预览/打开）`)
+  /* 🔴 用户 2026-10-19：「MC 模式这个会话的工具集里默认缺了 ACP 那一族。这个可以做成默认打开吗，
+   *    让用户装完就能用压缩等插件」—— 配套插件（billion-context）的压缩族必须默认放行，
+   *    否则长跑的 MC 会话（两三小时打龙那种）只能眼看着上下文撑爆。 */
+  {
+    const acp = (allowList ?? []).filter((n) => /^(compress|decompress|search_context|acp_)/.test(n))
+    console.log(`  ${['compress', 'decompress', 'search_context', 'acp_status', 'acp_cache'].every((n) => (allowList ?? []).includes(n)) ? '✅' : '❌'} 🔴 ACP（上下文压缩）那族默认放行：${JSON.stringify(acp)}`)
+    console.log(`  ${(allowList ?? []).every((n) => !/^(pwsh|subagent|workflow)$/.test(n)) ? '✅' : '❌'} 放行 ACP 之后仍然**没有**把标准工具面打开（pwsh/subagent/workflow 仍不可见）`)
+    const companionSwitch = /allowCompanionTools === false \? \[\] : MC_COMPANION_TOOLS/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))
+    console.log(`  ${companionSwitch ? '✅' : '❌'} 开关 mcMode.allowCompanionTools 能整族关掉（默认 true）`)
+  }
   // 🔴 宿主对不认识的名字**抛错**；要是直接放弃，隔离就等于没做（pwsh 又回来了）
   console.log(`  ${allowList && !allowList.includes('glob') && !allowList.includes('grep') ? '✅' : '❌'} 🔴 不在场的工具（这台 preset 没挂 tool-fs-search ⇒ glob/grep）被过滤掉，**不是**整次白名单作废`)
   console.log(`  ${allowList && allowList.length > 5 ? '✅' : '❌'} 过滤后白名单仍然生效（${allowList?.length ?? 0} 个）`)

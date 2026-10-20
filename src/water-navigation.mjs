@@ -49,8 +49,6 @@ export const WATER_ARRIVE = 1.6
  */
 export const WATER_MAX_MS = 400
 
-export const WATER_KINDS = ['dry', 'breath', 'passage']
-
 export const WATER_KIND_TEXT = {
   dry: '安全落脚点（干燥、有支撑、能交回陆地寻路）',
   breath: '可呼吸空间（能换气，但还没脱险）',

@@ -398,18 +398,16 @@ export async function apply (api) {
 
   ctx.tools.register(asTool({
     name: 'mc_furnace',
-    description: '🔥 **熔炼**（真熔炼，走服务端的熔炉，不是作弊给物）。生存模式下"粗铁 → 铁锭 → 铁镐"就靠它。\n'
+    description: '🔥 **熔炼**（真熔炼，走服务端的熔炉，不是作弊给物）。生存"粗铁 → 铁锭 → 铁镐"就靠它。\n'
       + '· 能烧：矿石/粗矿（铁、铜、金、远古残骸…）、沙 → 玻璃、圆石 → 石头、原木 → 木炭、'
-      + '生肉/马铃薯 → 熟的、黏土球 → 砖、海带 → 干海带、仙人掌 → 绿色染料 等等。\n'
+      + '生肉/马铃薯 → 熟的、黏土球 → 砖、仙人掌 → 染料 等等。\n'
       + '· **写产物名也行**：`name:"iron_ingot"` 会自动找背包里的粗铁/铁矿石去烧。\n'
-      + '· 附近没有熔炉、但背包里有，就**自己放到脚边**再用（`placeFurnace:false` 可关）；'
-      + '都没有会告诉你去 `mc_craft {name:"furnace"}` 做一个（8 个圆石）。\n'
-      + '· **自己挑燃料**：按要烧的数量算，一次放够 —— 有煤炭/木炭就先烧煤（木棍、原木、木板是合成料，'
-      + '只有没有正经燃料时才拿来烧）；要烧 1 个放 1 块煤（够烧 8 个），要烧 9 个放 2 块。'
-      + '可以 `fuel:"coal"` 指定；`list:true` 看背包里有哪些燃料。\n'
-      + '· 🔴 **装好料就返回，不用盯着**：炉子在服务端自己烧。默认**不盯**（`maxWaitSec` 默认 0，'
-      + '最多给 10 秒）；过一会儿再叫一次 `mc_furnace` 就能收成品（不用重新装料）。'
-      + '要烧很多就少量多次（一次最多装 8 个）。\n'
+      + '· 附近没有熔炉时**只告诉你缺什么**，不替你放（用户 2026-10-19 定的）：'
+      + '背包里有就自己 `mc_act {mode:"place",name:"furnace",x,y,z}`；没有就 `mc_craft {name:"furnace"}`（8 圆石）。\n'
+      + '· **自己挑燃料**：按数量一次放够 —— 有煤炭/木炭先烧煤（木棍/原木/木板是合成料）；'
+      + '烧 1 个放 1 块煤（够 8 个），烧 9 个放 2 块。可 `fuel:"coal"` 指定；`list:true` 看燃料。\n'
+      + '· 🔴 **装好料就返回，不用盯着**：炉子在服务端自己烧（`maxWaitSec` 默认 0，最多 10 秒）；'
+      + '过一会儿再叫一次就能收成品（不用重新装料），一次最多装 8 个。\n'
       + '· `takeOnly:true` = 只把熔炉里已经烧好的拿走（不新塞东西）；`dryRun:true` 只出计划。\n'
       + '🔴 熔炼会动世界里的熔炉，所以**受 mc_observe 门禁限制**（强制模式要先看）。',
     parameters: {
@@ -420,7 +418,6 @@ export async function apply (api) {
       y: { type: 'number', description: '指定熔炉坐标 y（可选）' },
       z: { type: 'number', description: '指定熔炉坐标 z（可选）' },
       radius: { type: 'number', description: '附近找熔炉的半径（默认 6，最大 12）' },
-      placeFurnace: { type: 'boolean', description: '附近没熔炉时自己放一个（默认 true）' },
       takeOnly: { type: 'boolean', description: '只取已经烧好的，不新塞（默认 false）' },
       maxWaitSec: { type: 'number', description: '最多盯多少秒（**默认 0 = 不盯**；最多 10）' },
       list: { type: 'boolean', description: '只看熔炼表和燃料（不烧）' },
@@ -443,7 +440,8 @@ export async function apply (api) {
 
       const radius = clamp(Number(args.radius) || 6, 1, 12)
       const wantPos = { x: args.x, y: args.y, z: args.z, radius }
-      const allowPlace = args.placeFurnace !== false
+      /* 🔴 用户 2026-10-19：「把自动放的功能去掉」—— 这里原来会"附近没熔炉就把背包里那张放脚边"，
+       *    等于工具替 AI 动世界。现在只找、只报，放不放由 AI/玩家自己决定。 */
       // 🔴 默认 0 = 不盯：装好料就返回，下次再叫一次取成品（用户要求：熔炉不用一直看着）
       const maxWaitSec = clamp(Number(args.maxWaitSec) || DEFAULT_MAX_WAIT_SEC, 0, MAX_WAIT_SEC)
 
@@ -470,7 +468,6 @@ export async function apply (api) {
         const b2 = blockAtXYZ(bot, last.x, last.y, last.z)
         if (b2 && FURNACE_NAMES.includes(b2.name)) fblock = b2
       }
-      let placedNote = null
       /* 🔴 2026-10-08 审计 H6：**给了坐标却在那里找不到熔炉**时，以前会照走"没熔炉就放一个"这条路
        *    ⇒ 在脚边另造一个新熔炉，然后对着它烧/取。给了坐标就只认那个坐标。 */
       if (!fblock && askedPos) {
@@ -485,58 +482,15 @@ export async function apply (api) {
         logLine(`mc_furnace：给的坐标 (${args.x},${args.y},${args.z}) 上没有熔炉，没另放`)
         return { text: lines.join('\n') }
       }
-      if (!fblock && allowPlace) {
-        const inv = furnaceInInventory(bot)
-        if (inv) {
-          const spots = findPlaceSpots(bot, { radius: 2, limit: 3 })
-          const spot = spots[0] ?? null
-          if (spot && args.dryRun === true) {
-            placedNote = `（dryRun：附近没熔炉，真跑的时候我会把背包里的 ${inv.name} 放到 (${spot.x},${spot.y},${spot.z})）`
-            fblock = { position: spot, name: inv.name, virtual: true }
-          } else if (spot) {
-            /* 🔴 实机（2026-10-08）：一个点位被服务端拒（目标格被自己占着 / 客户端世界失步 / 站位太靠边）
-             *    换下一个点位往往就成了 ⇒ 最多试 3 个候选，别一个点位失败就报"放不下"。 */
-            const refused = []
-            for (const s of spots) {
-              if ((mc.callLeft?.() ?? 9_999) < 900) break
-              try {
-                const r = await mc.placeBlock({ x: s.x, y: s.y, z: s.z, name: inv.name })
-                if (r?.placed) {
-                  /* 客户端收到方块更新会晚一拍：立刻查常常还是 null。放完轮询几百毫秒再认。 */
-                  for (let i = 0; i < 6 && !fblock; i++) {
-                    fblock = findFurnaceBlock(bot, { x: s.x, y: s.y, z: s.z })
-                    if (!fblock) await sleep(150)
-                  }
-                  placedNote = fblock
-                    ? `（附近本来没有熔炉，我把背包里的 ${inv.name} 放到 (${s.x},${s.y},${s.z}) 了${refused.length ? ` —— 前 ${refused.length} 个点位服务端没收` : ''}）`
-                    : `（方块放出去了，但客户端还没收到方块更新，读不到 (${s.x},${s.y},${s.z}) 上的熔炉 —— 过一会儿再叫我一次）`
-                  logLine(`mc_furnace：自动放了 ${inv.name} (${s.x},${s.y},${s.z})${fblock ? '' : '（还没读到）'}${refused.length ? `（换了 ${refused.length} 个点位）` : ''}`)
-                  break
-                }
-                refused.push(`(${s.x},${s.y},${s.z})：${r?.note ?? '未知原因'}`)
-              } catch (e) {
-                refused.push(`(${s.x},${s.y},${s.z})：${e.message}`)
-              }
-            }
-            if (!fblock && !placedNote) {
-              placedNote = `（想放熔炉，试了 ${refused.length} 个点位都没成功：${refused.join('；')} —— 先用 \`mc_move\` 走到平整点的地面上，再叫我一次）`
-            }
-          } else {
-            placedNote = '（想放熔炉，但脚边找不到能放的空位）'
-          }
-        }
-      }
       if (!fblock) {
         const inv = furnaceInInventory(bot)
         const lines = [...head]
-        if (placedNote) lines.push(placedNote)
-        lines.push(`❌ 附近 ${radius} 格没有熔炉，背包里${inv ? `有 ${inv.name}×${inv.have} 但放不下` : '也没有'}。`)
-        lines.push('　→ 先做一个：`mc_craft {name:"furnace"}`（8 个圆石），然后叫我（我会自己放）；')
-        lines.push('　　或者你自己 `mc_act {mode:"place",name:"furnace",x:…,y:…,z:…}` 放到脚边。')
+        lines.push(`❌ 附近 ${radius} 格没有熔炉${inv ? `（背包里有 ${inv.name}×${inv.have}）` : '，背包里也没有'}。`)
+        lines.push('　→ 背包里有就自己放一张：`mc_act {mode:"place",name:"furnace",x:…,y:…,z:…}`（找块平整地面，脚下要有方块）；')
+        lines.push('　　没有就先做一张：`mc_craft {name:"furnace"}`（8 个圆石）—— **我不替你放**（用户 2026-10-19 定）。')
         logLine(`mc_furnace：${t.output} 找不到熔炉`)
         return { text: lines.join('\n') }
       }
-      if (placedNote) head.push(placedNote)
       const fp = fblock.position
       const fname = FURNACE_NAMES.includes(fblock.name) ? fblock.name : 'furnace'
       const fast = /blast_furnace|smoker/.test(fname)
@@ -547,7 +501,12 @@ export async function apply (api) {
         try {
           const p = bot.entity.position
           if (p && p.distanceTo?.(fp) > 4) {
-            await mc.walkTo({ x: fp.x, y: fp.y, z: fp.z }, { arrive: 2.2, budget: 20_000 })
+            /* 🔴 2026-10-19 实机（生存流程）：这里原来写死 `budget: 20_000`，可整个工具调用的预算
+             * 只有 12 秒 —— 熔炉高一层、寻路要绕的时候，还没走完就被工具超时杀掉，报
+             * 「Error: tool call timed out after 12000ms」；给了 x/y/z 就正常（根本不用走）。
+             * 现在把这一步压在"这轮还剩多少时间"里，留 3 秒给开门/装料。 */
+            const leftWalk = Math.max(1500, Math.min(20_000, (mc.msLeft?.() ?? 8000) - 3000))
+            await mc.walkTo({ x: fp.x, y: fp.y, z: fp.z }, { arrive: 2.2, budget: leftWalk })
           }
         } catch (e) {
           logLine(`mc_furnace：靠近熔炉没成功（${e.message}），还是试着开一下`)

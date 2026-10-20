@@ -139,6 +139,48 @@ export function fixDigMs (b, blk, itemType) {
   } catch { return null }
 }
 
+/** 已经规整过的物品（免得多挖一格就重算一遍） */
+const ENCH_FIXED = new WeakSet()
+
+/**
+ * 🔴 修上游 bug：mineflayer `lib/plugins/digging.js:230-244`
+ *
+ * ```js
+ * enchantments = currentlyHeldItem.enchants           // ← 可能是 undefined / 对象
+ * ...
+ * enchantments = enchantments.concat(helmetEnchantments)   // ← 于是这里崩
+ * ```
+ *
+ * 只要**手上那件**的 `enchants` 不是数组（prismarine-item 某些版本给的是对象或
+ * `undefined`，带组件的新物品更常见），挖方块当场抛
+ * **`enchantments.concat is not a function`**（2026-10-19 实机踩到：背包里有附魔弓、
+ * 手上又不是镐时，`mc_dig` / `mc_sequence{op:"dig"}` 直接崩，整轮任务作废）。
+ *
+ * 这里在调上游之前把形状**规整成数组**（认不出的附魔按"没有"算），
+ * 上游那句 `.concat` 就永远有得拼。改的是物品实例自身的属性，不动原型。
+ */
+export function normalizeEnchants (it) {
+  if (!it || typeof it !== 'object') return it
+  if (ENCH_FIXED.has(it)) return it
+  try {
+    if (!Array.isArray(it.enchants)) {
+      Object.defineProperty(it, 'enchants', {
+        value: enchantsOfItem(it), configurable: true, writable: true, enumerable: false,
+      })
+    }
+    ENCH_FIXED.add(it)
+  } catch {}
+  return it
+}
+
+/** 把参与 `digTime` 的物品（手上那件 + 背包/装备槽里所有物品，含头盔）都规整一遍 */
+function normalizeEnchantsAll (b) {
+  try { normalizeEnchants(b?.heldItem) } catch {}
+  try {
+    for (const it of (b?.inventory?.slots ?? [])) if (it) normalizeEnchants(it)
+  } catch {}
+}
+
 /**
  * 拿 `itemType` 挖这块要多久（ms）；算不出来返回 null。
  *
@@ -155,6 +197,7 @@ export function digMsFor (b, blk, itemType = null) {
        *    直接调会递归。 */
       const fb = b?.__wcOrigDigTime ?? b?.digTime
       if (typeof fb === 'function' && (itemType == null || itemType === b?.heldItem?.type)) {
+        normalizeEnchantsAll(b)          // 同上：上游会在这条路上崩
         const fallback = fb.call(b, blk)
         return Number.isFinite(fallback) && fallback > 0 ? Math.round(fallback) : null
       }
@@ -204,6 +247,8 @@ export function patchDigTime (b) {
   const orig = b.digTime.bind(b)
   b.__wcOrigDigTime = orig
   b.digTime = (block) => {
+    /* 🔴 先规整附魔形状再碰上游：上游 `enchantments.concat` 会在 `enchants` 不是数组时直接崩 */
+    normalizeEnchantsAll(b)
     let base = null
     let baseErr = null
     try { base = orig(block) } catch (e) { baseErr = e }
@@ -220,7 +265,18 @@ export function patchDigTime (b) {
   return true
 }
 
-/** 背包里挖这块**最快**的那件（只考虑挖得动的；算不出时间的跳过） */
+/** 一件东西还剩多少耐久（读不到回 -1）——同种工具之间只比这个 */
+function durLeftOf (it) {
+  const max = Number(it?.maxDurability)
+  if (!Number.isFinite(max) || max <= 0) return -1
+  const used = Number(it?.durabilityUsed)
+  return max - (Number.isFinite(used) ? used : 0)
+}
+
+/** 背包里挖这块**最快**的那件（只考虑挖得动的；算不出时间的跳过）。
+ *  🔴 速度打平的时候挑**耐久多的**那件：同种工具的 `digMs` 完全一样，只按"ms < best.ms"严判
+ *  就永远选背包里排在前面的那把 —— 2026-10-19 实机：背包里两把石镐（19/131 和满耐久），
+ *  它一路用快坏的那把，新的闲置。 */
 export function bestToolFor (b, blk) {
   const items = (() => { try { return b?.inventory?.items?.() ?? [] } catch { return [] } })()
   const need = Object.keys(blk?.harvestTools ?? {})
@@ -229,7 +285,8 @@ export function bestToolFor (b, blk) {
     if (need.length && !blk.harvestTools[it.type]) continue
     const ms = digMsFor(b, blk, it.type)
     if (ms == null) continue
-    if (!best || ms < best.ms) best = { item: it, ms }
+    if (!best || ms < best.ms) { best = { item: it, ms }; continue }
+    if (ms === best.ms && durLeftOf(it) > durLeftOf(best.item)) best = { item: it, ms }
   }
   return best
 }

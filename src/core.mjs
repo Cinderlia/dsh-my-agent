@@ -57,6 +57,7 @@ import { breakBlock as breakBlockImpl, dig as digImpl } from './mining.mjs'
 import { placeRef, placeBlock as placeBlockImpl } from './place.mjs'
 import { bridgeAcross } from './bridge.mjs'
 import { attack } from './attack.mjs'
+import { driveBoat, dismountVehicle } from './boat.mjs'
 import { shoot } from './shoot.mjs'
 import { runSequence } from './sequence.mjs'
 /* 路线图第 ④ 条第十八刀：「服务端到底认没认这次破坏」的判决监听搬到
@@ -231,6 +232,7 @@ import { digMsFor, patchDigTime, bestToolFor } from './dig-speed.mjs'
 import { collectBusy, cancelCollect, waitGrounded, withHeld } from './dig-guard.mjs'
 import { isUnderground, caveCell, heightmapOf, glyphMapText, mapImageOf, mapImageOfAsync } from './map-render.mjs'
 import { scanAround, entitiesNear } from './world-scan.mjs'
+import { readBossBars } from './bossbar.mjs'
 import { connectionViewOf, statusOf } from './status.mjs'
 
 /* 路线图第 ④ 条第二十八刀：vendor 依赖加载器（`MC_DEPS` / `loadMcDep` / `loadPathfinder` /
@@ -583,17 +585,10 @@ export class McBot extends EventEmitter {
   async #makeSession (auth) { return await makeSession(this, auth) }
 
 
-  /* ───────────── 按键上报兼容层（player_input）——已整体移除（2026-10-02 用户决策） ─────────────
-   * 它原本为 26.2 而加（20Hz 上报按键位，mineflayer 不发）。移除原因：上游还连不了 26.2——
-   * mineflayer 4.39.0 的 testedVersions 只到 26.1；minecraft-data 3.117.0 只收了 26.2 的
-   * **元数据**、没有数据目录（`minecraft-data('26.2')` 为 null）。半吊子支持先撤，等上游真支持
-   * 26.2 再重建。
-   *
-   * 将来重建**必须**沿用"先查后发"：protodef 对未知包名**不报错**，写出「id=0x00 + 空 body」
-   * （实测字节 `02 00 00`），服务端会把 id 0x00 当成自己的 `accept_teleportation` 去读
-   * teleportId —— 没有字节 ⇒ DecoderException ⇒ 秒踢（2026-09-19 只报 1.21.1 掉线的根因；
-   * 现象极迷惑：进服完全成功、1 秒后掉线，错误却指向"确认传送"，详见 CHANGELOG 0.1.7）。
-   * ─────────────────────────────────────────────────────────────────────────────────────── */
+  /* 按键上报兼容层（player_input）—— 已整体移除（2026-10-02 用户决策）：上游连不了 26.2（mineflayer
+   * 4.39.0 testedVersions 到 26.1；minecraft-data 3.117.0 只有 26.2 元数据、`minecraft-data('26.2')` 为 null）。
+   * 将来重建**必须**沿用"先查后发"：protodef 对未知包名不报错，会写出「id=0x00 + 空 body」（实测 `02 00 00`），
+   * 服务端把 0x00 当 `accept_teleportation` 读 teleportId ⇒ DecoderException ⇒ 进服 1 秒后秒踢（CHANGELOG 0.1.7）。 */
 
   /* ───────────── 单实例锁（按实例分文件：同进程多会话不能共用一把锁） ───────────── */
 
@@ -860,6 +855,10 @@ export class McBot extends EventEmitter {
   /** 上浮换气（在水里按住 jump 游泳）—— 实现在 `src\movement.mjs` 的 `swimUp`。 */
   async swimUp (opts = {}) { return await swimUpImpl(this, opts, { bumpGen: () => this.#beginMove() }) }
 
+  /** 船/矿车：开（`look` 定方向 + `moveVehicle` 给动力）与下来（潜行，不是 dismount 包）—— `src\boat.mjs`。 */
+  async driveBoat (target, opts = {}) { return await driveBoat(this, target, opts, { bumpGen: () => this.#beginMove() }) }
+  async dismountVehicle (opts = {}) { return await dismountVehicle(this, opts) }
+
   /* ───────────── 创造取物 / 使用 / 攻击 / 丢弃（补能力，2026-09-15）───────────── */
 
   /** 选槽位放取来的物品：已搬到 `src\inventory.mjs` 的 `freeSlot(b, itemName)`（路线图第 ④ 条第七刀） */
@@ -942,21 +941,20 @@ export class McBot extends EventEmitter {
   async runSequence (steps, opts = {}) { return await runSequence(this, steps, opts) }
 
   /* ───────────── 附近有谁（已搬到 src\world-scan.mjs，第十二刀） ───────────── */
-
   /** 附近有谁（怪 / 玩家 / 动物 / 掉落物）：名字、坐标、距离、上下差、血量、是不是远程。见 `src\world-scan.mjs` 的 `entitiesNear()`。 */
   entities (radius = 24, opts = {}) { return entitiesNear(this.requireBot(), radius, opts) }
+  readBossBars () { return readBossBars(this.requireBot()) }           // Boss 血条（龙/凋灵的血只在 Boss Bar 里，实体元数据读不到）
 
   /**
    * 发服务器指令（以玩家身份走聊天）。
-   *
    * @param {string} cmd 以 `/` 开头的完整指令
-   * @param {{allow?: ((name:string)=>boolean)|null}} [opts]
-   *   白名单判定：默认用**内置**那份（保底，独立测试时不依赖插件配置）；
-   *   插件层会传自己的可配置白名单进来（用户 2026-09-16 要求白名单可配置）。
+   * @param {{allow?: ((name:string)=>boolean)|null}} [opts] 白名单判定：默认用**内置**那份（保底，独立测试时不依赖插件配置）；插件层会传自己的可配置白名单进来（用户 2026-09-16 要求白名单可配置）。
    */
   command (cmd, { allow = null } = {}) {
     const b = this.requireBot()
     const c = String(cmd).trim()
+    /* 🔴 换行符的聊天包会被服务端当场踢下线（2026-10-19 实机：10 条 /fill 拼多行 → `illegal_characters`）。这里挡死；多行用法走 `mc_command`（它逐条发）。 */
+    if (/[\r\n]/.test(c)) throw new Error('一条 command() 只能发一条指令：换行符会让服务端以 illegal_characters 把我踢下线（mc_command 支持多行，它会逐条发）')
     if (!c.startsWith('/')) throw new Error('指令必须以 / 开头')
     const name = c.slice(1).split(/\s+/)[0].toLowerCase()
     const ok = typeof allow === 'function' ? Boolean(allow(name)) : DEFAULT_COMMAND_WHITELIST.has(name)

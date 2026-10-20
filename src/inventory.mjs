@@ -269,7 +269,9 @@ export function invCounts (b) {
  * 选一个槽位放取来的物品。优先级：
  *   ① 已经放着**同一种**东西的槽（重复取同款不占新格，也不会覆盖别的）
  *   ② 快捷栏（36–44）的空槽
- *   ③ 手上那格（实在满了才覆盖）
+ *   ③ 主背包（9–35）的空槽 —— 🔴 2026-10-19 实机补上的：以前只扫 36–44，
+ *      快捷栏 9 格一满就落到 ④，明明主背包还空着 23 格，却去**覆盖手里那件东西**。
+ *   ④ 手上那格（实在 36 格全满才覆盖，且 `giveItem` 会**如实报出被顶掉的是什么**）
  * 为什么要在意：连建一面墙会反复调 placeBlock → giveItem，
  * 若每次都挑"第一个空槽"，很快就把之前取的方块覆盖掉，导致后面莫名"背包里没有 X"。
  */
@@ -279,8 +281,14 @@ export function freeSlot (b, itemName = null) {
     for (let s = 36; s <= 44; s++) {
       if (slots[s]?.name === itemName) return s
     }
+    for (let s = 9; s <= 35; s++) {
+      if (slots[s]?.name === itemName) return s
+    }
   }
   for (let s = 36; s <= 44; s++) {
+    if (!slots[s]) return s
+  }
+  for (let s = 9; s <= 35; s++) {
     if (!slots[s]) return s
   }
   return b.quickBarSlot != null ? 36 + b.quickBarSlot : 36
@@ -338,7 +346,7 @@ export function inventoryView (b) {
  * （`set_creative_slot` 包），服务端一般照收。所以走 `bot.creative.setInventorySlot`。
  * 这也是用户点名的缺口："连创造模式直接获取物品的方法都没有"。
  */
-export async function giveItem (b, { name, count = 1, slot = null } = {}, ctx = {}) {
+export async function giveItem (b, { name, count = 1, slot = null, force = false } = {}, ctx = {}) {
   const t = ctx.t ?? ((p) => p)
   if (b.game?.gameMode !== 'creative') {
     throw new Error(`取物只在创造模式可用（当前 ${b.game?.gameMode ?? '未知'}）；生存模式请挖或合成`)
@@ -364,6 +372,17 @@ export async function giveItem (b, { name, count = 1, slot = null } = {}, ctx = 
   if (typeof ctx.makeItem !== 'function') {
     throw new Error('创造模式取物需要 ctx.makeItem，但这次调用没给 —— 这是插件内部 bug，请报告（不要当成"取物失败"重试）')
   }
+  /* 覆盖前先记住目标格原来是什么：`freeSlot` 满格兜底会落到手上那格（见 `clobber`） */
+  const occBefore = b.inventory?.slots?.[target] ?? null
+  /* 🔴 2026-10-19 实机（用户点名要修的 bug ⑧）：**显式给 slot** 时以前照样覆盖，
+   *    只在那句 `clobber` 里事后提一句 —— 而模型常常一口气取十几种建材、看都不看回执，
+   *    于是背包里原有的弓 / 钻剑 / 末影之眼就凭空没了（那天顶掉了 2 把弓、1 把钻剑、2 颗眼）。
+   *    现在：显式指定一个**装着别的东西**的格子 ⇒ 直接拒绝，要顶必须 `force:true`。 */
+  const explicit = asked != null && Number.isFinite(asked)
+  if (explicit && occBefore && occBefore.name !== itemName && force !== true) {
+    throw new Error(`第 ${target} 格已经有 ${occBefore.name}x${occBefore.count} —— 显式指定槽位会把它顶掉。`
+      + '想找空位就别传 slot；确定要顶掉它就传 force:true')
+  }
   const item = ctx.makeItem(type, n)
   await t(b.creative.setInventorySlot(target, item, 800), 'give', `取物 ${itemName}`)
   await sleep(120)
@@ -372,12 +391,21 @@ export async function giveItem (b, { name, count = 1, slot = null } = {}, ctx = 
   const moved = asked != null && Number.isFinite(asked) && target !== Math.floor(asked)
     ? `你要的第 ${Math.floor(asked)} 格不是背包格（背包是 9-44：0=合成结果、1-4=合成格、5-8=盔甲）—— 我放进第 ${target} 格了；`
     : ''
+  /* 🔴 2026-10-19 实机：`freeSlot` 的最后一条兜底是"36 格全满就用手上那格"，
+   *    而创造取物只能覆盖 ⇒ 以前**静默**顶掉那一格，还回一句"已放进快捷栏第 5 格"。
+   *    实测：连着取 chest / furnace，第二次把第一次的东西原样顶没了（用户的东西凭空消失）。
+   *    现在先记下原来是什么（`occBefore`），真顶掉了就照实说。 */
+  const clobber = occBefore && occBefore.name !== itemName
+    ? `⚠️ ${explicit ? `你指定的第 ${target} 格` : '背包 36 格都满了 —— 第 ' + target + ' 格'}原来的 **${occBefore.name}x${occBefore.count}** 被顶掉了`
+      + '（创造取物只能覆盖那一格）。要留它就先用 mc_act {mode:"toss"} 丢点东西、或用 mc_chest 塞进箱子腾一格，再取物。'
+    : ''
   return {
     gave: `${itemName}x${n}`, slot: target, now,
     ...(moved ? { slotAsked: Math.floor(asked) } : {}),
+    ...(clobber ? { clobbered: `${occBefore.name}x${occBefore.count}` } : {}),
     /* 🔴 2026-10-08 审计：旧版**无条件**说"已放进背包/快捷栏"，即使那格还是空的。文案要跟 `now` 走。 */
     ...(now
-      ? { note: moved + (target >= 36 ? `已放进快捷栏第 ${target - 35} 格` : '已放进背包') }
+      ? { note: clobber || (moved + (target >= 36 ? `已放进快捷栏第 ${target - 35} 格` : '已放进背包')) }
       : { note: `**没放进去**（第 ${target} 格现在还是空的）—— 服务端没认这次 setInventorySlot（失步 / 权限 / 那格被别的窗口占着）。别当成拿到了` }),
   }
 }

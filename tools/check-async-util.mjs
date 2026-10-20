@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
- * `src/async-util.mjs` 的离线自检（2026-10-15 用户点名的异步方案 ②「统一 waitForEvent」）。
+ * `src/async-util.mjs` 的离线自检（2026-10-15 用户点名的异步方案 ②「统一 waitForEvent」；`waitForEvent` 本身
+ * 2026-10-20 精简时删掉了 —— 生产零调用，那一节断言随之移除）。
  *
- * 为什么单独一套：`waitUntil` / `waitForEvent` 现在是**全仓库唯一一份"等"的实现** ——
+ * 为什么单独一套：`waitUntil` 现在是**全仓库唯一一份"等"的实现** ——
  * 六处手写轮询（`dig-guard.mjs` 等落地、`server-break.mjs` 等回包、`runtime.mjs` 等区块、
  * `world-use.mjs` 等附魔选项 / 等铁砧成品、`wait.mjs` 等在途事件）全部改成调它。
  * 它要是错一点，这六处会**一起**错，所以判据本身必须有断言钉住。
@@ -21,7 +22,7 @@ const stripComments = (s) => String(s).replace(/\/\*[\s\S]*?\*\//g, '').replace(
 const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8')
 
 const A = await import(new URL('../src/async-util.mjs', import.meta.url))
-const { waitUntil, waitForEvent, sleep, withTimeout, raceAbort, abortError } = A
+const { waitUntil, sleep, withTimeout, raceAbort, abortError } = A
 
 /* ── 假时钟：`sleep` 直接把时间推过去，测试**一秒都不真等** ── */
 const mkClock = (t0 = 1000) => {
@@ -99,56 +100,6 @@ section('① waitUntil：已成立 / 会成立 / 等不到 / 被中止')
   ok(r9.label === '落地', 'label 原样带回（调用方报错时用得上）', String(r9.label))
 }
 
-/* ─────────── ② waitForEvent：能等事件就别轮询 ─────────── */
-section('② waitForEvent：事件先到 / 过滤 / 超时 / 中止 / 假件')
-{
-  const em1 = mkEmitter()
-  const p1 = waitForEvent(em1, 'blockUpdate', { ms: 5000, label: '方块更新' })
-  em1.emit('blockUpdate', { name: 'stone' })
-  const r1 = await p1
-  ok(r1.ok === true && r1.reason === 'event', '事件响了就收工 ⇒ reason=event', JSON.stringify(r1.reason))
-  ok(r1.value?.name === 'stone', '事件载荷原样带回', JSON.stringify(r1.value))
-  ok(em1.count('blockUpdate') === 0, '🔴 收工后**监听器摘干净了**（不然跑久了会漏事件/涨内存）', `left=${em1.count('blockUpdate')}`)
-
-  const em2 = mkEmitter()
-  const p2 = waitForEvent(em2, 'blockUpdate', { ms: 5000, filter: (v) => v?.name === 'diamond_ore' })
-  em2.emit('blockUpdate', { name: 'stone' })
-  em2.emit('blockUpdate', { name: 'dirt' })
-  em2.emit('blockUpdate', { name: 'diamond_ore' })
-  const r2 = await p2
-  ok(r2.ok === true && r2.value?.name === 'diamond_ore', '🔴 filter 返回假的事件**不消费**，继续等下一个', String(r2.value?.name))
-
-  const r3 = await waitForEvent(mkEmitter(), 'never', { ms: 60 })
-  ok(r3.ok === false && r3.reason === 'timeout', '没人发 ⇒ reason=timeout', JSON.stringify(r3.reason))
-  ok(r3.waitedMs >= 50, 'waitedMs 如实报（真等了约 ms 那么久）', String(r3.waitedMs))
-
-  const em4 = mkEmitter()
-  const ac4 = new AbortController()
-  ac4.abort()
-  const r4 = await waitForEvent(em4, 'x', { ms: 5000, signal: ac4.signal })
-  ok(r4.ok === false && r4.reason === 'aborted', '已经中止 ⇒ 立刻回 aborted（不挂监听器）', JSON.stringify(r4.reason))
-  ok(em4.count('x') === 0, '已中止时不挂监听器', `left=${em4.count('x')}`)
-
-  const em5 = mkEmitter()
-  const ac5 = new AbortController()
-  const p5 = waitForEvent(em5, 'x', { ms: 5000, signal: ac5.signal })
-  setTimeout(() => ac5.abort(), 20)
-  const r5 = await p5
-  ok(r5.ok === false && r5.reason === 'aborted', '等的中途被中止 ⇒ aborted', JSON.stringify(r5.reason))
-  ok(em5.count('x') === 0, '🔴 中途中止也要把监听器摘掉', `left=${em5.count('x')}`)
-
-  const r6 = await waitForEvent(null, 'x', { ms: 100 })
-  ok(r6.ok === false && r6.reason === 'no-emitter', '🔴 假件（没有 on）⇒ 回 no-emitter，**不抛**（套件里全是假 bot）', JSON.stringify(r6.reason))
-
-  const em7 = mkEmitter()
-  const p7 = waitForEvent(em7, 'a', { ms: 5000 })
-  const p8 = waitForEvent(em7, 'a', { ms: 5000 })
-  ok(em7.count('a') === 2, '两个等待者各自挂一个监听器', `n=${em7.count('a')}`)
-  em7.emit('a', 1)
-  await Promise.all([p7, p8])
-  ok(em7.count('a') === 0, '两个都收工后监听器归零', `left=${em7.count('a')}`)
-}
-
 /* ─────────── ③ 老三样没被改坏 ─────────── */
 section('③ sleep / withTimeout / raceAbort / abortError 照旧')
 {
@@ -205,7 +156,6 @@ section('⑤ 叶子纪律：这个模块不许长出依赖')
   ok(!/console\.(log|error)/.test(no), '自己不打 console')
   ok(!/setControlState/.test(no), '不碰控制位（它只管"等"，不管"动"）')
   ok(/export async function waitUntil/.test(no), '导出 waitUntil')
-  ok(/export function waitForEvent/.test(no), '导出 waitForEvent')
   ok(/unref/.test(src) === false || /故意不 unref/.test(src), '定时器没有 unref（unref 掉会让"只有它在等"时进程直接退出）')
 }
 

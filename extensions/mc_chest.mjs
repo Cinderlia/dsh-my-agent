@@ -157,8 +157,8 @@ export function listText (bot, { radius = 16 } = {}) {
   if (!boxes.length) {
     lines.push(`📦 ${radius} 格内没有箱子/木桶。`)
     const inv = chestInInventory(bot)
-    if (inv) lines.push(`　→ 背包里有 ${inv.name}×${inv.have}，说一声我就放到脚边（\`mc_chest {action:"put",name:"…",placeChest:true}\`）。`)
-    else lines.push('　→ 想攒东西就先做一个：`mc_craft {name:"chest"}`（8 个木板），然后叫我（我会自己放）。')
+    if (inv) lines.push(`　→ 背包里有 ${inv.name}×${inv.have}，自己放一个：\`mc_act {mode:"place",name:"chest",x:…,y:…,z:…}\`（我不替你放）。`)
+    else lines.push('　→ 想攒东西就先做一个：`mc_craft {name:"chest"}`（8 个木板），然后自己放（`mc_act {mode:"place",name:"chest",x:…,y:…,z:…}`）。')
     return lines.join('\n')
   }
   lines.push(`📦 ${radius} 格内的仓库（${boxes.length} 个）：`)
@@ -195,7 +195,7 @@ export async function apply (api) {
       + '· `action:"list"`（默认）：看背包里有什么、附近有哪些箱子；给 x/y/z 就打开那个箱子列内容。\n'
       + '· `action:"put"`：把背包里的东西放进箱子（`name:"iron_ingot", count:16`，或 `all:true` 全放）。\n'
       + '· `action:"take"`：从箱子里拿出来（`name:"coal", count:8`，或 `all:true` 全拿）。\n'
-      + '· 附近没有箱子、但背包里有，就**自己放到脚边**再用（`placeChest:false` 可关）；'
+      + '· 附近没有箱子时**只报缺什么**，不替你放（用户 2026-10-19 定）；'
       + '都没有会告诉你去 `mc_craft {name:"chest"}` 做一个（8 个木板）。\n'
       + '· `all:true` 是**真的全搬**（工具也会被放进去！想留东西就写 `name`，或者用 `keep:"wooden_pickaxe,stone_sword"` 留一手）。\n'
       + '· 背包满 / 箱子满 / 开不开都会如实说；搬完会重新读一遍箱子，告诉你现在里面有什么。\n'
@@ -210,7 +210,7 @@ export async function apply (api) {
       y: { type: 'number', description: '指定箱子坐标 y（可选）' },
       z: { type: 'number', description: '指定箱子坐标 z（可选）' },
       radius: { type: 'number', description: '找箱子的半径（默认 8，最大 32）' },
-      placeChest: { type: 'boolean', description: '附近没箱子时自己放一个（默认 true）' },
+
       dryRun: { type: 'boolean', description: '只出计划，不动手（默认 false）' },
     },
     output: {
@@ -286,7 +286,6 @@ export async function apply (api) {
       /* ③ 找箱子（没给坐标、附近也没有才放一个） */
       const wantPos = Number.isFinite(Number(args.x)) && Number.isFinite(Number(args.y)) && Number.isFinite(Number(args.z))
       let box = findContainerBlock(bot, { x: args.x, y: args.y, z: args.z, radius })
-      let placedNote = null
       /* 🔴 2026-10-08 审计 H6：**给了坐标却在那里找不到箱子**时，以前会照走"没箱子就放一个"这条路
        *    ⇒ 在脚边另造一个新箱子，然后对着它存/取。AI 从 `mc_scan` 拿到坐标、y 记错一格，
        *    就会把家当存进一个自己不知道的新箱子，或者对着新箱子说"箱子里没有 coal"。
@@ -303,56 +302,22 @@ export async function apply (api) {
           '　→ 我**没有**另放新箱子（免得你把东西存进一个自己不知道的箱子）。',
         ]
         lines.push(near.length ? `　附近 ${radius} 格内真实的箱子：${show.join('、')}` : `　附近 ${radius} 格内也没有箱子。`)
-        lines.push('　→ 坐标用 `mc_scan` 或 `mc_chest {action:"list"}` 里报的那一个；不想给坐标就直接 `mc_chest {action:"put",name:"…"}`（我会用最近的箱子，没有就放一个）。')
+        lines.push('　→ 坐标用 `mc_scan` 或 `mc_chest {action:"list"}` 里报的那一个；不想给坐标就直接 `mc_chest {action:"put",name:"…"}`（我会用最近的箱子）。')
         logLine(`mc_chest：给的坐标 (${args.x},${args.y},${args.z}) 上没有箱子，没另放`)
         return { text: lines.join('\n') }
-      }
-      if (!box && args.placeChest !== false) {
-        const inv = chestInInventory(bot)
-        if (inv) {
-          const spot = findPlaceSpot(bot, { radius: 2 })
-          if (spot && args.dryRun === true) {
-            placedNote = `（dryRun：附近没箱子，真跑的时候我会把背包里的 ${inv.name} 放到 (${spot.x},${spot.y},${spot.z})）`
-            box = { position: spot, name: inv.name, virtual: true }
-          } else if (spot) {
-            try {
-              const r = await mc.placeBlock({ x: spot.x, y: spot.y, z: spot.z, name: inv.name })
-              if (r?.placed) {
-                /* 客户端收到方块更新会晚一拍：立刻查常常还是 null（审计旁注）。
-                 * 放完轮询几百毫秒再认，免得"说放好了但找不到箱子"。 */
-                for (let i = 0; i < 6 && !box; i++) {
-                  box = findContainerBlock(bot, { x: spot.x, y: spot.y, z: spot.z })
-                  if (!box) await sleep(150)
-                }
-                placedNote = box
-                  ? `（附近本来没有箱子，我把背包里的 ${inv.name} 放到 (${spot.x},${spot.y},${spot.z}) 了）`
-                  : `（方块放出去了，但客户端还没收到方块更新，读不到 (${spot.x},${spot.y},${spot.z}) 上的箱子 —— 过一会儿再叫我一次）`
-                logLine(`mc_chest：自动放了 ${inv.name} (${spot.x},${spot.y},${spot.z})${box ? '' : '（还没读到）'}`)
-              } else {
-                placedNote = `（想放箱子但没成功：${r?.note ?? '未知原因'}）`
-              }
-            } catch (e) {
-              placedNote = `（想放箱子但失败：${e.message}）`
-            }
-          } else {
-            placedNote = '（想放箱子，但脚边找不到能放的空位）'
-          }
-        }
       }
       if (!box) {
         const inv = chestInInventory(bot)
         const lines = []
-        if (placedNote) lines.push(placedNote)
         lines.push(`❌ 附近 ${radius} 格没有箱子/木桶，背包里${inv ? `有 ${inv.name}×${inv.have} 但放不下` : '也没有'}。`)
-        lines.push('　→ 先做一个：`mc_craft {name:"chest"}`（8 个木板），然后叫我（我会自己放）；')
-        lines.push('　　或者你自己 `mc_act {mode:"place",name:"chest",x:…,y:…,z:…}` 放到脚边。')
+        lines.push('　→ 先做一个：`mc_craft {name:"chest"}`（8 个木板），然后自己放（`mc_act {mode:"place",name:"chest",x:…,y:…,z:…}`，脚边要平）—— **我不替你放**（用户 2026-10-19 定）。')
+
         logLine(`mc_chest：找不到箱子`)
         return { text: lines.join('\n') }
       }
 
       const at = box.position
       const head = []
-      if (placedNote) head.push(placedNote)
       head.push(`📦 ${box.name} @ (${at.x},${at.y},${at.z})`)
 
       /* ④ 走/飞到够得着（openContainer 要 4.5 格内） */

@@ -10,7 +10,7 @@
  * 本文件把它们包成工具 `mc_craft`，并补上 mineflayer 没做的事：
  *   ① **递归规划**：原料不够但能再合成（原木→木板→木棍）就自动排好顺序一起做，
  *      不再需要 AI 自己一步步算（它算错过，也会因此反问 用户）。
- *   ② **自动用/放工作台**：附近没有工作台、但背包里有，就自己放到脚边再用（mineflayer 只会抛错）。
+ *   ② **自动找工作台**：附近有就用；没有就报"缺桌子"并列出周围哪几张能用（**不替你放** —— 用户 2026-10-19）。
  *   ③ **缺料报告**：缺什么、缺几个、现有几个，并给出下一步该调哪个工具。
  *   ④ 名字解析（`planks` → `oak_planks` 这种）、`list` 看配方、`dryRun` 只出计划。
  *
@@ -59,6 +59,20 @@ export function findTableBlock (bot, { x, y, z, radius = 4 } = {}) {
   const ids = TABLE_NAMES.map((n) => blockIdOf(bot, n)).filter((v) => v != null)
   if (!ids.length) return null
   try { return bot.findBlock({ matching: ids, maxDistance: clamp(Number(radius) || 4, 1, 8) }) ?? null } catch { return null }
+}
+
+/** 周围所有工作台的坐标（用户 2026-10-19：「用不了附近工作台再加一个周围工作台的位置」）。
+ *  只读、不改世界；给 AI 一条"走过去用哪张"的路，或者拿来填 `mc_craft {x,y,z}`。 */
+export function listTablesNearby (bot, radius = 32, limit = 5) {
+  const ids = TABLE_NAMES.map((n) => blockIdOf(bot, n)).filter((v) => v != null)
+  if (!ids.length) return []
+  try {
+    const from = bot.entity?.position
+    const found = bot.findBlocks({ matching: ids, maxDistance: clamp(Number(radius) || 32, 1, 48), count: clamp(Number(limit) || 5, 1, 8) }) ?? []
+    return found
+      .map((p) => ({ x: p.x, y: p.y, z: p.z, dist: from ? Math.round(from.distanceTo(p) * 10) / 10 : null }))
+      .sort((a, b) => (a.dist ?? 1e9) - (b.dist ?? 1e9))
+  } catch { return [] }
 }
 
 function recipesAllOf (bot, id, table) {
@@ -168,7 +182,7 @@ export function ingredientsOf (recipe) {
 /* ───────────────────────── 名字解析 ───────────────────────── */
 
 /** 把 AI 写的名字解析成一个物品（planks → oak_planks；log → 背包里那种原木） */
-export function resolveItem (bot, query, table) {
+export function resolveItem (bot, query, table, want = 1) {
   const raw = String(query ?? '').trim()
   if (!raw) throw new Error('要合成什么？给个物品名，比如 name:"oak_planks"（也可以先 list:true 看当前能做什么）')
   const q = raw.toLowerCase().replace(/^minecraft:/, '').replace(/\s+/g, '_')
@@ -179,15 +193,24 @@ export function resolveItem (bot, query, table) {
     throw new Error(`没有叫“${raw}”的物品（要写英文 id，如 oak_planks / stick / wooden_pickaxe / crafting_table；list:true 可以看当前能做什么）`)
   }
   if (cands.length === 1) return { item: byName[cands[0]], note: null }
+  const wantN = Math.max(1, Number(want) || 1)
   const scored = cands.map((n) => {
     const it = byName[n]
     const have = countOf(bot, it.id, null)
     let ok = false
-    try { ok = planCraft(bot, it.id, 1, table).ok } catch { ok = false }
+    /* 🔴 `ok` 要用**这次要的数量**去试，不能用 1：背包有 5 块木板、但要 12 块、又没原木时，
+     * 拿 1 去试会回"能做（已有的够 1 个）"，于是被当成能做 ⇒ 选了个凑不齐的候选。 */
+    try { ok = planCraft(bot, it.id, wantN, table).ok } catch { ok = false }
     return { n, it, have, ok }
   })
-  const best = scored.filter((s) => s.have > 0).sort((a, b) => b.have - a.have)[0]
-    ?? scored.filter((s) => s.ok)[0]
+  /* 🔴 2026-10-19 实机：`{name:"planks", count:12}` 时背包有 birch_log×4（能做 12 块桦木木板）
+   * 和 oak_planks×5（但 oak_log 为 0，**做不出来**），它按"背包里有"选了 oak_planks，
+   * 接着就卡在"oak_log：需要 2，背包里有 0"。判据从"有就优先"改成"**够用 或 做得出**优先"。 */
+  const haveSome = scored.filter((s) => s.have > 0)
+  const byHave = (a, b) => b.have - a.have
+  const best = haveSome.filter((s) => s.ok || s.have >= wantN).sort(byHave)[0]
+    ?? scored.filter((s) => s.ok).sort(byHave)[0]
+    ?? haveSome.sort(byHave)[0]
     ?? null
   if (!best) {
     throw new Error(`“${raw}”能对应 ${cands.length} 个物品（${cands.slice(0, 10).join(' / ')}`
@@ -195,7 +218,7 @@ export function resolveItem (bot, query, table) {
   }
   return {
     item: best.it,
-    note: `“${raw}”能对应 ${cands.length} 个物品，按"背包里有 / 现在能做"自动选了 **${best.n}**（要别的请写全名）`,
+    note: `“${raw}”能对应 ${cands.length} 个物品，按"够用 / 现在能做"自动选了 **${best.n}**（要别的请写全名）`,
   }
 }
 
@@ -327,7 +350,7 @@ export function describePlan (plan, targetName, want) {
 }
 
 /** 缺料报告：缺什么、缺几个、现有几个、**卡在链条的哪一步**、下一步调什么 */
-export function describeMissing (plan) {
+export function describeMissing (plan, bot = null) {
   const lines = ['❌ 原料不够，做不了：']
   const tips = new Map() // 缺料叶子 → 链条上最靠近它的那一层（真正卡住的那一步）
   for (const m of plan.missing) {
@@ -351,7 +374,14 @@ export function describeMissing (plan) {
   for (const m of plan.missing) {
     if (/_log$/.test(m.name)) hints.add(`原木：\`mc_dig {name:"${m.name}",count:3}\`（或者砍你附近那种树，_log 换成对应名字）`)
     else if (/_ore$|raw_/.test(m.name)) hints.add('矿石：`mc_dig {name:"iron_ore",count:3}` 或下矿找')
-    else if (m.why?.includes('需要工作台')) hints.add('工作台：背包里有就 `mc_act {mode:"place",name:"crafting_table",x,y,z}` 放到脚边；没有就先 `mc_craft {name:"crafting_table"}`（4 木板）。放好后再试一次（本工具加 `placeTable:true` 会自己放）')
+    else if (m.why?.includes('需要工作台')) {
+      const near = bot ? listTablesNearby(bot, 32, 4) : []
+      hints.add('工作台：附近有就自动用；没有就报"缺桌子"并列出周围哪几张能用 —— **我不替你放**（要自己 `mc_act {mode:"place",…}` 放）'
+        + (near.length
+          ? `｜周围 32 格内找到 ${near.length} 张：${near.map((t) => `(${t.x},${t.y},${t.z}) ${t.dist} 格`).join('、')}`
+            + ` —— 走过去用，或者直接 \`mc_craft {…,x:${near[0].x},y:${near[0].y},z:${near[0].z}}\``
+          : '｜周围 32 格内也没有别的工作台'))
+    }
     else if (/cobble|stone/.test(m.name)) hints.add('石头：`mc_dig {name:"stone",count:8}`（要用镐子挖）')
     const tip = tips.get(m.name)
     if (tip && /_planks$/.test(tip.name)) {
@@ -772,7 +802,15 @@ async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null
         continue
       }
       got = countOf(bot, outId, null) - before
-      if (got > 0) { lastErr = null; break }
+      if (got > 0) {
+        lastErr = null
+        /* 🔴 成功也要清合成格：mineflayer 一次可能只点了一部分结果槽，剩下的原料还留在 2×2
+         *    合成格里，而 `bot.inventory` **看不见格子里的东西** —— 2026-10-19 实机表现成
+         *    "18 根原木凭空没了、只做出 8 块木板"，直到下一次合成开头才被点回背包。
+         *    点回背包之后才对得上账。 */
+        await closeMaybeWindow()
+        break
+      }
       lastErr = new Error('craft 正常返回但背包没变')
       await closeMaybeWindow()
       await new Promise((r) => setTimeout(r, 400))
@@ -803,10 +841,23 @@ async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null
         if (extra2) notes.push(`补做「${s.name}」时：${extra2}`)
         dbgLog(`补做「${s.name}」第 ${round + 1} 轮抛错：${e?.message ?? e}`)
         await closeMaybeWindow()
-        break
+        /* 🔴 抛错 ≠ 没做出来（跟上面主循环那条同一个道理）：`updateSlot did not fire` 这类
+         *    是"东西已经到手、只是窗口事件丢了"。**先对账再决定**：真涨了就接着补，
+         *    别把整步停在第一批进度上（2026-10-19 实机：要 24 块木板，只做了 4 块就不动了）。 */
+        const now2 = countOf(bot, outId, null)
+        if (now2 > before2) { made = now2 - before; continue }
+        if (!/missing ingredient|updateSlot|did not fire|timeout/i.test(String(e?.message ?? ''))) break
+        await new Promise((r) => setTimeout(r, 300))
+        continue
       }
+      /* 🔴 2026-10-19 实机：补做那一批**服务端已经做出来了**，但窗口还开着 ⇒ 客户端 slots 没同步，
+       *    读回来还是上一批的数 ⇒ 要 8 块木板时报"只做出来 4 个（材料不够了？）"，
+       *    模型于是又调一次 mc_craft —— 第二次才发现背包里其实是 8 个（白跑一趟，还差点重复合成）。
+       *    关窗（服务端必回整窗内容）对账后再量。 */
+      await closeMaybeWindow()
+      await new Promise((r) => setTimeout(r, 120))
       const now = countOf(bot, outId, null)
-      if (now <= before2) { await closeMaybeWindow(); break }
+      if (now <= before2) break
       made = now - before
     }
     got = made
@@ -848,7 +899,7 @@ export async function apply (api) {
     name: 'mc_craft',
     description: '🧱 **合成物品**（真合成，走服务端的合成台，不是作弊给物）。生存模式下"原木→木板→工作台→木镐"就靠它。\n'
       + '· 会**自动补齐中间产物**：给它 `name:"wooden_pickaxe"`，它自己排"木板→木棍→木镐"的顺序一起做，不用你一步步算。\n'
-      + '· 需要工作台时：附近有就直接用；附近没有但背包里有，就**自己放到脚边**再用（`placeTable:false` 可关）。\n'
+      + '· 需要工作台：附近有就用；没有就报"缺桌子"并列出周围哪几张能用 —— **不替你放**（用户 2026-10-19 定）。\n'
       + '· 原料不够会告诉你**缺什么、缺几个、现在有几个**，并给出下一步该调哪个工具（比如先 `mc_dig` 砍原木）。\n'
       + '· `name` 可以写简称：`planks` 会自动选背包里那种原木对应的木板（选了哪个会写在结果里）。\n'
       + '· `list:true` 看配方/看当前能做什么；`dryRun:true` 只出计划不动手（拿不准就先 dryRun）。\n'
@@ -860,7 +911,6 @@ export async function apply (api) {
       count: { type: 'number', description: '合成后背包里**一共**要有几个（默认 1）。要"再做 N 个"就加 more:true' },
       more: { type: 'boolean', description: 'count 当"再做几个"（在现有基础上加，默认 false = count 是"一共要到几个"）' },
       table: { type: 'boolean', description: '允许用工作台（默认 true）' },
-      placeTable: { type: 'boolean', description: '附近没工作台时自己放一个（默认 true）' },
       x: { type: 'number', description: '指定工作台坐标 x（可选，和 y/z 一起给）' },
       y: { type: 'number', description: '指定工作台坐标 y（可选）' },
       z: { type: 'number', description: '指定工作台坐标 z（可选）' },
@@ -915,7 +965,7 @@ export async function apply (api) {
       let placedNote = null
       let target
       try {
-        target = resolveItem(bot, args.name, table)
+        target = resolveItem(bot, args.name, table, args.count)
       } catch (e) {
         return { text: `❌ ${e.message}` }
       }
@@ -941,55 +991,13 @@ export async function apply (api) {
         table = null
         plan = planCraft(bot, target.item.id, want, null)
       }
-      /* 🔴 只要计划里有步骤，就**尽量用工作台**（哪怕这条配方 2×2 也能做）：
-       * mineflayer 的 2×2 背包合成容易卡在 `updateSlot` 上甚至丢材料（见 runPlan 的注释），
-       * 而"背包里有工作台就放到脚边"几乎零成本。想省这一步可以传 placeTable:false。 */
-      if (!table && allowTable && args.placeTable !== false
-        && (plan.missing.some((m) => /crafting_table/.test(String(m.name))) || plan.steps.length > 0)) {
-        const tid = itemIdOf(bot, 'crafting_table')
-        const haveTable = countOf(bot, tid, null)
-        if (haveTable > 0) {
-          const spot = findPlaceSpot(bot)
-          if (spot && args.dryRun === true) {
-            // dryRun 不该动世界：假装桌子已经放好了，好把计划完整写出来
-            table = { position: spot, virtual: true }
-            placedNote = `（dryRun：附近没工作台，真跑的时候我会把背包里的工作台放到 (${spot.x},${spot.y},${spot.z})）`
-          } else if (spot) {
-            try {
-              const r = await mc.placeBlock({ x: spot.x, y: spot.y, z: spot.z, name: 'crafting_table' })
-              if (r?.placed) {
-                /* 🔴 审计 G2：客户端收到方块更新晚一拍，放完**立刻**查常常还是 null ⇒
-                 * 旧代码这里直接 `table = findTableBlock(...)`（零轮询）⇒ `table` 是 null ⇒
-                 * 下面 `planCraft(bot, …, table)` 拿到 null ⇒ 计划没把工作台算进去，
-                 * 同一条回复里既说"我把工作台放好了"又说"缺工作台"。
-                 * `mc_chest.mjs` / `mc_furnace.mjs` 早就有这段轮询（6×150ms），照抄。 */
-                for (let i = 0; i < 6 && !table; i++) {
-                  table = findTableBlock(bot, { x: spot.x, y: spot.y, z: spot.z })
-                  if (!table) await sleep(150)
-                }
-                placedNote = table
-                  ? `（附近本来没有工作台，我把背包里的放到 (${spot.x},${spot.y},${spot.z}) 了）`
-                  : `（工作台放出去了，但客户端还没收到方块更新，读不到 (${spot.x},${spot.y},${spot.z}) 上的工作台 —— 过一会儿再叫我一次）`
-                logLine(`mc_craft：自动放了工作台 (${spot.x},${spot.y},${spot.z})${table ? '' : '（还没读到）'}`)
-              } else {
-                placedNote = `（想放工作台但没成功：${r?.note ?? '未知原因'}）`
-              }
-            } catch (e) {
-              placedNote = `（想放工作台但失败：${e.message}）`
-            }
-          } else {
-            placedNote = '（想放工作台，但脚边找不到能放的空位）'
-          }
-          if (table) plan = planCraft(bot, target.item.id, want, table)
-        }
-      }
       const head = []
       if (placedNote) head.push(placedNote)
       if (target.note) head.push(`　${target.note}`)
       if (table) head.push(`　🔨 工作台：(${table.position.x},${table.position.y},${table.position.z})`)
 
       if (!plan.ok) {
-        const text = [...head, describeMissing(plan)].filter(Boolean).join('\n')
+        const text = [...head, describeMissing(plan, bot)].filter(Boolean).join('\n')
         logLine(`mc_craft：${target.item.name} ×${want} 缺料（${plan.missing.map((m) => m.name).join(',')}）`)
         return { text }
       }

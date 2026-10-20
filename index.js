@@ -26,7 +26,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFi
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
-import { resolve, sep, join, isAbsolute, dirname } from 'node:path'
+import { resolve, sep, join, isAbsolute, dirname, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
 import { defineTool, toolDefKind } from './src/tool-def.mjs'
@@ -50,8 +50,10 @@ import { perfWrap, perfSnapshot, perfText, perfReset } from './src/perf-monitor.
 import { terrainCacheStats } from './src/terrain.mjs'
 import { workerPoolStats } from './src/worker-pool.mjs'
 import { MemoryStore } from './src/memory.mjs'
+import { createInjector } from './src/inject.mjs'
 import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, personaTextKeyOf, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS, matchCommandList, isRegexEntry } from './src/config.mjs'
-import { COMMAND_GROUPS, catalogNames, COMMANDS_THAT_MOVE_ME } from './src/commands.mjs'
+import { COMMAND_GROUPS, catalogNames, COMMANDS_THAT_MOVE_ME, splitCommands, commandNameOf, MAX_COMMANDS_PER_CALL } from './src/commands.mjs'
+import { readBossBars, formatBossBars } from './src/bossbar.mjs'
 import { AccountStore, parseAuthlibCard, normalizeServerUrl, dashUuid } from './src/accounts.mjs'
 import { msaCacheDir, msaHasCache, msaJobOf, msaJobStart, msaJobClear, msaSupported } from './src/msa.mjs'
 import { DEFAULT_AGENTS_MD, agentsMdPath, legacyAgentsMdPath, migrateLegacyAgentsMd, readAgentsMd, writeAgentsMd, resetAgentsMd, syncRulesVersion } from './src/agentsmd.mjs'
@@ -200,6 +202,13 @@ class McSession {
     // 🔴 lockDir = 插件的家（`$DSH_HOME/dsh-mc-agent/`）：**别把锁文件写进插件包目录**
     //    （装进 node_modules 后可能是只读的，升级时也会被覆盖）——与日志同一条理由。
     this.bot = new McBot({ instanceId: agentId, ...(lockDir ? { lockDir } : {}) })
+    /* 🔴 「遇到危险打不打断」是**插件级**配置（`mc_admin_config` 可当场改）。
+     *    长动作在循环里读 `self.cfg.stopOnDanger`，所以这里给它挂一个**活的** getter ——
+     *    改完配置立刻生效，不用重建会话。（用户 2026-10-19：「不要打断只提醒」） */
+    Object.defineProperty(this.bot.cfg, 'stopOnDanger', {
+      get: () => this.config?.get?.('stopOnDanger') === true,
+      configurable: true, enumerable: true,
+    })
     this.mode = 'standby'           // standby / active / sleep
     this.events = []                // 未消费的 MC 事件
     /* 🔴 审计报告 F2：事件带**单调 seq**。队列满 200 条时 `#pushEvent` 从头部 splice，
@@ -690,6 +699,77 @@ export function apply(ctx, rawConfig) {
     }
     logLine(`「文件分享」清除分享数据：${root}（${before.files} 个文件 / ${before.bytes} 字节）`)
     return { ...before, existed: true, removed: before.files }
+  }
+
+  /* ─────────── 「MC设置 → 记忆」页要的两件事：看目录内容 / 打开所在位置 ───────────
+   * 用户 2026-10-20：「把『文件分享』那页改成『记忆』，分享那些开关一律不要了，
+   *   只显示**这个会话的记忆文件在哪**（lessons.md / world.md …），并且能打开文件夹」。
+   * 🔴 目录照旧由服务端推导（`memoryRootFor`），**不接受客户端给的任意路径**。
+   * ------------------------------------------------------------------------ */
+  const memoryDirView = (dir) => {
+    let entries = []
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { entries = [] }
+    const files = []
+    const dirs = []
+    for (const ent of entries) {
+      const name = String(ent.name ?? '')
+      // 内部件（`.express` / `.out` / `config.json` 这类点开头的）不往外列
+      if (!name || name.startsWith('.')) continue
+      if (ent.isDirectory()) { dirs.push({ name }); continue }
+      if (!ent.isFile()) continue
+      let st = null
+      try { st = statSync(join(dir, name)) } catch { /* 读不到大小就只给名字 */ }
+      files.push({ name, bytes: st ? st.size : null, mtime: st ? st.mtimeMs : null })
+    }
+    /** README.md 排最前（它是索引），其余按名字排 —— 让用户一眼看到"从哪开始读" */
+    const rank = (n) => (n === 'README.md' ? 0 : 1)
+    files.sort((a, b) => rank(a.name) - rank(b.name) || a.name.localeCompare(b.name))
+    dirs.sort((a, b) => a.name.localeCompare(b.name))
+    return {
+      dir,
+      exists: existsSync(dir),
+      memoryPerSession: pluginConfig.memoryPerSession === true,
+      files,
+      dirs,
+    }
+  }
+
+  /**
+   * 用系统文件管理器打开记忆目录（给了 `name` 就在里面**选中**那个文件）。
+   *
+   * 为什么放在服务端：浏览器拿不到本地路径，只能让宿主机去开。
+   * `name` 只认**文件名**（`basename`），拼路径前先剥掉目录部分 —— 不让它跳出记忆根。
+   */
+  const openInFileManager = async (dir, name = null) => {
+    if (!existsSync(dir)) {
+      try { mkdirSync(dir, { recursive: true }) } catch (e) { throw new Error(`记忆目录不存在，也建不出来：${e.message}`) }
+    }
+    const nm = name ? basename(String(name)) : ''
+    const picked = nm && existsSync(join(dir, nm)) ? join(dir, nm) : null
+    const target = picked ?? dir
+    const { spawn } = await import('node:child_process')
+    const plat = process.platform
+    const [cmd, args] = plat === 'win32'
+      ? ['explorer.exe', picked ? ['/select,' + picked] : [dir]]
+      : plat === 'darwin'
+        ? ['open', picked ? ['-R', picked] : [dir]]
+        : ['xdg-open', [picked ? dirname(picked) : dir]]
+    await new Promise((resolvePromise) => {
+      let done = false
+      const fin = (err) => { if (done) return; done = true; resolvePromise(err) }
+      let child = null
+      try {
+        child = spawn(cmd, args, { detached: true, stdio: 'ignore' })
+      } catch (e) {
+        return fin(e)
+      }
+      child.on?.('error', (e) => fin(e))
+      child.unref()
+      /* 🔴 explorer.exe 常驻不退出（它自己就是外壳），不能等它 exit —— 800ms 没报错就当开成了 */
+      setTimeout(() => fin(null), 800)
+    })
+    logLine(`「记忆」打开所在位置：${target}`)
+    return { opened: true, dir, target }
   }
 
   /**
@@ -1486,6 +1566,206 @@ export function apply(ctx, rawConfig) {
       return ok(clearShared(gate.cwd))
     }
 
+    /* ── 「MC设置 → 记忆」：这个会话的记忆目录 + 里面有哪些文件 + 打开所在位置 ────────
+     * 用户 2026-10-20：原来那页是「文件分享」，现在整页换成「记忆」——
+     * 分享开关/base/清除全部下线，这页只回答：**我的记忆存在哪**、**里面有什么**、**帮我打开它**。
+     *   · GET  `/api/mc/memory`      → `{ dir, exists, files, dirs, memoryPerSession }`
+     *   · POST `/api/mc/memory/open` → 用系统文件管理器打开（带 `name` 就是在里面选中它）
+     * 目录只认服务端推导（`memoryRootFor`），客户端不能直接塞路径 —— 同 `usableWorkspace()` 的规矩。
+     * ------------------------------------------------------------------------ */
+    if (path === '/api/mc/memory' && req.method === 'GET') {
+      const gate = await gateOf()
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
+      const sid = String(url?.searchParams?.get('sessionId') ?? '')
+      return ok(memoryDirView(memoryRootFor(gate.cwd, agentIdOf(safeAgentById(sid)))))
+    }
+    if (path === '/api/mc/memory/open' && req.method === 'POST') {
+      const gate = await gateOf()
+      if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
+      const sid = String(body?.sessionId ?? url?.searchParams?.get('sessionId') ?? '')
+      const dir = memoryRootFor(gate.cwd, agentIdOf(safeAgentById(sid)))
+      return ok(await openInFileManager(dir, body?.name ? String(body.name) : null))
+    }
+
+    /* ── 更新（用户 2026-10-20）：`GET /api/mc/update` 查 / `POST /api/mc/update/apply` 拉 ──
+     * 🔴 这两条**不要求工作区**：红点要出现在"新会话页"上，那时候根本还没有工作区。 */
+    if (path === '/api/mc/update' && req.method === 'GET') {
+      const force = String(url?.searchParams?.get('force') ?? '') === '1'
+      return ok(await checkUpdate(force))
+    }
+    if (path === '/api/mc/update/apply' && req.method === 'POST') {
+      const r = await applyUpdate()
+      return r.ok ? ok(r) : sendJson(res, 400, { ok: false, error: r.error })
+    }
+
+    /* ── 更新（「MC设置 → 更新」页，用户 2026-10-20）─────────────────────────────
+     * 🔴 这个插件是 `link:<源码目录>` 装的（npm 上没有包），所以「新版本」**只可能来自 git 远端**：
+     *   比对本地 HEAD 与 `<remote>/<branch>`，落后的提交 + `CHANGELOG.md` 新增的那几行 = "新版加了什么"。
+     *   源优先级：**gitee → origin**（用户：优先用 gitee，github 兜底）。结果缓存 10 分钟，
+     *   红点靠 `GET /api/mc/update` 轮询，别每次开页面都真去 fetch。 */
+    const PLUGIN_ROOT = fileURLToPath(new URL('.', import.meta.url))
+    const UPDATE_TTL_MS = 10 * 60 * 1000
+    const updateCache = { at: 0, data: null }
+
+    /** 跑一条 git 命令（不弹窗、带超时）。返回 `{ code, out, err }`，**永不抛**。 */
+    const gitRun = async (args, timeoutMs = 20000) => {
+      const { spawn } = await import('node:child_process')
+      return await new Promise((resolvePromise) => {
+        let out = ''
+        let err = ''
+        let settled = false
+        const fin = (r) => { if (!settled) { settled = true; resolvePromise(r) } }
+        let child
+        try {
+          child = spawn('git', args, { cwd: PLUGIN_ROOT, windowsHide: true })
+        } catch (e) {
+          return fin({ code: -1, out: '', err: `起不了 git：${e?.message ?? e}` })
+        }
+        const timer = setTimeout(() => {
+          try { child.kill() } catch { /* 已经退了 */ }
+          fin({ code: -2, out, err: err + `超时（${timeoutMs}ms）` })
+        }, timeoutMs)
+        child.stdout?.on('data', (d) => { out += String(d) })
+        child.stderr?.on('data', (d) => { err += String(d) })
+        child.on('error', (e) => { clearTimeout(timer); fin({ code: -1, out, err: err + String(e?.message ?? e) }) })
+        child.on('close', (code) => { clearTimeout(timer); fin({ code, out, err }) })
+      })
+    }
+
+    /** 从 `git diff` 里挑出 CHANGELOG 的**新增行**（比整篇 CHANGELOG 更贴近"这次加了什么"）。 */
+    const changelogAddedOf = (diffText) => {
+      const out = []
+      for (const l of String(diffText).split(/\r?\n/)) {
+        if (l.startsWith('+') && !l.startsWith('+++')) out.push(l.slice(1))
+      }
+      return out.join('\n').trim().slice(0, 4000)
+    }
+
+    /**
+     * 查有没有新版本。`force` = 忽略 10 分钟缓存（用户点了「检查更新」）。
+     * 返回值恒是对象（`ok:false` 时 `reason` 说人话），前端直接照着渲染。
+     */
+    const checkUpdate = async (force = false) => {
+      if (!force && updateCache.data && Date.now() - updateCache.at < UPDATE_TTL_MS) return updateCache.data
+      const data = {
+        ready: true,
+        checkedAt: Date.now(),
+        currentVersion: PLUGIN_VERSION,
+        root: PLUGIN_ROOT,
+        isRepo: false,
+        source: null,
+        remotes: [],
+        branch: null,
+        currentCommit: null,
+        latestCommit: null,
+        latestVersion: null,
+        ahead: 0,
+        behind: 0,
+        commits: [],
+        changelog: '',
+        dirty: 0,
+        dirtyFiles: [],
+        canPull: false,
+        reason: '',
+      }
+      const remember = () => {
+        updateCache.at = Date.now()
+        updateCache.data = data
+        return data
+      }
+
+      const inside = await gitRun(['rev-parse', '--is-inside-work-tree'], 8000)
+      if (inside.code !== 0 || String(inside.out).trim() !== 'true') {
+        data.ready = false
+        data.reason = `插件目录不是 git 仓库（${PLUGIN_ROOT}）—— 这种安装方式没有"新版本"可拉，只能手动覆盖。`
+        return remember()
+      }
+      data.isRepo = true
+
+      const br = await gitRun(['rev-parse', '--abbrev-ref', 'HEAD'], 8000)
+      data.branch = String(br.out).trim() || 'main'
+      const head = await gitRun(['rev-parse', '--short', 'HEAD'], 8000)
+      data.currentCommit = String(head.out).trim() || null
+
+      const st = await gitRun(['status', '--porcelain'], 8000)
+      const dirtyList = String(st.out).split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
+      data.dirty = dirtyList.length
+      data.dirtyFiles = dirtyList.slice(0, 20)
+
+      const rm = await gitRun(['remote'], 8000)
+      data.remotes = String(rm.out).split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
+      data.source = ['gitee', 'origin'].find((x) => data.remotes.includes(x)) ?? data.remotes[0] ?? null
+      if (!data.source) {
+        data.ready = false
+        data.reason = '这个仓库一个远端都没配（`git remote` 是空的），不知道去哪找新版本。'
+        return remember()
+      }
+
+      const fetched = await gitRun(['fetch', data.source, '--prune', '--quiet'], 30000)
+      if (fetched.code !== 0) {
+        data.ready = false
+        data.reason = `拉不到 ${data.source}：${(fetched.err || fetched.out || '').trim().slice(0, 300) || `exit ${fetched.code}`}`
+        return remember()
+      }
+
+      const ref = `${data.source}/${data.branch}`
+      const has = await gitRun(['rev-parse', '--verify', '--quiet', `refs/remotes/${ref}`], 8000)
+      if (has.code !== 0) {
+        data.ready = false
+        data.reason = `远端没有 ${ref} 这个分支（本地分支叫 ${data.branch}）。`
+        return remember()
+      }
+      const lc = await gitRun(['rev-parse', '--short', ref], 8000)
+      data.latestCommit = String(lc.out).trim() || null
+
+      const cnt = await gitRun(['rev-list', '--left-right', '--count', `HEAD...${ref}`], 8000)
+      const parts = String(cnt.out).trim().split(/\s+/)
+      data.ahead = Number(parts[0]) || 0
+      data.behind = Number(parts[1]) || 0
+
+      if (data.behind > 0) {
+        const lg = await gitRun(['log', '--no-decorate', '--pretty=%h\t%s', `HEAD..${ref}`, '-n', '20'], 10000)
+        data.commits = String(lg.out).split(/\r?\n/).filter(Boolean).map((line) => {
+          const i = line.indexOf('\t')
+          return i === -1 ? { hash: line.trim(), subject: '' } : { hash: line.slice(0, i), subject: line.slice(i + 1) }
+        })
+        const lv = await gitRun(['show', `${ref}:package.json`], 10000)
+        try { data.latestVersion = JSON.parse(lv.out).version ?? null } catch { data.latestVersion = null }
+        const cl = await gitRun(['diff', '--unified=0', `HEAD..${ref}`, '--', 'CHANGELOG.md'], 15000)
+        data.changelog = changelogAddedOf(cl.out)
+        data.canPull = data.dirty === 0
+        data.reason = data.dirty === 0
+          ? ''
+          : `本地有 ${data.dirty} 个未提交改动，直接 pull 会被拦 —— 先提交或 stash。`
+      } else {
+        data.reason = '已经是最新。'
+      }
+      return remember()
+    }
+
+    /** 真去拉。只在能拉时才动手；失败把 git 的原话原样给用户。 */
+    const applyUpdate = async () => {
+      const info = await checkUpdate(true)
+      if (!info.isRepo) return { ok: false, error: info.reason }
+      if (info.behind === 0) return { ok: false, error: '已经是最新，没什么可拉的。' }
+      if (info.dirty > 0) {
+        return { ok: false, error: `本地有 ${info.dirty} 个未提交改动，先提交或 stash 再来：\n${info.dirtyFiles.join('\n')}` }
+      }
+      const pull = await gitRun(['pull', '--ff-only', info.source, info.branch], 60000)
+      if (pull.code !== 0) {
+        return { ok: false, error: (pull.err || pull.out || `git pull 退出码 ${pull.code}`).trim().slice(0, 1200) }
+      }
+      updateCache.at = 0
+      updateCache.data = null
+      const after = await checkUpdate(true)
+      return {
+        ok: true,
+        output: String(pull.out).trim().slice(0, 1200),
+        behind: after.behind,
+        needRestart: true,
+      }
+    }
+
     /* ── 提示词（「MC设置 → 提示词」页 = `.dsh-mc-agent/RULES.md` + `<记忆根>/版本提示.md`）──
      * 🔴 两份都是**按会话工作区**的**文件**（用户 2026-10-08：规则放文件里，会话自己去读）。
      *   · GET  **可无工作区** —— 无则**只读**返回内置默认（前端展示用，不建档）；
@@ -1866,7 +2146,9 @@ export function apply(ctx, rawConfig) {
      *    `MC_PRESETS_FALLBACK` 兜底，名单一旦和默认值不同就悄悄失灵。谁再加接口，**记得也加这里**。 */
     if (path.startsWith('/api/mc/accounts') || path.startsWith('/api/mc/authservers')
       || path.startsWith('/api/mc/agents-md') || path === '/api/mc/config'
-      || path === '/api/mc/express' || path === '/api/mc/presets'
+      || path === '/api/mc/express' || path === '/api/mc/memory' || path === '/api/mc/memory/open'
+      || path === '/api/mc/update' || path === '/api/mc/update/apply'
+      || path === '/api/mc/presets'
       || path === '/api/mc/servers' || path === '/api/mc/lan') {
       try {
         return await handleSettingsApi(req, res, path, url)
@@ -2062,6 +2344,23 @@ export function apply(ctx, rawConfig) {
    *    ①把 `tool-present` 组补进 MC 模式的 preset ②把它放进白名单。
    * 交付路径由 guard 限在**本会话工作区**内（`.dsh-mc-agent/` 与 `out/` 都在里面）。
    */
+  /**
+   * 配套插件（**别的包**装的工具）里，MC 模式**默认放行**的那些。
+   *
+   * 🔴 用户 2026-10-19：「MC 模式这个会话的工具集里默认缺了 ACP 那一族。这个可以做成默认打开吗，
+   *    让用户装完就能用压缩等插件」。
+   *
+   * 名单 = billion-context（ACP）那一族：上下文压缩/还原/检索 + 状态 + 缓存账本。
+   * 它们**只读会话上下文、不碰世界**，进 MC 模式没有任何越权风险（文件工具那条
+   * `<工作区>/.dsh-mc-agent/` 的限制跟它们无关）；而 MC 会话动辄两三小时、上下文最吃紧，
+   * 少了 `compress` 就只能硬扛。
+   *
+   * ⚠️ 这是**名字**不是包名：宿主没装/没挂同名工具时会被 `restrict({allow})` 过滤掉
+   * （见下面的 applyAllow），不会让整次白名单作废。开关：`mcMode.allowCompanionTools`。
+   */
+  const MC_COMPANION_TOOLS = [
+    'compress', 'decompress', 'search_context', 'acp_status', 'acp_cache', 'acp_read_original_image',
+  ]
   const MC_PRESENT_TOOL = 'present'
 
   /**
@@ -2225,6 +2524,15 @@ export function apply(ctx, rawConfig) {
    * 🔴 再省一层（同一轮）：**直接回一行行文本**，不回对象。宿主的规则是"有 `text` 用 text，
    *    没有就把对象 pretty-print 成 JSON"——回对象的话光是键名 + 缩进 + 引号就多花一倍字符。
    */
+  /* 🔴 2026-10-19：打 Boss（末影龙/凋灵）时**只有 Boss Bar 有血**，实体列表读不到
+   *    ⇒ 每个动作结果里顺手带一份，射一箭就知道"打到几成了"，不用再问用户。 */
+  const bossBarsField = (bot) => {
+    try {
+      const bars = bot?.readBossBars?.() ?? []
+      return bars.length ? { boss: formatBossBars(bars), bossBars: bars } : {}
+    } catch { return {} }
+  }
+
   const statusLean = (sess, s, w) => {
     const bits = [s.online ? `🟢 ${sess.mode}` : `⚪ ${sess.mode}`]
     if (sess.bot.reconnecting || sess.bot.reconnectPending) bits.push('重连中')
@@ -2254,6 +2562,9 @@ export function apply(ctx, rawConfig) {
       if (s.lastError) bits.push(`上次错误：${s.lastError}`)
     }
     const lines = [bits.join(' ｜ ')]
+    /* 🔴 2026-10-19 用户点的坑"读不到末影龙血量"：龙/凋灵的血只在 Boss Bar 里，
+     *    实体列表读不到 ⇒ 有血条就把"还剩几成 / 多少点"直接放状态条第二行。 */
+    if (s.online && s.bossBars?.length) lines.push(`🗡 ${formatBossBars(s.bossBars)}`)
     if (s.online && s.players?.length) lines.push(`👥 ${s.players.join('、')}`)
     if (sess.events?.length) lines.push(`📨 有 ${sess.events.length} 条事件没看（mc_events）`)
     if (w) {
@@ -2280,14 +2591,35 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const sess = getSession(exec)
       const s = sess.bot.status()
-      if (args.verbose === true) return { ...s, ...sess.modeView(), recentChat: sess.bot.recentChat(5) }
-      return { text: statusLean(sess, s, sess.watchdog?.status() ?? null) }
+      const w = sess.watchdog?.status() ?? null
+      if (args.verbose === true) {
+        /* 🔴 2026-10-20 审计（用户："减少 token 消耗"）：这里以前直接回裸对象 ⇒ 宿主
+         *    pretty-print JSON，18 个字段 + modeView + chat 能展开成上百行。
+         *    同样的信息现在压成几行文本（结构化字段照旧保留，老调用方不受影响）。 */
+        const mv = sess.modeView()
+        const chat = sess.bot.recentChat(5)
+        const lines = [statusLean(sess, s, w)]
+        const flat = []
+        for (const [k, v] of Object.entries(mv ?? {})) {
+          if (v == null) continue
+          flat.push(`${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`)
+        }
+        if (flat.length) lines.push(`⚙ ${flat.join(' ｜ ')}`)
+        if (chat.length) {
+          lines.push('💬 最近聊天：')
+          for (const c of chat) {
+            lines.push(`  ${c.kind === 'self' ? '我' : (c.who ?? '系统')}: ${String(c.text ?? '').slice(0, 120)}`)
+          }
+        }
+        return { ...s, ...mv, recentChat: chat, text: lines.join('\n') }
+      }
+      return { text: statusLean(sess, s, w) }
     },
   }))
 
   ctx.tools.register(asTool({
     name: 'mc_lan',
-    description: '探测**局域网里的 Minecraft 服务器**（只读：不连接、不进服）。只听原版"对局域网开放"那条多播公告（`224.0.2.60:4445`，`[MOTD]…[/MOTD][AD]端口[/AD]`，1.5 秒一次），听到就拿到地址+端口+MOTD。\n'
+    description: '探测**局域网里的 Minecraft 服务器**（只读：不连接）。只听原版"对局域网开放"的多播公告（`224.0.2.60:4445`），拿到地址+端口+MOTD。\n'
       + '🔴 不扫端口、不发探测包，所以**恒定在 `seconds` 秒内返回**（默认 3，上限 15）；拿到 host/port 后用 `mc_connect` 进服。\n'
       + '没听到时：确认对方真开了"对局域网开放"（或 `enable-lan-visibility`）；部分 WiFi / VPN / 容器会挡多播，那种直接问对方地址。',
     /* 🔴 审计：原来 parameters 里还声明了 mode（探测模式，目前只有 broadcast），但 execute 里
@@ -2355,7 +2687,7 @@ export function apply(ctx, rawConfig) {
       subserver: { type: 'string', description: '子服域名（Velocity fakeHost 路由，如 mc.example.com）' },
       account:   { type: 'string', description: '（可选）用哪个账户：innerID（mc_accounts 里能看到）；不传就用本会话选定的/默认账户' },
       version:   { type: 'string', description: 'MC 版本（如 1.20.4 / 1.21.4）。**默认不传 = 自动探测**（发 STATUS ping 按服务端上报的协议号反查），这是推荐用法；只有探测失败时才手填。' },
-      force:     { type: 'boolean', description: '已经连着也要**先断开再连**（普通 mc_connect 在已连着时是空操作）。⚠️ 这是**真退出游戏再进服**：服务器会广播「你离开了游戏」，玩家会看到你消失几秒。**别拿它当「刷新区块」的常规手段** —— 视图不刷新时先想是不是自己垫脚/搭高放的方块，再走远 32 格回来让区块重发；非做不可就先 mc_say 说一声。' },
+      force:     { type: 'boolean', description: '已经连着也要**先断开再连**（否则是空操作）。⚠️ 真退出再进服：服务器会广播「你离开了游戏」。**别拿它当刷新区块的手段**（先走远 32 格回来让区块重发）；非做不可先 mc_say 说一声。' },
     },
     output: text(),
     async execute(args, exec) {
@@ -2692,12 +3024,12 @@ export function apply(ctx, rawConfig) {
       + '⚠️ **被传送 / 捡物 / 其他玩家上下线不在这里**（那些只在看门狗的留档里，用 `mc_watch {action:"log"}` 看）。\n'
       + '⚠️ `waitSec` 是**兜底**，别用它长时间空等：有人叫你（mention）/ 受击 / 死亡 / 断线时，'
       + '**看门狗会主动叫醒你**，而且**会打断这个等待**（返回里 `interrupted:true` 就是在告诉你"有人找你了，'
-      + '唤醒内容马上会作为提示注入进来"）。真需要盯着某一类事件时才给 waitSec（**上限 10 秒**）。',
+      + '唤醒内容马上会作为提示注入进来"）。真需要盯着某一类事件时才给 waitSec（**上限 5 秒**）。',
     parameters: {
       limit: { type: 'number', description: '最多取几条（默认 20）' },
       kind: { type: 'string', description: '只看某类：chat / system / damage / lifecycle' },
       peek: { type: 'boolean', description: 'true=只看不消费' },
-      waitSec: { type: 'number', description: '先等最多几秒（默认 0=不等，上限 10；想继续等就再叫一次）。⚠️ 会被看门狗唤醒打断，别长等' },
+      waitSec: { type: 'number', description: '先等最多几秒（默认 0=不等，上限 5；想继续等就再叫一次）。⚠️ 会被看门狗唤醒打断，别长等' },
     },
     output: text(),
     timeoutMs: CALL_MS + 1_000,
@@ -2708,7 +3040,7 @@ export function apply(ctx, rawConfig) {
 
       // 可选阻塞等待（吸收原 mc_wait）。⚠️ 等待逻辑在 src/wait.mjs：**看门狗唤醒会打断它**
       //    —— 否则 steer 注入要等这个工具跑完（2026-09-19 真机：用户空等特别久）。
-      const waitSec = Math.min(Math.max(Number(args.waitSec ?? 0), 0), 10)
+      const waitSec = Math.min(Math.max(Number(args.waitSec ?? 0), 0), 5)   // 上限 5 秒（用户 2026-10-19：等太久了）
       let waitedMs = 0
       let interrupted = false
       let interruptReason = null
@@ -2757,10 +3089,12 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_scan',
-    description: '扫描我周围方块：给 name 就找这种方块的位置；不给就返回方块统计。',
+    description: '扫描我周围方块：给 name 就找这种方块的位置；不给就返回方块统计。'
+      + '\n· 竖向窗口默认以脚底为中心 ±height；看高处传 `y` 指定中心。',
     parameters: {
       radius: { type: 'number', description: '水平半径（默认 16，上限 48）' },
       height: { type: 'number', description: '垂直范围 ±（默认 4，上限 16）' },
+      y: { type: 'number', description: '可选：竖向窗口的中心高度（绝对 y；默认我脚底）' },
       name: { type: 'string', description: '可选：只找这种方块（如 oak_log）' },
       limit: { type: 'number', description: 'name 模式下最多返回几个（默认 10）' },
     },
@@ -2772,6 +3106,7 @@ export function apply(ctx, rawConfig) {
         radius: args.radius, height: args.height,
         name: args.name ? String(args.name) : null,
         limit: args.limit,
+        y: args.y,
       })
       /* 🔴 2026-10-18 审计（token）：不点名时以前把整个 `{center,radius,height,counts}` 用
        *    `JSON.stringify(…, null, 2)` 打印（半径 40 时约 970 字），一半是缩进和键名。
@@ -2785,6 +3120,32 @@ export function apply(ctx, rawConfig) {
           text: `⛏ 周围 ${r.radius} 格（上下 ${r.height}）约 ${total} 个方块：${list || '（空的）'}${more}`
             + `${r.unloaded ? `；另有 ${r.unloaded} 格未加载（不算空）` : ''}`
             + ' — 要坐标就给 name 点名',
+        }
+      }
+      /* 🔴 2026-10-20 审计（用户："减少 token 消耗"）：`name` 模式原来回裸对象 ⇒ 宿主
+       *    pretty-print JSON，每条 `pos` 占三行（`{ "x": …, "y": …, "z": … }`）。
+       *    这里补一句一行式的 `text`；结构化字段（`blocks[].state` 等）照旧留在返回值里。 */
+      if (r && args.name) {
+        const found = Array.isArray(r.found) ? r.found : []
+        const where = `周围 ${r.radius ?? args.radius ?? 16} 格（上下 ${r.height ?? args.height ?? 4}）`
+        if (!found.length) {
+          return {
+            ...r,
+            text: `⛏ ${where}没找到 ${args.name}`
+              + (r.unloaded ? `（但有 ${r.unloaded} 格未加载 —— **不算"没有"**，可以走近再看）` : ''),
+          }
+        }
+        const items = (r.blocks ?? []).map((blk) => `${blk.pos}`
+          + `${blk.distance != null ? ` 距 ${blk.distance}` : ''}`
+          + `${blk.ripe === true ? ' 熟' : (blk.ripe === false ? ' 没熟' : '')}`
+          + `${blk.age != null && blk.maxAge != null ? ` ${blk.age}/${blk.maxAge}` : ''}`)
+        return {
+          ...r,
+          text: `⛏ ${args.name}：${r.total} 个`
+            + `${found.length < r.total ? `（列最近 ${found.length} 个）` : ''}\n`
+            + items.join('\n')
+            + `${r.cropSummary ? `\n${r.cropSummary}` : ''}`
+            + `${r.unloaded ? `\n（另有 ${r.unloaded} 格未加载，不算空）` : ''}`,
         }
       }
       return r
@@ -2816,7 +3177,9 @@ export function apply(ctx, rawConfig) {
       format: { type: 'string', description: 'chars（默认）/ image / both' },
       scale: { type: 'number', description: '图像每格放大倍数（默认 4，1–16）' },
       out: { type: 'string', description: `落盘路径（工作区相对；默认 .dsh-mc-agent/${OUT_DIR}/mc-map-<时间>.png 不对外）。`
-        + `想让 用户 看到就写到 .dsh-mc-agent/${EXPRESS_DIR}/<子目录>/x.png（发布区），再用 mc_kit_express 取那一行` },
+        // 🔴 2026-10-19 实机踩到：发布区跟着 memoryDir 走，早就不在工作区下了 ——
+        //    按"工作区/.dsh-mc-agent/.express/"写会渲染成功但 mc_kit_express 说"不在发布区"。
+        + `想让 用户 看到就写到**记忆根**下的 ${EXPRESS_DIR}/<子目录>/x.png（不是工作区里的），再用 mc_kit_express 取那一行` },
     },
     output: {
       schema: { type: 'object', properties: {}, additionalProperties: true },
@@ -3018,23 +3381,28 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_move',
-    description: '移动。mode="walk" 走过去（自动避障；**在水里会自动改成"直接游"**，实测 2 格/秒）；mode="fly" 创造模式直飞（最稳，创造模式默认用它）；'
+    description: '移动。mode="walk" 走过去（自动避障；**在水里会自动改成"直接游"**）；mode="fly" 创造直飞（约 9 格/秒，会先发飞行权限包）；'
       + 'mode="jump" 原地跳一下（爬台阶/脱困，不需要坐标）；'
       + 'mode="swim" 在水里游到 x/y/z（不给坐标就只上浮换气）。\n'
+      + 'mode="boat" 开船（先 use 上船；下船用 mode="dismount"）。\n'
       + '🔴 **一次只走 10 秒**（用户要求：单次调用别超过 11 秒）。没走到会返回 '
       + '`arrived:false` + `remaining`（还差几格）+ `hint`——**直接再叫一次往同一目标走**，'
-      + '从当前位置接着走；走远路连着叫几次，比一次挂 90 秒好（挂住时用户看不到消息）。\n'
+      + '从当前位置接着走；走远路连着叫几次，比一次挂 90 秒好。\n'
       + '🔴 **在水里**（`mc_status` 里 `在水里`）寻路基本不动（A* 不把水当节点，实机"4 秒只挪 1 格"）：'
-      + '会自动直接游（按住 forward+jump，实测 2 格/秒），上岸再交回寻路。'
+      + '会自动直接游（实测 2 格/秒），上岸再交回寻路。'
       + '**快淹死了就 `mode:"swim"` 不给坐标**（只上浮换气）：水挖不掉，别去 `mc_dig` 水。\n'
-      + '🔴 **默认不原地垫 1×1 柱**（`allowTower:true` 才允许）—— 被服务端拒会摔死；要上高处走斜台阶。'
-      + '路上垫台阶会报 `pillaredWith`/`held`。'
+      + '🔴 **默认不挖方块**（用户 2026-10-20 定）：走路一格都不挖，只绕路/跳/下蹲过缝；'
+      + '要挖穿挡路的方块必须显式 `noDig:false`（`mode:"walk-nodig"` 恒不挖）。\n'
+      + '🔴 **默认不垫 1×1 柱**（`allowTower:true` 才允许）—— 会被服务端拒、摔死；上高处走斜台阶。'
+      + '垫台阶会报 `pillaredWith`/`held`。'
       + '🧭 `intent` 决定"到"的标准：near（默认）/ stand（站那格上）/ interact（够得着，2.2 格）/ same-level（同一层）。',
     parameters: {
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
-      mode: { type: 'string', description: 'walk / fly / jump / swim（创造模式缺省 fly；jump 不需要坐标；swim 不给坐标就只上浮换气）' },
-      budgetMs: { type: 'number', description: 'walk/swim 的最长时间（默认 10000，上限 10000）；swim 不给坐标时的上浮时间（默认 3000，上限 3000）' },
-      allowTower: { type: 'boolean', description: '允许寻路时原地垫 1×1 柱往上爬（默认不许，容易摔死）' },
+      mode: { type: 'string', description: 'walk / walk-nodig / fly / jump / swim / boat（创造缺省 fly；jump 不需坐标；swim 不给坐标=只上浮换气；boat 要先上船）' },
+      noDig: { type: 'boolean', description: '走路时挖不挖方块（**默认不挖**）；要挖穿挡路的写 false' },
+      budgetMs: { type: 'number', description: 'walk/swim 最长时间（≤10000）；swim 上浮默认 9000' },
+      waterRecover: { type: 'boolean', description: '游不动时自动找出口（默认 true）' },
+      allowTower: { type: 'boolean', description: '允许垫 1×1 柱往上爬（默认不许，容易摔死）' },
       intent: { type: 'string', description: 'near（默认）/ stand / interact / same-level' },
     },
     output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
@@ -3042,24 +3410,31 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const sess = getSession(exec)
       const mode = String(args.mode ?? '')
+      /* 「不破坏方块的模式」= `mode:"walk-nodig"` 或 `noDig:true`（用户 2026-10-20）。
+       * 只影响走路那一条：寻路的 `canDig` 关掉，卡住时"挖开台阶"的补救也关掉
+       * （见 `src/movement.mjs` 的 `walkPathfinder`）。 */
+      /* 用户 2026-10-20 定：**默认不挖** —— 走路一格都不挖，非挖不可要显式 `noDig:false`。
+       * `mode:"walk-nodig"` 仍恒为 true（旧写法/显式声明都还能用）。 */
+      const noDig = mode === 'walk-nodig' ? true : args.noDig !== false
       if (mode === 'jump') return { ...(await sess.bot.jump()), ...aroundOf(sess) }
       if (mode === 'swim') {
         // 给了坐标 = 游过去（walkTo 在水里会自动走"直接游"那条）；没给 = 只上浮换气
         if (args.x !== undefined && args.y !== undefined && args.z !== undefined) {
-          return { ...withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, intent: args.intent }), { expect: 'moved' }), ...aroundOf(sess) }
+          return { ...withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: args.intent, waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined }), { expect: 'moved' }), ...aroundOf(sess) }
         }
-        return { ...withOutcome(await sess.bot.swimUp({ hold: args.budgetMs }), { expect: 'moved' }), ...aroundOf(sess) }
+        return { ...withOutcome(await sess.bot.swimUp({ hold: callBudget(args.budgetMs ?? 9_000) }), { expect: 'moved' }), ...aroundOf(sess) }
       }
       if (args.x === undefined || args.y === undefined || args.z === undefined) {
         throw new Error('walk/fly 需要 x/y/z；只想跳一下请给 mode:"jump"，在水里上浮请给 mode:"swim"')
       }
       const target = { x: Number(args.x), y: Number(args.y), z: Number(args.z) }
       const creative = sess.bot.bot?.game?.gameMode === 'creative'
-      const use = mode || (creative ? 'fly' : 'walk')
+      const use = (mode === 'walk-nodig' ? 'walk' : mode) || (creative ? 'fly' : 'walk')
       // 🔴 2026-10-08 审计⑤：fly 以前不传 budgetMs —— 写 budgetMs:2000 也照样跑满 10 秒
       if (use === 'fly') return { ...withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
-      if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / fly / jump / swim）`)
-      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, intent: args.intent }), { expect: 'moved' }), ...aroundOf(sess) }
+      if (use === 'boat') return { ...withOutcome(await sess.bot.driveBoat(target, { arrive: args.intent === 'stand' ? 1.2 : 2, budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
+      if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / walk-nodig / fly / jump / swim / boat）`)
+      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: args.intent, waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined }), { expect: 'moved' }), ...aroundOf(sess) }
     },
   }))
 
@@ -3067,35 +3442,39 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_act',
+    /* 🔴 2026-10-20 审计（用户："减少 token 消耗"）：每行只留"这个 mode 干什么 + 影响决策的行为"，
+     *    参数细节交给下面那张参数表 —— 原来每个 mode 后面都跟着一长串解释，673 字里有近一半是重复的。 */
     description: '与游戏世界互动（**优先用它，别用服务器指令**）。mode：\n'
-      + '· look 看向坐标或玩家(who)：look+who\n'
+      + '· look 看向坐标或玩家(who)\n'
       + '· toward 看向并走近某个玩家(who)\n'
-      + '· place  放方块 (x,y,z)；悬空先垫脚（=搭高）\n'
-      + '· bridge 搭路：朝 (x,y,z) 一格格铺（脚下一层），每块等服务端确认才走；有坠落/岩浆风险就停；铺完换回原来的东西\n'
-      + '· break  破坏 (x,y,z)：先自动换对的工具；换不上就拒绝\n'
-      + '· use    用方块/实体(who)：开门、按钮、拉杆、喂动物；都不给=用手上的东西\n'
+      + '· place 放方块 (x,y,z)；悬空先垫脚（=搭高）\n'
+      + '· bridge 搭路：朝 (x,y,z) 铺脚下一层，有坠落/岩浆风险就停\n'
+      + '· break 破坏 (x,y,z)：自动换对的工具\n'
+      + '· use 用方块/实体(who)：门/按钮/拉杆/喂动物；都不给=用手上的\n'
       + '· useitem 用手上的东西：扔眼睛/雪球\n'
-      + '· shoot 射箭：自动换弓/拉满/放箭。水晶 x/y/z，龙 who:"ender_dragon"；count ≤5\n'
-      + '· attack 打实体：who 按名字找（中英文都认，24 格内会追）；不给按 priority 挑（threat/nearest/weakest）。开打先换把趁手的、举盾、给建议（不替你撤退）；kite 放风筝\n'
-      + '· equip 装备(name)：护甲自动穿（盾→副手），其余拿到手上；to 指定格子\n'
-      + '· enchant 附魔台：option 0-2；不给只报选项\n'
-      + '· anvil 铁砧：combine(默认)/rename；item+name\n'
-      + '· smithing 锻造台：item/name/template\n'
-      + '· prep  出发前自查 for:nether/end：附魔/附魔台/书架/青金石…缺哪样报哪样\n'      + '· toss 丢弃(name,count)',
+      + '· shoot 射箭。水晶 x/y/z，龙 who:"ender_dragon"；射完报 around\n'
+      + '· attack 打实体（who 中英文都认，24 格内会追；不给按 priority 挑；kite 放风筝）\n'
+      + '· equip 装备(name)：护甲自动穿、盾进副手\n'
+      + '· enchant 附魔台 option 0-2；anvil 铁砧；smithing 锻造台\n'
+      + '· prep 出发前自查 for:nether/end\n'
+      + '· toss 丢弃(name,count)\n'
+      + '· dismount 从船/矿车/坐骑上下来（开船用 mc_move boat）',
     parameters: {
       mode: { type: 'string', description: '见上面各 mode（默认 look）' },
-      who: { type: 'string', description: '玩家或实体名（look/toward/use/attack）' },
+      who: { type: 'string', description: '玩家/实体名（look/toward/use/attack）' },
       kite: { type: 'boolean', description: 'attack 放风筝：近战怪打一下退一步' },
       priority: { type: 'string', description: 'attack 选目标：threat(默认)/nearest/weakest(血最少)' },
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       allowDangerous: { type: 'boolean', description: 'break：允许挖自己脚下的支撑（默认拦）' },
       name: { type: 'string', description: '方块或物品名（place/equip/toss/anvil/smithing 用）' },
-      to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand/hand；只给 = 脱掉' },
-      count: { type: 'number', description: 'toss 丢几个（默认 1）；shoot 连射几箭（默认 1，最多 5）' },
+      to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand；只给=脱掉' },
+      count: { type: 'number', description: 'toss 丢几个（默认 1）；shoot 连射几箭（默认 1，≤5）' },
       /* ⚠️ `for` 是 JS 保留字，解构时必须 `args.for`，不能写 `const { for } = args` */
-      for: { type: 'string', description: 'prep 查哪一趟：nether（默认）/ end' },
+      for: { type: 'string', description: 'prep 查哪趟：nether（默认）/ end' },
       waitTime: { type: 'number', description: 'shoot 拉弓多久再放（默认 1200ms）' },
       weapon: { type: 'string', description: 'shoot 用什么射（默认 bow；可 crossbow/trident）' },
+      aim: { type: 'number', description: 'shoot 瞄点高度（相对脚底格数，负数往下）；不给=自动（龙 +2.8、普通怪瞄头）' },
+      maxDist: { type: 'number', description: 'shoot 只射这么近（格）' },
       hold: { type: 'number', description: 'useitem 按住毫秒（拉弓 1000）' },
       approach: { type: 'boolean', description: 'toward 走近吗（默认 true）' },
       budgetMs: { type: 'number', description: 'toward 走近毫秒（默认 10000）' },
@@ -3129,17 +3508,23 @@ export function apply(ctx, rawConfig) {
         /* 射箭（用户 2026-10-19：「hawkeye 主要是水晶和末影龙」）—— 弹道在 `src\shoot.mjs`：
          * 换弓回读 → 数箭 → hawkeye 算 yaw/pitch → 拉满 → 再瞄一次 → 放 → 数箭确认。
          * 算不出来（落点误差 > 4 格）就如实报"太远/角度刁"，不瞎射。 */
-        case 'shoot':   return withOutcome({ mode, ...(await bot.shoot({ who: args.who, x: args.x, y: args.y, z: args.z, count: args.count, waitTime: args.waitTime, lead: args.lead, weapon: args.weapon })) })
-        case 'attack':  return withOutcome({ mode, ...(await bot.attack(args)) })
+        /* 用户 2026-10-20：「shoot 完显示周围实体，和 attack 一样」—— 射完顺手报 12 格内身边有谁
+         * （`around`，和 mc_move / mc_sequence 同一个字段）。射完正是「有没有别的怪摸过来」要命的时候，
+         * 加一次只读快照，附近没人就一个字段都不多（常态零额外 token）。 */
+        case 'shoot':   return { ...withOutcome({ mode, ...(await bot.shoot({ who: args.who, x: args.x, y: args.y, z: args.z, count: args.count, waitTime: args.waitTime, lead: args.lead, weapon: args.weapon, aim: args.aim, maxDist: args.maxDist })), ...bossBarsField(bot) }), ...aroundOf(sess) }
+        case 'attack':  return withOutcome({ mode, ...(await bot.attack(args)), ...bossBarsField(bot) })
         case 'equip':   return { mode, ...(await bot.equip({ name: args.name, to: args.to })) }
         case 'enchant': return { mode, ...(await bot.enchantTable({ option: args.option, item: args.item, x: args.x, y: args.y, z: args.z })) }
         case 'anvil':   return { mode, ...(await bot.anvilTable({ action: args.action, item: args.item, name: args.name, x: args.x, y: args.y, z: args.z })) }
         case 'smithing': return { mode, ...(await bot.smithingTable({ item: args.item, name: args.name, template: args.template, x: args.x, y: args.y, z: args.z })) }
         case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
+        /* 用户 2026-10-20：「还有下船」—— 上船一直有（`use`→`activateEntity`），下来没有：
+         * `bot.dismount()` 只发包不确认，实现在 `src/boat.mjs`（发完轮询 `bot.vehicle`）。 */
+        case 'dismount': return { mode, ...(await bot.dismountVehicle()) }
         /* 出发前自查（用户 2026-10-19：「把附魔台 / 青金石 / 书架也加进前置清单」）——
          * 规矩写在 RULES.md 里模型不一定照做，这里**数真状态**：附魔、附魔台、书架、青金石、等级… */
         case 'prep':    return withOutcome({ mode, ...(prepCheck(bot.requireBot(), { for: args.for })) })
-        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/shoot/attack/equip/enchant/anvil/smithing/prep/toss）`)
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/shoot/attack/equip/enchant/anvil/smithing/prep/toss/dismount）`)
       }
     },
   }))
@@ -3147,11 +3532,13 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register(asTool({
     name: 'mc_give',
     description: '**创造模式直接获取物品**（不走 /give 指令——那是协议级改槽位，非 OP 也能用）。'
-      + '给英文物品 id，如 oak_planks / diamond_sword / white_concrete。clearAll=true 清空背包。',
+      + '给英文物品 id，如 oak_planks / diamond_sword / white_concrete。clearAll=true 清空背包。'
+      + '\n· 不传 slot 自动找空位；slot 那格已有别的东西会**拒绝**（要盖加 force:true）。',
     parameters: {
       name: { type: 'string', description: '物品英文 id（如 oak_planks）' },
       count: { type: 'number', description: '数量（默认 1，上限该物品堆叠数）' },
       slot: { type: 'number', description: '指定槽位 9-44（0=合成结果、1-4=合成格、5-8=盔甲；缺省自动找空位）' },
+      force: { type: 'boolean', description: 'slot 已有别的东西时 true=确认顶掉（默认拒绝）' },
       clearAll: { type: 'boolean', description: 'true=清空整个背包（忽略 name）' },
     },
     output: text(),
@@ -3159,14 +3546,14 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const sess = getSession(exec)
       if (args.clearAll) return sess.bot.clearInventory()
-      return sess.bot.giveItem({ name: args.name, count: args.count, slot: args.slot })
+      return sess.bot.giveItem({ name: args.name, count: args.count, slot: args.slot, force: args.force })
     },
   }))
 
   ctx.tools.register(asTool({
     name: 'mc_sequence',
     description: '**按顺序执行一串世界交互**（替代"写脚本"）：适合"走到这里放几个方块，再走到那里放几个"这类连串动作。\n'
-      + 'steps 是数组，每项 op 可为：wait(sec) / move(x,y,z,mode) / look(x,y,z 或 who) / toward(who) / '
+      + 'steps 是数组，每项 op 可为：wait(sec) / move(x,y,z,mode,noDig) / look(x,y,z 或 who) / toward(who) / '
       + 'place(x,y,z,name) / break(x,y,z) / dig(name 或 x,y,z,count) / use(x,y,z 或 who) / useitem(hold) / attack(who) / '
       + 'equip(name) / give(name,count) / toss(name,count) / say(text) / jump / swim(x,y,z 或 hold)。\n'
       + '逐步执行，默认遇错即停。\n'
@@ -3240,6 +3627,10 @@ export function apply(ctx, rawConfig) {
       const lines = await sess.bot.dig({
         name: args.name ? String(args.name) : null, pos,
         maxDistance: args.maxDistance ?? 16, count: args.count,
+        /* 🔴 2026-10-20 审计：`allowDangerous` 在上面声明了、`dig()` 也认这个参数，
+         *    但这里**从来没传过** —— 于是"带 allowDangerous:true 就能挖脚下"这句
+         *    写进报错文案的逃生阀**永远是 false**，AI 照着做也没用。 */
+        allowDangerous: args.allowDangerous === true,
       })
       /* 🔴 审计 F1：`dig()` 回的是**字符串数组**，这里必须同时给 `result`（结构化保留）
        * 和 `text`（拼好的正文）。`outcomeOf()` 与任务执行器的"失败分类"都只看
@@ -3387,26 +3778,49 @@ export function apply(ctx, rawConfig) {
     description: '以玩家身份执行服务器指令。**白名单可配置**（默认 tp/give/time/weather/say/gamemode/effect/'
       + 'setblock/fill/clone/summon/title/clear/xp）。要放行别的指令，在**普通会话**里用 `mc_admin_config` 改 '
       + '`commandWhitelist`（MC 模式会话改不了）。\n'
+      + '· **可以一次给多条**（一行一条）—— 会**逐条**发出去，间隔 120ms，避免被服务端判成刷屏。\n'
+      + '· 🔴 一行只放一条指令：把多条塞成一行、或者用换行以外的怪字符，都会被服务端以 '
+      + '`illegal_characters` 踢下线（2026-10-19 实机踩过）。\n'
       + '⚠️ 这是**最后手段**：正经动作优先 `mc_act` / `mc_build` / `mc_move`（那些不需要 OP）。',
-    parameters: { command: { type: 'string', required: true, description: '以 / 开头的完整指令' } },
+    parameters: {
+      command: {
+        type: 'string',
+        required: true,
+        description: '以 / 开头的完整指令；要发多条就一行一条（最多 32 条）',
+      },
+    },
     output: text(),
     async execute(args, exec) {
       const sess = getSession(exec)
-      const raw = String(args.command ?? '').trim()
-      const name = raw.replace(/^\//, '').split(/\s+/)[0].toLowerCase()
-      if (!pluginConfig.commandAllowed(name)) {
-        throw new Error(`指令 /${name} 不在白名单里。当前白名单：${JSON.stringify(pluginConfig.get('commandWhitelist'))}`
-          + '（要放行请在普通会话里用 mc_admin_config 改 commandWhitelist）')
+      /* 🔴 多行 = 多条：逐条发。为什么不能拼成一个包一起发 —— 换行符会让服务端踢人
+       *    （`multiplayer.disconnect.illegal_characters`，2026-10-19 实机：10 条 /fill 拼成一个包
+       *    发出去，人当场掉线）。拆分与格式校验在 `splitCommands()`（src/commands.mjs，有单测）。 */
+      const lines = splitCommands(args.command, { max: MAX_COMMANDS_PER_CALL })
+      /* 先把**每一条**都验一遍再发：不然前 20 条已经生效、第 21 条被拒，世界就只改了一半 */
+      const names = []
+      for (const [i, line] of lines.entries()) {
+        const name = commandNameOf(line)
+        if (!pluginConfig.commandAllowed(name)) {
+          throw new Error(`第 ${i + 1} 条 /${name} 不在白名单里。当前白名单：${JSON.stringify(pluginConfig.get('commandWhitelist'))}`
+            + '（要放行请在普通会话里用 mc_admin_config 改 commandWhitelist）')
+        }
+        names.push(name)
       }
-      const sent = sess.bot.command(raw, { allow: (n) => pluginConfig.commandAllowed(n) })
+      const sent = []
+      for (const [i, line] of lines.entries()) {
+        if (i > 0) await new Promise((r) => setTimeout(r, 120))
+        sent.push(sess.bot.command(line, { allow: (n) => pluginConfig.commandAllowed(n) }))
+      }
       /* 🔴 会挪人的指令（`tp`/`spreadplayers`/`execute`）发完就打断在飞的移动：
        *    真正改变位置的是服务端，占着 `movement` 资源没用（发包只要几微秒），
        *    但**正在跑的 mc_move 并不知道自己被挪走了** —— 它只会继续朝旧目标走，
        *    最后报"走不到"，让模型以为是路不通。推一次移动代次，它就会如实说"被挪走了"。 */
-      if (COMMANDS_THAT_MOVE_ME.has(name)) {
-        try { await sess.bot.interruptMove(`服务器指令 /${name} 把我挪走了`) } catch { /* 没在动就算了 */ }
+      if (names.some((n) => COMMANDS_THAT_MOVE_ME.has(n))) {
+        const how = names.length > 1 ? `服务器指令（${[...new Set(names)].join('/')}）把我挪走了` : `服务器指令 /${names[0]} 把我挪走了`
+        try { await sess.bot.interruptMove(how) } catch { /* 没在动就算了 */ }
       }
-      return { sent }
+      if (sent.length === 1) return { sent: sent[0] }
+      return { sent: `共 ${sent.length} 条`, commands: sent, count: sent.length }
     },
   }))
 
@@ -3443,8 +3857,8 @@ export function apply(ctx, rawConfig) {
       + '· render  SVG → PNG（可给 width/height/scale；svg 文本或 svgPath 二选一）\n'
       + '· grid    把多张图按网格拼成**可继续编辑的 SVG 文本**（省掉重复写 N 个 <image> 和算坐标）\n'
       + '· save    把 SVG 文本或 PNG 字节落盘\n'
-      + `输出默认落在 \`.dsh-mc-agent/${OUT_DIR}/\`（**不对外**）。要给用户看，就把 \`out\` 写成`
-      + `\`.dsh-mc-agent/${EXPRESS_DIR}/<子目录>/x.png\`（**发布区**），再用 \`mc_kit_express\` 取那一行。`,
+      + `输出默认落在记忆根下的 ${OUT_DIR}（**不对外**）。要给用户看就把 \`out\` 写成`
+      + `\`.dsh-mc-agent/${EXPRESS_DIR}/<子目录>/x.png\`（按**记忆根**解析，不是工作区），再用 \`mc_kit_express\` 取那一行。`,
     parameters: {
       action: { type: 'string', description: 'info / embed / render / grid / save' },
       path: { type: 'string', description: '输入文件（info/embed 用）' },
@@ -3479,8 +3893,21 @@ export function apply(ctx, rawConfig) {
        *      `GET /api/mc/dsh-mc-agent/<工作区目录名>/<剩余路径>` 访问 —— 要给用户看就显式写进这里，
        *      再用专用工具 `mc_kit_express` 换回那行路径，自己拼 markdown。
        */
-      const outDir = outRootOf(memoryRootFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent)))
-      const needOut = (name) => (args.out ? inWs(args.out) : join(outDir, name))
+      const memRoot = memoryRootFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent))
+      const outDir = outRootOf(memRoot)
+      /* 🔴 2026-10-19 实机踩到（真 bug）：原来的 `needOut` 恒用 `inWs(args.out)` —— 而发布区在
+       * **记忆根**下（`memoryRootFor(...)/.express/`），根本不在工作区里 ⇒ 写
+       * `out: ".dsh-mc-agent/.express/x.png"` 会**成功落到工作区**，然后 `mc_kit_express`
+       * 说"这个文件不在发布区里"。修法：绝对路径照用；`.dsh-mc-agent/...` 这种老写法按
+       * **记忆根**解析（和 `mc_map` / `mc_observe` 的 out 一致）；其余仍走工作区校验。 */
+      const MEM_PREFIX = /^\.dsh-mc-agent[\\/]/i
+      const needOut = (name) => {
+        if (!args.out) return join(outDir, name)
+        const raw = String(args.out)
+        if (isAbsolute(raw)) return resolve(raw)
+        if (MEM_PREFIX.test(raw)) return resolve(memRoot, raw.replace(MEM_PREFIX, ''))
+        return inWs(raw)
+      }
       /* 🔴 用户 2026-09-16：结果里**不再**塞任何 express 字段（'不要乱给已有工具加'）——取路径统一走 mc_kit_express。 */
 
       switch (action) {
@@ -3556,15 +3983,15 @@ export function apply(ctx, rawConfig) {
    */
   ctx.tools.register(asTool({
     name: 'mc_kit_express',
-    description: '把**发布区**（`.dsh-mc-agent/.express/`）里的文件换成"给用户的东西"。\n'
-      + '· 入参：`path` —— 发布区下的文件（工作区相对或绝对都行，**必须在 `.dsh-mc-agent/.express/` 下**）；\n'
-      + '· 返回**一行**，内容取决于用户在「MC设置 → 文件分享」里有没有开启分享：\n'
-      + '  · 关闭（默认）：只回一句"文件分享已关闭…"——那就把文件的**绝对路径**告诉用户，让用户自己打开；\n'
-      + '  · 开启：回**完整 URL**——图片 `![图片名](url)`、其它文件 `[文件名](url)` 嵌进回复里；\n'
-      + '· 链接**原样使用**，不要再补 `http://…` 或域名。\n'
-      + '⚠️ 只有 `.dsh-mc-agent/.express/` 下的文件可分享；默认输出目录 `.dsh-mc-agent/.out/` **不对外**。',
+    description: '把**发布区**（**记忆根**下的 `.express/`，不是工作区里的 `.dsh-mc-agent/.express/`）里的文件换成"给用户的东西"。\n'
+      + '· 入参：`path` —— 发布区下的文件（相对按**记忆根**解析，`.express/x.png` 与 `.dsh-mc-agent/.express/x.png` 都认；绝对照用）；\n'
+      + '· 返回**一行**，看「MC设置 → 文件分享」开没开：\n'
+      + '  · 关（默认）：只回"文件分享已关闭…"——把**绝对路径**告诉用户自己打开；\n'
+      + '  · 开：回**完整 URL**——图片 `![名](url)`、其它 `[名](url)` 嵌进回复里；\n'
+      + '· 链接**原样使用**，别补 `http://…` 或域名。\n'
+      + '⚠️ 只有**记忆根/.express/** 可分享；记忆根/.out/ **不对外**。',
     parameters: {
-      path: { type: 'string', required: true, description: '发布区下的文件路径（工作区相对或绝对；必须在 .dsh-mc-agent/.express/ 下）' },
+      path: { type: 'string', required: true, description: '发布区（记忆根/.express/）里的文件；相对按记忆根解析' },
     },
     output: {
       schema: { type: 'object', properties: { url: { type: 'string' }, enabled: { type: 'boolean' } }, additionalProperties: true },
@@ -3598,8 +4025,10 @@ export function apply(ctx, rawConfig) {
       const ref = expressRefFor(abs, memRoot, wsId)
       if (!ref) {
         throw new Error('这个文件不在发布区里，所以没有可分享的地址。'
-          + `请先把它放到 .dsh-mc-agent/${EXPRESS_DIR}/<子目录>/ 下（出图时把 out 写成那里，`
-          + '或用 mc_kit_memory {action:"put", path:".express/<子目录>/x.png"} 复制过去），再来取。')
+          + `\n发布区是：${expressRootOf(memRoot)}`
+          + `\n请先把它放到记忆根下的 ${EXPRESS_DIR}/<子目录>/（mc_kit_image / mc_map / mc_observe 的 out 写成`
+          + ` ".dsh-mc-agent/${EXPRESS_DIR}/<子目录>/x.png" 会自动落到记忆根下；已有文件用`
+          + ' mc_kit_memory {action:"put", path:".express/<子目录>/x.png"} 复制过去），再来取。')
       }
       const enabled = pluginConfig.expressEnabled
       // 关闭（默认）：恒回那一句（**不抛错** —— 让 AI 直接把话转达用户，而不是去试别的歪招）
@@ -3618,18 +4047,12 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_kit_memory',
-    description: '长期记忆（跨会话、重启后还在），放在 `.dsh-mc-agent/` 里，按服务器建子文件夹（`_global/` 放通用的）。\n'
-      + '**索引由你自己维护**：`README.md`（插件每轮把它的内容 + 自动目录树注入上下文，忘了更新也不失真，但改了记忆就顺手更新它）。\n'
-      + 'action：\n'
-      + '· index（默认）看总览：有哪些文件夹/文件、各多少条、README 现状\n'
-      + '· kinds   四类记忆的说明 + 各类各有几个文件\n'
-      + '· record  记一条**带元数据**的记忆（推荐）：kind+key+text+from+version+ok；**同 key 再记累加成功/失败**，不堆重复；`ok:false` 必须给 `condition`\n'
-      + '· read    读文件（path 或 topic+server）；**读图片会作为附件给你，你能直接看到**\n'
-      + '· append  追加一条（同 key 覆盖）—— 只对文本文件\n'
-      + '· write   整文件覆盖（重组内容/小标题/表格）\n'
-      + '· put     把工作区里的**任意文件（图片最常用）复制进记忆**\n'
-      + '· delete  删文件（path 指向目录则整目录删）\n'
-      + '· search  跨文本文件搜关键词，返回命中行\n'
+    description: '长期记忆（跨会话、重启后还在），放 `.dsh-mc-agent/`，按服务器建子文件夹（`_global/` 放通用的）。\n'
+      + '**索引自己维护** `README.md`（插件每轮注入它的内容 + 目录树，改了记忆顺手更新它）。\n'
+      + 'action：`index`（默认）总览 ｜ `kinds` 四类记忆说明 ｜ `search` 跨文件搜关键词 ｜ '
+      + '`record` 记一条**带元数据**的（推荐）：kind+key+text+from+version+ok，同 key 再记累加成功/失败，`ok:false` 必须给 `condition` ｜ '
+      + '`read` 读文件（path 或 topic+server；读图片会作为附件给你）｜ `append` 追加（同 key 覆盖，只对文本）｜ '
+      + '`write` 整文件覆盖 ｜ `put` 把工作区任意文件（图片最常用）复制进记忆 ｜ `delete` 删文件（目录则整目录删）。\n'
       + '路径写法：`path:"mc.example.com/maps/town.png"` 或 `topic:"landmarks"`（server 默认当前服，不传写进 `_global/`）。\n'
       + '⚠️ 只读写文件，不执行任何东西（没有 shell、不跑脚本）。',
     parameters: {
@@ -3717,672 +4140,12 @@ export function apply(ctx, rawConfig) {
       }
     },
   }))
+  /* ── 提示词注入 / 通知台账 / 记忆根播种 ──
+   * 🔴 这一大块（原来就在这儿、约 666 行）2026-10-20 搬去了 `src/inject.mjs`，
+   *    调用点在下面"MC 模式判据"之后（那里才拿得到 isMcModeAgent 等依赖）。
+   *    这里只留个指路牌，别再往这儿写注入/台账的逻辑。
+   * ------------------------------------------------------------------------ */
 
-  /* ── 总索引自动注入系统提示（用户要求：自动注入 + 提醒及时读）── */
-
-  /** 记忆根在提示词里的写法：还是默认的 `<工作区>/.dsh-mc-agent` 就写相对名，被 memoryDir 挪走了就写绝对路径。
-   *  🔴 2026-10-06（本机补丁）：以前这里写死 `.dsh-mc-agent/`，记忆一挪 AI 就会去工作区里找/建那个文件夹。 */
-  const memLabelOf = (store) => {
-    const r = String(store?.root ?? '')
-    return /(^|[\\/])\.dsh-mc-agent$/i.test(r) ? '.dsh-mc-agent/' : `${r}${sep}`
-  }
-  /** 记忆索引的正文（按工作区渲染；`store` 的根不存在且要求静默时返回空串） */
-  const memoryIndexText = (store, { silentWhenMissing = false } = {}) => {
-    if (silentWhenMissing && !existsSync(store.root)) return ''
-    // 没记忆时不占位（第一次 append 后自动出现）
-    const files = store.list()
-    const label = memLabelOf(store)
-    if (!files.length) {
-      return `【麦块长期记忆】现在是空的（\`${label}\`）。学到值得记住的事（用户是谁、地标坐标、约定）就用 `
-        + '`mc_kit_memory {action:"append", topic:"<主题>", text:"..."}` 记下来，'
-        + `并在 \`${label}README.md\` 里补一行索引。`
-    }
-    return `【麦块长期记忆】根目录 \`${label}\`（其中 \`README.md\` 是**你维护的索引**）\n\n`
-      + store.indexText()
-      + '\n\n**要动手前先读相关文件**（`mc_kit_memory {action:"read", path:"..."}`）——'
-      + '别凭印象做事；不确定就先 `search`。新学到的事实随手 `append`，'
-      + `并且**改了记忆就顺手更新 \`${label}README.md\`**。`
-  }
-
-  /**
-   * 🔴 2026-09-16 用户定的：**本插件不再往系统提示词里塞任何东西**。
-   *
-   * 他的原话：系统提示词在 preset 里设置好就行，宿主管组装、**会自动注入**；
-   * 插件再往系统提示里注册段是冗余。而且真机事故证明那条路**不可靠**：
-   * 宿主 `system-prompt/src/index.ts:606` 是 `contexts: runtimeContextSuppressed ? [] : [...]`，
-   * 从官方 `minimal` 复制来的 persona 带着 `includeRuntimeContext: false` / `complete: true` 时，
-   * 我们注册的 context 段会在组装时被**整个丢掉** —— 症状正是"设置页显示正常、AI 却什么都没收到"。
-   *
-   * 所以注入**只剩一条通道**：学宿主注入工作区 `AGENTS.md` 的做法，把内容当**插件提示行**
-   * 投进 `agent.inbox.nextStep`（见 `reconcileNotices`，在 `agent/pre-step` 里对账投递）——
-   * 必达、在对话里看得见、而且完全不过 systemPrompt 组装，任何 persona 都压不掉它。
-   * 记忆索引（`.dsh-mc-agent/README.md`）也走同一条路。
-   */
-
-  /* 🔴 这里原来有一段"给每个 agent 注册两个 systemPrompt 段（记忆索引 + 模式指导）"的代码，
-   * 2026-09-16 用户要求**整段删掉**："系统提示词不用显式注入，设置好了会自动注入" ——
-   * 插件自己往系统提示里塞东西既冗余，又会被 persona 的 complete/includeRuntimeContext 压掉
-   * （见上一段）。记忆索引与模式相关的话现在都走 `reconcileNotices()` 的插件提示行。 */
-
-  /**
-   * 行事准则文件缺了就补一份默认。
-   * 用户 2026-09-16："启动对话时设置要求注入、但找不到文件" → **注入默认 + 重建文件**（自愈）。
-   * @returns {boolean} 是否刚建出来（调用方据此打一行日志）
-   */
-  const ensureAgentsMdFile = (dir) => {
-    const p = agentsMdPath(dir)
-    try {
-      // 先把老名字（`.dsh-mc-agent/AGENTS.md`）迁走 —— 只要那个文件名还在，宿主就会把它
-      // 当"工作区指令"注入任何碰过本目录的会话（含非 MC 会话），而我们的开关关不掉它。
-      const mig = migrateLegacyAgentsMd(dir)
-      if (mig.migrated) logLine(`行事准则已改名迁移：${legacyAgentsMdPath(dir)} → ${p}（老文件备份为 ${mig.backup}）`)
-      else if (mig.reason) logLine(`行事准则迁移失败（不影响使用）：${mig.reason}`)
-      if (existsSync(p)) return false
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-      writeFileSync(p, DEFAULT_AGENTS_MD, 'utf8')
-      return true
-    } catch (e) { logLine(`重建行事准则失败（${p}）：${e.message}`); return false }
-  }
-
-  /**
-   * **把提示词当"插件提示"投递**（学宿主的做法，**绝不冒充用户发言**）。
-   *
-   * 投三条（各一条插件提示行）：
-   *    ① `<工作区>/AGENTS.md`（开关 `injectWorkspaceAgentsMd`）—— 用户要求先投它
-   *    ② `<工作区>/.dsh-mc-agent/RULES.md`（开关 `injectDshMcAgentAgentsMd`）
-   *    ③ `<工作区>/.dsh-mc-agent/README.md` = **记忆总索引**（无开关：记忆是这个模式的本职）
-   *
-   * 🔴 为什么走这条路：宿主注入工作区 `AGENTS.md` **不用 systemPrompt** ——
-   *    `packages/context/agent-instructions` 把一条消息放进 `agent.inbox.nextStep`
-   *    → ① **必达**（不经过 systemPrompt 组装：persona 的 `complete:true` /
-   *    `includeRuntimeContext:false` 压不到它）；② **看得见**（对话里一行折叠提示）。
-   *
-   * 用户 2026-09-16 的要求（照做，**不多做**）：
-   *    · **不加新开关** —— 就用设置里那两个：`injectDshMcAgentAgentsMd` / `injectWorkspaceAgentsMd`；
-   *    · 两个都开时**先投工作区的，再投我们自己的**；
-   *    · 每条都要让人**和 AI**一眼看出是哪个文件：折叠标题与正文首行都带**相对路径**
-   *      （`AGENTS.md` 与 `.dsh-mc-agent/AGENTS.md` 是两回事）；
-   *    · `source` 写死 `{kind:'plugin:dsh-mc-agent', form:'notice'}`（v4 规范值）→ 插件提示行，不归到用户头上；
-   *    · **不做 steer 兜底**（steer 空闲会"起一轮"＝没问就替用户说话）。
-   */
-  /**
-   * 造一条"用户角色"的消息（宿主 `UserMessage` 的形状）。
-   *
-   * 🔴🔴 2026-09-18 真机事故（用户在**另一台设备**上 npm 装了 0.1.3）：**提示词一条都没注入**，
-   *    而工具白名单/guard 一切正常。根因这里：`@deepseek-ai/dsh-llm` **没有写进依赖声明**，
-   *    本机是因为 `node_modules` 里有指向宿主源码树的链接才 `require` 得到；
-   *    别人 `npm i` 装出来的插件目录里没有这个包、向上也找不到 ⇒ 提示行**一条都建不出来**。
-   *    而工具白名单（`tools.restrict`）+ guard 全靠 ctx，不碰任何宿主包 ——
-   *    于是症状精确地是"**工具都在、提示词全无**"。
-   *
-   * 现在统一走 `src/user-message.mjs`：**优先宿主实现，拿不到就用自带等价实现**
-   * （字段逐个对齐 `role` / `content` / `source` / `id`），并且解析失败会记一行日志。
-   * 看门狗（`src/watchdog.mjs`）是同一次事故的第二处，也已切到同一个模块。
-   */
-  if (pluginLoadNote) {
-    // 同一句话原来在这台机器上打了 22 遍（每个会话都重打）⇒ 进程内只留一行
-    logOnce('no-host-createUserMessage',
-      `拿不到宿主的 createUserMessage（${pluginLoadNote}）→ 用插件自带的等价实现兜底（提示词与看门狗注入照常）`)
-  }
-
-  /**
-   * 提示词投递台账（agent → 状态）。
-   *
-   * 🔴 2026-09-18 改挂载点（用户："应该切换到正确的挂载点……而是在对话开始后设置工具/注入提示词"）：
-   *    **投递时机从"会话开始/切模式那一刻"搬到"每个请求组装之前"**（`agent/pre-step`）。
-   *    台账因此按 **preset** 记账：`fp` 记"这批提示词是给哪个模式投的"，切模式就作废重投。
-   *
-   * 字段：`sessionId` · `fp`（mode/版本指纹）· `rel`（已投的文件名）· `items`（那一刻的正文）
-   *      · `since`（会话日志的下标：**上次切出模式那一刻**，之前的投递记录不再算数）
-   */
-  const noticeLedger = new WeakMap()
-  const ledgerOf = (agent) => {
-    let l = noticeLedger.get(agent)
-    if (!l) { l = { sessionId: null, fp: null, rel: [], items: new Map(), since: 0 }; noticeLedger.set(agent, l) }
-    if (l.sessionId !== (agent?.id ?? null)) { l.sessionId = agent?.id ?? null; l.fp = null; l.rel = []; l.items = new Map(); l.since = 0 }
-    return l
-  }
-
-  /** 这条（会话日志里的）消息是不是**我们**（dsh-mc-agent）投的插件提示行
-   *  —— 认 `kind` 的 **v4 规范值**（回读日志用的判据，与投递侧同一口径；见 user-message.mjs 头注释） */
-  const isOurNotice = (m) => String(m?.source?.kind ?? '') === 'plugin:dsh-mc-agent' && m?.source?.form === 'notice'
-
-  /** 提示行正文里"它出自哪个文件"（首行 `Instructions from: <rel>`），取不到就 null */
-  const noticeRelOf = (m) => {
-    try {
-      const text = (m?.content ?? []).map((c) => c?.text ?? '').join('')
-      const m2 = /^Instructions from:\s*(\S+)/m.exec(text)
-      return m2 ? m2[1] : null
-    } catch { return null }
-  }
-
-  /**
-   * 从**会话日志**里读"这个 preset 下我们已经投过哪些文件"。
-   *
-   * 为什么必须读日志：台账是**进程内**的（WeakMap），宿主重启 / 插件重载就没了，
-   * 而会话日志是持久的 —— 一个已经投过提示词的 MC 会话在重启后 resume，
-   * 只看台账就会**再投一遍**（重复注入）。`snapshotEvents()` 在真机上可用，
-   * 拿不到就退化成"只信台账"（不抛错，绝不让诊断路径把 turn 弄挂）。
-   *
-   * ⚠️ 只看 `l.since`（**上次切出 MC 模式那一刻**）之后的事件：切出时提示词已经作废
-   *    （台账也清了），若不划这条线，"切出 → 再切回"会被日志里的旧记录误判成"已经投过"
-   *    ⇒ **再也不投**（自检逮到过这个 bug）。
-   */
-  const deliveredRelsFor = (agent, rels) => {
-    const out = new Set()
-    try {
-      const from = Number(ledgerOf(agent).since) || 0
-      let events = []
-      try {
-        const ev = agent?.session?.snapshotEvents?.()
-        events = Array.isArray(ev) ? ev : []
-      } catch { events = [] }
-      for (const ev of events.slice(from)) {
-        if (ev?.type !== 'user/message') continue
-        const m = ev.data
-        if (!isOurNotice(m)) continue
-        const text = (m.content ?? []).map((c) => c?.text ?? '').join('')
-        for (const rel of rels) if (rel && text.includes(rel)) out.add(rel)
-      }
-    } catch { /* 读不到日志就只信台账 */ }
-    return out
-  }
-
-  /**
-   * 把一条插件提示行放进会话的"待投递"队列。
-   * 优先用宿主的 inbox API（`append` → 会**durable** 落事件 + 通知投影；宿主自己也走 splice 系列），
-   * 老版本/替身没有这个 API 才退回直接 push。
-   */
-  const pushNotice = (inbox, message) => {
-    if (typeof inbox.append === 'function') { inbox.append('next-step', message); return true }
-    if (Array.isArray(inbox.nextStep)) { inbox.nextStep.push(message); return true }
-    return false
-  }
-
-  /**
-   * **清掉还没投递的**本插件提示行（切出 MC 模式时用）。
-   *
-   * 🔴 2026-09-18 变简单了（挂载点搬到 `agent/pre-step` 之后）：
-   *    以前提示词是"会话开始/切到 MC 模式那一刻"就入队，而模式允许在**空白期**继续改，
-   *    于是"切 MC → 一句话没发 → 切回标准"会把 MC 提示词留在一个标准模式会话里
-   *    （真机 `session-be2e43d7`：seq 3 切 MC、seq 4 切回标准、seq 7 三条提示词还在队列里等着）。
-   *    现在**只在请求组装前现场判定并投递**（见 reconcileNotices）：不是 MC 模式就一条都不投，
-   *    所以那种串模式**从根上不可能发生**，也**不再需要**补一条"MC 行事准则作废"声明去圆场。
-   * 这里只负责把队列里可能残留的自家提示行摘干净（幂等；本模式重新进入时会照常重投）。
-   * @param agent - 宿主 Agent
-   * @returns {{removed: number, delivered: boolean}} 摘掉的条数 / 之前是否真的投递过
-   */
-  const withdrawAgentsMdNotices = (agent) => {
-    const inbox = agent?.inbox
-    let removed = 0
-    if (inbox && Array.isArray(inbox.nextStep)) {
-      for (const m of [...inbox.nextStep]) {
-        if (!isOurNotice(m)) continue
-        try {
-          if (typeof inbox.remove === 'function' && m?.id !== undefined && inbox.remove(m.id) === true) { removed++; continue }
-          const i = inbox.nextStep.indexOf(m)
-          if (i >= 0) { inbox.nextStep.splice(i, 1); removed++ }
-        } catch (e) { logLine(`清掉待投递提示行失败：${e?.message ?? e}`) }
-      }
-    }
-    // 🔴 真事故（自检逮到）：清了队列就必须**同时把台账里的 rel 抹掉**。
-    //    否则"切回普通模式（清队列）→ 再切回 MC 模式"时，台账还以为投过了 ⇒ **永远不再投**，
-    //    典型症状就是"提示词莫名其妙没了"。队列里还没被 claim 的，本来就不算投过。
-    // 🔴 切出模式 ⇒ 这批提示词**作废**：台账里的"已投"记录必须一起清掉，否则再切回来会被
-    //    误判成"已经投过" ⇒ **再也不投**。这里**不能**加 `if (removed > 0)` 的条件 ——
-    //    现在提示行是在本步消息里当场送出的，队列通常是空的（removed === 0），
-    //    当年那版靠"队列非空"来判断"这次真的要作废"是错的（自检逮到过）。
-    {
-      const l = ledgerOf(agent)
-      l.rel = []
-      l.items = new Map()
-    }
-    // 🔴 无论有没有从队列里摘到东西，都要**划一条线**：把"切出这一刻"的日志下标记下来，
-    //    之后 `deliveredRelsFor` 只认这条线之后的投递记录 —— 这样"切出 → 再切回"才会重投
-    //    （否则日志里的旧记录会让插件误判"已经投过"，表现为**再也不投**）。
-    try {
-      const ev = agent?.session?.snapshotEvents?.()
-      ledgerOf(agent).since = Array.isArray(ev) ? ev.length : 0
-    } catch { /* 拿不到日志下标就算了（退化：只信台账） */ }
-    // 队列本来就干净 ⇒ 说明那几条**已经进过对话**（载入时从日志认出来的）
-    const delivered = removed === 0 && Boolean(ledgerOf(agent).fp)
-    if (removed || delivered) {
-      logLine(`已退出 MC 模式：清掉待投递提示行 ${removed} 条${delivered ? '（之前投过的那几条仍在对话历史里）' : ''}`)
-    }
-    return { removed, delivered }
-  }
-
-  /**
-   * 「规则放在文件里，让每个新会话直接去读文件」（用户 2026-10-08）。
-   *
-   * 投给会话的**只有这一行指针**：绝对路径 + 读法。正文留在文件里，由会话自己读 ——
-   * 这样正文只在"读的那一刻"占上下文，而且**用户改文件立刻生效**（不用重启、不用重投）。
-   *
-   * 读法给两种：`mc_kit_memory {action:"read"}`（记忆根相对路径，MC 模式一定在）与
-   * `read {file_path:"<绝对路径>"}`（宿主的文件工具；MC 模式里也在白名单里，受保护文件只读）。
-   * @param {{abs:string, fileName:string, what:string}} o
-   * @returns {string}
-   */
-  const rulesPointerText = ({ abs, fileName, what }) => [
-    `📖 ${what}在文件里，**以文件为准**（改了立刻生效，不用重启）：`,
-    `   \`${abs}\``,
-    `   开工前先读一遍：\`mc_kit_memory {action:"read", path:"${fileName}"}\``
-      + `（或 \`read {file_path:"${abs}"}\`）`,
-  ].join('\n')
-
-  /**
-   * **每个请求组装之前对账一次**：现在是 MC 模式 + 这个模式还没投过 → 投三条插件提示行。
-   *
-   * 🔴 2026-09-18 改挂载点（用户："应该切换到正确的挂载点"）。挂在这里而不是"会话开始/切模式那一刻"，
-   *    是因为**模式的最终值在第一次请求之前仍然可能变**（宿主允许空白期反复切 preset：
-   *    `agent-presets/src/index.ts:709-728`，真机 `session-be2e43d7` 就是 seq3 切 MC、seq4 切回标准），
-   *    而"发给 LLM 之前"这一刻才是模式已经定下来的时刻。
-   *    宿主自己的同类特性也挂在这条瀑布上（`context/agent-instructions` 在 `agent/pre-step` 里同步上下文）。
-   *
-   * 幂等靠两件事：① 台账按 **preset 指纹**记账（`rel` 已有就不重复投）；
-   * ② 队列里已经有同名提示行也不重复投（宿主可能还没把它们领走）。
-   * @param agent - 宿主 Agent
-   * @returns {{delivered: boolean, queued: number, reason?: string}}
-   */
-  const reconcileNotices = (agent) => {
-    // ⚠️ 每个提前返回都必须带 `todo` 字段：`enterWithNotices` 会读 `r.todo.length`，
-    //    漏一个就是 TypeError（这里被 catch 兜住 ⇒ 表现成"静默不注入"，正是最难查的那种）。
-    if (!agent?.ctx) return { delivered: false, todo: [], queued: 0, reason: 'no-agent' }
-    if (!isMcModeAgent(agent)) return { delivered: false, todo: [], queued: 0, reason: 'not-mc-mode' }
-    const cwd = workspaceOf(agent)
-    if (!cwd) return { delivered: false, todo: [], queued: 0, reason: 'no-workspace' }
-    noteAgent(agent)   // 记忆按会话分：让下面只传 cwd 的调用落到本会话的记忆根
-    const inbox = agent.inbox
-    if (!inbox || !Array.isArray(inbox.nextStep)) return { delivered: false, todo: [], queued: 0, reason: 'no-inbox' }
-    // 注：消息构造由 `src/user-message.mjs` 保证 —— 宿主实现拿不到就用自带等价实现，
-    //     所以这里**不再有"静默失败"的死角**。
-
-    // 顺序：**先工作区，再我们自己的**（用户指定）。两个开关都是**本工作区**的（src/wsconfig.mjs）。
-    const wsSwitches = wsCfgValues(cwd)
-    const items = []
-    if (wsSwitches.injectWorkspaceAgentsMd === true) {
-      try {
-        const p = join(workspaceRootFor(agent), 'AGENTS.md')
-        const t = existsSync(p) ? readFileSync(p, 'utf8').trim() : ''
-        if (t) items.push({ rel: 'AGENTS.md', title: '提示词注入：AGENTS.md', text: t })
-      } catch { /* 读不到就当没有 */ }
-    }
-    if (wsSwitches.injectDshMcAgentAgentsMd === true) {
-      const root = memoryRootFor(cwd)
-      ensureAgentsMdFile(root)
-      const cur = readAgentsMd(root)
-      // 🔴 用户 2026-10-08：「把规则放在文件里，让每个新会话直接去读文件。」
-      //    ⇒ 这里**只投一行指针**（路径 + 读法），正文留在文件里由会话自己去读。
-      //    好处：正文只在读的那一刻占上下文；用户改文件立刻生效（不用重启、不用重投）。
-      items.push({
-        rel: '.dsh-mc-agent/RULES.md',
-        title: '提示词注入：.dsh-mc-agent/RULES.md',
-        text: rulesPointerText({
-          abs: cur.path,
-          fileName: 'RULES.md',
-          what: `行事准则（${cur.source === 'custom' ? '用户 自定义版' : '默认版'}，长期有效）`,
-        }),
-      })
-    }
-    // ③ **版本提示**（随插件版本发布，无开关）：同样只投指针，正文在 `<记忆根>/版本提示.md`。
-    //    读起来就是"对这个版本的工具成熟度的补充说明"。见 src/version-prompt.mjs。
-    {
-      const vpDir = memoryRootFor(cwd)
-      const vp = readVersionPrompt(vpDir, PLUGIN_VERSION)
-      items.push({
-        rel: versionPromptSource(PLUGIN_VERSION),
-        title: versionPromptTitle(PLUGIN_VERSION),
-        text: rulesPointerText({
-          abs: vp.path,
-          fileName: VERSION_PROMPT_FILE,
-          what: 'dsh-mc-agent 的版本提示（这个版本的时效性注意事项）',
-        }),
-      })
-    }
-    // ③·5 **MC+ 模式说明**（无开关，仅 MC+ 会话）：MC+ 在 MC 模式基础上多一层"标准工具全量 +
-    //      文件全工作区"的语境，随版本硬编码。MC 模式**不投**这条（preset 指纹换代时会整体重投）。
-    if (isMcPlusAgent(agent)) {
-      items.push({
-        rel: versionPromptSource(PLUGIN_VERSION) + '（MC+ 模式说明）',
-        title: versionPromptTitle(PLUGIN_VERSION) + '｜MC+ 模式说明',
-        text: MC_PLUS_NOTICE_TEXT,
-      })
-    }
-    // ④ 记忆总索引（`.dsh-mc-agent/README.md`）：**每个 MC 会话都给一次**——这正是"长期记忆"的入口。
-    //    内容空（还没记过东西）也照样给：里面写着"怎么记"，第一轮就知道该往哪写。
-    {
-      const idx = memoryIndexText(memoryFor(cwd)).trim()
-      if (idx) items.push({ rel: '.dsh-mc-agent/README.md', title: '提示词注入：.dsh-mc-agent/README.md', text: idx })
-    }
-    if (!items.length) return { delivered: false, todo: [], queued: 0, reason: 'no-items' }
-
-    const ledger = ledgerOf(agent)
-    /* 🔴 审计：这里原来是 `?? String(agent?.ctx ? '' : '')` —— 两支都是 `''`，等于什么都没兜。
-     * preset 还没认出来时指纹就是 `|<版本>`（对照 1536/3777 用的 `?? null`）。 */
-    const preset = lastPresetSeen.get(agent) ?? ''
-    const fp = `${preset}|${PLUGIN_VERSION}`
-    if (ledger.fp !== fp) { ledger.fp = fp; ledger.rel = []; ledger.items = new Map() }
-
-    const delivered = deliveredRelsFor(agent, items.map((i) => i.rel))
-    // 队列里**已经排着的**同名提示行：算"已经安排了"，不重复投（宿主下一个 step 会领走它）。
-    const queuedRels = new Set(inbox.nextStep.filter(isOurNotice).map(noticeRelOf).filter(Boolean))
-    const rels = new Set([...ledger.rel, ...delivered])
-    const todo = items.filter((it) => !rels.has(it.rel) && !queuedRels.has(it.rel))
-    if (!todo.length) {
-      return { delivered: false, todo: [], queued: queuedRels.size }
-    }
-    // 只负责"算出该投什么"；**真正入队/改写本步消息**由 pre-step 监听器做（那里才有 decision）。
-    // 注：版本提示的短哈希由 `versionPromptTitle()` 自己带进折叠标题，这里不需要再算。
-    return { delivered: true, todo, queued: queuedRels.size }
-  }
-
-  /**
-   * 🔴🔴 2026-09-18 **第二次改挂载点**（用户："两个全都是 LLM 运行了一半才后知后觉地注入，
-   *    根本不是用户发送第一条信息后注入"）。
-   *
-   * 上一次我只把投递挂到 `agent/pre-step`，但**塞进了 `inbox.nextStep`** —— 而宿主的顺序是：
-   *    `preStep()` 里**先 `inbox.claim()`**（把这一步的消息领走）**再**跑 `agent/pre-step` 瀑布
-   *    （`core/agent-loop/src/agent.ts:244` → `:249`）。
-   * 所以那一步塞进队列的提示行**这一步用不上**，要等**下一步**才被领走 ——真机实测：
-   *
-   *     seq= 7-9  next-step +3        ← 我在 pre-step 塞进队列
-   *     seq=10    step/start  step=1  ← 这一步的消息**已经领完了**
-   *     seq=12    user/message 用户那句
-   *     seq=25    next-step -3        ← 到第 2 步才被领走
-   *     seq=27-29 user/message ×3     ← 提示行晚了整整一步
-   *
-   * 这正是宿主 `agent-instructions` 的写法要解决的问题：**改写 `decision.messages`**
-   *   （`context/agent-instructions/src/index.ts:313-338`：拿 `next()` 的结果 → 先把队列里
-   *    那几条 `inbox.remove()` → 再 `{...decision, messages: toSpliced(...)}` 返回）。
-   * 宿主紧接着在 `agent.ts:373-377` 把 `decision.messages` **逐条落成会话日志的 `user/message`**
-   * 并作为请求里的那批消息 —— 既是**正规通道**（`stepAt`/重放都对得上），又能**当场**生效。
-   *
-   * 位置：**排在本步消息的最前面**。本步消息 = 用户那句 + 运行时上下文快照；
-   * 把规矩放在最前，模型第一眼就看到（而不是先看到用户那句话再补规矩）。
-   *
-   * cordis：`agent/pre-step` 是 waterfall，**必须交棒**（`next()`）—— 见下面那段注释与自检。
-   */
-  const noticeMessagesFor = (todo) => todo.map((it) => userMessage({
-    content: [{ type: 'text', text: `Instructions from: ${it.rel}\n\n${it.text}` }],
-    // source.kind 用 **v4 规范值** `plugin:dsh-mc-agent`（v4 会话格式**拒绝**裸露的 'plugin'；
-    // 宿主 createUserMessage 对 source 原样透传、不会替我们修正）—— 见 src/user-message.mjs 头注释
-    source: { kind: 'plugin:dsh-mc-agent', form: 'notice', summary: it.title },
-  }))
-
-  /** 记一笔台账（投出去的那些文件名 + 正文，供诊断与"内容变了就地更新"） */
-  const markNoticesSent = (agent, todo) => {
-    const ledger = ledgerOf(agent)
-    for (const it of todo) ledger.items.set(it.rel, it.text)
-    ledger.rel = [...new Set([...ledger.rel, ...todo.map((i) => i.rel)])]
-    logLine(`提示词已投递 ${todo.length} 条（**本步消息里**，与用户那句同批送出；插件提示行，非用户发言）：${todo.map((i) => i.rel).join(' → ')}`)
-  }
-
-  /**
-   * 把提示行塞进**本步**的 `decision.messages` 最前面；没有要投的就原样返回。
-   * 幂等：投过就记账，下一个 step 不会再投。
-   * @param agent - 宿主 Agent（用来判模式与工作区）
-   * @param decision - 交棒拿回来的 `PreStepDecision`
-   * @returns 改写后的 decision（不改就别返回新对象）
-   */
-  const enterWithNotices = (agent, decision) => {
-    try {
-      if (!decision || decision.kind !== 'enter') return decision
-      const r = reconcileNotices(agent)
-      if (!r.todo.length) return decision
-      // 队列里若有残留的自家提示行，先摘掉：它们马上要作为**本步消息**送出去了，
-      // 留着会让下一步再送一遍（重复注入）。
-      try { withdrawAgentsMdNotices(agent) } catch { /* 摘不掉也不影响本步 */ }
-      markNoticesSent(agent, r.todo)
-      const msgs = (decision.messages ?? []).filter((m) => !isOurNotice(m))
-      const out = { ...decision, messages: [...noticeMessagesFor(r.todo), ...msgs] }
-      return out
-    } catch (e) {
-      // 绝不带崩这一轮：改写失败就用内层原样结果。
-      logLine(`提示词注入失败（不打断本轮，按原样继续）：${e?.message ?? e}｜${String(e?.stack ?? '').split('\n')[1] ?? ''}`)
-      return decision
-    }
-  }
-
-  /**
-   * 「MC模式」那个 preset 的**人设压制**诊断（每次现读，便宜）。
-   *
-   * 为什么需要：宿主 `system-prompt/src/index.ts:606` 写着
-   * `contexts: runtimeContextSuppressed ? [] : […]` —— persona 只要写了 `includeRuntimeContext: false`，
-   * **我们注入的段（全是 context）会在组装时被整个丢掉**；`complete: true` 再压掉别的 section。
-   * 复制官方 `minimal` 恰好带这两个开关 → "设置页显示一切正常、AI 却什么都没收到"（2026-09-16 真机）。
-   */
-  let mcPresetDiag = null
-  /**
-   * @param agent - 可选：优先诊断**这个会话自己**的 preset（两个 preset 在名单里时，
-   *   不能永远只报第一个）。读不到组成文件（如新宿主的声明式 preset 没有磁盘目录）→
-   *   返回上次结果/`null`；声明式 preset 的 persona 由本包声明掌控、不存在压制开关，
-   *   所以新宿主上这里是空转，只对旧宿主（目录式 preset）有诊断意义。
-   */
-  const refreshMcPresetDiag = (agent) => {
-    try {
-      const svc = agentPresetsSvc
-      if (!svc) return mcPresetDiag
-      const prefer = agent ? lastPresetSeen.get(agent) : null
-      const list = pluginConfig.mcModePresets
-      const ids = prefer && list.includes(prefer) ? [prefer, ...list.filter((x) => x !== prefer)] : list
-      for (const id of ids) {
-        const dir = mcPresetDir(svc, id)
-        const p = dir ? join(dir, 'agent.cordis.yml') : null
-        if (!p || !existsSync(p)) continue
-        const comp = readFileSync(p, 'utf8')
-        mcPresetDiag = {
-          id,
-          path: p,
-          complete: /complete:\s*true/.test(comp),
-          runtimeContextSuppressed: /includeRuntimeContext:\s*false/.test(comp),
-          personaIsOurs: /Minecraft Java 版服务器里扮演一名玩家/.test(comp),
-        }
-        return mcPresetDiag
-      }
-    } catch { /* 读不到就当没有 */ }
-    return mcPresetDiag
-  }
-
-  /**
-   * 这个会话**已经投出去**的提示行文件名（诊断/UI 用）。
-   *
-   * 来源两处，缺一不可：① 进程内台账（`ledgerOf`，按 preset 记账）；
-   * ② **会话日志回读** —— 台账是进程内的，宿主重启/插件重载就没了，只信台账会漏报
-   *    （用户会看到"没投递"，而 AI 其实早就收到了）。
-   */
-  const sentNoticeRels = (agent) => {
-    if (!agent) return []
-    const out = new Set(ledgerOf(agent).rel)
-    for (const rel of deliveredRelsFor(agent, noticeRelCandidates())) out.add(rel)
-    return [...out]
-  }
-
-  /** 所有可能被投递的文件名（回读日志时用来匹配） */
-  const noticeRelCandidates = () => [
-    'AGENTS.md',
-    '.dsh-mc-agent/RULES.md',
-    '.dsh-mc-agent/README.md',
-    versionPromptSource(PLUGIN_VERSION),
-    versionPromptSource(PLUGIN_VERSION) + '（MC+ 模式说明）',
-  ]
-
-  /**
-   * **提示词注入状态**（给 UI / `mc_diag` 看）：每条各自"投出去了没有、为什么没有"。
-   *
-   * 2026-09-16 加：用户在真机上反复报"没有任何我们的提示词"，而这件事**极难从外面判断**
-   * （是没进 MC 模式？开关关了？文件不在？投递失败？）。与其让人猜，不如把判据摆出来：
-   * `segments` 报**实际投递**（台账 + 会话日志回读），`notes` 是人话版原因。
-   */
-  const promptInjectionStatus = (agent) => {
-    const cwd = workspaceOf(agent)
-    const root = cwd ? memoryRootFor(cwd, agentIdOf(agent)) : null
-    const mcMode = Boolean(agent) && isMcModeAgent(agent)
-    const mcPlus = Boolean(agent) && isMcPlusAgent(agent)
-    const wsAgents = agent ? join(workspaceRootFor(agent), 'AGENTS.md') : null
-    const cur = root ? readAgentsMd(root) : null
-    const agentsFile = root ? agentsMdPath(root) : null
-    const wsSw = wsCfgValues(cwd)
-    const injectWc = wsSw.injectDshMcAgentAgentsMd === true
-    const injectWs = wsSw.injectWorkspaceAgentsMd === true
-    const wsExists = Boolean(wsAgents) && existsSync(wsAgents)
-    // 版本提示现在是**文件**（`<记忆根>/版本提示.md`，用户 2026-10-08）：
-    //   注入只投一行指针，正文由会话自己去读 ⇒ 这里给界面展示/编辑的是**文件内容**。
-    const vpPath = root ? versionPromptPath(root) : null
-    const vpCur = root ? readVersionPrompt(root, PLUGIN_VERSION) : null
-    const presetId = (agent && lastPresetSeen.get(agent)) ?? null
-    // 🔴 宿主的硬规则（system-prompt/src/index.ts:606）：persona 若写了 `includeRuntimeContext: false`，
-    //    组装时 `contexts` 直接变成 `[]`；写了 `complete: true` 则"人设即全部系统提示"。
-    //    复制官方 minimal 就会带这两个开关（2026-09-16 真机事故的根因）。
-    //    ⚠️ 现在我们的提示词走**插件提示行**（inbox.nextStep），**不受它影响** —— 这条只作为
-    //    "preset 还没被修好"的提示留着（它仍会压掉宿主自己的运行期上下文）。
-    const personaSuppresses = Boolean(refreshMcPresetDiag(agent)?.complete || mcPresetDiag?.runtimeContextSuppressed)
-    const sent = sentNoticeRels(agent)
-    return {
-      mcMode,
-      mcPlus,
-      presetId,
-      workspace: cwd ?? null,
-      switches: { injectDshMcAgentAgentsMd: injectWc, injectWorkspaceAgentsMd: injectWs },
-      files: {
-        agentsMd: agentsFile
-          ? { path: agentsFile, exists: existsSync(agentsFile), source: cur?.source ?? null, bytes: cur ? Buffer.byteLength(cur.text) : 0 }
-          : null,
-        versionPrompt: vpPath
-          ? { path: vpPath, exists: existsSync(vpPath), source: vpCur?.source ?? null, bytes: vpCur ? Buffer.byteLength(vpCur.text) : 0 }
-          : null,
-        workspaceAgentsMd: wsAgents ? { path: wsAgents, exists: wsExists } : null,
-        memoryIndex: root ? { path: join(root, 'README.md'), exists: existsSync(join(root, 'README.md')) } : null,
-      },
-      preset: mcPresetDiag ?? null,
-      // **实际投出去的文件名**（投递是唯一通道，这就是判据本身）
-      notices: sent,
-      // 版本提示（**文件**：`<记忆根>/版本提示.md`，随版本发布、无开关）：界面上可看可改，
-      //   注入只投指针（见 reconcileNotices）。
-      versionPrompt: {
-        version: PLUGIN_VERSION,
-        title: versionPromptTitle(PLUGIN_VERSION),
-        path: vpPath,
-        source: vpCur?.source ?? null,
-        isDefault: (vpCur?.source ?? 'default') === 'default',
-        bytes: vpCur ? Buffer.byteLength(vpCur.text) : 0,
-        text: vpCur?.text ?? versionPromptText(PLUGIN_VERSION),
-        defaultText: versionPromptText(PLUGIN_VERSION),
-      },
-      // 保留 registered/segments 两个键名（前端与 mc_diag 在用）：现在两者同源 —— 都是"真的投了"
-      registered: {
-        'agents-md': sent.includes('.dsh-mc-agent/RULES.md'),
-        'workspace-agents-md': sent.includes('AGENTS.md'),
-        'version-prompt': sent.some((r) => String(r).startsWith('dsh-mc-agent@')),
-        'memory-index': sent.includes('.dsh-mc-agent/README.md'),
-        'mc-plus-note': sent.some((r) => String(r).includes('（MC+ 模式说明）')),
-      },
-      segments: {
-        'agents-md': sent.includes('.dsh-mc-agent/RULES.md'),
-        'workspace-agents-md': sent.includes('AGENTS.md'),
-        'version-prompt': sent.some((r) => String(r).startsWith('dsh-mc-agent@')),
-        'memory-index': sent.includes('.dsh-mc-agent/README.md'),
-        'mc-plus-note': sent.some((r) => String(r).includes('（MC+ 模式说明）')),
-      },
-      // ⚠️ 这里只留**用户看不出来、又真的影响投递**的原因。
-      //    "还没到投递时机 / 开关是关的" 这种**不用提示**（用户 2026-09-18：多余）——
-      //    上面那行 `本会话注入：…` 已经用 ✓/✗ 摆出来了，而"还没发过消息"本来就是一目了然的状态。
-      //    （前端对 `notes.length === 0` 已经不渲染那一行了，所以全空也没关系。）
-      notes: [
-        ...(agent ? [] : ['拿不到当前会话（没有 agent 上下文）']),
-        ...(agent && !cwd ? ['这个会话没有选中工作区 → 提示词没地方放，插件不会投递'] : []),
-        ...(agent && cwd && !mcMode ? [`这个会话不是 MC 模式（preset=${presetId ?? '未知'} 不在 mcModePresets 里）→ 不投递`] : []),
-        ...(mcMode && injectWs && !wsExists ? ['工作区根目录里没有 AGENTS.md 这个文件'] : []),
-        ...(personaSuppresses ? ['⚠️ preset 的 persona 还带着 complete / includeRuntimeContext:false（会压掉宿主自己的运行期上下文；我们的提示走插件提示行不受影响。重启 DSH 后本插件会自动修这个 preset）'] : []),
-      ],
-    }
-  }
-
-  /**
-   * 在**选中工作区**里备好 `.dsh-mc-agent/`（缺 README.md / RULES.md 就补默认）。
-   *
-   * 🔴 用户 2026-09-16 定的**时机**：**不是**启动时对每个会话建，只在两个时刻建：
-   *    ① **首次发起 MC 模式会话**（`applyMcModePolicy` 跑的时候）
-   *    ② **点开「MC设置」**（那组 /api/mc/* 接口进来的时候）
-   * 🔴 **没有选中工作区就拒绝**（不再退到 `$DSH_HOME` 兜底目录去建）。
-   *
-   * @returns {boolean} 备好了吗（false = 没工作区 / 建失败）
-   */
-  const seededRoots = new Set()
-  /**
-   * 新会话记忆根要"继承"的文件（本机补丁 2026-10-06，记忆按会话分）。
-   * 🔴 只拷这几样：**行事准则 + 开关**。绝不拷 `README.md`（那是记忆索引，新会话必须从空开始）、
-   *    也绝不拷 `192.168.1.104/` 那种服务器记忆树 —— 拷了就等于没分。
-   * 🔴 必须在 `ensureAgentsMdFile` / `syncRulesVersion` **之前**做，否则用户改过的 RULES.md
-   *    会被内置默认内容盖掉。
-   * 🔴 2026-10-08：`版本提示.md` 也一起继承（它同样是"规则文件"，用户改过的那份要带过去，
-   *    不能因为新会话根是空的就回退成内置默认）。
-   */
-  const SESSION_SEED_FILES = ['RULES.md', '版本提示.md', 'config.json', 'auto.json', 'view.json']
-  const seedSessionRoot = (base, root) => {
-    if (base === root) return false
-    let n = 0
-    try {
-      for (const f of SESSION_SEED_FILES) {
-        const from = join(base, f)
-        const to = join(root, f)
-        if (!existsSync(from) || existsSync(to)) continue
-        copyFileSync(from, to)
-        n++
-      }
-    } catch (e) { logLine(`播种新会话记忆失败（不影响使用）：${e.message}`) }
-    return n > 0
-  }
-
-  const ensureMemoryRootForCwd = (cwd, agentId = null) => {
-    if (!cwd) return false
-    const root = memoryRootFor(cwd, agentId)
-    if (seededRoots.has(root)) return true
-    try {
-      if (!existsSync(root)) {
-        mkdirSync(root, { recursive: true })
-        logDebug(`已在工作区建立记忆目录：${root}`)
-      }
-      /* 记忆按会话分：新会话根从**基根**播种行事准则与开关（RULES.md / config.json / auto.json / view.json） */
-      if (agentId && seedSessionRoot(memoryBaseFor(cwd), root)) logDebug(`新会话记忆已从基根播种：${root}`)
-      try { if (memoryFor(cwd, agentId).ensureReadme()) logDebug(`已写入默认记忆索引：${join(root, 'README.md')}`) } catch (e) { logLine(`写默认索引失败：${e.message}`) }
-      if (ensureAgentsMdFile(root)) logDebug(`已写入默认行事准则：${agentsMdPath(root)}`)
-      /* 按工作区的 config.json（src/wsconfig.mjs）：建档 + 迁移 —— **必须先于下面的版本同步**，
-       * 否则旧 `.rules-version` 的值这一轮看不到，会被当成"第一次遇到"（from=null，只 marked 不替换）。
-       * seed = 旧版全局 config.json 里**显式设过**的三个开关（搬进本工作区作初值，之后互不影响）。 */
-      const mig = migrateWorkspaceConfig(root, { seed: pluginConfig.legacyPromptSwitches() })
-      if (mig.created) logDebug(`已建立工作区配置：${wsConfigPath(root)}${mig.seeded.length ? `（沿用了 ${mig.seeded.join('/')} 的旧全局值）` : ''}`)
-      if (mig.markerRemoved) logDebug(`提示词版本标记已并入工作区配置：${wsConfigPath(root)}（旧的 .rules-version 已删除）`)
-      if (mig.error) logLine(`工作区配置迁移跳过（不影响使用）：${mig.error}`)
-      /* 「随版本更新」（默认开，**按工作区**）：插件版本变了就用新版本默认准则替换**基根**那份
-       * （=「默认提示词」，也就是以后新建的会话会拿到的模板）。
-       * 🔴 用户 2026-10-15：「对升级只动默认的，会话的不动」—— 所以这里同步的是 `memoryBaseFor(cwd)`，
-       * 不是本会话的 `root`：正在跑的那个会话不该被一次升级半路换掉规矩。
-       * 开关（`rulesFollowVersion`）仍从**本工作区**的 config.json 读（页面上的开关就写在那儿）。
-       * 覆盖前留一份 `RULES.md.bak-<旧版本>`（基根那份往往就是用户自己改过的模板）。
-       * 第一次遇到（没有版本记录）只记版本、不覆盖；关着时也只记版本。 */
-      const syncDir = memoryBaseFor(cwd)
-      const sync = syncRulesVersion(syncDir, PLUGIN_VERSION, {
-        follow: workspaceConfigValues(root).rulesFollowVersion !== false,
-        backup: true
-      })
-      if (sync.action === 'replaced') logLine(`插件已更新到 v${sync.to}：「随版本更新」开启 → **默认提示词**（基根那份）已替换为新版本默认内容（原为 v${sync.from}）${sync.backup ? `，旧的留在 ${sync.backup}` : ''}；本会话那份没动`)
-      else if (sync.action === 'created') logLine(`已写入默认提示词：${agentsMdPath(syncDir)}（v${sync.to}）`)
-      else if (sync.error) logLine(`默认提示词版本同步失败（不影响使用）：${sync.error}`)
-      /* 会话根那份**内容一个字不动**，但版本标记还是跟上 —— 页面上「注入本提示词 RULES.md」的
-       * 说明行显示的就是它（"当前内容对应：v…"）。`follow: false` = 只记版本、绝不覆盖内容。 */
-      try { syncRulesVersion(root, PLUGIN_VERSION, { follow: false }) } catch { /* 只记版本，失败无所谓 */ }
-      /* 版本提示（`版本提示.md`，用户 2026-10-08 从硬编码提示词挪成文件）：与 RULES.md 同一套
-       * 「随版本更新」语义，标记独立（`config.json` 的 `versionPromptVersion`）。 */
-      const vpsync = syncVersionPrompt(root, PLUGIN_VERSION, { follow: workspaceConfigValues(root).rulesFollowVersion !== false })
-      if (vpsync.action === 'replaced') logLine(`插件已更新到 v${vpsync.to}：「随版本更新」开启 → 版本提示已替换为新版本默认内容（原为 v${vpsync.from}）`)
-      else if (vpsync.action === 'created') logLine(`已写入默认版本提示：${versionPromptPath(root)}（v${vpsync.to}）`)
-      else if (vpsync.error) logLine(`版本提示同步失败（不影响使用）：${vpsync.error}`)
-      seededRoots.add(root)   // 只在全部成功后记账（失败本进程还会重试）
-      return true
-    } catch (e) { logLine(`初始化记忆目录失败（${root}）：${e.message}`); return false }
-  }
-
-  /** 同上，但按 agent 取工作区（活 agent 路径：首次发起 MC 模式会话时用） */
   const ensureMemoryRoot = (agent) => ensureMemoryRootForCwd(workspaceOf(agent), noteAgent(agent))
 
   /* ─────────── MC 模式：权限隔离 + 专属指导（用户 2026-09-16 要求）───────────
@@ -4823,6 +4586,34 @@ export function apply(ctx, rawConfig) {
   /** MC+ 变体判据（MC 模式基础上开放标准模式全部工具）；名单与语义见 src/config.mjs isMcPlusPreset */
   const isMcPlusAgent = (agent) => pluginConfig.isMcPlusPreset(mcPresetIdOf(agent))
 
+  /* ── 提示词注入 / 通知台账 / 记忆根播种 ─────────────────────────────────
+   * 原来这几摊子就写在这儿（666 行），2026-10-20 搬进了 `src/inject.mjs`：
+   * 它和"工具"没关系，讲的是"该不该塞提示词 / 哪些指令发过了 / 新会话播种哪些文件"。
+   * 工厂拿的是**这个闭包里的**配置与记忆根，所以状态仍是每插件实例一份。
+   * 🔴 调用点必须在这儿：`agentPresetsSvc` / `isMcModeAgent` / `isMcPlusAgent` /
+   *    `MC_PLUS_NOTICE_TEXT` 都在上面才声明（早于它们会 TDZ）。
+   * ------------------------------------------------------------------ */
+  const {
+    SESSION_SEED_FILES, ensureMemoryRootForCwd, enterWithNotices,
+    memoryIndexText, promptInjectionStatus, reconcileNotices,
+    seedSessionRoot, sentNoticeRels, withdrawAgentsMdNotices,
+    memLabelOf, ensureAgentsMdFile, rulesPointerText,
+  } = createInjector({
+        DEFAULT_AGENTS_MD, MC_PLUS_NOTICE_TEXT, PLUGIN_VERSION,
+        VERSION_PROMPT_FILE, agentIdOf, agentPresetsSvc,
+        agentsMdPath, isMcModeAgent, isMcPlusAgent,
+        lastPresetSeen, logDebug, logLine,
+        logOnce, mcPresetDir, memoryBaseFor,
+        memoryFor, memoryRootFor, migrateLegacyAgentsMd,
+        migrateWorkspaceConfig, noteAgent, pluginConfig,
+        pluginLoadNote, readAgentsMd, readVersionPrompt,
+        syncRulesVersion, syncVersionPrompt, userMessage,
+        versionPromptPath, versionPromptSource, versionPromptText,
+        versionPromptTitle, workspaceConfigValues, workspaceOf,
+        workspaceRootFor, wsCfgValues,
+  })
+
+
   /**
    * 看门狗的**模式闸门**：只有"仍然是 MC 模式"的会话才允许它往会话里注入。
    *
@@ -4959,13 +4750,15 @@ export function apply(ctx, rawConfig) {
     try {
       const t = scopedTools(agent.ctx)
       if (!t) { mcPolicyKind.delete(agent); logLine('MC 模式：拿不到 scoped tools，跳过可见性限制（guard 仍会硬拒，下次再试）'); return }
-      const { allowOtherTools, hideAdminTools } = pluginConfig.mcMode
+      const { allowOtherTools, hideAdminTools, allowCompanionTools } = pluginConfig.mcMode
       const adminNames = ourToolNames.filter((n) => n.startsWith('mc_admin_'))
       const wanted = [
         ...ourToolNames.filter((n) => !n.startsWith('mc_admin_')),
         ...(hideAdminTools ? [] : adminNames),
         ...MC_FILE_TOOLS,
         MC_PRESENT_TOOL,
+        // 配套插件（ACP / billion-context 那族）默认放行 —— 用户 2026-10-19 要的"装完就能用"
+        ...(allowCompanionTools === false ? [] : MC_COMPANION_TOOLS),
         ...allowOtherTools,
       ]
       // 🔴 `tools.restrict()` 对**不认识的工具名是抛错**的（宿主 index.ts:1078 拿 restrictableNames 校验）。
@@ -5233,12 +5026,12 @@ export function apply(ctx, rawConfig) {
     description: '【管理】读写 dsh-mc-agent 的**全局配置**（指令白名单、MC 模式工具暴露、记忆目录…）。\n'
       + '⚠️ **MC 模式会话调不动它**（在普通会话或 MC+ 模式里改）。\n'
       + 'action：\n'
-      + '· get（默认）看生效配置（给 path 看单项）\n'
-      + '· set 改一项（path + value）· unset 删一项（回默认）· reset 全恢复默认 · list 默认值 + 生效值\n'
+      + '· get（默认）· set（path+value）· unset · reset · list（默认+生效）\n'
       + '可用键：`commandWhitelist`（数组；"tp" 精确、"/^gi.*/" 正则、"*" 全放行）· '
       + '`mcModePresets`（哪些 preset 算 MC 模式，应含 MC+ 的 id）· `mcPlusPresets`（MC+ 变体：开放全部工具）· '
-      + '`mcMode.allowOtherTools`（MC 模式**额外**放行的工具）· '
-      + '`mcMode.hideAdminTools`（默认 true）· `expressEnabled`（文件分享开关）· '
+      + '`mcMode.allowOtherTools`（MC 模式**额外**放行的工具）· `mcMode.allowCompanionTools`（配套插件工具，默认 true：compress/decompress/acp_* 那族）· '
+      + '`mcMode.hideAdminTools`（默认 true）· `stopOnDanger`（true = 遇险打断动作；默认 false 只提醒）· '
+      + '`expressEnabled`（文件分享开关）· '
       + '`expressBase`（分享 base，如 https://example.com）· `memoryDir`（记忆根目录）· '
       + '`memoryPerSession`（true = 每会话一份独立记忆 `<memoryDir>/sessions/<短会话 id>/`，看不到别的会话；'
       + '默认 false = 共用一份）。\n'
@@ -5341,9 +5134,9 @@ export function apply(ctx, rawConfig) {
     name: 'mc_diag',
     /* 🔴 2026-10-17（用户实机：`mc_diag` 一次输出几万字符，AI 只想知道其中一节）：
      *    加 `only` 分节。同时把描述压短腾出 token 预算（`check-token-budget` 只剩几十字符余量）。 */
-    description: '诊断：机器人内部状态（物理/控制位/收包/事件/合成窗口）+ 提示词注入 + 性能监测（`perf`）。**输出很大**，用 `only` 只取需要的节。',
+    description: '诊断：机器人内部状态 + 提示词注入 + 性能（`perf`）。**输出很大** —— 默认只给 state+connection，别的节用 `only` 点名。',
     parameters: {
-      only: { type: 'string', description: '只取这几节（逗号分隔）：state/perf/crafting/scheduler/watching/prompt/terrain/workers/connection' },
+      only: { type: 'string', description: '只取这几节（逗号分隔）：state/perf/crafting/scheduler/watching/prompt/terrain/workers/connection；`all` = 全给' },
       resetPerf: { type: 'boolean', description: '顺手清空性能样本（换场景重测用）' },
     },
     output: text(),
@@ -5415,7 +5208,22 @@ export function apply(ctx, rawConfig) {
         connection: ['connection'],
       }
       const asked = String(args?.only ?? '').split(/[,，\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean)
-      if (!asked.length) return full
+      /* 🔴 2026-10-20 审计（用户："减少 token 消耗"）：以前**不传 `only` ⇒ 原样全给**，
+       *    可整份输出上万字符，而 AI 十次里有九次只想知道"我在不在线 / 在不在水里"。
+       *    现在缺省只给 `state` + `connection`（这两节回答了绝大多数问题），
+       *    并把可选的节名列在 `availableSections` 里 —— AI 看得见还差什么，再点名要。
+       *    想要老行为（一次全给）就 `only:"all"`。 */
+      if (!asked.length || asked.includes('all')) {
+        if (asked.includes('all')) return full
+        const def = {}
+        const keepDef = new Set(['online', 'version', 'position', 'mode', 'connection',
+          ...(ONLY_GROUPS.state ?? [])])
+        for (const k of Object.keys(full)) if (keepDef.has(k)) def[k] = full[k]
+        def.defaultSections = ['state', 'connection']
+        def.availableSections = Object.keys(ONLY_GROUPS)
+        def.hint = '默认只给 state + connection；别的节用 only 点名（逗号分隔），要全部就 only:"all"'
+        return def
+      }
       const keep = new Set(['online', 'version', 'position', 'mode'])
       const unknown = []
       for (const name of asked) {

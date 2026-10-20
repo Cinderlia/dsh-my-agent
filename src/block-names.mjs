@@ -177,3 +177,13 @@ export function cropStageOf (name, props) {
   if (!Number.isFinite(age)) return null
   return { age, maxAge, ripe: age >= maxAge }
 }
+
+/** 放下去变成**实体**的物品（船 / 矿车 / 刷怪蛋 / 盔甲架 / 末影水晶）。
+ *
+ * 🔴 2026-10-20 实机：这些**不能用** `placeBlock` / `activateBlock` 放 —— mineflayer 的
+ *    `lib/plugins/place_entity.js` 要先 `_genericPlace()` 再**补发一个 `use_item` 包**，
+ *    少发后面那个，服务端就当"空手右键"，永远不生成（用户报的"船放不出来"）。
+ *    放在这个叶子模块里，`place.mjs`（负责放）和 `world-use.mjs`（负责提示）都能 import，
+ *    不会绕出循环依赖。 */
+export const ENTITY_ITEM_RE = /(boat|raft|minecart|spawn_egg|end_crystal|armor_stand)$/i
+export const isEntityItem = (name) => Boolean(name) && ENTITY_ITEM_RE.test(String(name))

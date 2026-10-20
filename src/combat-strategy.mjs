@@ -25,8 +25,6 @@ export const HEALTH_CRITICAL = 8
 export const HEALTH_LOW = 12
 /** 近战攻击距离（`mineflayer-pvp` 默认 3.5 格） */
 export const MELEE_RANGE = 3.5
-/** 手能够到的距离（没有 pvp 时原地挥拳用） */
-export const REACH_RANGE = 4.5
 /** 远程威胁：这个距离内的远程怪算"它够得着我" */
 export const RANGED_THREAT_RANGE = 12
 /**
@@ -129,13 +127,8 @@ export const REPOSITION_MAX = 2
 export const COMBAT_PHASE_MS = 1_200
 /** 两次换武器之间至少隔多久（换装本身要花时间） */
 export const EQUIP_COOLDOWN_MS = 1_500
-/** 撤退时往反方向走多远 */
-export const RETREAT_DISTANCE = 8
 /** 撤退最多试几次（走不动就如实说，不无限试） */
 export const RETREAT_TRIES = 2
-
-/** 战斗状态机的状态（用户方案里的七个） */
-export const COMBAT_STATES = ['assess', 'engage', 'reposition', 'defend', 'retreat', 'recover', 'complete']
 
 /**
  * 机器可读的战斗结局（用户方案里的七个）。
@@ -147,13 +140,12 @@ export const COMBAT_STATES = ['assess', 'engage', 'reposition', 'defend', 'retre
  *    意思不同，读的人只能靠猜。现在 `outcomeOf()` 会把 `combat` **翻译**成统一结局，
  *    两个字段各说各的、都能看见。
  */
-export const COMBAT_OUTCOMES = ['damaged', 'killed', 'retreated', 'unreachable', 'aborted', 'timeout', 'unknown']
+export const COMBAT_OUTCOMES = ['damaged', 'killed', 'unreachable', 'aborted', 'timeout', 'unknown']
 
 /** 结局 → 给人看的一句话（模型不用去猜 `outcome` 这个词什么意思） */
 export const COMBAT_OUTCOME_TEXT = {
   damaged: '⚔️ 打到了，但没打死',
   killed: '✅ 打死了',
-  retreated: '🏃 主动撤了',
   unreachable: '🚧 够不着',
   aborted: '🛑 被打断',
   timeout: '⏱ 这一轮时间到了',
@@ -195,12 +187,6 @@ export function weaponScoreOf (name) {
 /** 是盾牌吗（用户点名：没有盾牌就别进"靠盾硬顶"的策略） */
 export function isShield (name) {
   return /(^|_)shield$/.test(String(name ?? '').trim().toLowerCase())
-}
-
-/** 是弓/弩吗（有箭才算真能远程；这里只认"手里有这件东西"） */
-export function isRangedWeapon (name) {
-  const n = String(name ?? '').trim().toLowerCase()
-  return n === 'bow' || n === 'crossbow'
 }
 
 /**
@@ -510,13 +496,12 @@ export function chooseStrategy (s, mem = {}) {
  *
  * 判据全部来自**证据**（掉血、实体消失、被中断、预算耗尽），不来自自然语言。
  *
- * @param {{ killed?:boolean, gone?:boolean, sawDamage?:boolean, retreated?:boolean,
+ * @param {{ killed?:boolean, gone?:boolean, sawDamage?:boolean,
  *           unreachable?:boolean, aborted?:boolean, timedOut?:boolean }} r
  */
 export function combatOutcomeOf (r = {}) {
   if (r.killed === true) return 'killed'
   if (r.aborted === true) return 'aborted'
-  if (r.retreated === true) return 'retreated'
   if (r.unreachable === true) return 'unreachable'
   /* 🔴 审计 F5：`timedOut` 必须排在 `sawDamage` 前面。攻击循环结束那一刻常同时带着
    *    「打中过」和「时间到了」；以前先判 damaged ⇒ 报"打到了"、被判成功，
@@ -530,33 +515,6 @@ export function combatOutcomeOf (r = {}) {
 /** 结局 → 给人看的一句话（找不到就用 `unknown` 那句） */
 export function combatOutcomeText (outcome) {
   return COMBAT_OUTCOME_TEXT[outcome] ?? COMBAT_OUTCOME_TEXT.unknown
-}
-
-/**
- * 撤退点：从"我"出发，朝**背离目标**的方向走 `RETREAT_DISTANCE` 格。
- *
- * 为什么不做寻路/找掩体：那是第二套移动控制器（用户明令禁止）。
- * 这里只算一个坐标，真正的移动交给现成的 `walkTo`（它自己有进度监控和脱困阶梯）。
- *
- * @returns {{x:number,y:number,z:number}|null} 算不出（我和目标重合）就回 null
- */
-export function retreatPointOf (me = {}, target = {}, distance = RETREAT_DISTANCE) {
-  const mx = Number(me.x); const my = Number(me.y); const mz = Number(me.z)
-  const tx = Number(target.x); const tz = Number(target.z)
-  if (![mx, my, mz, tx, tz].every(Number.isFinite)) return null
-  let dx = mx - tx; let dz = mz - tz
-  let len = Math.hypot(dx, dz)
-  if (len < 0.5) {
-    /* 和目标重叠（或者就在脚下）—— 没有"背离"方向可算，随便挑一个，
-     * 但**必须**挑一个：回 null 会让"撤退"变成"原地不动"。 */
-    dx = 1; dz = 0; len = 1
-  }
-  const k = distance / len
-  return {
-    x: Math.round((mx + dx * k) * 100) / 100,
-    y: Math.round(my),
-    z: Math.round((mz + dz * k) * 100) / 100,
-  }
 }
 
 /**

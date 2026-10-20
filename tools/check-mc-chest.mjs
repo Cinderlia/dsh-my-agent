@@ -6,7 +6,7 @@
  *   ③ 文本：背包概览 / 箱子概览 / listText 的两条分支 / hintFor
  *   ④ 端到端 put：点名物品、count 截断、all:true、keep 留一手、没有→报错+建议
  *   ⑤ 端到端 take：点名物品、count 截断、all:true、空箱子、箱子里没有→报错+建议、背包满
- *   ⑥ 放箱子：附近没有→自己放（placeChest:false 可关）、放不下→说清、dryRun 只出计划
+ *   ⑥ 放箱子：附近没有→只报缺（**不替 AI 放**，用户 2026-10-19）、dryRun 只出计划
  *   ⑦ 边界：开不开、action 写错、put/take 既没 name 也没 all、搬完复核
  * 不连 MC、不需要 DSH。**必须在包目录里跑**（core.mjs 要真 import 到 mineflayer）。
  * 跑法：cd <profile>/node_modules/dsh-mc-agent && node tools/check-mc-chest.mjs
@@ -225,7 +225,7 @@ console.log('— ① 工具注册 —')
   ok(Boolean(spec), '注册了 mc_chest')
   ok(typeof spec.execute === 'function', '有 execute')
   ok(spec.timeoutMs > 0 && spec.timeoutMs <= 300_000, 'timeoutMs 是合理正数', String(spec.timeoutMs))
-  for (const k of ['action', 'name', 'count', 'all', 'keep', 'x', 'y', 'z', 'radius', 'placeChest', 'dryRun']) {
+  for (const k of ['action', 'name', 'count', 'all', 'keep', 'x', 'y', 'z', 'radius', 'dryRun']) {
     ok(Boolean(spec.parameters[k]), `parameters.${k} 存在`)
   }
   ok(spec.parameters.name.type === 'string', 'parameters.name 是 string')
@@ -286,7 +286,7 @@ console.log('— ③ 文本 —')
   ok(noBox.includes('mc_craft'), 'listText：没箱子也没存货 → 建议做一个')
   const f3 = mkBot({ chest: 1 }, { world: mkWorld({}) })
   const t3 = listText(f3.bot, { radius: 8 })
-  ok(t3.includes('背包里有 chest×1') && t3.includes('placeChest:true'), 'listText：附近没箱子但背包有 → 说会自己放', t3.split('\n').join(' | '))
+  ok(t3.includes('背包里有 chest×1') && t3.includes('我不替你放'), 'listText：附近没箱子但背包有 → 说"不替你放"', t3.split('\n').join(' | '))
   const f4 = mkBot({}, { world: mkWorld({ '2,1,0': 'chest', '6,1,6': 'barrel' }) })
   const t4 = listText(f4.bot, { radius: 16 })
   ok(t4.includes('chest @ (2,1,0)') && t4.includes('barrel @ (6,1,6)'), 'listText 列位置', t4.split('\n').join(' | '))
@@ -417,37 +417,22 @@ console.log('— ⑤ 端到端 take —')
 /* ─────────────────────── ⑥ 放箱子 / dryRun ─────────────────────── */
 console.log('— ⑥ 放箱子 / dryRun —')
 {
-  // 附近没有 + 背包有 → 自己放
+  // 附近没有 + 背包有 → 只报缺，不自己放（用户 2026-10-19：「把自动放的功能去掉」）
   {
     const f = mkBot({ chest: 1, iron_ingot: 5 }, { world: mkWorld({ '1,1,0': 'grass_block', '1,0,0': 'grass_block' }), pos: { x: 0.5, y: 1, z: 0.5 } })
     const mc = mkMc(f)
     const r = await run({ action: 'put', name: 'iron_ingot' }, { mc })
-    ok(mc.placeCalls.length === 1 && mc.placeCalls[0].name === 'chest', '附近没箱子 → 自己放一个', JSON.stringify(mc.placeCalls))
-    ok(r.text.includes('放到'), '报告里说明自己放了', r.text.split('\n').join(' | '))
-    ok(logs.some((l) => l.includes('mc_chest：自动放了 chest')), '日志记了自己放箱子')
+    ok(mc.placeCalls.length === 0, '🔴 附近没箱子也不自己放（用户 2026-10-19）', JSON.stringify(mc.placeCalls))
+    ok(r.text.includes('我不替你放'), '报告里说清"我不替你放"', r.text.split('\n').join(' | '))
+    ok(/mc_act .*place/.test(r.text), '教它自己 mc_act place 放箱子', r.text.split('\n').join(' | '))
   }
-  // 没东西可搬 → 不要白放一个箱子（先查背包再找箱子）
+  // 没东西可搬 → 直接说背包里没有（先查背包再找箱子）
   {
     const f = mkBot({ chest: 1 }, { world: mkWorld({ '1,1,0': 'grass_block', '1,0,0': 'grass_block' }), pos: { x: 0.5, y: 1, z: 0.5 } })
     const mc = mkMc(f)
     const r = await run({ action: 'put', name: 'iron_ingot' }, { mc })
     ok(r.text.includes('背包里没有'), '没东西可搬 → 直接说背包里没有', r.text.split('\n').join(' | '))
-    ok(mc.placeCalls.length === 0, '🔴 没东西可搬就不要白放一个箱子', JSON.stringify(mc.placeCalls))
-  }
-  // placeChest:false → 不自己放，教它做
-  {
-    const f = mkBot({ chest: 1, iron_ingot: 5 }, { world: mkWorld({}), pos: { x: 0.5, y: 1, z: 0.5 } })
-    const mc = mkMc(f)
-    const r = await run({ action: 'put', name: 'iron_ingot', placeChest: false }, { mc })
-    ok(mc.placeCalls.length === 0, 'placeChest:false → 不放')
-    ok(r.text.includes('mc_craft') && r.text.includes('chest'), '教它 mc_craft {name:"chest"}', r.text.split('\n').join(' | '))
-  }
-  // 放不下（假服务器拒了）
-  {
-    const f = mkBot({ chest: 1 }, { world: mkWorld({ '1,1,0': 'grass_block', '1,0,0': 'grass_block' }), pos: { x: 0.5, y: 1, z: 0.5 } })
-    const mc = mkMc(f, { placeFails: true })
-    const r = await run({ action: 'put', name: 'chest' }, { mc })
-    ok(r.text.includes('没成功') || r.text.includes('失败'), '放箱子失败 → 如实说', r.text.split('\n').join(' | '))
+    ok(mc.placeCalls.length === 0, '🔴 没东西可搬更不该放箱子', JSON.stringify(mc.placeCalls))
   }
   // dryRun
   {
@@ -575,13 +560,13 @@ console.log('— ⑧ count 是总数 / 简称 / 给了坐标就别另放箱子 �
     ok(/没有\*\*另放|我\*\*没有\*\*另放/.test(r.text), '明确说"我没有另放新箱子"', r.text.split('\n').join(' | '))
     ok(String(f.bot.inventory.count(idOf('chest'))) === '1', '背包里的箱子还在（没被放掉）', String(f.bot.inventory.count(idOf('chest'))))
   }
-  // H6：没给坐标时，照旧可以自己放（别误伤）
+  // H6：没给坐标时也不自己放（用户 2026-10-19）—— 报缺 + 教它自己放
   {
     const f = mkBot({ chest: 1 }, { world: mkWorld(), pos: near() })
     const mc = mkMc(f, { win: mkChestWin(f, {}) })
     const r = await run({ action: 'put', name: 'chest', count: 1 }, { mc })
-    ok(mc.placeCalls.length === 1, '没给坐标 ⇒ 照旧自己放一个（这条别误伤）', JSON.stringify(mc.placeCalls))
-    ok(/放到/.test(r.text), '报告里说明放了箱子', r.text.split('\n').join(' | '))
+    ok(mc.placeCalls.length === 0, '🔴 没给坐标也不自己放（用户 2026-10-19）', JSON.stringify(mc.placeCalls))
+    ok(/我不替你放/.test(r.text), '报告里说清"我不替你放"', r.text.split('\n').join(' | '))
   }
   // H6：给的坐标是空/没加载 ⇒ 也如实说，并列出附近真实的箱子
   {

@@ -44,14 +44,11 @@ export const LOOP_LIMIT = 3
 /** 历史条目上限（每个任务） */
 export const HISTORY_KEEP = 40
 
-export const STATUSES = ['running', 'waiting', 'paused', 'blocked', 'failed', 'done', 'cancelled']
 /** "还在做"的状态（`current()` 只认这些） */
 export const LIVE_STATUSES = ['running', 'waiting', 'paused', 'blocked']
 
 /* ── 目标 / 步骤的数据模型（2026-10-14 用户"任务驱动"设计第一步） ── */
 
-/** 目标类型：`type` 是"要达成什么"，`kind` 是"怎么干"（一个 kind 只对应一种 type） */
-export const GOAL_TYPES = ['obtain_item', 'reach', 'kill', 'custom']
 /** 步骤状态（`skipped` 也算走完了） */
 export const STEP_STATUSES = ['pending', 'running', 'done', 'failed', 'skipped']
 /** 单步重试上限：超了把任务标 `blocked` 等指示（和 `LOOP_LIMIT` 同一个语义） */
@@ -101,24 +98,6 @@ export function goalSpecOf (t) {
     count: n == null ? null : Number(n),
     unit: t?.progress?.unit ?? '个',
   }
-}
-
-/**
- * 这类活的步骤骨架（**只写形状**，材料链条仍然交给 `mc_craft` / `mc_furnace` 的规划器，不在这里重写）。
- * 🔴 现在**没有**任何地方自动套用这张表：等第二步的执行器上来，由它 `setSteps()` 填。
- */
-const STEP_TEMPLATE = {
-  dig: ['locate', 'approach', 'dig', 'pickup', 'verify'],
-  craft: ['check-inventory', 'gather-materials', 'craft', 'verify'],
-  smelt: ['check-inventory', 'fuel', 'load', 'wait', 'take', 'verify'],
-  chest: ['find-container', 'transfer', 'verify'],
-  move: ['plan-route', 'walk', 'arrive'],
-  attack: ['locate', 'engage', 'confirm'],
-}
-
-export function defaultSteps (kind = null) {
-  const ids = STEP_TEMPLATE[String(kind ?? '').toLowerCase()] ?? null
-  return ids ? ids.map((id) => ({ id, status: 'pending', attempts: 0 })) : []
 }
 
 /** 把外来的步骤数组洗干净（字符串也认；认不出的一律丢掉，别把假数据记进台账） */
@@ -294,7 +273,6 @@ export function taskBrief (t) {
  *   · failed    —— 明确被拒/明确没做成（没有工具、够不着、服务端复原、NoPath…）
  *   · unknown   —— 时间到/被抢占/超时，读不到证据（**服务器可能已经做了**）
  */
-export const OUTCOMES = ['confirmed', 'failed', 'unknown']
 export const OUTCOME_LABEL = { confirmed: '已确认成功', failed: '动作失败', unknown: '结果未知', stale: '这一步作废了' }
 
 /** 把一个动作的返回值判成四种结局之一（判不出就如实说 unknown，绝不硬判成成功） */
@@ -319,18 +297,18 @@ export function outcomeOf (res, { expect = null } = {}) {
   if (r.stale === true) return 'stale'
 
   /* 🔴 战斗策略层（2026-10-17）：`attack()` 自带一个**战斗结局** `combat`
-   *    （`damaged` / `killed` / `retreated` / `unreachable` / `aborted` / `timeout` / `unknown`）。
+   *    （`damaged` / `killed` / `unreachable` / `aborted` / `timeout` / `unknown`）。
    *    它**故意不叫 `outcome`** —— 那个键是跨工具的统一结局，被它占了以后
    *    `withOutcome()` 会原样放过（`index.js:1989`），AI 就再也看不到"这事成没成"。
    *    这里把战斗结局**翻译**成统一结局，两个字段各说各的、都能看见。
-   *    排在最前面：`retreated` 是**做到了我想做的事**，不能被下面那条
-   *    "够不着 / NoPath"的文本正则误判成失败（撤退时 note 里常常带"走不过去"）。 */
+   *    （2026-10-20 审计：`retreated` 这个结局已删 —— 策略层没有否决权，
+   *    攻击循环永远不会"自己撤"，所以那一路是死分支。） */
   if (r.combat != null) {
     const c = s(r.combat)
     /* 🔴 审计 F5：`damaged` 只是"打中了一下"，不是"打死了"。它以前被翻成 confirmed ⇒
      *    任务执行器把这一步记成 done，AI 以为怪没了、背身走开被咬死。
-     *    `retreated` 例外：撤退是**主动做到了想做的事**。 */
-    if (c === 'killed' || c === 'retreated') return 'confirmed'
+     *    只有 `killed` 才算真的做成了。 */
+    if (c === 'killed') return 'confirmed'
     if (c === 'unreachable') return 'failed'
     return 'unknown'   // damaged / aborted / timeout / unknown：可能已经打中了，但没打完
   }
@@ -342,6 +320,9 @@ export function outcomeOf (res, { expect = null } = {}) {
   /* 🔴 报告 H4（2026-10-13）：`placeBlock` 只在"放完复核没过"时回 `placed:false`（`place.mjs:189`），
    *    那是明确失败 —— 以前它落到最后变成"结果未知"，模型会以为还有机会。 */
   if (r.placed === false) return 'failed'
+  /* 🔴 2026-10-19：`useBlock` 等 1.2 秒窗口没弹出来 = 明确没成（够不着/被占/位置读错），
+   *    不是"服务器可能已经做了"。`opened:false` 自己带着解释 note，这里只补结局。 */
+  if (r.opened === false) return 'failed'
   /* 🔴 审计 F2：**结构化**的"时间到 / 被抢占"必须排在下面那条**文本**失败正则之前。
    *    原来顺序反了 ⇒ `mc_move` 带着 `{mcTimeout:true}` 回来时，只要 note 里出现"够不着"
    *    之类字样就先被判成 'failed'，"结果未知"那条永远走不到。 */
@@ -364,6 +345,13 @@ export function outcomeOf (res, { expect = null } = {}) {
   /* 🔴 审计 F1：`mc_dig` 回的是字符串数组（`index.js` 里包成 `{result, text}`），
    *    没有 `dug`/`broken` 这类字段 ⇒ 挖成功了也一路掉到"结果未知"，被任务执行器记成失败。
    *    它唯一的成功证据就是这一句（`mining.mjs` 只在**收到服务端破坏包**时才写）。 */
+  /* 🔴 2026-10-19 实机（真 bug）：`useBlock` 对容器类方块的**唯一硬证据**就是
+   *    `opened: "minecraft:crafting"`（窗口真的弹出来了）；门/按钮/拉杆那边是 `toggled: true`
+   *    （方块状态真的翻了）。这里以前没有这两条 ⇒ `mc_act {mode:"use"}` 对合成台/箱子/门
+   *    一律被判成"结果未知（服务器可能已经做了）"，模型以为没开成、可能白重做一遍。
+   *    `opened: false` / `toggled: false` 走 ① 的失败侧（它们都带 note 说明为什么没成）。 */
+  if (typeof r.opened === 'string' && r.opened.length > 0) return 'confirmed'
+  if (r.toggled === true) return 'confirmed'
   if (/（服务端已确认/.test(blob)) return 'confirmed'
   if (Array.isArray(r.dug) && r.dug.length > 0) return 'confirmed'
   if (pos(r.dug) > 0 || pos(r.placed) > 0 || pos(r.got) > 0) return 'confirmed'

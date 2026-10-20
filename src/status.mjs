@@ -15,6 +15,7 @@
  */
 import { isLiquid } from './block-names.mjs'
 import { inWaterNow } from './world-observer.mjs'
+import { readBossBars } from './bossbar.mjs'
 
 /**
  * 给前端 / 工具看的**连接信息**：只有地址三件套。
@@ -61,6 +62,9 @@ export function statusOf (b, ctx = {}) {
     }
   }
   const p = b.entity.position
+  /* 🔴 2026-10-19：末影龙/凋灵的血**不进**实体元数据（`entitiesNear()` 读不到），
+   *    只在 Boss Bar 包里。这里带上，`mc_status` 就能一眼看到打龙打到几成。 */
+  const bossBars = readBossBars(b)
   return {
     online: true, sub: ctx.sub, connection,
     position: { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) },
@@ -85,5 +89,6 @@ export function statusOf (b, ctx = {}) {
         return isLiquid(b.blockAt(eye)?.name)
       } catch { return false }
     })(),
+    ...(bossBars.length ? { bossBars } : {}),
   }
 }

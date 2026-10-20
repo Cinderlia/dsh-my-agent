@@ -24,6 +24,7 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { mkdtempSync, rmSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { tmpdir, homedir } from 'node:os'
 
 // ── 断言小工具（和别的 check-*.mjs 一致）────────────────────────────────────────
@@ -422,6 +423,19 @@ section('⑦ 采集任务卡死（cancelTask 永远等不到 collectBlock_finish
     `cleared=${fake.calls.cleared}`)
   ok(ms < 4000, '清队列不会把这一轮拖爆', `${ms}ms`)
   ok(r?.via === 'pathfinder', '清完照样继续走路', String(r?.via))
+}
+
+section('⑧ 只给坐标时 count 不生效（否则第二格会去挖"空气"）')
+{
+  /* 背景（2026-10-19 实机）：`mc_dig {x,y,z,count:2}` 的第二格，`want` 取的是
+   * `blockAt(pos).name` —— 而那格刚被挖空，读回来是 `air`，于是 `findBlocks` 抓一堆**空气**
+   * 当目标，返回里就成了"（12,-60,28）已经不在了"。指定坐标的语义本来就是"挖这一格"。
+   * 这里用源码断言钉死（跑真 bot 的整条链太重，而这两处的形状就是判据本身）。 */
+  const src = await readFile(new URL('../src/mining.mjs', import.meta.url), 'utf8')
+  ok(/const n = Math\.min\(Math\.max\(pos \? 1 : count, 1\), 16\)/.test(src),
+    '🔴 给了 pos 时 n 强制成 1（count 不再去找空气）')
+  ok(!/const want = name \?\?/.test(src),
+    '🔴 不再用"pos 那格的方块名"当第二个目标（那格已经挖空了）')
 }
 
 /* ─────────── 收尾 ─────────── */

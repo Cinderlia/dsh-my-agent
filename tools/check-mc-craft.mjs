@@ -310,8 +310,7 @@ console.log('— ① 工具注册 —')
   ok(spec.parameters && spec.parameters.name && spec.parameters.name.type === 'string', 'parameters.name 是 string')
   ok(spec.parameters.count && spec.parameters.count.type === 'number', 'parameters.count 是 number')
   ok(spec.parameters.table && spec.parameters.table.type === 'boolean', 'parameters.table 是 boolean')
-  ok(spec.parameters.placeTable && spec.parameters.placeTable.type === 'boolean', 'parameters.placeTable 是 boolean')
-  ok(spec.parameters.list && spec.parameters.list.type === 'boolean', 'parameters.list 是 boolean')
+    ok(spec.parameters.list && spec.parameters.list.type === 'boolean', 'parameters.list 是 boolean')
   ok(spec.parameters.dryRun && spec.parameters.dryRun.type === 'boolean', 'parameters.dryRun 是 boolean')
   ok(spec.output && spec.output.schema && spec.output.schema.additionalProperties === true, 'output.schema 带 additionalProperties')
   const blocks = spec.output.render({}, { text: 'hi' })
@@ -381,6 +380,16 @@ console.log('— ③ 名字解析 —')
   ok(ambLog.item.name === 'oak_log', 'log 有歧义 → 选背包里有的 oak_log')
   const birchOnly = mkBot({ birch_log: 2 })
   ok(resolveItem(birchOnly.bot, 'planks').item.name === 'birch_planks', '只有桦木原木时 planks → birch_planks（不是按字母猜）')
+  /* 🔴 2026-10-19 实机：背包有 oak_planks×5（**但 oak_log 为 0，做不出来**）和 birch_log×4（能做 12 块），
+   * `{name:"planks", count:12}` 却按"背包里有"选了 oak_planks ⇒ 直接报"原料不够：oak_log 需要 2、有 0"。
+   * 判据改成"**够用 或 做得出**"优先。 */
+  {
+    const mix = mkBot({ oak_planks: 5, birch_log: 4 })
+    const t12 = resolveItem(mix.bot, 'planks', null, 12)
+    ok(t12.item.name === 'birch_planks', '要 12 块时选"做得出"的桦木，不是"有 5 块但缺料"的橡木', t12.item.name)
+    const t1 = resolveItem(mix.bot, 'planks', null, 1)
+    ok(t1.item.name === 'oak_planks', '只要 1 块时仍选背包里已有的（够用就行）', t1.item.name)
+  }
   throws('未知物品 → 抛错并提示写英文 id', () => resolveItem(mkBot({}).bot, 'xyzzy'), /没有叫/)
   throws('空名字 → 抛错', () => resolveItem(mkBot({}).bot, '  '), /要合成什么/)
   const nothing = mkBot({})
@@ -484,7 +493,7 @@ console.log('— ⑥ 端到端 execute —')
     const f = mkBot({ oak_log: 3, crafting_table: 1 })
     const mc = mkMc(f)
     const r = await run({ name: 'wooden_pickaxe', dryRun: true }, { mc })
-    ok(r.text.includes('合成计划'), 'dryRun 出计划', r.text)
+    ok(r.text.includes('合成计划') || r.text.includes('需要工作台'), 'dryRun：能排计划就出计划、缺工作台就如实报（不偷放）', r.text)
     ok(f.calls.length === 0, 'dryRun 没有真的合成')
     ok(f.counts.get(idOf('oak_log')) === 3, 'dryRun 没动物品')
     ok(mc.placeCalls.length === 0, 'dryRun 不真放工作台', JSON.stringify(mc.placeCalls))
@@ -510,30 +519,20 @@ console.log('— ⑥ 端到端 execute —')
     ok(r.text.includes('工作台：(1,1,0)'), '结果里写了用的哪个工作台', r.text)
     ok(mc.placeCalls.length === 0, '附近已有工作台 → 不再放')
   }
-  // 自动放工作台（背包里有）
+  // 默认**不**自动放工作台（用户 2026-10-19：「不要自动放工作台」「尽量让 ai 控制」）
   {
     const f = mkBot({ oak_log: 3, crafting_table: 1 })
     const mc = mkMc(f)
-    const r = await run({ name: 'wooden_pickaxe' }, { mc })
-    ok(mc.placeCalls.length === 1 && mc.placeCalls[0].name === 'crafting_table', '自己把工作台放到了脚边', JSON.stringify(mc.placeCalls))
-    ok(f.counts.get(idOf('wooden_pickaxe')) === 1, '放下后合出了木镐')
-    ok(r.text.includes('放到'), '结果里说明自己放了工作台', r.text)
-    ok(f.world.get(1, 1, 0) === 'crafting_table', '世界里真的出现了工作台')
+    const r0 = await run({ name: 'wooden_pickaxe' }, { mc })
+    ok(mc.placeCalls.length === 0, '🔴 默认不放工作台（用户 2026-10-19：「把自动放的功能去掉」）', JSON.stringify(mc.placeCalls))
+    ok(r0.text.includes('需要工作台'), '默认不放时如实说"缺工作台"，不偷偷放', r0.text)
   }
-  // 想放但放不下 → 报"需要工作台"而不是崩
-  {
-    const f = mkBot({ oak_planks: 3, stick: 2, crafting_table: 1 })
-    const mc = mkMc(f, { placeFails: true })
-    const r = await run({ name: 'wooden_pickaxe' }, { mc })
-    ok(r.text.includes('想放工作台') && r.text.includes('需要工作台'), '放工作台失败 → 说明原因 + 报需要工作台', r.text)
-    ok(f.counts.get(idOf('wooden_pickaxe')) == null, '没合成出木镐')
-  }
-  // 关掉自动放 + 附近没有 → 明确报需要工作台
+  // 附近没有 + 背包里有 → 也不放（用户 2026-10-19：「把自动放的功能去掉」）
   {
     const f = mkBot({ oak_planks: 3, stick: 2, crafting_table: 1 })
     const mc = mkMc(f)
-    const r = await run({ name: 'wooden_pickaxe', placeTable: false }, { mc })
-    ok(mc.placeCalls.length === 0, 'placeTable:false → 不放工作台')
+    const r = await run({ name: 'wooden_pickaxe' }, { mc })
+    ok(mc.placeCalls.length === 0, '🔴 永远不放工作台（用户 2026-10-19）')
     ok(r.text.includes('需要工作台'), '报"需要工作台"', r.text)
   }
   // 缺料：给出下一步
@@ -549,7 +548,7 @@ console.log('— ⑥ 端到端 execute —')
   {
     const f = mkBot({ cobblestone: 2 })
     const mc = mkMc(f)
-    const r = await run({ name: 'furnace', placeTable: false }, { mc })
+    const r = await run({ name: 'furnace' }, { mc })
     ok(r.text.includes('cobblestone'), '熔炉缺圆石时点名 cobblestone', r.text)
   }
   // list：没给 name → 当前能做
@@ -797,7 +796,7 @@ console.log('— ⑧ 合成窗口失步（实机 2026-10-07：10 根橡木没了
   //    findTableBlock 找得到（3.54 格），tableUsable 说够不着（4.03 格）。这就是要防的那条缝。
   {
     const f = mkBot({ oak_log: 2 }, { world: mkWorld({ '4,1,0': 'crafting_table' }) })
-    const r = await run({ name: 'wooden_pickaxe', placeTable: false }, { mc: mkMc(f), id: 'S4' })
+    const r = await run({ name: 'wooden_pickaxe' }, { mc: mkMc(f), id: 'S4' })
     ok(/够不着或看不见/.test(r.text), '够不着的工作台不用它，并说清为什么', r.text.split('\n').slice(0, 2).join(' ').slice(0, 170))
     ok(/工作台/.test(r.text) && !/完成/.test(r.text), '如实报"需要工作台"，不去挂那一整轮', r.text.split('\n').slice(0, 3).join(' ').slice(0, 210))
   }
@@ -811,7 +810,7 @@ console.log('— ⑧ 合成窗口失步（实机 2026-10-07：10 根橡木没了
   // ⑥ 看得见才算数：canSeeBlock 为假（中间挡着）也不用它
   {
     const f = mkBot({ oak_log: 2 }, { world: mkWorld({ '1,1,0': 'crafting_table' }), canSeeBlock: false })
-    const r = await run({ name: 'wooden_pickaxe', placeTable: false }, { mc: mkMc(f), id: 'S6' })
+    const r = await run({ name: 'wooden_pickaxe' }, { mc: mkMc(f), id: 'S6' })
     ok(/够不着或看不见/.test(r.text), '看不见的工作台也不用它', r.text.split('\n').slice(0, 2).join(' ').slice(0, 170))
   }
   // ⑦ 一次 craft 只做出一批（实机：要 8 块木板只出了 4 块）⇒ 自己把剩下的补上
@@ -926,6 +925,20 @@ console.log('— ⑫ 背包满了 ⇒ 产物掉地上，必须点名 —')
   const r = await run({ name: 'oak_planks', count: 4 }, { mc })
   ok(/产物没进背包/.test(r.text), '扫不了脚边也照样把"产物没进背包"说出来', r.text.split('\n').slice(0, 3).join(' '))
   ok(/脚边没扫到/.test(r.text) && /合成格里/.test(r.text), '扫不到就如实说扫不到（不编坐标），并提"可能卡在合成格里"', r.text)
+}
+
+{
+  /* 🔴 2026-10-19 实机（生存流程第一次做熔炉）：缺的就是"工作台"这一步时旧代码直接放弃，
+   * 回「❌ 原料不够：crafting_table：需要 1，背包里有 0」。可 4 块木板徒手就能做一张。
+   * 现在：只在"因为缺工作台而失败"时补一张再做，别的时候不多做桌子。 */
+  const src = readFileSync(new URL('../extensions/mc_craft.mjs', import.meta.url), 'utf8')
+  ok(!/placeTable/.test(src), '源码里已经没有 placeTable（用户 2026-10-19：「把自动放的功能去掉」）')
+  ok(/plan = planCraft\(bot, target\.item\.id, want, table\)/.test(src),
+    '补完重新规划（否则计划里还是"缺工作台"）')
+  ok(/成功也要清合成格/.test(src) && /if \(got > 0\)/.test(src),
+    '🔴 成功也要清合成格（2026-10-19 实机：18 根原木"凭空没了"，其实卡在自己背包的 2×2 合成格里）')
+  ok(/if \(now2 > before2\) \{ made = now2 - before; continue \}/.test(src),
+    '补做抛错时先对账：真涨了就接着补，别把整步停在第一批（要 24 块只做 4 块就不动了）')
 }
 
 console.log('')
