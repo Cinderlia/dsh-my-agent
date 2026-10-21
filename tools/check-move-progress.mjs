@@ -320,7 +320,10 @@ function mkLoopBot (start = { x: 0, y: 64, z: 0 }) {
     calls: { goto: 0, setGoal: [] },
     _pending: null,
   }
-  b.blockAt = () => ({ name: 'stone' })
+  /* 🔴 2026-10-22：以前是"全世界都是石头"（`() => ({name:'stone'})`）—— 那种世界里人头那格
+   *   也是实心 = 已经在窒息，`shaftInfoOf` 量出来"头顶净空 0 ⇒ 跳不起来"，跳跃脱困被跳过是**对的**。
+   *   现在按真实地面写：y ≤ start.y-1 实心，上面是空气。 */
+  b.blockAt = (p) => (p && Math.floor(p.y) <= Math.floor(start.y) - 1 ? { name: 'stone' } : { name: 'air' })
   b.setControlState = (k, v) => b.controls.push([k, v])
   b.on = () => {}
   b.removeListener = () => {}
@@ -405,6 +408,29 @@ function mkCtx (self, clock) {
   ok(clock.live === 0, '🔴 收尾时采样器定时器全清掉（不然把进程钉住）')
   ok(bot.calls.setGoal.filter((g) => g === null).length >= MOVE_ESCAPES.length,
     '每次重发 goto 前都先 setGoal(null) 真停（不攒重复的 goal_reached 监听器）', String(bot.calls.setGoal.filter((g) => g === null).length))
+}
+/* 🔴 2026-10-22 用户实机：「跳上方块的时候会悬空，然后再把那个方块挖了」——
+ *    头顶没有净空时"跳跃脱困"注定白跳（蹦起来顶到天花板、落回原地 = 看起来在悬空），
+ *    下一轮还是走不动 ⇒ 掉进"挖开挡路那格"的兜底。所以这一级要先量头顶，跳不起来就跳过。 */
+{
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  /* feet=64 / head=65 是空气，y=66 就是天花板 ⇒ `shaftInfoOf.headroom = 0`、`canJump = false` */
+  bot.blockAt = (p) => {
+    const y = p ? Math.floor(p.y) : 0
+    return y <= 63 || y === 66 ? { name: 'stone' } : { name: 'air' }
+  }
+  const self = mkSelf(bot)
+  const ctx = mkCtx(self, clock)
+  const r = await walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, ctx)
+  clock.stopPump()
+  ok(!bot.controls.some(([k, v]) => k === 'jump' && v === true),
+    '头顶没净空 ⇒ 一次 jump 都不按（不然就是在原地蹦给用户看）', JSON.stringify(bot.controls))
+  ok(self.logs.some((m) => /头顶没净空/.test(m)), '日志点名"跳也跳不上去，跳过跳跃脱困"',
+    JSON.stringify(self.logs.filter((m) => /脱困|净空/.test(m)).map((s) => s.slice(0, 40))))
+  ok(r.arrived === false && r.stuck === true && r.reason === 'unreachable',
+    '照样如实认输（跳过一级不等于无限重试）', JSON.stringify({ a: r.arrived, s: r.stuck, why: r.reason }))
+  ok(clock.live === 0, '定时器清干净')
 }
 {
   // 一路靠近 ⇒ 不脱困、直接到达
@@ -874,10 +900,51 @@ section('⑧′⁗ 卡住恢复：门"通不通"要看门现在的状态，不�
     patchDoorMoves(mv3)
     ok(mv3.getNeighbors({ x: 0, y: 64, z: 0 }).length === 1, '兜底只在"全没了"时生效')
   }
+  {
+    /* 🔴 回归（2026-10-22 用户实机「现在寻路会踩在岩浆块上掉血」）：
+     * `blocksToAvoid` 管的是"这一格能不能站"，岩浆块是**实心**的 —— 人站在它**上面**，
+     * 脚那格永远是空气 ⇒ 那个名单对它从来没生效过。真正的判据是**落脚点下面那一格**。 */
+    const { patchHarmfulFloorMoves } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    const mk = (floorName, feetName = 'air', cost = 3) => ({
+      getBlock: (node, dx, dy, dz) => ({ name: dy === -1 ? floorName : (dy === 0 ? feetName : 'air') }),
+      getNeighbors () { return [{ x: 1, y: 64, z: 0, cost, toBreak: [], toPlace: [] }] },
+    })
+    const m1 = mk('magma_block')
+    patchHarmfulFloorMoves(m1, { penalty: 60 })
+    const g1 = m1.getNeighbors({ x: 0, y: 64, z: 0 })
+    ok(g1.length === 1 && g1[0].cost === 63,
+      '🔴 落在岩浆块上：cost 加 60（绕路比踩上去划算）', JSON.stringify(g1[0]))
+    ok(g1[0].__harmfulFloor === 'magma_block', '标出踩的是什么（排查时不用猜）', String(g1[0].__harmfulFloor))
+    const m2 = mk('stone')
+    patchHarmfulFloorMoves(m2, { penalty: 60 })
+    ok(m2.getNeighbors({ x: 0, y: 64, z: 0 })[0].cost === 3, '普通石头地板：cost 一分不动')
+    const m3 = mk('stone', 'sweet_berry_bush')
+    patchHarmfulFloorMoves(m3, { penalty: 60 })
+    ok(m3.getNeighbors({ x: 0, y: 64, z: 0 })[0].cost === 63,
+      '脚踩进去那格是甜浆果丛（空碰撞盒、会扎人）也算')
+    const m4 = mk('magma_block')
+    patchHarmfulFloorMoves(m4, { penalty: 0 })
+    ok(m4.getNeighbors({ x: 0, y: 64, z: 0 })[0].cost === 3 && !m4.__dshHarmfulFloorPatched,
+      'penalty=0 ⇒ 完全不动手（用户想关就关）')
+    const m5 = {
+      getBlock: () => ({ name: 'magma_block' }),
+      getNeighbors () { return [{ x: 1, y: 64, z: 0, cost: 3 }, { x: 0, y: 64, z: 1, cost: 3 }] },
+    }
+    patchHarmfulFloorMoves(m5, { penalty: 60 })
+    const g5 = m5.getNeighbors({ x: 0, y: 64, z: 0 })
+    ok(g5.length === 2 && g5.every((m) => m.cost === 63),
+      '🔴 满地板都是岩浆块（下界玄武岩三角洲）⇒ **不许删 move**：全加价但路还在，否则 NoPath 原地不动')
+  }
   const plug2 = read('../src/plugins.mjs')
   ok(/const isDoorSupport = \(node, p\)/.test(plug2) && /isDoorSupport\(node, p\)\) \{[\s\S]{0,160}?continue/.test(plug2),
     '🔴 规划层：门脚支撑块也剔出 toBreak 并退工钱')
   ok(/const protectedDoorOf = \(block\)/.test(plug2), '🔴 执行层：门脚支撑块也拦（不只门本身）')
+  ok(/export const HARMFUL_FLOOR = /.test(plug2) && /magma_block/.test(plug2),
+    '🔴 规划层：岩浆块/营火/仙人掌这类"站上去掉血"的地板有名单（2026-10-22 用户实机反馈）')
+  ok(/patchHarmfulFloorMoves\(mv, \{ penalty: Number\(self\.cfg\.walkHarmfulFloorPenalty \?\? 60\) \}\)/.test(plug2),
+    '🔴 movements() 里真的挂上了这个补丁（写了函数没人调 = 白改）')
+  ok(/const floor = nameAt\(node, dx, dy - 1, dz\)/.test(plug2),
+    '🔴 判据看的是落脚点**下面那一格**（`m.y - 1`）—— 看脚那格的话岩浆块永远看不出来')
   const src = read('../src/movement.mjs')
   ok(/const doorAlreadyOpen = doorOpened === 0 && doorAheadOpen\(b, target\)/.test(src),
     '🔴 恢复分支把"门本来就开着"算作通')

@@ -1,22 +1,22 @@
 #!/usr/bin/env node
 /**
- * check-core-map.mjs —— `mc_map`「在地下自动切洞穴层视图」的回归检查
+ * check-core-map.mjs —— `mc_map` 地形图的回归检查
  *
  * 背景（用户 2026-10-08 原话：「map工具ai说只能看地表的，添加在地下变成看以自身为中心上下2格
- *   洞穴。就像地图模组那样」）：
- *   旧版 `heightmap()` 只做**地表图**：每列从 `cy+yTop` 往下扫，取第一块非空气 ⇒ 在地底下
- *   整个图都是头顶那层岩石（或者干脆一片"未加载"），完全没用。
+ *   洞穴。就像地图模组那样」）——**那条需求 2026-10-22 已被用户撤回**（原话「把 cave 去掉」）：
+ *   洞穴层视图整块删除（`isUnderground` / `caveCell` / `CAVE_GLYPH` / `CAVE_LABEL` / `mode:"auto"`
+ *   / `mode:"cave"` / `slab`）。现在 `mc_map` 只有三种模式：
  *
- * 现在：
- *   · `isUnderground()` —— 头顶 40 格内有实心遮挡（树叶/竹子/雪层这类"软顶"不算）就当地下；
- *   · `heightmap({ mode })` —— `auto`（默认，自动切）/ `surface`（强制地表）/ `cave`（强制洞穴层）；
- *   · 洞穴层：以我为中心，`slab` 格上下（默认 2 = 上下各 2 格，共 5 层）逐列判断
- *     「能不能站、脚下有没有地面」，画成 `# · ↓ v ~ ≈ * ?`（另起一套字形，不是方块名）；
- *   · `mapImage({ mode, slab })` 跟着切，洞穴层图有自己的配色（能走=亮、墙=暗）。
+ *   · `floor`（默认）—— 脚下方块那一层（`floorMapOf()`，2026-10-15 用户需求）；
+ *   · `surface` —— 地表图（`heightmapOf()`，每列从 `cy+yTop` 往下扫，取第一块非空气）；
+ *   · `column` —— 竖列图（`columnOf()`，只看脚下这一格往下/往上看几格）。
+ *
+ * 下面按功能分区跑：⑥ 地板层 / ⑦ 坐标换算 / ⑧ 危险格 / ⑨ 导航摘要 / ⑩ 竖列图 / ⑪ 头顶 /
+ * ⑤ 静态接线（core.mjs / index.js 的骨架有没有被改烂）。
  *
  * 🔴 2026-10-08 路线图第 ④ 条第十一刀：这一层的实现已搬到 `src/map-render.mjs`
- *   （`isUnderground(b)` / `caveCell(b, …)` / `heightmapOf(b, …)` / `glyphMapText(…)` / `mapImageOf(b, …)`），
- *   `core.mjs` 只留四个同名薄包装（公开面不变）⇒ 下面⑤那些"按源码文本找代码"的断言
+ *   （`heightmapOf(b, …)` / `floorMapOf(b, …)` / `glyphMapText(…)` / `mapImageOf(b, …)`），
+ *   `core.mjs` 只留同名薄包装（公开面不变）⇒ 下面⑤那些"按源码文本找代码"的断言
  *   必须去**新模块**里找（踩坑档案第 46 条那个坑，第十一次）。
  *
  * 用法：node tools/check-core-map.mjs
@@ -101,158 +101,6 @@ const mkBot = ({ pos = [0, 64, 0], world = mkWorld() } = {}) => ({
 })
 
 try {
-  // ═══════════════════════════════════════════════════════════════════════════
-  section('① 是不是"在地下"（isUnderground：头顶 40 格内有没有实心遮挡）')
-
-  {
-    // 露天：头顶全空
-    const mc = mkMc(mkBot({ pos: [0, 64, 0], world: mkWorld({ fill: 'air' }) }))
-    ok(mc.isUnderground() === false, '头顶全空 ⇒ 不是地下（给地表图）')
-  }
-  {
-    // 洞穴：头顶 2 格就有石头
-    const w = mkWorld({ fill: 'air' })
-    w.set(0, 66, 0, 'stone')
-    const mc = mkMc(mkBot({ pos: [0, 64, 0], world: w }))
-    ok(mc.isUnderground() === true, '头顶 2 格是石头 ⇒ 在地下（给洞穴层图）')
-  }
-  {
-    // 站在树下：树叶不算"顶"
-    const w = mkWorld({ fill: 'air' })
-    w.set(0, 68, 0, 'oak_leaves')
-    const mc = mkMc(mkBot({ pos: [0, 64, 0], world: w }))
-    ok(mc.isUnderground() === false, '头顶只有树叶/原木 ⇒ 不算地下（站在树下仍看地表图）')
-  }
-  {
-    // 地下 30 格高的洞顶也能认出来
-    const w = mkWorld({ fill: 'air' })
-    w.set(0, 94, 0, 'deepslate')
-    const mc = mkMc(mkBot({ pos: [0, 64, 0], world: w }))
-    ok(mc.isUnderground() === true, '头顶 30 格才是洞顶也认得出')
-  }
-  {
-    // 未加载 ⇒ 保守当露天（否则地表图会变成一片"未加载"）
-    const w = mkWorld({ fill: 'air' })
-    w.set(0, 66, 0, null)
-    const mc = mkMc(mkBot({ pos: [0, 64, 0], world: w }))
-    ok(mc.isUnderground() === false, '头顶那格未加载 ⇒ 当露天（保守）')
-  }
-  {
-    // 屋里的木头顶也算（不然只能看到屋顶）
-    const w = mkWorld({ fill: 'air' })
-    w.set(0, 68, 0, 'oak_planks')
-    const mc = mkMc(mkBot({ pos: [0, 64, 0], world: w }))
-    ok(mc.isUnderground() === true, '头顶是木板屋顶（屋里）⇒ 当地下（看室内平面图）')
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  section('② 洞穴层一格：能不能站 / 脚下有没有地面')
-
-  const CAVE = 'air'
-  const w = mkWorld({ fill: CAVE })
-  const Y = 64
-  const RAD = 12
-  // 我脚边这一片（dx=-4..3）铺一层石头当地面；dx≥4 的列留空，好测"会掉下去 / 深不见底"
-  for (let x = -4; x < 4; x++) for (let z = -4; z < 4; z++) w.set(x, Y - 1, z, 'stone')
-  w.set(0, Y + 6, 0, 'stone')        // 我这一列头顶 6 格有洞顶（auto 模式要靠它认出"在地下"）
-  w.set(1, Y, 0, 'stone')            // dx=1：身体那一格被堵 ⇒ 墙
-  w.set(2, Y + 1, 0, 'stone')        // dx=2：头那一格被堵（只有 1 格高）⇒ 墙
-  w.set(3, Y - 1, 0, CAVE)           // dx=3：脚下低 1 格…
-  w.set(3, Y - 2, 0, 'stone')        //        …地面在 cy-2 ⇒ ↓（低一格）
-  w.set(4, Y - 1, 0, CAVE)           // dx=4：地面在 cy-3 ⇒ v（会掉下去）
-  w.set(4, Y - 2, 0, CAVE)
-  w.set(4, Y - 3, 0, 'stone')
-  // dx=5 故意什么都不放（slab 内 + 再往下 4 格全空）⇒ ?（深不见底/未加载）
-  w.set(6, Y - 1, 0, 'water')        // dx=6：脚下是水 ⇒ ~
-  w.set(7, Y, 0, 'lava')             // dx=7：身体那格是岩浆 ⇒ ≈
-  w.set(8, Y, 0, 'iron_ore')         // dx=8：身体那格是矿石 ⇒ *
-  w.set(9, Y + 2, 0, 'stone')        // dx=9：天花板在 +2（2 格高巷道）⇒ 照样能站
-  w.set(9, Y - 1, 0, 'stone')
-  const mc = mkMc(mkBot({ pos: [0, Y, 0], world: w }))
-  const hm = mc.heightmap({ radius: RAD, mode: 'cave', slab: 2 })
-  const R = hm.radius
-  const row = hm.names[R]                  // dz = 0 那一行
-  const at = (dx) => row[R + dx]
-  ok(hm.mode === 'cave', 'mode:"cave" 强制洞穴层视图')
-  ok(hm.layer && hm.layer.y === Y && hm.layer.slab === 2, 'layer 报出"我这一层 y"与上下格数', `y=${hm.layer?.y} slab=${hm.layer?.slab}`)
-  ok(at(0) === 'cave_open', '脚下就是地面 ⇒ cave_open（能站）', at(0))
-  ok(at(1) === 'cave_wall', '脚那一格被堵 ⇒ cave_wall（墙）', at(1))
-  ok(at(2) === 'cave_wall', '头顶被堵（只有 1 格高）⇒ cave_wall（站不下）', at(2))
-  ok(at(3) === 'cave_step', '脚下低 1 格 ⇒ cave_step（↓）', at(3))
-  ok(at(4) === 'cave_drop', '脚下 2 格才是地 ⇒ cave_drop（v，会掉下去）', at(4))
-  /* 🔴 2026-10-15 审计（报告 G 第 4 条）：以前"探不到底"（slab 内脚下全空 + 再下探 4 格
-   *    都没有地面 = 大洞穴/深井）和"区块没加载"都算 cave_void，于是 `unloaded` 计数虚高、
-   *    `mc_observe` 会提示"未加载像素偏多"。现在分开：探不到底 = cave_deep（V）。 */
-  ok(at(5) === 'cave_deep', '脚下 4 格内没地 ⇒ cave_deep（V，探不到底 —— 不是"未加载"）', at(5))
-  ok(at(6) === 'cave_water', '脚下是水 ⇒ cave_water（~）', at(6))
-  ok(at(7) === 'cave_lava', '那一格是岩浆 ⇒ cave_lava（≈）', at(7))
-  ok(at(8) === 'cave_ore', '墙里是铁矿 ⇒ cave_ore（*）', at(8))
-  ok(at(9) === 'cave_open', '只有天花板在 +2（2 格高）⇒ 照样能站', at(9))
-
-  ok(glyphOf('cave_wall') === '#' && glyphOf('cave_open') === '·' && glyphOf('cave_step') === '↓'
-    && glyphOf('cave_drop') === 'v' && glyphOf('cave_water') === '~' && glyphOf('cave_lava') === '≈'
-    && glyphOf('cave_ore') === '*' && glyphOf('cave_void') === '?'
-    && glyphOf('cave_deep') === 'V', '9 个洞穴字形齐全（# · ↓ v V ~ ≈ * ?）')
-  ok(glyphOf('stone') === ':' && glyphOf('grass_block') === '"', '地表图的字形没被改坏（stone=: / grass_block="）')
-
-  {
-    const g = McBot.glyphMap(hm.names, 1, { x: R, y: R })
-    const lines = g.split('\n')
-    ok(lines.length === 2 * R && lines[R].length === 2 * R, '字符图尺寸 = 2×半径', `${lines.length}×${lines[R]?.length}`)
-    ok(lines[R].slice(R - 1, R + 10) === '·@##↓vV~≈*·', '中心那一行画出来就是 ·@##↓vV~≈*·（@ 是我）', lines[R].slice(R - 1, R + 10))
-    ok(lines[R][R] === '@', '中心格是 @（我自己）')
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  section('③ 图例 / 配色 / 图像')
-
-  ok(hm.legend.every((e) => e.glyph && e.key && typeof e.count === 'number'), '洞穴层图例带 glyph/key/count（给文案用）')
-  ok(hm.legend.some((e) => e.name === '墙' && e.glyph === '#' && e.count >= 2), '图例有中文名（墙 #）', JSON.stringify(hm.legend.slice(0, 3)))
-  ok(hm.colors.length === hm.names.length && hm.colors[0].length === hm.names[0].length, 'colors 与 names 同尺寸')
-  {
-    const light = hm.colors[R][R]                  // 能站
-    const dark = hm.colors[R][R + 1]               // 墙
-    ok(light[0] + light[1] + light[2] > dark[0] + dark[1] + dark[2], '能走的地方比墙亮（像地图模组那样一眼看出通道）',
-      `能站 ${light} / 墙 ${dark}`)
-  }
-  {
-    const img = mc.mapImage({ radius: 4, scale: 2, mode: 'cave' })
-    ok(img.width === 16 && img.height === 16 && img.rgba.length === 16 * 16 * 4, 'mapImage 跟着切洞穴层（尺寸/像素数对）',
-      `${img.width}×${img.height}`)
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  section('④ 地表 / 洞穴两种模式：自动切 + 手动强制')
-
-  {
-    // 同一个"地下"世界：auto 给洞穴层、surface 给地表
-    const mc2 = mkMc(mkBot({ pos: [0, Y, 0], world: w }))
-    const auto = mc2.heightmap({ radius: 4 })
-    const surf = mc2.heightmap({ radius: 4, mode: 'surface' })
-    ok(auto.mode === 'cave', 'mode 缺省（auto）+ 在地下 ⇒ 洞穴层图')
-    ok(surf.mode === 'surface' && !String(surf.names[4][4]).startsWith('cave_'), 'mode:"surface" 强制地表图（不被自动判据改掉）',
-      String(surf.names[4][4]))
-    ok(surf.legend.every((e) => e.name && !e.glyph), '地表图例仍是 {name,count}（旧形状，前端/文案都靠它）')
-  }
-  {
-    // 露天世界：auto 给地表
-    const wOpen = mkWorld({ fill: 'air' })
-    wOpen.set(0, Y - 1, 0, 'grass_block')
-    const mc3 = mkMc(mkBot({ pos: [0, Y, 0], world: wOpen }))
-    ok(mc3.heightmap({ radius: 4 }).mode === 'surface', '露天 + auto ⇒ 地表图（不误切）')
-    ok(mc3.heightmap({ radius: 4, mode: 'cave' }).mode === 'cave', '露天也能 mode:"cave" 强制看洞穴层')
-  }
-  {
-    // slab 钳制
-    const mc4 = mkMc(mkBot({ pos: [0, Y, 0], world: w }))
-    ok(mc4.heightmap({ radius: 4, mode: 'cave', slab: 99 }).layer.slab === 8, 'slab 上限 8')
-    ok(mc4.heightmap({ radius: 4, mode: 'cave', slab: 0 }).layer.slab === 2, 'slab 给 0 ⇒ 回默认 2')
-    ok(mc4.heightmap({ radius: 4, mode: 'cave', slab: 1 }).layer.slab === 1, 'slab 给 1 ⇒ 上下各 1 格')
-    // slab 变大以后，脚下 3 格的地面就落进 slab 里了（判据跟着 slab 走）
-    ok(mc4.heightmap({ radius: RAD, mode: 'cave', slab: 3 }).names[12][12 + 4] === 'cave_drop',
-      'slab=3 时脚下 3 格的地仍算 cave_drop（判据按 slab 走）')
-  }
-
   // ═══════════════════════════════════════════════════════════════════════════
   section('⑥ 地板层视图（2026-10-15 用户需求：默认看"脚下方块那一层"）')
 
@@ -638,26 +486,14 @@ try {
 
   const checks = [
     [names, /export const PASSABLE = /, 'block-names：有"能穿过去的小东西"名单（花草火把不算墙）'],
-    [names, /export const SOFT_ROOF = /, 'block-names：有"软顶"名单（树叶/竹子/雪层不算地下）'],
-    [names, /export const CAVE_GLYPH = \{/, 'block-names：洞穴字形表'],
     [core, /from '\.\/block-names\.mjs'/, 'core：这些纯方块名判据改成从 block-names.mjs 导入（路线图第 ④ 条第二刀）'],
     [core, /from '\.\/map-render\.mjs'/, 'core：地图那一层改成从 map-render.mjs 导入（路线图第 ④ 条第十一刀）'],
-    [core, /isUnderground \(\) \{ return isUnderground\(this\.requireBot\(\)\) \}/, 'core：isUnderground() 留成薄包装（公开面不变）'],
     [core, /heightmap \(opts = \{\}\) \{ return heightmapOf\(this\.requireBot\(\), opts\) \}/, 'core：heightmap() 留成薄包装'],
     [core, /static glyphMap \(names, step = 2, selfIndex = null\) \{ return glyphMapText\(names, step, selfIndex\) \}/, 'core：static glyphMap() 留成薄包装'],
     [core, /mapImage \(opts = \{\}\) \{ return mapImageOf\(this\.requireBot\(\), opts\) \}/, 'core：mapImage() 留成薄包装'],
-    [mapSrc, /export function isUnderground \(b\) \{/, 'map-render：isUnderground(b)'],
-    [mapSrc, /export function caveCell \(b, x, cy, z, slab\) \{/, 'map-render：caveCell()（原来叫 #caveCell，第十一刀搬过去的）'],
-    [mapSrc, /const cave = mode === 'cave' \|\| \(mode !== 'surface' && isUnderground\(b\)\)/, 'map-render：auto 模式按 isUnderground(b) 自动切'],
-    [mapSrc, /export function mapImageOf \(b, \{ radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'auto', slab = 2, layer = null, depth = 4 \} = \{\}\)/, 'map-render：mapImageOf 也接 mode/slab（2026-10-15 起还接 floor 的 layer/depth）'],
     [strip(idx), /mode: \{ type: 'string'/, 'index：mc_map 有 mode 参数'],
-    [strip(idx), /slab: \{ type: 'number'/, 'index：mc_map 有 slab 参数'],
-    [strip(idx), /heightmap\(\{ radius: args\.radius, yTop: args\.yTop, yBottom: args\.yBottom, mode, slab \}\)/, 'index：把 mode/slab 传进 heightmap'],
-    [strip(idx), /scale: args\.scale, mode, slab,/, 'index：把 mode/slab 传进 mapImage'],
-    [strip(idx), /🕳️ 洞穴层图 中心/, 'index：文案区分"洞穴层图"'],
     [strip(idx), /const legendText = hm\.legend\.slice\(0, 15\)/, 'index：图例渲染抽成 legendText'],
-    [strip(idx), /e\?\.glyph \? `\$\{e\.glyph\}\$\{e\.name\}×\$\{e\.count\}`/, 'index：图例渲染认 glyph（洞穴层）'],
-    [strip(idx), /洞穴层俯视图/, 'index：图像文案区分洞穴层'],
+    [strip(idx), /e\?\.glyph \? `\$\{e\.glyph\}\$\{e\.name\}×\$\{e\.count\}`/, 'index：图例渲染认 glyph（地板层的图例带字形）'],
     /* ── 2026-10-15：地板层视图（用户需求）── */
     [names, /export const FLOOR_GLYPH = \{/, 'block-names：地板层字形表'],
     [names, /export const isSolidBlock = /, 'block-names：isSolidBlock（实心判据，与 isPassable 互补但不等价）'],
@@ -670,15 +506,16 @@ try {
     [strip(idx), /🪨 地板层图/, 'index：文案区分"地板层图"'],
   ]
   for (const [src, re, label] of checks) ok(re.test(src), label)
-  ok(!/this\.#caveCell/.test(core) && !/#caveCell \(b, x, cy, z, slab\) \{/.test(core),
-    'core：没有残留的 #caveCell（第十一刀搬走了 —— 别只搬不接）')
+  ok(!/isUnderground|caveCell/.test(strip(core)), 'core：cave 相关的薄包装已删干净（2026-10-22 用户要求）')
+  ok(!/isUnderground|caveCell|cave_void|cave_deep|CAVE_GLYPH|CAVE_LABEL/.test(strip(mapSrc) + strip(names)),
+    'map-render / block-names：洞穴层视图彻底没了（没有 isUnderground / caveCell / cave_* / CAVE_* 残留）')
   ok(!/export \{[^}]*\} from '\.\/map-render\.mjs'/.test(core),
     'core：没有多写 re-export（公开面靠四个同名薄包装）')
   ok(!/hm\.legend\.slice\(0, 15\)\.join\(' '\)/.test(strip(idx)),
     '顺手修掉的老 bug：图例不再是 [object Object]（以前 legend 是对象却直接 join）')
-  ok(/想强制看地表就 mode:"surface"/.test(idx), '文案告诉 AI 可以 mode:"surface" 强制看地表')
-  ok(/modeArg === 'auto' \|\| modeArg === 'surface' \|\| modeArg === 'cave' \|\| modeArg === 'column' \? modeArg : 'floor'/.test(strip(idx)),
-    'index：mc_map 默认 floor，但 auto/surface/cave/column 老模式一个没丢（老参数兼容）')
+  ok(/modeArg === 'surface' \|\| modeArg === 'column' \? modeArg : 'floor'/.test(strip(idx)),
+    'index：mc_map 只认 floor / surface / column，其余（含 auto、cave）一律退回 floor')
+  ok(!/modeArg === 'cave'|modeArg === 'auto'/.test(strip(idx)), 'index：mode 解析里已经没有 cave / auto 了')
   /* ⑩ 竖列图的接线（2026-10-15） */
   ok(/if \(mode === 'column'\) \{/.test(strip(idx)), 'index：mc_map 有 mode:"column" 分支')
   ok(/columnOf\(sess\.bot\.requireBot\(\), \{\s*x: p\?\.x \?\? null, z: p\?\.z \?\? null, yBottom: args\.yBottom, up: args\.up,/.test(strip(idx)),
@@ -693,7 +530,7 @@ try {
   ok(/up: \{ type: 'number'/.test(strip(idx)), 'index：mc_map 有 `up` 参数（头顶看几格）')
   ok(/above: col\.above/.test(strip(idx)), 'index：column 分支把 above（头顶扫描）透传出去')
   ok(/头顶什么封着/.test(idx), 'index：mc_map 描述里写了"头顶什么封着/跳不跳得起来"')
-  ok(/export const COLUMN_UP_DEFAULT = 40/.test(mapSrc), 'map-render：COLUMN_UP_DEFAULT = 40（和 isUnderground 的 40 格同一个数）')
+  ok(/export const COLUMN_UP_DEFAULT = 40/.test(mapSrc), 'map-render：COLUMN_UP_DEFAULT = 40（头顶一次最多看 40 格）')
   ok(/export function columnOf \(b, \{ x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX, up = null \} = \{\}\) \{/.test(mapSrc),
     'map-render：columnOf(b, {x,z,yTop,yBottom,maxDepth,up})')
   ok(/const headFrom = fy \+ 2/.test(strip(mapSrc)),

@@ -564,6 +564,56 @@ export function patchDoorMoves (mv, { digPenalty = 0 } = {}) {
   return mv
 }
 
+/**
+ * 「站上去 / 走过去就掉血」的方块 —— A* 要绕开它们。
+ * 2026-10-22 用户实机：「现在寻路会踩在岩浆块上掉血」。
+ *
+ * 🔴 为什么 `blocksToAvoid` 治不了这事：那个名单管的是**"这一格能不能站"**
+ *    （`movements.js:233` 的 `b.safe`），而岩浆块是**实心方块** —— 人站在它**上面**，
+ *    脚那一格永远是空气（永远 safe）。所以 `magma_block` 早就躺在
+ *    `BRIDGE_FATAL_NAMES` / `avoidBlockIds()` 里，**一次都没生效过**（看起来"修过了"，其实没有）。
+ *
+ * 真正该看的是**脚下那一格**（`m.y - 1`，托着你的方块）和**脚踩进去那一格**（`m.y`，
+ * 甜浆果丛/凋灵玫瑰这类空碰撞盒但会扎人的东西在这一格）。
+ *
+ * 做法：给这种 move **加一笔重罚**（默认 60 ≈ 宁可绕 60 格也不踩），**不删 move** ——
+ * 岩浆三角洲那种"满地板都是岩浆块"的地方删光了就是 NoPath，宁可慢一点走过去也不能原地不动。
+ */
+export const HARMFUL_FLOOR = /^(magma_block|campfire|soul_campfire|cactus|sweet_berry_bush|wither_rose|fire|soul_fire|powder_snow)$/
+
+export function patchHarmfulFloorMoves (mv, { penalty = 60 } = {}) {
+  if (!mv || typeof mv.getNeighbors !== 'function') return mv
+  const P = Number.isFinite(Number(penalty)) ? Math.max(0, Number(penalty)) : 60
+  if (P <= 0) return mv
+  const nameAt = (node, dx, dy, dz) => {
+    try { return mv.getBlock?.(node, dx, dy, dz)?.name ?? null } catch { return null }
+  }
+  const order = (node, m) => {
+    if (!m) return m
+    const dx = Number(m.x) - Number(node.x)
+    const dy = Number(m.y) - Number(node.y)
+    const dz = Number(m.z) - Number(node.z)
+    if (![dx, dy, dz].every((v) => Number.isFinite(v))) return m
+    const feet = nameAt(node, dx, dy, dz)
+    const floor = nameAt(node, dx, dy - 1, dz)
+    const hit = HARMFUL_FLOOR.test(String(feet ?? '')) ? feet
+      : (HARMFUL_FLOOR.test(String(floor ?? '')) ? floor : null)
+    if (hit) {
+      m.cost = (Number(m.cost) || 0) + P
+      m.__harmfulFloor = hit
+    }
+    return m
+  }
+  const origNeighbors = mv.getNeighbors
+  mv.getNeighbors = function (node) {
+    const moves = origNeighbors.call(this, node)
+    if (!Array.isArray(moves) || !node) return moves
+    return moves.map((m) => order(node, m))
+  }
+  mv.__dshHarmfulFloorPatched = true
+  return mv
+}
+
 export function movements (self, { terrain = null } = {}) {
   const b = self.bot
   const { Movements } = self._pf ?? {}
@@ -629,6 +679,10 @@ export function movements (self, { terrain = null } = {}) {
    * 有门就走门。用户要挖墙可以显式 `preferDoors:false`，或直接叫 `mc_dig`。 */
   const preferDoors = self.cfg.preferDoors !== false
   patchDoorMoves(mv, { digPenalty: preferDoors ? Number(self.cfg.doorDigPenalty ?? 8) : 0 })
+  /* 2026-10-22 用户实机：「现在寻路会踩在岩浆块上掉血」—— 站上去会掉血的地板加点重罚，让它绕开。
+   * 为什么光有 `blocksToAvoid` 不够，见 `patchHarmfulFloorMoves` 的注释（那名单管"能不能站"，
+   * 而岩浆块是实心的、人站在它上面，脚那格永远是空气 ⇒ 那条路从来就没生效过）。 */
+  patchHarmfulFloorMoves(mv, { penalty: Number(self.cfg.walkHarmfulFloorPenalty ?? 60) })
   return mv
 }
 

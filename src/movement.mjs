@@ -1769,6 +1769,20 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           err.mcExhausted = true
           throw err
         }
+        /* 🔴 2026-10-22 用户实机：「跳上方块的时候会悬空，然后再把那个方块挖了」——
+         *   这正是"跳跃脱困"（按住 jump `MOVE_JUMP_MS`）在**头顶没有净空**时的样子：人蹦起来顶到
+         *   天花板、落回原地（看着就是悬空/原地抖），下一轮还是走不动 ⇒ 掉进"挖开挡路那格"的兜底，
+         *   于是旁观到的顺序就成了"跳一下 → 那格方块没了"。
+         *   `shaftInfoOf` 本来就是只读探针（净空 / 能不能跳 / 四面通不通）：先量头顶，
+         *   跳不起来就别白蹦一次（跳了还会把自己卡住/把地形挖改），直接进下一级脱困。 */
+        if (step === 'jump') {
+          const sh = shaftInfoOf(b, target)
+          if (sh && sh.canJump === false) {
+            self.log(`⬆️ 头顶没净空（${sh.ceiling ?? '实心'}）—— 跳也跳不上去，跳过"跳跃脱困"，直接换下一招`)
+            attempt++
+            continue
+          }
+        }
         repathCount++
         self.log(`🔁 走不动了 → 第 ${attempt} 级脱困：${escapeTextOf(step)}（累计重算 ${repathCount} 次）`)
         await escapeMove(b, goal, step, ctx)

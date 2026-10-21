@@ -25,36 +25,27 @@ export const isPassable = (n) => Boolean(n) && PASSABLE.test(String(n))
 
 /** 头顶有这些东西**不算**"在地下"（树冠、竹子、雪层…）：站在树下 / 竹林里看地表图更有用 */
 /**
- * 头在那格里**不会窒息**的方块：门/活板门/栅栏门/床/半砖/楼梯这些**不占满整格**。
+ * 头在那格里**不会窒息**的方块：门/活板门/栅栏门/床/半砖/楼梯这些**不占满整格**，
+ * 加上**作物和贴地的小植物**（小麦/胡萝卜/土豆/甜菜/下界疣/甘蔗/海带/甘蔗苗…）——
+ * 它们 `boundingBox === 'empty'`，实体可以直接穿过去。
  *
  * 🔴 2026-10-18 实机：AI 从**开着的门**里走过时，`isSolidBlock('oak_door')` 为真 ⇒ 被当成
  *    "头卡在方块里正在窒息"，每次穿门都叫醒 + `stopWork`，实机表现是"穿个门要两次工具调用"。
  *    判据不是"能不能走"（门在没开时确实不能走），而是"这一格有没有被方块塞满"。
+ *
+ * 🔴 2026-10-22 实机（用户点名要修）：站在**小麦田**里（`wheat`，y=79 那格）被反复报
+ *    "【自保：我头卡在方块里，正在窒息】"。原因是 `isSolidBlock('wheat')` 为真 —— `PASSABLE`
+ *    名单里没有作物。真实判据是**碰撞盒**：作物是 `empty`，不闷人。名字表只是没有碰撞盒读数时的
+ *    退路（离线假世界 / 旧数据），所以两边都要补上。
  */
-export const NON_SUFFOCATING = /_(?:door|trapdoor|fence_gate|bed|slab|stairs)$/
+export const NON_SUFFOCATING = /_(?:door|trapdoor|fence_gate|bed|slab|stairs)$|^(?:wheat|carrots|potatoes|beetroots|torchflower_crop|pitcher_crop|nether_wart|sugar_cane|kelp|kelp_plant|seagrass|tall_seagrass|sweet_berry_bush|cocoa|bamboo|bamboo_sapling|scaffolding|tripwire|redstone_wire|repeater|comparator|ladder|rail|powered_rail|detector_rail|activator_rail|cake)$/
 
 export const SOFT_ROOF = /_leaves$|_log$|_wood$|^bamboo|^snow|_snow$|cactus|^moss|^melon|^pumpkin|_sapling$|_flower$|^vine$|glow_lichen|^hanging_roots$|^big_dripleaf/
 
 /**
- * 洞穴层视图的**合成方块名 → 字符**（`heightmap({ mode:'cave' })` 用，见 `core.mjs` 的 `#caveCell`）。
- * 地表图是"这格地表是什么方块"，洞穴图是"这格能不能走、脚下有没有地面"，所以另起一套字形。
- */
-export const CAVE_GLYPH = {
-  cave_wall: '#', cave_open: '·', cave_step: '↓', cave_drop: 'v',
-  cave_water: '~', cave_lava: '≈', cave_ore: '*', cave_void: '?', cave_deep: 'V',
-}
-
-/** 洞穴层视图的中文标签（图例 / 文案用） */
-export const CAVE_LABEL = {
-  cave_wall: '墙', cave_open: '能站', cave_step: '低一格', cave_drop: '会掉下去',
-  cave_water: '水', cave_lava: '岩浆', cave_ore: '矿石', cave_void: '未加载', cave_deep: '探不到底',
-}
-
-/**
  * **"脚下方块那一层"（地板层视图）**的合成名 → 字符（2026-10-15 用户需求）。
  *
- * 和洞穴层视图（`CAVE_GLYPH`）的区别：洞穴图问"我站在这格行不行"（以我**脚下那层**为中心
- * 往上下看），地板图问"**这一层本身**是什么、站上去会不会掉"。两者判据不同，所以另起一套键。
+ * 地板图问"**这一层本身**是什么、站上去会不会掉"（`floorMapOf()` 用的键）。
  */
 export const FLOOR_GLYPH = {
   floor_walk: '·', floor_wall: '#', floor_drop: 'v',
@@ -80,7 +71,6 @@ export const isSolidBlock = (n) => Boolean(n) && !isAir(n) && !isLiquid(n) && !i
 /** 方块名 → 单字符（给没有视觉的模型"看"地形） */
 export function glyphOf (name) {
   if (!name) return '?'
-  if (CAVE_GLYPH[name]) return CAVE_GLYPH[name]
   if (FLOOR_GLYPH[name]) return FLOOR_GLYPH[name]
   if (isAir(name)) return ' '
   if (/_water$|water|_ice$|^ice$/.test(name)) return '~'
@@ -96,10 +86,6 @@ export function glyphOf (name) {
 }
 
 export const COLORS = {
-  // 洞穴层视图（`mode:'cave'`）：能走 = 亮，墙 = 暗，掉下去 = 偏蓝，水/岩浆/矿石各自一色
-  cave_wall: [95, 95, 100], cave_open: [205, 205, 195], cave_step: [165, 165, 150],
-  cave_drop: [125, 125, 175], cave_water: [51, 76, 178], cave_lava: [222, 110, 40],
-  cave_ore: [190, 155, 70], cave_void: [40, 40, 48], cave_deep: [70, 55, 90],
   // 地板层视图（`mode:'floor'`，2026-10-15）：能站 = 亮，墙 = 暗，掉下去 = 偏蓝
   floor_walk: [205, 205, 195], floor_wall: [95, 95, 100], floor_drop: [125, 125, 175],
   floor_water: [51, 76, 178], floor_lava: [222, 110, 40], floor_void: [40, 40, 48],

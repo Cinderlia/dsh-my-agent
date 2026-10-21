@@ -331,6 +331,29 @@ const asVec = (b, pos) => {
   return o
 }
 
+/** 头那一格**真的会把人闷住**吗 —— 会就返回方块名，不会返回 null。
+ *
+ *  🔴 2026-10-22 实机（用户点名要修）：站在**小麦田**里（`wheat`，作物那格）被反复报
+ *     「【自保：我头卡在方块里，正在窒息】」。根因是 `isSolidBlock('wheat')` 为真
+ *     —— `PASSABLE` 名单里没有作物，于是"作物叶子"被当成了"实心墙面"。
+ *     真实判据是**碰撞盒**：作物 `boundingBox === 'empty'`，实体直接穿过去，根本不闷人。
+ *     所以这里以碰撞盒为权威；读不到碰撞盒（离线假世界只给方块名）才退回名字表。
+ */
+const suffocantBlockAt = (b, pos) => {
+  try {
+    if (!pos) return null
+    const v = typeof pos.floored === 'function' ? pos : asVec(b, pos)
+    const blk = b?.blockAt?.(v)
+    if (!blk?.name) return null
+    if (SOFT_ROOF.test(blk.name) || NON_SUFFOCATING.test(blk.name)) return null
+    const bb = blk.boundingBox
+    // empty = 能穿过去（作物/花草/水/火把/藤/铁轨）；partial = 塞不满一格（半砖/楼梯/门/床/台阶）
+    if (bb === 'empty' || bb === 'partial') return null
+    if (bb === 'block') return blk.name
+    return isSolidBlock(blk.name) ? blk.name : null
+  } catch { return null }
+}
+
 /** 头在水下吗（眼睛那一格是液体）。这是"憋气"的直接判据：
  *  `bot.oxygenLevel` 只在**头入水之后**才有读数（mineflayer 收到 `air_supply` 元数据才设它，
  *  实机验证：水面上是 null、头一埋进水里就有 7/20），所以判据要两条一起看。
@@ -1521,10 +1544,12 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
      *    `air_supply`；地面/刚出生时是 null，埋进去也不变。用 `air <= 19` 会把功能整个关死，
      *    而假世界能随便造 air，测试还全绿 —— 2026-10-18 审计抓到的就是这条。
      *    窒息既不算"被打"也不算"溺水"：不点名的话 AI 会以为闲下来了，然后每秒掉 1 点血安静地死。 */
-    const headName = here[1]
     /* 门/活板门/栅栏门/床/半砖/楼梯**不占满整格**，站在里面不窒息（2026-10-18 实机：
-     * 穿过开着的门时被当成"头卡在方块里"，每次都叫醒 + 停手 ⇒ 穿门要两次工具调用）。 */
-    const headSolidNow = Boolean(headName && isSolidBlock(headName) && !SOFT_ROOF.test(headName) && !NON_SUFFOCATING.test(headName))
+     * 穿过开着的门时被当成"头卡在方块里"，每次都叫醒 + 停手 ⇒ 穿门要两次工具调用）。
+     * 🔴 2026-10-22：这里以前是 `isSolidBlock(here[1])` —— 小麦不在 `PASSABLE` 名单里，
+     *    所以站在**麦田**里被判成"头卡在方块里"，一路过就误报（用户点名要修）。现在看**真实碰撞盒**。 */
+    const headSuffocant = suffocantBlockAt(b, p.offset(0, 1, 0))
+    const headSolidNow = Boolean(headSuffocant)
     /* 🔴 判据只看"头被盖住"这件事本身，**不能靠氧气读数**：窒息（沙埋/卡墙）走的是另一套伤害，
      *    服务端只在水下才发 `air_supply` —— 地面/刚出生时 `oxygenLevel` 是 null，被沙埋也不会变，
      *    原来那条 `air <= 19` 会把功能整个关死（2026-10-18 审计抓到的 P0，测试用假 air 所以没暴露）。
@@ -1533,7 +1558,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
      *    1 格高洞里"当成埋人；② 头一直实心、但**正在掉血**（掉血 = 已经在窒息了）。 */
     const headChanged = headSolidNow && s.lastHeadSolid === false
     s.lastHeadSolid = headSolidNow
-    const suffocant = !submerged && !fellRecently && headSolidNow && (headChanged || hurtRecently) ? headName : null
+    const suffocant = !submerged && !fellRecently && headSolidNow && (headChanged || hurtRecently) ? headSuffocant : null
     if (suffocant) {
       pushAutoEvent(s, 'suffocate', `head:${Math.round(p.x)},${Math.round(p.y + 1)},${Math.round(p.z)}`,
         { name: suffocant, health: Math.round(health) })

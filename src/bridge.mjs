@@ -11,6 +11,10 @@
  *   C 放置一个方块（执行放置，**等待服务端确认结果**）
  *   D 验证成功再移动（确认方块存在、角色仍安全，再进入下一轮）
  * 失败处理：放置失败 / 目标坐标变化 / 脚下支撑异常 / 坠落风险 ⇒ **立即停止前进**，重新观察。
+ * 🔴 2026-10-22（用户："很多格下面有岩浆 + 悬空搭" ⇒ "改成警告"）：桥下是要命方块
+ *    （岩浆/火/岩浆块/营火/仙人掌/细雪）**不再一刀切拒铺** —— 改成照铺 + 结果里点名警告。
+ *    还在拦的只剩"真会立刻把人弄死/弄没"的那几条：脚下不是实地、还在下落、血量 < 8、下方看不到底。
+
  *
  * 🔴 这一层的**全部价值**就是"**不确认就不前进**"（用户给的验收标准）：
  *    每放一块都回读服务端、每走一步都核对坐标与脚下，
@@ -34,6 +38,8 @@ export const BRIDGE_MAX = 16
 export const BRIDGE_MIN_HEALTH = 8
 /** 桥面下方比这个还深就记一条风险（不拦，但如实说） */
 export const BRIDGE_DEEP = 8
+/** 往下找地面最多看多少格（超过它就算"深空"：知道很深、不知道多深；2026-10-22 从 24 加到 64） */
+export const DROP_SCAN = 64
 /** 放置后回读服务端的次数 / 间隔（1.21 在本地服上 200ms 通常就够，留点余量） */
 export const BRIDGE_CONFIRM_TRIES = 8
 export const BRIDGE_CONFIRM_MS = 150
@@ -140,13 +146,27 @@ export function bridgeDirTo (feet, { x, y, z } = {}) {
 
 /** 从 `pos` 往下数几个空格才踩到实地（`max` 之内没有就回 `null`） */
 export function dropBelow (b, pos, max = 24) {
+  const r = dropProbe(b, pos, max)
+  return r.drop
+}
+
+/**
+ * 跟 `dropBelow` 一样往下看，但**把三种"看不见底"分清楚**（2026-10-22 用户：
+ * 「改，有会超过24格的情况」）：
+ *   · `{ drop: 3 }`                       —— 3 格内踩到实地
+ *   · `{ drop: null, unloaded: true }`    —— 读到 null（区块没加载）⇒ 真·不知道，别搭
+ *   · `{ drop: null, bottomed: true }`    —— 一路全是空气/液体到 max 还没见到底 ⇒ **深空**，
+ *                                            知道它很深但不知道多深 ⇒ 记风险放行（悬空长廊就该长这样）
+ *   · `{ drop: null }`                    —— 其它（读方块抛错）
+ */
+export function dropProbe (b, pos, max = 24) {
   for (let d = 1; d <= max; d++) {
     let blk = null
-    try { blk = b.blockAt(new Vec3(pos.x, pos.y - d, pos.z)) } catch { return null }
-    if (!blk) return null                    // 未加载 ⇒ 说"不知道"，别猜
-    if (isSolidBlock(blk.name)) return d - 1
+    try { blk = b.blockAt(new Vec3(pos.x, pos.y - d, pos.z)) } catch { return { drop: null } }
+    if (!blk) return { drop: null, unloaded: true }   // 未加载 ⇒ 说"不知道"，别猜
+    if (isSolidBlock(blk.name)) return { drop: d - 1 }
   }
-  return null
+  return { drop: null, bottomed: true }
 }
 
 /** 从 `pos` 往下（含自己）扫 `depth` 格，第一个要命/要湿的方块 */
@@ -181,21 +201,38 @@ export function bridgeSafetyOf (b, { feet, dir, count = 1, item = null, need = 1
   if (item && need > 1 && item.count < need) {
     return { ok: false, why: `背包里 ${item.name} 只剩 ${item.count} 块，铺不到 ${need} 格——先补料，或把 count 改小`, cells }
   }
-  // 逐格看：危险 ⇒ 硬停；落差 ⇒ 记风险（搭桥本来就是跨深沟，不因为这个拦）
+  // 逐格看：要命方块 ⇒ 只记警告（不再硬拦，见文件头）；落差 ⇒ 记风险（搭桥本来就是跨深沟）
   let worstDrop = 0
+  let bottomless = false
   let risk = null
+  const hazards = []
   for (const c of cells) {
     const hz = hazardIn(b, c, 6)
     if (hz?.kind === 'fatal') {
-      return { ok: false, why: `前方 (${c.x},${c.y},${c.z}) 下方 ${Math.abs(hz.dy)} 格是 ${fatalText(hz.name)}——搭过去也会掉进去，**不搭**`, cells, hazard: hz }
+      hazards.push({ x: c.x, y: c.y, z: c.z, name: hz.name, dy: hz.dy, text: fatalText(hz.name) })
+      continue
     }
     if (hz?.kind === 'wet' && !risk) risk = `桥下 ${Math.abs(hz.dy)} 格是${hz.name}（掉下去淹不死但会湿透）`
-    const d = dropBelow(b, c, 24)
-    if (d === null) return { ok: false, why: `前方 (${c.x},${c.y},${c.z}) 下方看不到底（区块没加载或真是虚空）——**不知道深浅就不搭**`, cells }
-    if (d > worstDrop) worstDrop = d
+    const probe = dropProbe(b, c, DROP_SCAN)
+    if (probe.unloaded) {
+      return { ok: false, why: `前方 (${c.x},${c.y},${c.z}) 下方区块没加载（读到 null）——**不知道深浅就不搭**，先走靠近再看`, cells }
+    }
+    if (probe.bottomed) {
+      // 一路空到扫描深度：明确是"很高的悬空"（用户 2026-10-22：有超过 24 格的情况）⇒ 照搭，记风险
+      bottomless = true
+      if (worstDrop < DROP_SCAN) worstDrop = DROP_SCAN
+      continue
+    }
+    if (probe.drop > worstDrop) worstDrop = probe.drop
   }
   if (worstDrop >= BRIDGE_DEEP && !risk) risk = `桥下最深 ${worstDrop} 格是空的（悬空作业，摔下去会掉血）`
-  return { ok: true, cells, drop: worstDrop, risk }
+  if (bottomless) risk = `桥下 ${DROP_SCAN} 格内都没到底（真·悬空长廊，掉下去基本没救${worstDrop > DROP_SCAN ? '；最深落差已超过扫描深度' : ''}）` + (risk ? `；另外${risk}` : '')
+  if (hazards.length > 0) {
+    const h0 = hazards[0]
+    const head = `桥下有${h0.text}：最近 (${h0.x},${h0.y},${h0.z}) 下方 ${Math.abs(h0.dy)} 格，共 ${hazards.length} 格踩空就掉进去`
+    risk = risk ? `${head}；另外${risk}` : head
+  }
+  return { ok: true, cells, drop: worstDrop, risk, hazardCount: hazards.length, hazards: hazards.slice(0, 6) }
 }
 
 /**
@@ -273,12 +310,15 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
    *    人明明已经在同一列上，高度差是地形造成的 —— 以前这里判死"没走到"，整趟报 failed。
    *    这些格单独记下来，结果里如实说"站到了它上面一层"，不算没走。 */
   const stoodAbove = []
+  /** 逐格复查时攒下的警告（要命方块）——只说不拦 */
+  const warned = []
   let walked = 0
   const deadline = Date.now() + self.callLeft()
   /** 收场：任何一处对不上都从这里出去，**绝不继续往下铺** */
   const stop = (why, extra = {}) => ({
     ok: false, stopped: true, why, dir: d.name, count: n, from: start,
     placed: placed.length, walked, placedAt: placed, ...(skipped.length ? { skipped: skipped.length } : {}),
+    ...(warned.length ? { warnings: warned.slice(0, 8), warningCount: warned.length } : {}),
     held: heldText(b), ...extra,
     hint: '**别在当前这一格继续硬铺**：先 mc_scan / mc_map 看看前面到底什么样（多半是服务端拒了放置、或脚下已经不是实地）。'
       + '已经铺好的格子会跳过，处理完再叫一次同一个方向就行。',
@@ -309,7 +349,9 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
     }
     const hz = hazardIn(b, deck, 6)
     if (hz?.kind === 'fatal') {
-      return stop(`前方 (${at}) 下方 ${Math.abs(hz.dy)} 格是 ${fatalText(hz.name)}——**再往前就是死**，不铺了`)
+      // 用户 2026-10-22：「改成警告」—— 不拦，记一条接着铺（掉下去是玩家自己的选择）
+      const line = `(${at}) 下方 ${Math.abs(hz.dy)} 格是 ${fatalText(hz.name)}`
+      if (!warned.includes(line)) warned.push(line)
     }
     const health = Number(b.health)
     if (Number.isFinite(health) && health < minHealth) {
@@ -376,6 +418,7 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
     ...(skipped.length ? { skipped: skipped.length, skippedWhy: `这 ${skipped.length} 格本来就有方块（不是空档），没重铺：${skipped.slice(0, 3).join('、')}` } : {}),
     ...(stoodAbove.length ? { stoodAbove: stoodAbove.length, stoodAboveWhy: `有 ${stoodAbove.length} 格「该站的位置」被方块占着，人站到了它上面一层（${stoodAbove.slice(0, 3).join('、')}）—— 同一列，算走到了` } : {}),
     ...(safety.risk ? { risk: safety.risk } : {}),
+    ...(warned.length ? { warnings: warned.slice(0, 8), warningCount: warned.length } : {}),
     ...(held !== held0 ? { held, heldBefore: held0 } : { held }),
     ...(placed.length === n ? { hint: '整条铺完了，人也走过来了。' } : {}),
   }

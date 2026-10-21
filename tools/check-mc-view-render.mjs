@@ -399,6 +399,56 @@ console.log('— 8. 皮肤（真实皮肤按 MC 布局贴到模型各面 + 朝�
   ok(capeParts.length === 7 && capeParts.some((p) => p.cape === true), '有披风时多一个披风部件（7 个）', String(capeParts.length))
 }
 
+console.log('— 8.5 非实体方块（火把/花草）也要画出来 —')
+{
+  const build = (withSoft) => ({
+    getBlock (pos) {
+      const { x, y, z } = pos.floored()
+      if (y === 0) return { name: 'grass_block', boundingBox: 'block' }
+      if (z === -6 && y >= 1 && y <= 3) return { name: 'stone', boundingBox: 'block' }
+      if (withSoft && y === 1 && x === 0 && z === -4) {
+        // 火把：boundingBox 是空的，真实碰撞盒是一根细柱（0.4375~0.5625 宽、0.625 高）
+        return { name: 'torch', boundingBox: 'empty', shapes: [[0.4375, 0, 0.4375, 0.5625, 0.625, 0.5625]] }
+      }
+      if (withSoft && y === 1 && x === 2 && z === -4) {
+        // 读不到 shapes 的软方块：必须走兜底小方块，不能不画
+        return { name: 'short_grass', boundingBox: 'empty' }
+      }
+      return { name: 'air', boundingBox: 'empty' }
+    },
+  })
+  const base = { origin: [0, 1.3, 0], yaw: 0, pitch: 0, width: 192, height: 108, distance: 48 }
+
+  // ① 射线照旧穿过它们（不能因为要画就把视线挡住）
+  const hit = castRay(build(true), 0, 1.3, 0, 0, 0, -1, 20, undefined, 200)
+  ok(hit && hit.name === 'stone', '射线穿过火把 → 命中后面的石头墙', hit && hit.name)
+
+  // ② 图里画出来了
+  const withSoft = renderView({ ...base, world: build(true) })
+  const noSoft = renderView({ ...base, world: build(false) })
+  const torchStat = withSoft.stats.softTop.find((t) => t.name === 'torch')
+  ok(withSoft.stats.softDrawn === 2, '两个非实体方块都画了', String(withSoft.stats.softDrawn))
+  ok(torchStat && torchStat.pixels > 20, '火把有像素（细柱，比草小得多）', JSON.stringify(torchStat))
+  ok(withSoft.stats.softTop.some((t) => t.name === 'short_grass' && t.pixels > 0),
+    '读不到碰撞盒的软方块有兜底方块', JSON.stringify(withSoft.stats.softTop))
+  ok(noSoft.stats.softDrawn === 0, '没有软方块时 softDrawn = 0', String(noSoft.stats.softDrawn))
+  let diff = 0
+  for (let i = 0; i < withSoft.rgba.length; i += 4) {
+    if (withSoft.rgba[i] !== noSoft.rgba[i]
+      || withSoft.rgba[i + 1] !== noSoft.rgba[i + 1]
+      || withSoft.rgba[i + 2] !== noSoft.rgba[i + 2]) diff++
+  }
+  ok(diff > 20, '火把/草确实改了画面像素', String(diff))
+
+  // ③ 准星正前方的软方块要单独认出来（主射线穿过它，打的是后面的墙）
+  const cs = withSoft.stats.centerSoft
+  ok(cs && cs.name === 'torch', 'centerSoft = torch', JSON.stringify(cs))
+  ok(cs && cs.dist > 2 && cs.dist < 4.5, 'centerSoft 距离在 2~4.5 格', cs && String(cs.dist))
+  ok(noSoft.stats.centerSoft === null, '没有软方块时 centerSoft = null', JSON.stringify(noSoft.stats.centerSoft))
+
+  writeFileSync(join(outDir, 'view-soft-blocks.png'), encodePng(base.width, base.height, withSoft.rgba))
+}
+
 console.log('— 9. 性能（默认 192×108 + 更大档）—')
 {
   const { world, entities } = selfTest()

@@ -10,7 +10,8 @@
  *   验收标准：「**不会因未确认放置就盲目前进**」
  *
  * 这一套钉死五件事：
- *   ① **A 开铺前就拦** —— 血量不够 / 脚下不是实地 / 前方岩浆 / 看不到底 / 材料不够 ⇒ 一块都不放；
+ *   ① **A 开铺前就拦** —— 血量不够 / 脚下不是实地 / 看不到底 / 材料不够 ⇒ 一块都不放；
+ *      （2026-10-22 起**前方岩浆不再是"拦"**：改成照铺 + 结果里带 `warnings`/`risk` 点名，见 ⑦）
  *   ② **C 只认回读** —— `placeBlock()` 说放上了不算，必须 `blockAt` 真读到那个方块名；
  *      回读对不上 ⇒ **停，且一格都不往前走**；
  *   ③ **D 先确认再走** —— 走完要核对"人真到了那一格"+"新脚下还是实地"，
@@ -27,7 +28,7 @@ import vec3pkg from 'vec3'
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 const {
   BRIDGE_MAX, BRIDGE_MIN_HEALTH, BRIDGE_DEEP,
-  dirOf, dirNameOf, bridgeCellsOf, bridgeDirTo, dropBelow, hazardIn,
+  dirOf, dirNameOf, bridgeCellsOf, bridgeDirTo, dropBelow, dropProbe, DROP_SCAN, hazardIn,
   bridgeSafetyOf, confirmBlockAt, feetOf, bridgeAcross, heldSnapshotOf, restoreHeldOf,
   BRIDGE_FATAL, BRIDGE_FATAL_NAMES, avoidBlockIds,
 } = await import(new URL('../src/bridge.mjs', import.meta.url))
@@ -175,7 +176,12 @@ section('④ dropBelow / hazardIn：往下看，看不着底就说"不知道"')
   ok(dropBelow(b, { x: 0, y: 64, z: 0 }, 24) === 3, 'y=64 往下 3 格到 y=60 的石头 ⇒ 3')
   ok(dropBelow(b, { x: 0, y: 61, z: 0 }, 24) === 0, '正下方就是石头 ⇒ 0')
   ok(dropBelow(b, { x: 200, y: 64, z: 200 }, 24) === null, '区块外 ⇒ null（不猜深浅）')
-  ok(dropBelow(b, { x: 0, y: 64, z: 0 }, 2) === null, 'max 之内找不到 ⇒ null')
+  ok(dropBelow(b, { x: 0, y: 64, z: 0 }, 2) === null, 'max 之内找不到 ⇒ null（老接口保持 null）')
+  ok(dropProbe(b, { x: 0, y: 64, z: 0 }, 24).drop === 3, 'dropProbe：踩到实地 ⇒ drop=3')
+  ok(dropProbe(b, { x: 0, y: 64, z: 0 }, 2).bottomed === true, 'dropProbe：扫到底还是空 ⇒ bottomed（深空，不是"不知道"）')
+  ok(dropProbe(b, { x: 200, y: 64, z: 200 }, 24).unloaded === true, 'dropProbe：区块外 ⇒ unloaded（真·不知道）')
+  ok(dropProbe(b, { x: 0, y: 64, z: 0 }, 24).unloaded !== true, '踩到实地时不算 unloaded')
+  ok(DROP_SCAN === 64 && DROP_SCAN > 24, '扫描深度从 24 加到 64（用户：有会超过 24 格的情况）')
   const w2 = mkWorld()
   w2.set(0, 60, 0, 'lava')
   w2.set(1, 60, 0, 'water')
@@ -213,7 +219,10 @@ section('⑤ bridgeSafetyOf：A「开铺前就拦」（一块都不放）')
   const { w: w2, bot: bot2 } = gapScene({ depth: 5 })
   w2.set(2, 62, 0, 'lava')
   const lv = bridgeSafetyOf(bot2, { feet: feetOf(bot2), dir: dirOf('east'), count: 3, item: { name: 'cobblestone', count: 64 }, need: 3 })
-  ok(lv.ok === false && lv.why.includes('lava'), '前方桥面下有岩浆 ⇒ 拦住（搭过去也会掉进去）')
+  ok(lv.ok === true, '前方桥面下有岩浆 ⇒ 不再拦（用户 2026-10-22「改成警告」），照铺')
+  ok(lv.hazardCount === 1 && lv.hazards[0].name === 'lava', '但如实记账：hazardCount / hazards 里点名 lava')
+  ok(lv.risk?.includes('岩浆'), 'risk 里写清"桥下有岩浆、踩空就掉进去"')
+  ok(bridgeSafetyOf(bot2, { feet: feetOf(bot2), dir: dirOf('east'), count: 3, item: { name: 'cobblestone', count: 64 }, need: 3 }, undefined) !== undefined, '（签名没被这次改动破坏）')
 
   const { bot: bot3 } = gapScene({ depth: 5, items: [{ name: 'cobblestone', count: 2 }] })
   const nm = bridgeSafetyOf(bot3, { feet: feetOf(bot3), dir: dirOf('east'), count: 3, item: { name: 'cobblestone', count: 2 }, need: 3 })
@@ -223,8 +232,18 @@ section('⑤ bridgeSafetyOf：A「开铺前就拦」（一块都不放）')
   const orig4 = w4.blockAt.bind(w4)
   bot4.blockAt = (p) => (p.y < 63 ? null : orig4(p))   // 脚下那格是实地，前方"看不到底"
   const un = bridgeSafetyOf(bot4, { feet: feetOf(bot4), dir: dirOf('east'), count: 3, item: { name: 'cobblestone', count: 64 }, need: 3 })
-  ok(un.ok === false && un.why.includes('看不到底'), '看不到底（区块没加载）⇒ 拦住，不猜')
+  ok(un.ok === false && un.why.includes('没加载'), '读到 null（区块没加载）⇒ 拦住，不猜深浅')
   ok(BRIDGE_MIN_HEALTH === 8 && BRIDGE_DEEP === 8, '常量值：最低血量 8、深沟阈值 8')
+
+  // ── 很高的悬空长廊：一路空到 64 格还没底 ⇒ 照搭 + risk（2026-10-22 用户：有超过 24 格的情况） ──
+  const sky = mkWorld()
+  // 站在 y=100（假世界的"已加载区"是 y=0..160），下面 64 格全是空气且**都读得到** ⇒ 只会 bottomed
+  sky.set(0, 99, 0, 'stone')
+  const skyBot = mkBot(sky, { x: 0, y: 100, z: 0 })
+  const sd = bridgeSafetyOf(skyBot, { feet: feetOf(skyBot), dir: dirOf('east'), count: 3, item: { name: 'cobblestone', count: 64 }, need: 3 })
+  ok(sd.ok === true, '🔴 下方一路空到 64 格 ⇒ 不再拒（以前必拒"看不到底"）')
+  ok(sd.drop === DROP_SCAN, '落差按扫描深度记（>= 深沟阈值，会带 risk）')
+  ok(sd.risk?.includes('没到底') && sd.risk.includes('悬空长廊'), 'risk 说清"64 格内没到底、真·悬空长廊"')
 }
 
 section('⑥ confirmBlockAt：C 的确认（只认回读，不认"我以为"）')
@@ -324,14 +343,24 @@ section('⑦ bridgeAcross 整条：放一块 → 确认 → 才走一格')
   const rg = await bridgeAcross(sg, { dir: 'east', count: 3, name: 'cobblestone' })
   ok(rg.ok === false && rg.why.includes('支撑'), '走完发现脚下支撑没了 ⇒ 立刻停（再往前就是掉）')
 
-  // ── 前方有岩浆：A 阶段就拦，一块都不放 ──
+  // ── 前方有岩浆：现在只警告，照铺（用户 2026-10-22「改成警告」） ──
   const h = gapScene({ depth: 5 })
   h.w.set(2, 58, 0, 'lava')
   const sh = mkSelf(h.bot, h.w)
   const rh = await bridgeAcross(sh, { dir: 'east', count: 3, name: 'cobblestone' })
-  ok(rh.ok === false && rh.stopped === true, '前方岩浆 ⇒ 开铺前就停')
-  ok(sh.placedCalls.length === 0, '🔴 一块都没放')
-  ok(rh.why.includes('lava'), 'why 点名 lava')
+  ok(rh.ok === true && rh.placed === 3, '前方岩浆 ⇒ 照样铺完 3 格（不再一块都不放）')
+  ok(rh.warningCount >= 1 && String(rh.warnings || '').includes('岩浆'), '结果里点名岩浆（warnings）')
+  ok(rh.risk && rh.risk.includes('岩浆'), 'risk 也写着桥下有岩浆')
+  ok(rh.warningCount === 1, '只是"经过"(2,63,0) 那格时扫到一次，同一处不重复刷')
+
+  // ── 深空长廊：一路空 ⇒ 照铺（不只安全检查放行，复跑装配也要真走完） ──
+  const sky2 = mkWorld()
+  sky2.set(0, 99, 0, 'stone')
+  const sky2Bot = mkBot(sky2, { x: 0, y: 100, z: 0 })
+  const ssky = mkSelf(sky2Bot, sky2)
+  const rsky = await bridgeAcross(ssky, { dir: 'east', count: 3, name: 'cobblestone' })
+  ok(rsky.ok === true && rsky.placed === 3, '深空长廊 ⇒ 3 格全铺上')
+  ok(ssky.placedCalls.length === 3, '真放了 3 块方块')
 
   // ── 血量低：A 阶段拦 ──
   const i2 = gapScene({ depth: 5, health: 3 })

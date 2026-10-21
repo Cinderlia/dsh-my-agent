@@ -190,6 +190,69 @@ export const isAirName = (n) => n === 'air' || n === 'cave_air' || n === 'void_a
 export const isWaterName = (n) => typeof n === 'string' && /water/.test(n)
 export const isLavaName = (n) => n === 'lava'
 
+/** 非实体方块最多收集多少个（防极端场景表爆炸） */
+const SOFT_CAP = 4096
+/** 一帧最多补画多少个软方块 */
+const SOFT_DRAW_MAX = 1200
+
+/** 方块碰撞盒（block.shapes）→ 世界坐标 AABB 列表 */
+function softBoxesOf (s) {
+  const list = []
+  const shapes = Array.isArray(s.block && s.block.shapes) ? s.block.shapes : null
+  let unit = 1
+  if (shapes && shapes.length > 0) {
+    let maxv = 0
+    for (const sh of shapes) {
+      if (!sh) continue
+      for (let i = 0; i < 6 && i < sh.length; i++) if (sh[i] > maxv) maxv = sh[i]
+    }
+    if (maxv > 1.5) unit = 1 / 16 // 少数数据源用 1/16 格为单位
+  }
+  if (shapes && shapes.length > 0) {
+    for (const sh of shapes.slice(0, 12)) {
+      if (!sh || sh.length < 6) continue
+      const x0 = sh[0] * unit
+      const y0 = sh[1] * unit
+      const z0 = sh[2] * unit
+      const x1 = sh[3] * unit
+      const y1 = sh[4] * unit
+      const z1 = sh[5] * unit
+      if (!(x1 > x0) || !(y1 > y0) || !(z1 > z0)) continue
+      list.push({ minX: s.x + x0, minY: s.y + y0, minZ: s.z + z0, maxX: s.x + x1, maxY: s.y + y1, maxZ: s.z + z1 })
+    }
+  }
+  if (list.length === 0) {
+    // 读不到碰撞盒：给个"小竖块"占位（0.5 宽、0.85 高、贴底），总比不画强
+    list.push({ minX: s.x + 0.25, minY: s.y, minZ: s.z + 0.25, maxX: s.x + 0.75, maxY: s.y + 0.85, maxZ: s.z + 0.75 })
+  }
+  return list
+}
+
+/** 把收集到的非实体方块画上去（远的先画，近的写深度盖住） */
+function drawSoftBlocks (pc, soft) {
+  const names = new Map()
+  let drawn = 0
+  if (!soft || soft.size === 0) return { drawn, names }
+  const list = []
+  for (const s of soft.values()) if (s.dist <= pc.distance) list.push(s)
+  list.sort((a, b) => b.dist - a.dist)
+  for (const s of list.slice(0, SOFT_DRAW_MAX)) {
+    const rule = ruleOf(s.name)
+    let color = rule.color
+    if (rule.emissive === true) {
+      // 会发光的（火把/萤石…）用提亮色，跟环境拉开
+      color = [Math.min(255, color[0] + 16), Math.min(255, color[1] + 16), Math.min(255, color[2] + 12)]
+    }
+    let painted = 0
+    for (const box of softBoxesOf(s)) painted += paintBox(pc, box, color, { plain: true })
+    if (painted > 0) {
+      drawn++
+      names.set(s.name, (names.get(s.name) || 0) + painted)
+    }
+  }
+  return { drawn, names }
+}
+
 /** 面 + 局部坐标 → 该像素的**未打光**颜色（含程序化贴图） */
 export function patternPixel (rule, axis, step, u, v, bx, by, bz) {
   // 先决定这一面的基础色（草方块侧面是土、原木顶面是年轮）
@@ -397,7 +460,7 @@ export function makePos () {
  * @returns null（没命中=天空）| { unknown:true, dist }（撞到未加载区块）
  *          | { name, dist, axis, step, block, bx, by, bz }（axis: 0=x 1=y 2=z；step: 沿该轴的前进方向）
  */
-export function castRay (world, ox, oy, oz, dx, dy, dz, maxDist, scratch, maxSteps = VIEW_DEFAULTS.maxSteps) {
+export function castRay (world, ox, oy, oz, dx, dy, dz, maxDist, scratch, maxSteps = VIEW_DEFAULTS.maxSteps, soft = null) {
   // 把"几乎为 0"的分量按 0 处理：否则 yaw 正好 ±90° 时 cos(yaw)≈6e-17 会让射线
   // 在第一步就沿另一轴漂一格（tMax≈0），画面出现一格错位。
   const EPS = 1e-12
@@ -449,7 +512,14 @@ export function castRay (world, ox, oy, oz, dx, dy, dz, maxDist, scratch, maxSte
     const n = b.name
     if (isAirName(n)) continue
     // 花草/藤蔓/红石线等 boundingBox 为空的**非实体**方块穿过去（水/岩浆例外，要停）
-    if (b.boundingBox === 'empty' && !isWaterName(n) && !isLavaName(n)) continue
+    // 但**记一笔**（soft 表）：这些方块看得见、挡不住视线 —— 由 drawSoftBlocks 单独补画。
+    if (b.boundingBox === 'empty' && !isWaterName(n) && !isLavaName(n)) {
+      if (soft !== null && soft.size < SOFT_CAP) {
+        const sk = x + ',' + y + ',' + z
+        if (!soft.has(sk)) soft.set(sk, { name: n, dist: t, block: b, x, y, z })
+      }
+      continue
+    }
     return { name: n, dist: t, axis, step, block: b, bx: x, by: y, bz: z }
   }
   return null
@@ -1123,7 +1193,8 @@ export function renderView (opts) {
   const aoPos = makePos()
   const aoCache = new Map()
   const counts = new Map()
-  const stats = { sky: 0, unknown: 0, hit: 0, pixels: width * height, top: [], entityPixels: 0, entitiesDrawn: 0, skinned: 0 }
+  const soft = new Map() // 被穿过的非实体方块（火把/花草/作物…），像素循环后再补画
+  const stats = { sky: 0, unknown: 0, hit: 0, pixels: width * height, top: [], softTop: [], softDrawn: 0, centerSoft: null, entityPixels: 0, entitiesDrawn: 0, skinned: 0 }
   const ox = origin[0]
   const oy = origin[1]
   const oz = origin[2]
@@ -1159,7 +1230,7 @@ export function renderView (opts) {
       let tintB = 0
       let tintA = 0
       for (let layer = 0; layer < 4; layer++) {
-        const h = castRay(world, ox + dx * travelled, oy + dy * travelled, oz + dz * travelled, dx, dy, dz, distance - travelled, scratch, maxSteps)
+        const h = castRay(world, ox + dx * travelled, oy + dy * travelled, oz + dz * travelled, dx, dy, dz, distance - travelled, scratch, maxSteps, soft)
         if (h === null || h.unknown) { hit = h; break }
         const rule = ruleOf(h.name)
         if (rule.glass === true && layer < 3) {
@@ -1259,6 +1330,23 @@ export function renderView (opts) {
       if (px === cx && py === cy) center = hit
       o += 4
     }
+  }
+
+  /* ── 非实体方块（火把/花草/作物/铁轨…）：射线穿过去了，这里按碰撞盒单独补画 ── */
+  const softResult = drawSoftBlocks(pc, soft)
+  stats.softDrawn = softResult.drawn
+  stats.softTop = [...softResult.names.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([name, pixels]) => ({ name, pixels }))
+  // 准星正前方最近的非实体方块（主射线打不到它们，单独再走一条）
+  if (soft.size > 0) {
+    const cSoft = new Map()
+    try {
+      castRay(world, ox, oy, oz, f[0], f[1], f[2], distance, makePos(), maxSteps, cSoft)
+      const first = [...cSoft.values()].sort((a, b) => a.dist - b.dist)[0]
+      if (first) stats.centerSoft = { name: first.name, dist: Math.round(first.dist * 10) / 10 }
+    } catch { /* 读不到世界就算了 */ }
   }
 
   /* ── 实体 ── */

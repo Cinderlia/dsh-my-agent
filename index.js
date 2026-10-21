@@ -3423,21 +3423,19 @@ export function apply(ctx, rawConfig) {
     name: 'mc_map',
     description: '看周围地形。**默认给"脚下方块那一层"**（地板层图：这一层哪里是实心地面、哪里是坑/岩浆/未加载）：'
       + '· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载。'
-      + 'mode="floor"（默认）/ "auto"（地下自动切洞穴层：# 墙 · 能站 ↓ 低一格 v 会掉 * 矿石）'
-      + '/ "surface"（地表：@ 我 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田）/ "cave"'
-      + '/ "column"（竖列：只看你脚下这一格，往下几格实心、哪里开始是空的、头顶什么封着、跳不跳得起来）；slab = 洞穴层上下各看几格（默认 2）。'
+      + 'mode="floor"（默认）/ "surface"（地表：@ 我 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田）'
+      + '/ "column"（竖列：只看你脚下这一格，往下几格实心、哪里开始是空的、头顶什么封着、跳不跳得起来）。'
       + 'format="image" 出**俯视图像**（有视觉的模型能直接看，并落盘）。'
       + '🔴 想让 用户 看到图：见 out 参数。'
       + '字符图省 token 且坐标精确；形状/外观问题用图像。',
     parameters: {
       radius: { type: 'number', description: '半径（默认 32，上限 96）' },
-      mode: { type: 'string', description: 'floor（默认，脚下方块那一层）/ auto（地下自动切洞穴层）/ surface / cave / column（竖列）' },
+      mode: { type: 'string', description: 'floor（默认，脚下方块那一层）/ surface（地表图）/ column（竖列）；2026-10-22 起 cave 与 auto 已删除，传它们等于没传' },
       purpose: { type: 'string', description: 'overview（默认）/ navigation（加目标方位）/ hazards（先列危险格）' },
       target: { type: 'string', description: '（可选）目标坐标 "x,y,z"（mc_scan 给的）；竖列图用它定 x/z' },
       up: { type: 'number', description: '竖列图头顶看几格（默认 40）' },
       layer: { type: 'number', description: 'floor 层的 y（默认 feetY-1）' },
       depth: { type: 'number', description: 'floor 层往下探几格找地面（默认 4，0–8）' },
-      slab: { type: 'number', description: '洞穴层上下各看几格（默认 2，范围 1–8；5 = 上下各 5 格）' },
       glyphStep: { type: 'number', description: '字符图抽稀步长（默认 2；1 最细）' },
       yTop: { type: 'number', description: '地表搜索起始高度偏移（默认 +10，仅地表图用）' },
       yBottom: { type: 'number', description: '向下搜索深度（默认 -24；地表图与竖列图用）' },
@@ -3467,9 +3465,9 @@ export function apply(ctx, rawConfig) {
       const step = Math.max(1, Number(args.glyphStep ?? 2))
       const modeArg = String(args.mode ?? '').toLowerCase()
       /* 🔴 2026-10-15（用户需求）：**默认给"脚下方块那一层"**（地板层视图）。
-       *    老行为一个都没丢：`mode:"auto"`（地下自动切洞穴层）/ `"surface"` / `"cave"` 原样保留 ——
-       *    传了就用传的那个；不传、或传了不认识的值 ⇒ `floor`。 */
-      const mode = modeArg === 'auto' || modeArg === 'surface' || modeArg === 'cave' || modeArg === 'column' ? modeArg : 'floor'
+       *    2026-10-22（用户要求「把 cave 去掉」）：`auto` / `cave` 两个取值删了（洞穴层视图整块没了），
+       *    现在只认 `floor` / `surface` / `column`；不传、或传了不认识的值（含 `auto`/`cave`）⇒ `floor`。 */
+      const mode = modeArg === 'surface' || modeArg === 'column' ? modeArg : 'floor'
       /* 🔴 2026-10-15（用户需求）：**竖列图** —— 只看一格，从脚底那一格往下，回答"我往下挖会不会掉下去"。
        *    它跟俯视图是两件事（一个是"周围哪能走"，一个是"底下有没有空的"），所以拿到 x/z 就直接返回，
        *    不参与 radius / legend / 导航摘要那一套。`target` 用 `parseXZ` 定 x/z（`"12,-4"` 或 `"12,63,-4"`），
@@ -3489,12 +3487,11 @@ export function apply(ctx, rawConfig) {
           text: columnText(col),
         }
       }
-      const slab = Math.min(Math.max(Number(args.slab ?? 2) || 2, 1), 8)
       /* `floor` 走新函数（直接 import `src/map-render.mjs`，不经过 `core.mjs` 的薄包装 —— 那文件贴着 1000 行上限）；
-       * 其余三条仍走 `sess.bot.heightmap()`。 */
+       * `surface` 走 `sess.bot.heightmap()`（它现在只会出地表图，没有 mode/slab）。 */
       const hm = mode === 'floor'
         ? floorMapOf(sess.bot.requireBot(), { radius: args.radius, layer: args.layer, depth: args.depth })
-        : sess.bot.heightmap({ radius: args.radius, yTop: args.yTop, yBottom: args.yBottom, mode, slab })
+        : sess.bot.heightmap({ radius: args.radius, yTop: args.yTop, yBottom: args.yBottom })
       const purposeArg = String(args.purpose ?? '').toLowerCase()
       const purpose = purposeArg === 'navigation' || purposeArg === 'hazards' ? purposeArg : 'overview'
       const nav = navSummaryOf(hm, { purpose, target: args.target })
@@ -3525,7 +3522,7 @@ export function apply(ctx, rawConfig) {
       }
       if (format === 'image' || format === 'both') {
         const img = await sess.bot.mapImageAsync({
-          radius: args.radius, yTop: args.yTop, yBottom: args.yBottom, scale: args.scale, mode, slab,
+          radius: args.radius, yTop: args.yTop, yBottom: args.yBottom, scale: args.scale, mode,
           layer: args.layer, depth: args.depth,
         })
         const png = encodePng(img.width, img.height, img.rgba)
@@ -3583,23 +3580,19 @@ export function apply(ctx, rawConfig) {
       const lines = [
         hm.mode === 'floor'
           ? `🪨 地板层图（脚下方块那一层）y=${hm.layer.y} ｜ 中心 (${hm.center.x}, ${hm.center.z}) ｜ 半径 ${hm.radius} ｜ 未加载 ${hm.unloaded} 格`
-          : (hm.mode === 'cave'
-            ? `🕳️ 洞穴层图 中心 (${hm.center.x}, ${hm.center.z}) ｜ 我这一层 y=${hm.layer.y}，上下各 ${hm.layer.slab} 格 ｜ 半径 ${hm.radius} ｜ 未加载 ${hm.unloaded} 格`
-            : `🗺️ 地形图 中心 (${hm.center.x}, ${hm.center.z}) ｜ 半径 ${hm.radius} ｜ 未加载 ${hm.unloaded} 格`),
+          : `🗺️ 地形图 中心 (${hm.center.x}, ${hm.center.z}) ｜ 半径 ${hm.radius} ｜ 未加载 ${hm.unloaded} 格`,
         `图例 ${legendText}`,
       ]
       if (hm.mode === 'floor') {
         const t = hm.counts ?? {}
         lines.push(`能站 ${t.walkable ?? 0} 格 ｜ 墙 ${t.blocked ?? 0} ｜ 会掉下去 ${t.drop ?? 0} ｜ 液体 ${t.liquid ?? 0} ｜ 未加载 ${t.unknown ?? 0}`)
-        lines.push('（· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载；想看老视图就 mode:"auto"（地下自动切洞穴层）/ "surface"（地表）/ "cave"）')
-      } else if (hm.mode === 'cave') {
-        lines.push('（# 墙 · 能站 ↓ 低一格 v 会掉下去 ~ 水 ≈ 岩浆 * 矿石 ? 未加载；想强制看地表就 mode:"surface"）')
+        lines.push('（· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载；想看地表图就 mode:"surface"）')
       }
       /* 2026-10-15：`purpose` 的紧凑摘要（导航/危险）—— 让模型不用自己从几十行字符图里数 */
       for (const l of nav.lines) lines.push(l)
       if (out.glyphMap) lines.push(out.glyphMap)
       if (out.image) {
-        lines.push(`🖼️ ${hm.mode === 'floor' ? '地板层俯视图' : (hm.mode === 'cave' ? '洞穴层俯视图' : '俯视图')} ${out.image.width}×${out.image.height}（每格 ${out.image.scale}px，${out.image.bytes} B）`
+        lines.push(`🖼️ ${hm.mode === 'floor' ? '地板层俯视图' : '俯视图'} ${out.image.width}×${out.image.height}（每格 ${out.image.scale}px，${out.image.bytes} B）`
           + `${out.image.file ? ` 落盘：${out.image.file}` : ''}${out.image.attachment ? '（已内联）' : ''}`)
         if (out.image.attachmentError) lines.push(`（内联失败：${out.image.attachmentError}）`)
         if (out.image.fileError) lines.push(`（落盘失败：${out.image.fileError}）`)
@@ -3715,10 +3708,10 @@ export function apply(ctx, rawConfig) {
       + '· look 看向坐标或玩家(who)\n'
       + '· toward 看向并走近某个玩家(who)\n'
       + '· place 放方块 (x,y,z)；悬空先垫脚（=搭高）\n'
-      + '· bridge 搭路：朝 (x,y,z) 铺脚下一层，有坠落/岩浆风险就停\n'
+      + '· bridge 搭路：朝 (x,y,z) 铺脚下一层；脚下悬空/区块没加载/血量<8 就停，岩浆与深空只警告\n'
       + '· break 破坏 (x,y,z)：自动换对的工具\n'
       + '· use 用方块/实体(who)：门/按钮/拉杆/喂动物；都不给=用手上的\n'
-      + '· useitem 用手上的东西：扔眼睛/雪球\n'
+      + '· useitem 用手上的东西：扔眼睛/雪球；**带 x/y/z 会先瞄准、停 450ms 再用**（舀水/骨粉/补种都带坐标）\n'
       + '· shoot 射箭。水晶 x/y/z，龙 who:"ender_dragon"；射完报 around\n'
       + '· attack 打实体（who 中英文都认，24 格内会追；不给按 priority 挑；kite 放风筝）\n'
       + '· equip 装备(name)：护甲自动穿、盾进副手\n'
@@ -3761,7 +3754,7 @@ export function apply(ctx, rawConfig) {
         case 'toward':  return { mode, ...(await bot.interact(args)) }
         case 'place':   return withOutcome({ mode, ...(await bot.placeBlock(args)) }, { expect: 'placed' })
         /* P0-2（用户 m02868）：搭路是**独立状态机** —— 每格"放一块 → 等服务端确认 → 才走"，任何一处
-         * 对不上（脚下悬空 / 前方致命 / 血量太低 / 回读没确认）立刻停，绝不继续往下铺。
+         * 对不上（脚下悬空 / 区块没加载 / 血量太低 / 回读没确认）立刻停，绝不继续往下铺；桥下有岩浆/火、或者下方是 >64 格深空 ⇒ **只警告不拦**（2026-10-22 用户要求），结果里带 warnings/risk。
          * `x/y/z` 是**终点那一格**（铺在脚下一层），方向与格数由 `bridgeDirTo()` 反推。 */
         case 'bridge':  return withOutcome({ mode, ...(await bot.bridge({ x: args.x, y: args.y, z: args.z, name: args.name })) })
         case 'break':   return withOutcome({ mode, ...(await bot.breakBlock(args)) })

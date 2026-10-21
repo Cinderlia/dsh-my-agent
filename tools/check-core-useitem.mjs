@@ -65,7 +65,7 @@ const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\
  *   - `withDeactivate` 有没有 `deactivateItem`（老版本 mineflayer / 假 bot 可能没有）
  */
 const mkBot = ({ held = { name: 'snowball', count: 16 }, withDeactivate = true } = {}) => {
-  const calls = { activate: 0, deactivate: 0, at: [] }
+  const calls = { activate: 0, deactivate: 0, at: [], look: [] }
   const bot = {
     entity: { position: new Vec3(0, 64, 0) },
     _client: {},
@@ -74,6 +74,8 @@ const mkBot = ({ held = { name: 'snowball', count: 16 }, withDeactivate = true }
     // 真 mineflayer 的 activateItem() 是**同步发包**、返回 undefined —— 故意返回 undefined
     // 来钉住"core 必须自己 Promise.resolve() 包一层"，否则 #t 会拿到非 promise。
     activateItem: () => { calls.activate++; calls.at.push(Date.now()) },
+    // 2026-10-22：useItem 可以"先瞄再用"（带 x/y/z 时）—— 记下瞄准点与时刻，好断言顺序
+    lookAt: (p, force) => { calls.look.push({ x: p?.x, y: p?.y, z: p?.z, force, at: Date.now() }) },
     setControlState: () => {},
     on: () => bot,
     removeListener: () => {},
@@ -202,8 +204,9 @@ section('⑦ 工具层接线 —— mc_act{useitem} 与"use 不给目标"都要�
 
   const useSrc = stripComments(readFileSync(new URL('../src/world-use.mjs', import.meta.url), 'utf8'))
 
-  ok(/export async function useItem \(b, \{ hold = 0 \} = \{\}, ctx = \{\}\)/.test(useSrc),
-    'useItem 的实现在 src/world-use.mjs（签名照旧收 { hold }）')
+  ok(/export async function useItem \(b, \{ hold = 0, x, y, z \} = \{\}, ctx = \{\}\)/.test(useSrc),
+    'useItem 的实现在 src/world-use.mjs（{ hold, x, y, z } —— x/y/z 是"先瞄再用"的目标格）')
+  ok(/export const AIM_SETTLE_MS = 450/.test(useSrc), 'AIM_SETTLE_MS = 450（转头包与交互包之间那一拍）')
   ok(/b\.activateItem\(\)/.test(useSrc), 'world-use.mjs 调了 `b.activateItem()`')
   ok(/b\.deactivateItem\(\)/.test(useSrc), 'world-use.mjs 调了 `b.deactivateItem()`')
   ok(/ctx\.callLeft \? Number\(ctx\.callLeft\(\)\) : 11_000/.test(useSrc), 'hold 用 `ctx.callLeft()` 钳过（不是裸 3000）')
@@ -233,6 +236,29 @@ section('⑦ 工具层接线 —— mc_act{useitem} 与"use 不给目标"都要�
   ok(/可用 [^）]*useitem[^）]*toss/.test(idx),
     '未知 mode 的报错文案里列出了 useitem')
   ok(/useitem\(hold\)/.test(idx), 'mc_sequence 的描述里列出了 useitem(hold)')
+}
+
+/* ─────────── ⑧ 先瞄再用：带 x/y/z 时 look → 等一拍 → activateItem ─────────── */
+section('⑧ 先瞄再用（2026-10-22 用户：AI 不知道怎么用水桶舀水）')
+{
+  const fake = mkBot({ held: { name: 'bucket', count: 1 } })
+  const mc = mkMc(fake)
+  const r = await mc.useItem({ x: 10, y: 62, z: -5 })
+  ok(fake.calls.look.length === 1, '带 x/y/z ⇒ 先 lookAt 一次', `look=${fake.calls.look.length}`)
+  ok(fake.calls.activate === 1, '再 activateItem 一次', `activate=${fake.calls.activate}`)
+  ok(fake.calls.look[0].x === 10.5 && fake.calls.look[0].y === 62.5 && fake.calls.look[0].z === -4.5,
+    '瞄准点是那格的**中心**（+0.5）', JSON.stringify(fake.calls.look[0]))
+  ok(fake.calls.look[0].force === true, 'lookAt 用了强制转头（force=true，别插值等半天）')
+  const gap = fake.calls.at[0] - fake.calls.look[0].at
+  ok(gap >= 350 && gap <= 1200, '转头包和交互包之间真等了一拍（约 450ms）', `gap=${gap}ms`)
+  ok(r?.aimedAt && r.aimedAt.x === 10, '返回里带 aimedAt（知道瞄的是哪格）', JSON.stringify(r?.aimedAt))
+  ok(/水没装进来/.test(String(r?.note ?? '')), '桶没装到水 ⇒ 直接说"目标那格大概率是流动水、要静水面"', String(r?.note ?? '').slice(0, 60))
+
+  const fake2 = mkBot({ held: { name: 'snowball', count: 8 } })
+  const mc2 = mkMc(fake2)
+  const r2 = await mc2.useItem({})
+  ok(fake2.calls.look.length === 0, '不带 x/y/z ⇒ 不瞄（扔雪球这类照旧）', `look=${fake2.calls.look.length}`)
+  ok(!r2?.aimedAt, '不带目标时返回里没有 aimedAt')
 }
 
 /* ─────────── 收尾 ─────────── */

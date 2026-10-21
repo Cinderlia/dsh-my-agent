@@ -230,7 +230,7 @@ import { entityHealth, inWaterNow, slowDigWhy, dropsNear, dropHint, blockReachOf
 import { grabDrops } from './pickup.mjs'
 import { digMsFor, patchDigTime, bestToolFor } from './dig-speed.mjs'
 import { collectBusy, cancelCollect, waitGrounded, withHeld } from './dig-guard.mjs'
-import { isUnderground, caveCell, heightmapOf, glyphMapText, mapImageOf, mapImageOfAsync } from './map-render.mjs'
+import { heightmapOf, glyphMapText, mapImageOf, mapImageOfAsync } from './map-render.mjs'
 import { scanAround, entitiesNear } from './world-scan.mjs'
 import { readBossBars } from './bossbar.mjs'
 import { connectionViewOf, statusOf } from './status.mjs'
@@ -664,10 +664,8 @@ export class McBot extends EventEmitter {
 
   /* ───────────── 地图（已搬到 src\map-render.mjs，第十一刀） ───────────── */
 
-  /** 我是不是"在地下"（头顶 40 格内有实心遮挡，树叶/竹子/雪层这类"软顶"不算）。 */
-  isUnderground () { return isUnderground(this.requireBot()) }
-
-  /** 俯视地形：见 `src\map-render.mjs` 的 `heightmapOf()`（mode/slab 的说明也在那边）。 */
+  /** 俯视地形（**地表图**）：见 `src\map-render.mjs` 的 `heightmapOf()`。
+   *  2026-10-22：`mode:"cave"` / `"auto"` 和 `isUnderground()` 一起删了 —— 这里没有模式可选。 */
   heightmap (opts = {}) { return heightmapOf(this.requireBot(), opts) }
 
   /** 字符地形图（无视觉也能读） */

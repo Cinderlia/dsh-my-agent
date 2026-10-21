@@ -32,6 +32,16 @@ import { entityNameOf, pickEntity } from './entity-names.mjs'
 import { heldText, equipDestOf } from './inventory.mjs'
 
 /**
+ * "先瞄 → 等一拍 → 再用"里那一拍的时长（毫秒）。
+ *
+ * 🔴 2026-10-22（用户：「AI 不知道怎么用水桶舀水」）：`activateItem` / `activateBlock` 发出去的只是
+ *    "用一次"，**对着哪一格是服务端拿玩家当前 rotation 现算的**；而 mineflayer 的 `lookAt` 只写包，
+ *    转头包和交互包挨着扔出去时，服务端很可能还按旧朝向判定 ⇒ 射线打在自己脚下那块上、交互被丢掉。
+ *    实机就是这么错的：站水边 1 格、俯角 -74°，怎么点都舀不上水；改成 look → 等 450ms → useitem 一次成。
+ */
+export const AIM_SETTLE_MS = 450
+
+/**
  * 使用/激活方块或实体（开门、按按钮、拉杆、开箱子、喂动物…）。
  *
  * 🔴 2026-10-08 审计改了两处：
@@ -161,7 +171,7 @@ export async function useBlock (b, { x, y, z, who = null } = {}, ctx = {}) {
  *   - 喝药水约 1600ms；
  *   - 可扔物（眼睛 / 珍珠 / 雪球）给了也无害，松手包是幂等的。
  */
-export async function useItem (b, { hold = 0 } = {}, ctx = {}) {
+export async function useItem (b, { hold = 0, x, y, z } = {}, ctx = {}) {
   const t = ctx.t ?? ((p) => p)
   const item = b.heldItem
   if (!item) {
@@ -175,12 +185,25 @@ export async function useItem (b, { hold = 0 } = {}, ctx = {}) {
   const left = Number.isFinite(raw) ? raw : 11_000
   const want = Math.max(0, Number(hold) || 0)
   const ms = Math.max(0, Math.min(want, 3_000, Math.max(0, left - 400)))
+  /* 🎯 给了 x/y/z 就先精确瞄准，再等一拍（见 AIM_SETTLE_MS）。水桶舀水 / 骨粉催熟 / 补种都吃这一套。 */
+  let aimedInfo = null
+  const hasTarget = [x, y, z].every((v) => Number.isFinite(Number(v)))
+  if (hasTarget) {
+    try {
+      await t(Promise.resolve(b.lookAt(new Vec3(Number(x) + 0.5, Number(y) + 0.5, Number(z) + 0.5), true)), 'act', `瞄准 (${x},${y},${z})`)
+      await sleep(AIM_SETTLE_MS)
+      aimedInfo = { x: Number(x), y: Number(y), z: Number(z) }
+    } catch (e) {
+      aimedInfo = { x: Number(x), y: Number(y), z: Number(z), error: e.message }
+    }
+  }
   await t(Promise.resolve(b.activateItem()), 'act', `使用 ${item.name}`)
   if (ms > 0) await sleep(ms)
   if (want > 0 && typeof b.deactivateItem === 'function') {
     await t(Promise.resolve(b.deactivateItem()), 'act', `松开 ${item.name}`)
   }
   const out = { used: item.name, count: item.count, heldMs: ms }
+  if (aimedInfo) out.aimedAt = aimedInfo
   /* 🔴 2026-10-08 第五份审计报告 ⑦：`count` 是**使用前**的快照 —— 末影珍珠/雪球扔出去后
    *    仍报旧数量，模型以为手上还有 N 个。这里补一个"用完之后还剩多少"。 */
   const after = (() => {
@@ -201,6 +224,12 @@ export async function useItem (b, { hold = 0 } = {}, ctx = {}) {
    *    补发的 `use_item`，见 `place_entity.js`）。别让模型以为"再按一次就好"。 */
   if (isEntityItem(item.name) && after != null && after >= item.count) {
     out.note = [out.note, `${item.name} 这类东西**不能靠"对着空气用"放** —— 用 mc_act {mode:"place", name:"${item.name}", x, y, z}（船放水面上、矿车放铁轨上；别对着自己脚下）`]
+      .filter(Boolean).join('；')
+  }
+  if (/^(?:water_)?bucket$/.test(item.name) && after != null && after >= item.count) {
+    out.note = [out.note, hasTarget
+      ? '水没装进来 —— 目标那格大概率是**流动水**（瀑布/渗水）：桶只装**静止水面或水源方块**，换个真正的静水塘，站 2~4 格外斜着看过去再 useitem'
+      : '舀水要"先瞄再用"：mc_act {mode:"useitem", x, y, z}（带上水面的坐标）—— 它会 look → 等 450ms → 再用；站 2~4 格外、俯角 30°~45°，别贴着水边 1 格']
       .filter(Boolean).join('；')
   }
   if (want > ms) {

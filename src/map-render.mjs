@@ -1,5 +1,5 @@
 /**
- * 地图那一层（路线图第 ④ 条第十一刀）：俯视地形、洞穴层视图、字符图、RGBA 像素图。
+ * 地图那一层（路线图第 ④ 条第十一刀）：俯视地形（地表图）、地板层视图、字符图、RGBA 像素图。
  *
  * 三条约定：
  *   ① **不反向 import `core.mjs`** —— 缺什么就往下依赖 `block-names.mjs`；
@@ -8,97 +8,25 @@
  *   ③ **只读、不 await、同步**：整块是同步扫描（`heightmapOf` 自带 2.5 秒软上限，
  *      到点就停并标 `truncated`，见 `tools\check-core-map.mjs` 与审计报告 ⑨）。
  *
- * 原来的 `#caveCell` 去掉井号改名 `caveCell`（模块级函数）；
- * `isUnderground` / `heightmap` / `static glyphMap` / `mapImage` 在 `core.mjs` 里
+ * 2026-10-22（用户要求「把 cave 去掉」）：**洞穴层视图整块删除** —— `isUnderground()`、
+ * `caveCell()`、`CAVE_GLYPH` / `CAVE_LABEL`、`heightmap` 的 `mode`/`slab` 参数全没了。
+ * `mc_map` 现在只有 `floor`（默认）/ `surface` / `column`。
+ *
+ * `heightmap` / `static glyphMap` / `mapImage` 在 `core.mjs` 里
  * **留同名薄包装**（它们是公开面：`index.js`、`tools\check-core-map.mjs`、
  * `实机验证\地图\live-map.mjs` 都在用），所以这一刀不需要 re-export。
  */
 
 import { Vec3 } from 'vec3'
-import { isAir, isLiquid, isPassable, isSolidBlock, SOFT_ROOF, glyphOf, colorOf, CAVE_LABEL, CAVE_GLYPH, FLOOR_LABEL, FLOOR_GLYPH } from './block-names.mjs'
+import { isAir, isLiquid, isPassable, isSolidBlock, glyphOf, colorOf, FLOOR_LABEL, FLOOR_GLYPH } from './block-names.mjs'
 import { rgbaOfNames } from './worker-tasks.mjs'
 import { runInWorker } from './worker-pool.mjs'
-
-/**
- * 我是不是"在地下"（头顶 40 格内有实心遮挡，且遮挡不是树叶/竹子/雪层这类"软顶"）。
- *
- * 🔴 用户 2026-10-08 需求：**在地下时 `mc_map` 要切成"以我为中心上下 2 格"的洞穴层视图**
- *    （像地图模组的洞穴模式）。地表图在地下只能看到头顶那层岩石，完全没用。
- * 判据只用客户端自己算得出来的事实（逐格 `blockAt`），不依赖光照/元数据。
- */
-export function isUnderground (b) {
-  const p = b.entity?.position
-  if (!p) return false
-  const x = Math.floor(p.x)
-  const z = Math.floor(p.z)
-  const y0 = Math.floor(p.y)
-  for (let y = y0 + 2; y <= y0 + 40; y++) {
-    const blk = b.blockAt(new Vec3(x, y, z))
-    if (!blk) return false                       // 未加载 → 当露天（保守：地表图不会误导）
-    const n = blk.name
-    if (isAir(n) || isPassable(n) || SOFT_ROOF.test(String(n))) continue
-    return true
-  }
-  return false
-}
-
-/**
- * 洞穴层视图的**一格**：判断这格能不能站、脚下有没有地面。返回 `{ key, name }`（key 见 `CAVE_GLYPH`）。
- *
- * 分两步 —— **先看我身体这两格（cy / cy+1）有没有被占，再看脚下**：
- * · 身体那两格里是方块 ⇒ 站不下（墙）；是矿 ⇒ `cave_ore`；是水/岩浆 ⇒ `cave_water`/`cave_lava`
- * · 身体那两格是空的 ⇒ 再看脚下 `slab` 格之内第一块地面：cy-1 = 正常走、cy-2 = 低一格、更低 = 会掉下去
- * · 脚下 `slab` 格内全是空的 ⇒ 再往下探 4 格（找到地面 = 会掉下去；找不到 = 深不见底/未加载）
- *
- * 🔴 别只看"最高的那块"：2 格高的巷道（天花板在 cy+2、地面在 cy-1）如果先看到天花板就会
- *    被误判成"会掉下去"。天花板高不高**不影响能不能站**，所以只查身体那两格。
- */
-export function caveCell (b, x, cy, z, slab) {
-  const bottom = cy - slab
-  // ① 身体（cy / cy+1）被占了吗
-  let block = null
-  for (let y = cy + 1; y >= cy; y--) {
-    const blk = b.blockAt(new Vec3(x, y, z))
-    if (!blk) return { key: 'cave_void', name: null }
-    if (isPassable(blk.name)) continue
-    block = { y, name: blk.name }
-    break
-  }
-  if (block) {
-    if (isLiquid(block.name)) return { key: /lava/.test(block.name) ? 'cave_lava' : 'cave_water', name: block.name }
-    if (/_ore$/.test(block.name)) return { key: 'cave_ore', name: block.name }
-    return { key: 'cave_wall', name: block.name }
-  }
-  // ② 脚下 slab 格之内找地面
-  for (let y = cy - 1; y >= bottom; y--) {
-    const blk = b.blockAt(new Vec3(x, y, z))
-    if (!blk) return { key: 'cave_void', name: null }
-    if (isPassable(blk.name)) continue
-    if (isLiquid(blk.name)) return { key: /lava/.test(blk.name) ? 'cave_lava' : 'cave_water', name: blk.name }
-    if (y === cy - 1) return { key: 'cave_open', name: blk.name }
-    if (y === cy - 2) return { key: 'cave_step', name: blk.name }
-    return { key: 'cave_drop', name: blk.name }
-  }
-  // ③ slab 内脚下全是空的：再往下探 4 格（找不到就是"深不见底/大洞穴"）
-  for (let y = bottom - 1; y >= bottom - 4; y--) {
-    const blk = b.blockAt(new Vec3(x, y, z))
-    if (!blk) return { key: 'cave_void', name: null }
-    if (isPassable(blk.name)) continue
-    if (isLiquid(blk.name)) return { key: /lava/.test(blk.name) ? 'cave_lava' : 'cave_water', name: blk.name }
-    return { key: 'cave_drop', name: blk.name }
-  }
-  /* 🔴 审计 G4：这里原来回 `cave_void`，和上面"`blockAt` 读到 null = 区块没加载"混成同一个 key
-   *    ⇒ `unloaded++` 把"大洞穴/深井探不到底"也算成"未加载"，`mc_observe` 据此提示
-   *    "未加载像素偏多"，模型会以为只是没加载、等等就好。深不可测单独一个 key。 */
-  return { key: 'cave_deep', name: null }
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 脚下方块那一层（"地板层"视图）—— 2026-10-15 用户需求
  *
- * 与洞穴层视图（`caveCell`）的区别：洞穴图问"**我**站在这格行不行"（以我脚下那层为中心往
- * 上下看），地板图问"**这一层本身**是什么、站上去会不会掉"。所以不能拿 `cy-1` 去调
- * `caveCell` —— 那会把地板本身当成墙，整张图全是 `#`。
+ * 地板图问"**这一层本身**是什么、站上去会不会掉"（不是"我这格站不站得下"），
+ * 所以判据是"这一层的方块本身 + 往下几格内有没有地板"，不是"我身体那两格有没有被占"。
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -279,7 +207,6 @@ export function gridToWorld (row, col, map) {
 const HAZARD_RANK = { lava: 0, water: 1, drop: 2, unloaded: 3 }
 const HAZARD_KIND = {
   floor_lava: 'lava', floor_water: 'water', floor_drop: 'drop', floor_void: 'unloaded',
-  cave_lava: 'lava', cave_water: 'water', cave_drop: 'drop', cave_deep: 'drop', cave_void: 'unloaded',
   lava: 'lava', water: 'water',
 }
 
@@ -396,18 +323,16 @@ export function navSummaryOf (map, { purpose = 'overview', target = null } = {})
 }
 
 /**
- * 俯视地形：返回 { names（二维字符数组）, legend, center, unloaded, mode, layer? }
+ * 俯视地形（**地表图**）：返回 { names（二维字符数组）, legend, center, unloaded, mode }
  *
- * `mode`：`'auto'`（默认）| `'surface'`（强制地表）| `'cave'`（强制洞穴层）。
- * `'auto'` 时由 `isUnderground()` 决定 —— **在地下自动给洞穴层视图**（用户 2026-10-08 需求）。
- * 洞穴层视图里 `names` 是 `cave_*` 合成名（`glyphOf` 把它们画成 `#·↓v~≈*?`），
- * 用 `slab` 控制上下看几格（默认 2 = 上下各 2 格，共 5 层）。
+ * 2026-10-22（用户要求「把 cave 去掉」）：**洞穴层视图已删除**，没有 `mode` / `slab`
+ * 参数了，返回的 `mode` 恒为 `'surface'`。默认层仍是地板层视图 `floorMapOf()`；
+ * 这条只有 `mc_map {mode:"surface"}` 显式要走时才走到。
  *
  * 2026-10-15：补上 `originX/originZ/cellSize/bounds/complete`，让"字符图第几行第几列"
- * 能换算回真实坐标（`gridToWorld()`）；**默认层已改成地板层视图 `floorMapOf()`**，
- * 这里是 `mode:"auto"/"surface"/"cave"` 的老行为，一字未改。
+ * 能换算回真实坐标（`gridToWorld()`）。
  */
-export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24, mode = 'auto', slab = 2 } = {}) {
+export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24 } = {}) {
   const R = Math.min(Math.max(radius, 4), 96)
   const cx = Math.floor(b.entity.position.x)
   const cz = Math.floor(b.entity.position.z)
@@ -422,41 +347,6 @@ export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24, mode = 
   const t0 = Date.now()
   const budgetMs = 2_500
   let truncated = false
-
-  const cave = mode === 'cave' || (mode !== 'surface' && isUnderground(b))
-  if (cave) {
-    const S = Math.min(Math.max(Number(slab) || 2, 1), 8)
-    /* 🔴 审计 G6：截断提示原来用 `names.filter(r => r.some(c => c !== 'cave_void')).length`
-     *    当"扫了几行" —— 那不是一回事（没扫的行被补成整行 cave_void，而扫过但全是洞的行
-     *    也全是 cave_void）⇒ 开阔洞穴会报"只扫了前 0 行"。老实数行数。 */
-    let scannedRows = 0
-    for (let dz = -R; dz < R; dz++) {
-      if (Date.now() - t0 > budgetMs) { truncated = true; break }
-      const row = []
-      for (let dx = -R; dx < R; dx++) {
-        const cell = caveCell(b, cx + dx, cy, cz + dz, S)
-        /* 只有 `blockAt` 读到 null 才算"未加载"（`cave_deep` 是探不到底，不是没加载） */
-        if (cell.key === 'cave_void') unloaded++
-        legend.set(cell.key, (legend.get(cell.key) ?? 0) + 1)
-        row.push(cell.key)
-      }
-      names.push(row)
-      scannedRows++
-    }
-    while (names.length < R * 2) names.push(new Array(R * 2).fill('cave_void'))
-    return {
-      center: { x: cx, y: cy, z: cz }, radius: R, unloaded, names, truncated, scannedRows,
-      colors: names.map((row) => row.map(colorOf)),
-      mode: 'cave', layer: { y: cy, slab: S },
-      /* 2026-10-15：行/列 ↔ 世界坐标（`gridToWorld()` 用），以及"实际扫到哪" */
-      originX: cx - R, originZ: cz - R, cellSize: 1,
-      bounds: { minX: cx - R, maxX: cx + R - 1, minZ: cz - R, maxZ: cz + Math.max(0, scannedRows) - 1 },
-      complete: !truncated,
-      ...(truncated ? { note: `范围太大，只扫了前 ${scannedRows} 行（剩下的行是空的）—— 想看全就调小 radius` } : {}),
-      legend: [...legend.entries()].sort((a, b2) => b2[1] - a[1])
-        .map(([name, count]) => ({ name: CAVE_LABEL[name] ?? name, key: name, glyph: CAVE_GLYPH[name] ?? '?', count })),
-    }
-  }
 
   let scannedRows = 0
   for (let dz = -R; dz < R; dz++) {
@@ -509,12 +399,13 @@ export function glyphMapText (names, step = 2, selfIndex = null) {
  *
  * @returns {{width:number,height:number,rgba:Uint8Array,center:object,radius:number,unloaded:number,legend:Array}}
  */
-export function mapImageOf (b, { radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'auto', slab = 2, layer = null, depth = 4 } = {}) {
+export function mapImageOf (b, { radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'surface', layer = null, depth = 4 } = {}) {
   /* 2026-10-15：`mode:'floor'`（脚下方块那一层）也出图 —— 两条路的返回形状一样
-   * （names/colors/center/radius/unloaded/legend），下面一行都不用改。 */
+   * （names/colors/center/radius/unloaded/legend），下面一行都不用改。
+   * 2026-10-22：`cave` 删了，这里只剩 `'floor'` 和 `'surface'` 两种（默认 surface）。 */
   const hm = mode === 'floor'
     ? floorMapOf(b, { radius, layer, depth })
-    : heightmapOf(b, { radius, yTop, yBottom, mode, slab })
+    : heightmapOf(b, { radius, yTop, yBottom })
   const h = hm.names.length
   const w = h > 0 ? hm.names[0].length : 0
   if (!w || !h) throw new Error('地形数据为空（区块可能还没加载）')
@@ -541,10 +432,10 @@ export function mapImageOf (b, { radius = 32, scale = 4, yTop = 10, yBottom = -2
  * @returns {Promise<object>} 形状与 `mapImageOf()` 一致，另带 `via`/`workerMs`
  */
 export async function mapImageOfAsync (b, opts = {}) {
-  const { radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'auto', slab = 2, layer = null, depth = 4 } = opts
+  const { radius = 32, scale = 4, yTop = 10, yBottom = -24, markSelf = true, mode = 'surface', layer = null, depth = 4 } = opts
   const hm = mode === 'floor'
     ? floorMapOf(b, { radius, layer, depth })
-    : heightmapOf(b, { radius, yTop, yBottom, mode, slab })
+    : heightmapOf(b, { radius, yTop, yBottom })
   const h = hm.names.length
   const w = h > 0 ? hm.names[0].length : 0
   if (!w || !h) throw new Error('地形数据为空（区块可能还没加载）')
@@ -604,7 +495,7 @@ export const COLUMN_GLYPH = { solid: '#', air: '.', water: '~', lava: '≈', unl
 export const COLUMN_LABEL = { solid: '实心', air: '空腔', water: '水', lava: '岩浆', unloaded: '未加载' }
 /** 一次最多往下看几格（再深就该用 mc_scan 或 mc_move 了） */
 export const COLUMN_MAX = 96
-/** 头顶一次最多往上看几格（默认 40 —— 跟 `isUnderground` 判"地下"用的 40 格同一个数） */
+/** 头顶一次最多往上看几格（默认 40） */
 export const COLUMN_UP_DEFAULT = 40
 export const COLUMN_UP_MAX = 96
 

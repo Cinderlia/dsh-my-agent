@@ -376,6 +376,10 @@ export async function apply (api) {
               skyPct: pct(frame.stats.sky),
               unloadedPct: pct(frame.stats.unknown),
               topBlocks: frame.stats.top.map((t) => `${t.name} ${pct(t.pixels)}%`),
+              /* 火把/花草/作物这类 boundingBox 为空的方块：视线直接穿过去，主射线打不到，
+               * 渲染器在像素循环后按碰撞盒单独补画（stats.softTop）。 */
+              softBlocks: (frame.stats.softTop ?? []).map((t) => `${t.name} ${pct(t.pixels)}%`),
+              centerSoft: frame.stats.centerSoft ?? null,
             }
           : null,
       }
@@ -556,10 +560,12 @@ export async function apply (api) {
         if (wantImage) {
           lines.push(
             `👁 **我看到**（图里数出来的，${width}×${height}）：命中 ${out.image.hitPct}% · 天空 ${out.image.skyPct}% · 未加载 ${out.image.unloadedPct}%`
-              + (out.image.topBlocks.length ? ` · 画面里：${out.image.topBlocks.slice(0, 5).join(' · ')}` : ''),
+              + (out.image.topBlocks.length ? ` · 画面里：${out.image.topBlocks.slice(0, 5).join(' · ')}` : '')
+              + (out.image.softBlocks?.length ? ` · 非实体方块：${out.image.softBlocks.slice(0, 4).join(' · ')}` : ''),
             `   · 准星${cross === null ? `指着天空（${distance} 格内没方块）` : cross.unknown ? '撞在未加载区块上' : `压在 **${cross.name}** 上（${r1(cross.dist)} 格）`}`
               + ` · 图右下角手里是 ${out.held ?? '空手'} · 脚下 ${out.surroundings.underFeet}`
-              + (out.surroundings.inWater ? ' · 泡在水里' : ''),
+              + (out.surroundings.inWater ? ' · 泡在水里' : '')
+              + (out.image.centerSoft ? ` · 射线先穿过 **${out.image.centerSoft.name}**（${out.image.centerSoft.dist} 格，不是没东西）` : ''),
             visEnts.length
               ? `   · 图里 ${visEnts.length} 个实体：${visEnts.map((x) => `${x.name}（${x.label}${x.hostile ? '·敌对' : ''}·${lookOf(x)}）${x.distance} 格 ${dirOf(x.screen.xPct)}${x.underCrosshair ? '·准星正对' : ''}`).join(' · ')}`
               : (drawEntities
@@ -610,6 +616,8 @@ export async function apply (api) {
                 size: `${width}×${height}`,
                 hitPct: out.image.hitPct, skyPct: out.image.skyPct, unloadedPct: out.image.unloadedPct,
                 topBlocks: out.image.topBlocks.slice(0, 5),
+                softBlocks: (out.image.softBlocks ?? []).slice(0, 5),
+                centerSoft: out.image.centerSoft ?? null,
                 crosshair: cross === null ? null : cross.unknown ? 'unloaded' : { block: cross.name, distance: r1(cross.dist) },
                 held: out.held,
                 entities: visEnts.map((x) => ({
@@ -641,7 +649,8 @@ export async function apply (api) {
             + ` · 脚下 ${out.surroundings.underFeet} · 脚内 ${out.surroundings.feetBlock} · 头上一格 ${out.surroundings.headBlock}`
             + ` · 正前方一格 ${out.surroundings.ahead}`,
           `🧱 画面：命中 ${out.image.hitPct}% · 天空 ${out.image.skyPct}% · 未加载 ${out.image.unloadedPct}%`
-            + (out.image.topBlocks.length ? ` · 视野里：${out.image.topBlocks.slice(0, 5).join(' · ')}` : ''),
+            + (out.image.topBlocks.length ? ` · 视野里：${out.image.topBlocks.slice(0, 5).join(' · ')}` : '')
+            + (out.image.softBlocks?.length ? ` · 非实体方块：${out.image.softBlocks.slice(0, 4).join(' · ')}` : ''),
         )
         lines.push(visEnts.length
           ? '👥 视野里 ' + visEnts.length + ' 个实体：' + visEnts.map((x) =>

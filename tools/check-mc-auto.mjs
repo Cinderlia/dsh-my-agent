@@ -32,6 +32,9 @@ const mkP = (x, y, z) => ({
 
 const mkWorld = ({
   pos = [10.5, 64, 20.5], yaw = 1.0, pitch = 0.2, ground = 63, overrides = {},
+  // 逐格指定 `block.boundingBox`（'block' / 'partial' / 'empty'）。默认仍按老规矩
+  // `air → 'empty'`、其余 `'block'`；只在需要模拟"碰撞盒和方块名不一致"时用（2026-10-22 窒息误报）
+  bbOverrides = {},
   items = [], players = [], mobs = [], drops = [], online = true, food = 20, health = 20, thrown = null,
   noPlugins = false,
   // 憋气（溺水）：`air` 是氧气 0–20（`bot.oxygenLevel`；1.21.9/1.21.10 的真服上读不到 ⇒ null），
@@ -56,7 +59,7 @@ const mkWorld = ({
     const k = `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`
     if (submerged && k === eyeKey) return { name: 'water', boundingBox: 'empty' }
     const name = overrides[k] ?? (Math.floor(p.y) <= ground ? 'stone' : 'air')
-    return { name, boundingBox: name === 'air' ? 'empty' : 'block' }
+    return { name, boundingBox: bbOverrides[k] ?? (name === 'air' ? 'empty' : 'block') }
   }
   const entities = { 1: entity }
   let id = 1
@@ -884,6 +887,36 @@ section('3.8 头卡在方块里（窒息）→ 叫醒 AI（2026-10-18 审计）'
   await flush()
   ok('头那格是床 ⇒ 不按窒息报', bed.agent.steers.length === 0, steered(bed).slice(0, 80))
 
+  /* ⑤″ 作物 ⇒ **不**报窒息。
+   * 🔴 2026-10-22 实机（用户点名要修）：站在**麦田**里（头那格 `wheat`）被反复报"我头卡在方块里，
+   *    正在窒息"，实际血一点没掉。根因是 `isSolidBlock('wheat')` 为真 —— `PASSABLE` 名单里没有作物。
+   *    两条路都要测：① 名字表兜底（离线/假世界只有方块名）；② 以真实碰撞盒为准（作物 = 'empty'）。 */
+  for (const crop of ['wheat', 'carrots', 'potatoes', 'beetroots']) {
+    const cw = buried({ '10,65,20': crop })
+    cw.state().lastHeadSolid = false
+    cw.tick(cw.at(1000))
+    await flush()
+    ok(`头那格是 ${crop}（作物）⇒ 不按窒息报`, cw.agent.steers.length === 0, steered(cw).slice(0, 80))
+  }
+  // 名字不认识、但碰撞盒是 empty ⇒ 照样不算闷人（真服上以 boundingBox 为准）
+  const hollow = setup({
+    world: { overrides: { '10,65,20': 'some_unknown_plant' }, bbOverrides: { '10,65,20': 'empty' } },
+    patch: { lookAround: false },
+  })
+  hollow.state().lastHeadSolid = false
+  hollow.tick(hollow.at(1000))
+  await flush()
+  ok('碰撞盒 empty 的陌生方块 ⇒ 不按窒息报（碰撞盒优先于名字表）', hollow.agent.steers.length === 0, steered(hollow).slice(0, 80))
+  // 反过来：名字不认识、但碰撞盒塞满整格 ⇒ 照报（不能因为"名字不在名单里"就沉默）
+  const solidish = setup({
+    world: { overrides: { '10,65,20': 'some_unknown_wall' }, bbOverrides: { '10,65,20': 'block' } },
+    patch: { lookAround: false },
+  })
+  solidish.state().lastHeadSolid = false
+  solidish.tick(solidish.at(1000))
+  await flush()
+  ok('碰撞盒是整格的陌生方块 ⇒ 照样报窒息', solidish.agent.steers.length === 1, steered(solidish).slice(0, 80))
+
   // ⑥ 头是空气（正常站着）⇒ 当然不报
   const clean = setup({ patch: { lookAround: false } })
   clean.tick(clean.at(1000))
@@ -896,6 +929,8 @@ section('3.8 头卡在方块里（窒息）→ 叫醒 AI（2026-10-18 审计）'
   ok('判据 = 头实心 +（上一拍是空 / 正在掉血）',
     /const headChanged = headSolidNow && s\.lastHeadSolid === false/.test(src) && /suffocant = !submerged && !fellRecently && headSolidNow/.test(src))
   ok('SOFT_ROOF 不按窒息算', /SOFT_ROOF/.test(src))
+  ok('窒息判据以碰撞盒为准（empty/partial 不算闷人）',
+    /boundingBox/.test(src) && /bb === 'empty' \|\| bb === 'partial'/.test(src))
 }
 
 /* ───────────────────────── 4. 吃 / 捡 ───────────────────────── */
