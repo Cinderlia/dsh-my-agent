@@ -22,6 +22,7 @@ import { join } from 'node:path'
 
 const { recordChat, chatLineOf, trimChatLog, chatSections, chatLogHeader, CHAT_LOG_REL, CHAT_LINE_MAX } =
   await import(new URL('../src/chat-log.mjs', import.meta.url))
+const { playerNameOf } = await import(new URL('../src/chat.mjs', import.meta.url))
 const { MemoryStore } = await import(new URL('../src/memory.mjs', import.meta.url))
 
 let pass = 0
@@ -169,6 +170,25 @@ section('⑥ 不撞受保护文件')
   writeFileSync(join(root, '_global', 'x.md'), '# x\n', 'utf8')
   const w = recordChat(store, { kind: 'player', who: P, text: '和别的记忆文件并存', at: at(12, 0) })
   ok(w.written === true && existsSync(join(root, CHAT_LOG_REL)), '和其它记忆文件放在一起没问题')
+}
+
+// ── ⑦ 说话人名字不能丢（真机 2026-10-21：整片写成 <?> 测试）───────────
+section('⑦ 说话人名字')
+{
+  ok(playerNameOf({}, { networkName: { value: 'Bluezi' } }) === 'Bluezi', 'networkName.value 直接用')
+  ok(playerNameOf({}, { networkName: 'Bluezi' }) === 'Bluezi', 'networkName 是字符串也认（老版本）')
+  const players = { DeepSeek: { uuid: 'f4cf1fc0-6293-3d4c-b22f-66355c8483db' } }
+  ok(playerNameOf({ players }, { senderUuid: 'f4cf1fc0-6293-3d4c-b22f-66355c8483db' }) === 'DeepSeek',
+    'networkName 空就按 senderUuid 反查玩家表')
+  ok(playerNameOf({ players }, { senderUuid: 'f4cf1fc062933d4cb22f66355c8483db' }) === 'DeepSeek',
+    'uuid 没连字符也认得')
+  ok(playerNameOf({ players }, { senderUuid: '00000000-0000-0000-0000-000000000000' }) === '?',
+    '查不到才退回 ?（不编名字）')
+  ok(playerNameOf({}, {}) === '?', '什么都没有就是 ?')
+  const chatSrc = readFileSync(new URL('../src/chat.mjs', import.meta.url), 'utf8')
+  ok(/const who = playerNameOf\(b, p\)/.test(chatSrc), 'player_chat 分支走的是 playerNameOf')
+  ok(!/networkName\?\.value \?\? p\?\.networkName \?\? '\?'/.test(chatSrc), '老的"直接退回 ?"那行已经换掉')
+  ok(/export function playerNameOf \(b, p\)/.test(chatSrc), 'playerNameOf 是导出的（自检能走同一份实现）')
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} 通过 / ${fail} 失败`)

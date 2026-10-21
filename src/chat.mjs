@@ -54,13 +54,36 @@ export function wireChatEvents (self, b) {
     self.emit('system', { text })
   })
   b._client?.on?.('player_chat', (p) => {
-    const who = String(p?.networkName?.value ?? p?.networkName ?? '?')
+    const who = playerNameOf(b, p)
     const text = p?.plainMessage ?? ''
     emitPlayerChat(self, who, text, b.username)
   })
   return b
 }
 
+/**
+ * 签名聊天包（`player_chat`）里的发送者名字。
+ *
+ * 🔴 2026-10-21 真机：局域网开放的世界里 `networkName` 是**空的**，于是记忆里的聊天记录
+ *    整片写成 `<?> 测试` —— 说话人丢了，事后翻记录分不清谁说的。顺序：
+ *    ① `networkName`（新版是 `{ value }`，老版可能直接是字符串）
+ *    ② 拿 `senderUuid` 去 `bot.players` 里反查用户名（uuid 忽略大小写与连字符）
+ *    ③ 都没有才退回 `'?'`
+ * @param {object} b mineflayer bot（要 `players`）
+ * @param {object} p player_chat 包
+ */
+export function playerNameOf (b, p) {
+  const direct = p?.networkName?.value ?? p?.networkName
+  if (direct) return String(direct)
+  const want = String(p?.senderUuid ?? '').replace(/-/g, '').toLowerCase()
+  if (want) {
+    for (const [name, pl] of Object.entries(b?.players ?? {})) {
+      const id = String(pl?.uuid ?? '').replace(/-/g, '').toLowerCase()
+      if (id && id === want) return String(name)
+    }
+  }
+  return '?'
+}
 export function plainText (msg) {
   try { return msg.toString().replace(/§./g, '') } catch { return String(msg) }
 }
@@ -79,16 +102,33 @@ export function emitPlayerChat (self, who, text, selfName) {
   /* 🔴 省 token：自己说的话服务端会**回显**一遍 —— `chatSay` 先记一条 `self`，回显又记一条 `player`，
    *    内容一字不差（`mc_status` 的 recentChat / `mc_events` 里就出现两条一模一样的）。
    *    自己的话只留 `self` 那条；别人说的话照旧记 `player`。 */
-  if (w === selfName) {
+  /* 🔴 2026-10-21 实测（用户「看门狗收不到我说话」追查出来的）：未签名聊天（LAN 开放世界）里
+   *    说话人名字经常解析不出来，`who` 会变成 `'?'` —— 于是**自己说的话回显**也被当成「别人说话」，
+   *    看门狗的 anyChat 立刻叫醒 AI，AI 看到的是一个没有正文的空轮（自己那句话又触发自己）。
+   *    所以名字是 `selfName` **或解析不出来**时，都按「可能是自己的回显」比对最近一条 self。 */
+  const anonymous = w === '?' || w === '' || w === 'unknown'
+  if (w === selfName || anonymous) {
     const last = self.chat[self.chat.length - 1]
-    if (last?.kind === 'self' && last.text === t && now - last.at < 2000) return
+    if (last?.kind === 'self' && last.text === t && now - last.at < 5000) return
+  }
+  /* 🔴 2026-10-21 实机回归：名字解析不出来时**不能把事件丢掉** —— 这个 LAN 服上用户说的每句话
+   *    `who` 都是 `'?'`，早先那句「匿名就不往外发」把所有真人消息都吞了，看门狗一次都没响。
+   *    正确做法：先排除"自己的回显"（上面那步），剩下的匿名消息就是**真人在说话**，照常发事件；
+   *    名字能猜就猜（只有一个别的玩家在线时就是他），猜不到就留 `?`。 */
+  let who2 = w
+  if (anonymous) {
+    try {
+      const b = self.requireBot()
+      const others = Object.keys(b?.players ?? {}).filter((n) => n !== selfName)
+      who2 = others.length === 1 ? others[0] : '?'
+    } catch { who2 = '?' }
   }
   self._lastChatKey = key
   self._lastChatAt = now
-  pushChat(self, 'player', w, t)
+  pushChat(self, 'player', who2, t)
   self.stats.chats++
   self.stats.lastEventAt = now
-  if (w !== selfName) self.emit('chat', { who: w, text: t })
+  if (who2 !== selfName) self.emit('chat', { who: who2, text: t })
 }
 
 /**
