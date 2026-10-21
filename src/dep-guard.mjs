@@ -111,7 +111,15 @@ export function patchText (text, mines) {
 export function scanDepTree (root, { maxFiles = 20000, maxBytes = 2_000_000, skipUnder = [] } = {}) {
   const report = { root, files: 0, truncated: false, mines: [] }
   const seenDirs = new Set()
-  const under = (p) => skipUnder.some((base) => base && (p === base || p.startsWith(base + sep)))
+  /* 🔴 skipUnder 必须按 **realpath** 比：`link:`/junction 装出来的
+   * `node_modules/dsh-mc-agent` 就指着我们自己的仓库 —— 只比字面路径会把
+   * 「我们的源码」当成依赖树去改（2026-10-20 真踩：把自己自检里的样本改没了）。 */
+  const prunedTo = skipUnder.filter(Boolean).map((b) => { try { return realpathSync(b) } catch { return b } })
+  const under = (p) => {
+    let rp = p
+    try { rp = realpathSync(p) } catch { /* 不存在就用字面路径 */ }
+    return prunedTo.some((base) => p === base || p.startsWith(base + sep) || rp === base || rp.startsWith(base + sep))
+  }
   const walk = (dir) => {
     if (report.truncated) return
     if (under(dir)) return

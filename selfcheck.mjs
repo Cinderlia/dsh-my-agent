@@ -1134,6 +1134,27 @@ console.log('\n--- 发布区：目录即白名单 / 不用 token / 必须防穿�
       console.log(`  ${s2.ok && s2.files === 0 && s2.bytes === 0 ? '✅' : '❌'} 清完发布区是空的（files=${s2.files}）`)
       console.log(`  ${existsSync(join(cwd, '.dsh-mc-agent', E.EXPRESS_DIR)) ? '✅' : '❌'} 发布区目录**重建**（AI 不用再建）`)
 
+      /* ── ⑥ 「更新」接口：TDZ 回归（2026-10-20 真机报 `Cannot access 'checkUpdate' before initialization`）──
+       * 当初两条路由写在 `const checkUpdate = …` **前面**，而它们在同一个函数体里 ⇒ 一调就抛。
+       * 这里**真调一次**（临时把 PATH 掐掉，让 git 立刻失败，免得自检去连网络）：
+       * 只断言"不再 TDZ" + "形状对" + "第二次走缓存"。 */
+      {
+        const savedPath = process.env.PATH
+        process.env.PATH = ''
+        let upd
+        try {
+          upd = JSON.parse(String((await callRaw('GET', '/api/mc/update')).body ?? '{}'))
+        } finally {
+          if (savedPath === undefined) delete process.env.PATH
+          else process.env.PATH = savedPath
+        }
+        const tdz = /before initialization/.test(String(upd.error ?? ''))
+        console.log(`  ${!tdz ? '✅' : '❌'} GET /api/mc/update 不再 TDZ：${tdz ? String(upd.error).slice(0, 120) : 'ok'}`)
+        console.log(`  ${upd.ok === true && upd.ready === false && typeof upd.reason === 'string' ? '✅' : '❌'} 拿不到 git 时如实报 ready=false + 人话 reason：${String(upd.reason ?? '').slice(0, 80)}`)
+        const upd2 = JSON.parse(String((await callRaw('GET', '/api/mc/update')).body ?? '{}'))
+        console.log(`  ${upd2.checkedAt === upd.checkedAt ? '✅' : '❌'} 第二次命中缓存（checkedAt 相同 ⇒ updateCache 不在请求作用域里）`)
+      }
+
       // 还原：回到关闭（默认），别把临时配置留给后面的断言
       await patchCfg({ expressEnabled: false, expressBase: '' })
       const backDefault = await callRaw('GET', '/api/mc/config?cwd=' + encodeURIComponent(cwd))

@@ -11,6 +11,21 @@
 
 ## [未发布]
 
+### 🩹 设置页「更新」一点就报 `Cannot access 'checkUpdate' before initialization`
+
+真机上点开「更新」页就红字报这个。两个问题，同一个来源：
+
+- **顺序错了**：`GET /api/mc/update` 这两条路由写在 `const checkUpdate = …` **前面**，
+  而它们**在同一个函数体里**（`handleSettingsApi`）⇒ 一调就撞上"声明还没执行"的 TDZ。
+  → 把两条路由挪到函数定义**之后**。
+- **缓存白做**：`updateCache` 原来写在 `handleSettingsApi` 里 = **每个请求一份新的**，
+  那 10 分钟缓存等于没做 —— 每次开页面都真去 `git fetch` 一次。
+  → 三件状态（`PLUGIN_ROOT` / `UPDATE_TTL_MS` / `updateCache`）提到**插件作用域**，函数还留在原地。
+
+自检里补了三条（`selfcheck.mjs`）：真调一次 `GET /api/mc/update` 断言"不再 TDZ"、
+"拿不到 git 时如实报 `ready:false` + 人话"、"第二次命中缓存（`checkedAt` 相同）"。
+为了不连网络，调之前把 `PATH` 掐掉让 `git` 立刻失败。
+
 ### 🩹 别人 `git` 装完之后插件是 inactive —— 依赖里一行尾斜杠把我们带崩了（issue #2）
 
 有用户用 `pnpm add github:blueziii/dsh-mc-agent` 装，插件那一项直接 inactive，日志里是：
@@ -33,6 +48,9 @@ TypeError: createRequire.resolve.paths is not a function or its return value is 
 - **手动入口**：`npm run fix:deps`（`--dry` 只报告不改）。
 - **不想让它动文件**：环境变量 `DSH_MC_AGENT_DEP_GUARD=off` 关掉自愈（只保留报错时的人话提示）。
 - 顺手把 `src/core.mjs` 里那句静态 `import mineflayer` 也拆了 —— 它会把整条链重新拉起来，光修 `connection.mjs` 不够。
+- **顺手修的 bug**：修复器会顺着 `link:` 装出来的 `node_modules/dsh-mc-agent`（一个指向本仓库的链接）
+  爬进我们自己的源码，把自检里当样本用的字符串也"修"了 —— 于是那几条断言永远 0 命中还看不出来。
+  现在按 **realpath** 排除本包目录。
 
 ### 🛶 船 / 矿车 / 刷怪蛋 / 盔甲架 现在真能放了（`mc_act {mode:"place"}`）
 

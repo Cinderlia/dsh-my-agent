@@ -14,7 +14,7 @@
  *   ④ 宿主那句报错的识别；
  *   ⑤ 三条防线都接上了（懒加载、postinstall、files 里带上了修复脚本）。
  */
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync, statSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -29,6 +29,9 @@ const ok = (cond, label, extra = '') => {
   if (cond) { pass++; console.log(`  ✅ ${label}`) } else { fail++; console.log(`  ❌ ${label}${extra ? ` — ${extra}` : ''}`) }
 }
 const section = (t) => console.log(`\n── ${t} ──`)
+
+/* 尾斜杠单独拼：这个文件自己也会被修复器扫到，字面写出来会被它「顺手改干净」（见 ② 的注释） */
+const SL = '/'
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
 
@@ -48,25 +51,28 @@ section('① 判据：只认「尾斜杠 + 内置名」')
 // ── ② 文本扫描 / 改写 ─────────────────────────────────────────────────────────
 section('② 文本扫描与改写')
 {
+  /* 🔴 尾斜杠单独拼（`SL`）：这个文件会被 `postinstall` / 自愈扫描到，
+   *    字面写出「尾斜杠」的话，**它自己的修复器会把这行样本改掉** ——
+   *    2026-10-20 真踩过：样本被"修好"了，于是自检永远 0 命中。 */
   const src = [
-    "const { StringDecoder } = require('string_decoder')",
-    "const p = require('process')",
-    "const ok1 = require('string_decoder')",
-    "const ok2 = require('./local/')",
-    "import x from 'path'",
-    "const ok3 = require('safe-buffer/')",
+    `const { StringDecoder } = require('string_decoder${SL}')`,
+    `const p = require('process${SL}')`,
+    `const ok1 = require('string_decoder')`,
+    `const ok2 = require('./local${SL}')`,
+    `import x from 'path${SL}'`,
+    `const ok3 = require('safe-buffer${SL}')`,
   ].join('\n')
   const mines = landminesInText(src)
-  ok(mines.length === 3, '三处命中（string_decoder/、process/、path/）', `实际 ${mines.length}`)
+  ok(mines.length === 3, `三处命中（string_decoder${SL}、process${SL}、path${SL}）`, `实际 ${mines.length}`)
   ok(mines.map((m) => m.name).join(',') === 'string_decoder,process,path', '改完的名字对', mines.map((m) => m.name).join(','))
   ok(mines.every((m) => src.slice(m.index, m.index + m.spec.length) === m.spec), 'index 精确定位到 spec 本体（不含引号）')
 
   const out = patchText(src, mines)
   ok(out.includes("require('string_decoder')") && out.includes("require('process')") && out.includes("from 'path'"), '三处都去掉了斜杠')
-  ok(out.includes("require('safe-buffer/')"), '非内置名的 safe-buffer 一个字没动')
+  ok(out.includes(`require('safe-buffer${SL}')`), '非内置名的 safe-buffer 一个字没动')
   ok(out.split('\n').length === src.split('\n').length, '行数不变（没吃掉换行）')
 
-  const dq = 'const a = require("process");\n'
+  const dq = `const a = require("process${SL}");\n`
   ok(patchText(dq, landminesInText(dq)) === 'const a = require("process");\n', '双引号原样保留')
 
   ok(patchText('no spec here', []) === 'no spec here', '没有命中时原样返回')
@@ -84,15 +90,15 @@ section('③ 树扫描与落盘修补')
     const good = join(nm, 'fake-stream', 'lib', 'writable.js')
     const skipMe = join(nm, 'myown', 'backup.js')
     mkdirSync(join(nm, 'myown'), { recursive: true })
-    const badSrc = "const { StringDecoder } = require('string_decoder')\nmodule.exports = { StringDecoder }\n"
+    const badSrc = `const { StringDecoder } = require('string_decoder${SL}')\nmodule.exports = { StringDecoder }\n`
     writeFileSync(bad, badSrc, 'utf8')
-    writeFileSync(good, "const x = require('safe-buffer/')\n", 'utf8')
-    writeFileSync(skipMe, "require('string_decoder')\n", 'utf8')
+    writeFileSync(good, `const x = require('safe-buffer${SL}')\n`, 'utf8')
+    writeFileSync(skipMe, `require('string_decoder${SL}')\n`, 'utf8')
 
     const rep = scanDepTree(nm)
     ok(rep.files === 3, '扫到 3 个 js 文件', String(rep.files))
     ok(rep.mines.length === 2, '认出 2 处地雷（safe-buffer 不算）', String(rep.mines.length))
-    ok(rep.mines.every((m) => m.file && m.spec === 'string_decoder/'), '每处都带 file 和 spec')
+    ok(rep.mines.every((m) => m.file && m.spec === `string_decoder${SL}`), '每处都带 file 和 spec')
 
     const skipped = scanDepTree(nm, { skipUnder: [join(nm, 'myown')] })
     ok(skipped.mines.length === 1, 'skipUnder 生效：本包目录（含备份）不扫', String(skipped.mines.length))
@@ -100,20 +106,46 @@ section('③ 树扫描与落盘修补')
     const goodBefore = readFileSync(good, 'utf8')
     const res = patchLandmines(rep)
     ok(res.patched === 2 && res.failed.length === 0, '修补 2 处、无失败', `patched=${res.patched} failed=${res.failed.length}`)
-    ok(readFileSync(bad, 'utf8') === badSrc.replace("require('string_decoder')", "require('string_decoder')"), '坏文件改对了，其它字节不变')
+    ok(readFileSync(bad, 'utf8') === badSrc.replace(`require('string_decoder${SL}')`, "require('string_decoder')"), '坏文件改对了（斜杠没了，其它字节原样）')
     ok(readFileSync(good, 'utf8') === goodBefore, '干净文件一个字节没动')
 
     const again = scanDepTree(nm)
     ok(again.mines.length === 0, '再扫一遍是干净的（幂等）')
 
     const dryFile = join(nm, 'fake-stream', 'lib', 'dry.js')
-    const drySrc = "require('process')\n"
+    const drySrc = `require('process${SL}')\n`
     writeFileSync(dryFile, drySrc, 'utf8')
     const dry = patchLandmines(
       { mines: landminesInText(drySrc).map((m) => ({ ...m, file: dryFile })) },
       { dryRun: true },
     )
     ok(dry.patched === 1 && readFileSync(dryFile, 'utf8') === drySrc, 'dryRun 只报数、不落盘', `patched=${dry.patched}`)
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+// ── ③b 别改我们自己的包（`link:`/junction 会把 node_modules 指回仓库）────────────
+section('③b 自己的包是禁区')
+{
+  /* 2026-10-20 真踩：`node_modules/dsh-mc-agent` 是 `link:` 出来的 junction，指着我们的源码；
+   * 修复器顺着它爬进仓库，把本文件里**当样本用的字面量**改干净了 —— 自检从此永远 0 命中，
+   * 而且看不出来（断言退化成 x === x）。 */
+  const tmp = mkdtempSync(join(tmpdir(), 'dep-guard-link-'))
+  try {
+    const nm = join(tmp, 'node_modules')
+    mkdirSync(nm, { recursive: true })
+    const link = join(nm, 'self-link')
+    let linked = false
+    try {
+      symlinkSync(PACKAGE_ROOT, link, process.platform === 'win32' ? 'junction' : 'dir')
+      linked = true
+    } catch { /* 没权限建链接：下面那条 ensureDepGuard 断言仍然有效 */ }
+    const rep = scanDepTree(nm, { skipUnder: [PACKAGE_ROOT] })
+    ok(rep.files === 0, '指向本包目录的链接被整枝跳过（一个文件都不扫）', `files=${rep.files}`)
+    ok(linked, '（真的建了 junction 实测）', linked ? '' : '这台机器建不了链接，只验兜底那条')
+    const guard = ensureDepGuard({ roots: [nm], patch: false })
+    ok(guard.mines.every((m) => !m.file.startsWith(PACKAGE_ROOT)), '报告里没有我们自己仓库里的文件')
   } finally {
     rmSync(tmp, { recursive: true, force: true })
   }

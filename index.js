@@ -617,6 +617,16 @@ export function apply(ctx, rawConfig) {
    * 不再用"目录名 + 进程内见过的工作区集合"那套（同名会撞、改名会失效、重启要重新见过）。
    * 🔴 用户定的兜底是 **(a) 拒绝**：注册表里查不到这个 cwd 对应的 uuid 就不分享（不退回目录名）。
    * ------------------------------------------------------------------------ */
+  /* ── 「MC设置 → 更新」用的插件作用域状态 ──────────────────────────────────
+   * 🔴 2026-10-20 真机踩的：这三个原来写在 `handleSettingsApi` 里 ⇒
+   *    ① 每次请求都是新的 `updateCache`，10 分钟缓存**等于没做**（每次开页面都真去 git fetch）；
+   *    ② 同一函数里"路由在前、`const checkUpdate` 在后" ⇒ 一调就 TDZ 抛
+   *       `Cannot access 'checkUpdate' before initialization`。
+   *    状态放这儿、函数留在下面（函数按请求重建无所谓，缓存必须跨请求）。
+   * ------------------------------------------------------------------------ */
+  const PLUGIN_ROOT = fileURLToPath(new URL('.', import.meta.url))
+  const UPDATE_TTL_MS = 10 * 60 * 1000
+  const updateCache = { at: 0, data: null }
   const EXPRESS_MAX_BYTES = 32 * 1024 * 1024
 
   /** 宿主的工作区注册表（可能还没就绪 → 返回空表，别抛） */
@@ -1588,25 +1598,12 @@ export function apply(ctx, rawConfig) {
       return ok(await openInFileManager(dir, body?.name ? String(body.name) : null))
     }
 
-    /* ── 更新（用户 2026-10-20）：`GET /api/mc/update` 查 / `POST /api/mc/update/apply` 拉 ──
-     * 🔴 这两条**不要求工作区**：红点要出现在"新会话页"上，那时候根本还没有工作区。 */
-    if (path === '/api/mc/update' && req.method === 'GET') {
-      const force = String(url?.searchParams?.get('force') ?? '') === '1'
-      return ok(await checkUpdate(force))
-    }
-    if (path === '/api/mc/update/apply' && req.method === 'POST') {
-      const r = await applyUpdate()
-      return r.ok ? ok(r) : sendJson(res, 400, { ok: false, error: r.error })
-    }
-
     /* ── 更新（「MC设置 → 更新」页，用户 2026-10-20）─────────────────────────────
      * 🔴 这个插件是 `link:<源码目录>` 装的（npm 上没有包），所以「新版本」**只可能来自 git 远端**：
      *   比对本地 HEAD 与 `<remote>/<branch>`，落后的提交 + `CHANGELOG.md` 新增的那几行 = "新版加了什么"。
      *   源优先级：**gitee → origin**（用户：优先用 gitee，github 兜底）。结果缓存 10 分钟，
      *   红点靠 `GET /api/mc/update` 轮询，别每次开页面都真去 fetch。 */
-    const PLUGIN_ROOT = fileURLToPath(new URL('.', import.meta.url))
-    const UPDATE_TTL_MS = 10 * 60 * 1000
-    const updateCache = { at: 0, data: null }
+    /* 下面三个在**插件作用域**（不是每个请求里）—— 见 §「更新」那段开头的说明 */
 
     /** 跑一条 git 命令（不弹窗、带超时）。返回 `{ code, out, err }`，**永不抛**。 */
     const gitRun = async (args, timeoutMs = 20000) => {
@@ -1765,6 +1762,17 @@ export function apply(ctx, rawConfig) {
         behind: after.behind,
         needRestart: true,
       }
+    }
+
+    /* ── 更新（用户 2026-10-20）：`GET /api/mc/update` 查 / `POST /api/mc/update/apply` 拉 ──
+     * 🔴 这两条**不要求工作区**：红点要出现在"新会话页"上，那时候根本还没有工作区。 */
+    if (path === '/api/mc/update' && req.method === 'GET') {
+      const force = String(url?.searchParams?.get('force') ?? '') === '1'
+      return ok(await checkUpdate(force))
+    }
+    if (path === '/api/mc/update/apply' && req.method === 'POST') {
+      const r = await applyUpdate()
+      return r.ok ? ok(r) : sendJson(res, 400, { ok: false, error: r.error })
     }
 
     /* ── 提示词（「MC设置 → 提示词」页 = `.dsh-mc-agent/RULES.md` + `<记忆根>/版本提示.md`）──
