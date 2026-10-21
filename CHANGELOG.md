@@ -147,6 +147,25 @@ vendor 的 `goal_reached` 是**全局**事件（`lib/goto.js:60` 根本不看 go
 - **更新完要重启 DSH 才生效**（插件是启动时加载的），页面上直接写着这句。
 - 这个插件是 `link:` 安装、npm 上没有这个包 ⇒ 唯一的"新版本"来源是 **git 远端**。
 
+### 🛡 寻路被抢占不再把整个 DSH 带走（issue #1）
+
+`mc_move` 被调度器抢占后，`mineflayer-pathfinder` 会把上一次的 goto reject 成 `PathStopped`，
+而它早就没人 `await` 了 —— 派生链（`withTimeout` → `raceAbort` → `Promise.race`、
+或 collectBlock 内部的 co 生成器）一个个先撤，最后那条拒绝落到进程级 ⇒ 宿主 fail-loud `exit(1)`
+⇒ **应用闪退**（不是掉线）。`work.catch()` 与 `guardPathfinderRejections()` 只盖住 goto
+**直接返回的那个 promise**，派生链盖不住，往里补 catch 是补不完的。
+
+新增 `src/crash-guard.mjs`：接管宿主的 `unhandledRejection`，把 `PathStopped` / `NoPath` /
+`GoalChanged` / `Timeout` 这四个**正常结局**拦下并记一行日志，其余**原样转交**（真 bug 照崩、
+照留栈）。`DSH_MC_AGENT_REJECTION_GUARD=off` 可关。自检 `tools/check-crash-guard.mjs` 24 条（含"装完之后才注册的监听"补挂）。
+
+### 🧹 凭据守卫不再误伤记忆目录（MC+ 下现在能改行事准则文件）
+
+`memoryDir` 一旦把记忆根挪到宿主目录里（本机就是），凭据守卫那条"路径里带宿主目录就拒"的规则会**连
+`RULES.md` / `world.md` / `lessons.md` 一起挡** —— 用户选了 MC+ 也改不了自己的行事准则，
+报的还是"不允许触碰宿主凭据文件"。现在放行「插件目录 + `memory` 段」，凭据文件与 `secrets/`
+备忘目录照旧挡住。`node tools/check-all.mjs` = 54/54。
+
 ### 🧠 设置页第四个标签换成「记忆」：一眼看到这个会话的记忆文件在哪
 
 用户：「修改 MC 设置里的文件共享变为记忆，现在文件共享下的内容全部去掉，显示该会话记忆文件位置，

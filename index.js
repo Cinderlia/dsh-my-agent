@@ -51,6 +51,7 @@ import { terrainCacheStats } from './src/terrain.mjs'
 import { workerPoolStats } from './src/worker-pool.mjs'
 import { MemoryStore } from './src/memory.mjs'
 import { createInjector } from './src/inject.mjs'
+import { installRejectionGuard, refreshRejectionGuard } from './src/crash-guard.mjs'
 import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, personaTextKeyOf, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS, matchCommandList, isRegexEntry } from './src/config.mjs'
 import { COMMAND_GROUPS, catalogNames, COMMANDS_THAT_MOVE_ME, splitCommands, commandNameOf, MAX_COMMANDS_PER_CALL } from './src/commands.mjs'
 import { readBossBars, formatBossBars } from './src/bossbar.mjs'
@@ -2247,6 +2248,29 @@ export function apply(ctx, rawConfig) {
       logLine(`⚠️ 未处理拒绝（宿主可能会因此 exit(1)，栈如下，请据此定位）：${stack.split('\n').slice(0, 6).join(' ⏎ ')}`)
     })
   } catch (e) { logLine(`装未处理拒绝记录器失败（不影响使用）：${e?.message ?? e}`) }
+
+  /* ─────────── 「别让它崩」闸：把寻路那几种**正常结局**的未处理拒绝拦下来 ───────────
+   * 2026-10-20（GitHub issue #1，用户报的一晚上闪退 3 次）：`mc_move` 被抢占之后，
+   * `mineflayer-pathfinder` 会把上一次的 goto reject 成 `PathStopped`，而它已经没人 await 了
+   * （超时先返回 / 新目标顶掉 / collectBlock 内部先撤）⇒ unhandledRejection ⇒ 宿主 fail-loud exit(1)。
+   * 上面那条"遗言"只能记录，救不回来；`work.catch()` 与 `guardPathfinderRejections()` 只盖住
+   * goto 直接返回的那个 promise，**派生链（withTimeout → raceAbort → Promise.race）盖不住**。
+   * 所以这里接管宿主的 unhandledRejection：白名单内吞（记一行日志），其余原样转交 —— 真 bug 照崩。
+   * 详见 `src/crash-guard.mjs`；`DSH_MC_AGENT_REJECTION_GUARD=off` 可关。 */
+  try {
+    const g = installRejectionGuard({ log: (m) => logLine(m) })
+    if (g.installed) logLine(`未处理拒绝守卫已装：拦 PathStopped / NoPath / GoalChanged / Timeout，其余照旧转交（接管了 ${g.forwarded} 个原监听）`)
+    else if (g.reason === 'disabled') logLine('未处理拒绝守卫：环境变量 DSH_MC_AGENT_REJECTION_GUARD 已关闭，仍按宿主默认处置')
+    /* 装完之后可能还有人注册 unhandledRejection（宿主 fail-loud 晚于插件、或别的插件后来插一条）——
+     * 那种会排在我们后面单独跑，照样能 exit。低频补挂一次，保持"只有我们一个 handler"。 */
+    if (g.installed) {
+      ctx.effect(() => {
+        const t = setInterval(() => { try { refreshRejectionGuard({ log: (m) => logLine(m) }) } catch {} }, 60_000)
+        t?.unref?.()
+        return () => clearInterval(t)
+      }, 'dsh-mc-agent: 未处理拒绝守卫补挂')
+    }
+  } catch (e) { logLine(`装未处理拒绝守卫失败（不影响使用）：${e?.message ?? e}`) }
 
   /* ─────────── 「闪退」网：uncaughtException 至少留下栈 ───────────
    * 2026-10-18：mineflayer-pathfinder 的 tick 监听在某次 `placingBlock` 为 undefined 时抛错，
@@ -4842,7 +4866,12 @@ export function apply(ctx, rawConfig) {
       if ((isMc || isPlus) && /^(read|edit|write|glob|grep|ls|cat|read_image|mc_kit_memory)$/i.test(name)) {
         const text = JSON.stringify(exec?.arguments ?? {})
         if (/(\.credentials|credentials\.yaml|[/\\]\.dsh[/\\])/i.test(text)) {
-          return 'MC 模式不允许触碰宿主凭据文件；账号密码在「MC设置」里维护，AI 不需要也不应该看到。'
+          /* 2026-10-20（用户选了 MC+ 却改不了行事准则文件才发现）：记忆根常被 `memoryDir` 挪到
+           *    `$DSH_HOME/dsh-mc-agent/memory/` 底下，那条"路径里带宿主目录"的规则会**连记忆一起挡**——
+           *    可那里装的是行事准则 / 世界记忆 / 踩坑档案，不是账号凭据。这里放行"插件目录 + memory 段"，
+           *    凭据文件与 secrets 备忘目录仍由本判断和下面那条单独的规则挡住。 */
+          const memPathOk = /dsh-mc-agent(?:\\\\|\/)+memory(?:\\\\|\/)/i.test(text)
+          if (!memPathOk) return 'MC 模式不允许触碰宿主凭据文件；账号密码在「MC设置」里维护，AI 不需要也不应该看到。'
         }
         // 明文凭据备忘（`secrets/` 下用户自己的私密档）：同样不许读
         // （2026-09-16：账户体系上线后，密码只该待在「MC设置 → 账户」里）
