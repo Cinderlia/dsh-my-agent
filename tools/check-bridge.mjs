@@ -467,12 +467,26 @@ section('⑧ 铺完把手换回来：之前的武器/镐子，所有返回路径
     ok(bot.heldItem?.name === 'diamond_pickaxe', '🔴 半路停下也要把手换回来', String(bot.heldItem?.name))
   }
   {
+    /* 🔴 空手开搭（2026-10-21 用户："搭路自动切回去…不生效"）：搭路会把方块塞到手上，
+     *    铺完必须**把手放回空手** —— 原来空手时 `heldSnapshotOf` 返回 null，`if (keep)` 直接跳过，
+     *    手里就一直攥着那摞方块。 */
     const { w, bot } = gapScene({ depth: 5 })
     bot.heldItem = null
+    bot.quickBarSlot = 0
+    bot.inventory = { items: () => [{ name: 'cobblestone', count: 64 }], slots: [] }
+    bot.inventory.slots[36] = { name: 'cobblestone', count: 64 }
+    bot.inventory.slots[37] = null
+    bot.setQuickBarSlot = (i) => { bot.quickBarSlot = i; bot.heldItem = bot.inventory.slots[36 + i] ?? null }
+    bot.equip = async (item) => { bot.heldItem = { name: item.name, count: item.count } }
+    const snap = heldSnapshotOf(bot)
+    ok(snap != null && snap.empty === true && snap.name === null, 'heldSnapshotOf：空手也记快照（empty:true，不再返回 null）', JSON.stringify(snap))
     const self = mkSelf(bot, w)
+    const orig = self.placeBlock.bind(self)
+    self.placeBlock = async (t) => { bot.heldItem = { name: 'cobblestone', count: 64 }; return await orig(t) }
     const r = await bridgeAcross(self, { dir: 'east', count: 1, name: 'cobblestone' })
-    ok(r.ok === true && r.heldRestored === undefined, '空手开搭 ⇒ 不假装"换回来了"', String(r.heldRestored))
-    ok(heldSnapshotOf(bot) === null, 'heldSnapshotOf：空手 ⇒ null（没东西可还）')
+    ok(r.ok === true, '空手开搭照常铺完', JSON.stringify(r).slice(0, 80))
+    ok(bot.heldItem == null, '🔴 空手开搭 ⇒ 铺完把手里的方块放回去（收工空手）', `${r.held} / ${String(bot.heldItem?.name)}`)
+    ok(r.heldRestored === '空手' && r.held === '空手', '结果里如实标成"还原成空手"', `${r.heldRestored} / ${r.held}`)
   }
   {
     const b = { heldItem: { name: 'cobblestone', count: 3 }, inventory: { items: () => [{ name: 'cobblestone', count: 3 }] }, equip: async () => {} }

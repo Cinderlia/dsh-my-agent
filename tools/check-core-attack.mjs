@@ -1370,6 +1370,16 @@ section('⑳ 自动换武器：回读确认 + 换不上如实说 + name=null 不
   }
 }
 
+section('㉑ 换武器"没生效"要说得清 —— 有更好的却没换时给 equipNote（用户 2026-10-21）')
+{
+  const src = readFileSync(new URL('../src/attack.mjs', import.meta.url), 'utf8')
+  ok(/let equipNote = null/.test(src), 'attack.mjs 有 equipNote 变量')
+  ok(/背包里有更好的 \$\{snap\.weapon\.name\}，但这一场已经换过/.test(src), '换过 2 次就不再换时说出来（次数上限）')
+  ok(/换装冷却中（\$\{EQUIP_COOLDOWN_MS\}ms）/.test(src), '冷却中没换也说出来（不是静默）')
+  ok(/\.\.\.\(equipNote && !equippedTo\.length \? \{ equipNote \} : \{\}\)/.test(src), '结果里带 equipNote（只在真没换上去时）')
+  ok(/threatScoreOf, EQUIP_COOLDOWN_MS,/.test(src), 'EQUIP_COOLDOWN_MS 从 combat-strategy 导入（不是猜的数字）')
+}
+
 for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 console.log(`\ncheck-core-attack：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

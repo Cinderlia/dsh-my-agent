@@ -1707,7 +1707,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     ...(terrainReeval ? { terrainReeval } : {}),
     ...(carved ? { carved } : {}),
     ...(pathThrash ? { pathThrash } : {}),
-    ...(pathResetsTotal >= 2 ? { pathResets: pathResetsTotal, pathResetReasons: { ...resetReasons } } : {}),
+    ...(pathResetsTotal >= 1 ? { pathResets: pathResetsTotal, pathResetReasons: { ...resetReasons } } : {}),
   })
   /** 到达时**重算落点地形**：`classifyTerrainCached` 的缓存键含脚下坐标，走到新位置会自动重算，
    *  不用手动清缓存。平地/未知照旧不报（默认值）。 */
@@ -2049,7 +2049,23 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     let blockedAhead = null
     try { blockedAhead = obstacleAheadOf(b, target) } catch { blockedAhead = null }
     /* `reason` 也别把内部字符串原样透出去（旧版漏出过 `Error` / `block_updated`） */
-    const REASON_TEXT = { stuck: 'stuck', block_updated: 'block-changed', goal_changed: 'goal-changed', path_stopped: 'stopped', path_reset: 'path-reset' }
+    /* 🔴 2026-10-21 用户：「我看经常 reset」—— 原来这张表只认得 5 个理由，vendor 真正会发的
+     *    `chunk_loaded`（走一趟要触发好多次，属于正常重算）、`goal_moved`、`movements_updated`、
+     *    `dig_error`、`place_error`、`no_scaffolding_blocks` 全落进兜底的 'path-reset'，
+     *    看起来就像「老是路被重置」。现在逐条翻成人话，看到就知道是哪一类。 */
+    const REASON_TEXT = {
+      stuck: 'stuck（3.5 秒没挪动，vendor 自己判的）',
+      block_updated: 'block-changed（路过的方块变了）',
+      goal_changed: 'goal-changed（目标被换掉）',
+      goal_moved: 'goal-moved（目标点动了）',
+      path_stopped: 'stopped（被主动停）',
+      chunk_loaded: 'chunk-loaded（区块刚加载，正常重算）',
+      movements_updated: 'movements-updated（移动配置变了）',
+      dig_error: 'dig-error（该挖的没挖成）',
+      place_error: 'place-error（该垫的没垫成）',
+      no_scaffolding_blocks: 'no-scaffolding（没方块可垫）',
+      path_reset: 'path-reset（其它原因）',
+    }
     const PF_ERR = new Set(['NoPath', 'Timeout', 'PathStopped', 'GoalChanged', 'NoPathFound'])
     /* 🔴 2026-10-08 实机（熔炼验证，真服）：`why` 记的是**中途**事件（`path_reset` 在
      *    A* 重算 / 踩到方块更新 / 3.5 秒没推进时都会发），不能拿它盖过"这一轮时间用完了"
@@ -2108,6 +2124,11 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
            : !preempted && terrain.kind === 'hazard'
              ? `—— 你脚边是**${terrain.text}**（${terrain.note}）：别从这边走，换个方向绕。`
              : '')
+         + (!preempted && !exhausted && pathResetsTotal > 0
+           ? `—— 途中路径被重算了 ${pathResetsTotal} 次`
+             + `（${Object.entries(resetReasons).map(([k, v]) => `${REASON_TEXT[k] ?? k}×${v}`).join('、')}）：`
+             + '**不是走不通** —— chunk-loaded 那种是正常重算，stuck 是挪不动被 vendor 判的；直接再叫一次 mc_move 往同一目标走就行。'
+           : '')
          + (preempted
            ? (fellOf(end) != null
             ? '—— 这次走路被**另一次移动**打断了（旁边有怪时是自保反射先跑），但更值得注意的是：**你刚掉下来了**。先站稳、看清脚下，再决定往哪走，别对着同一个高度反复爬。'

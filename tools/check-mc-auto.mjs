@@ -309,24 +309,25 @@ section('2. 反射层时序（静默窗口 / running / 只转头不挪窝 / 开�
 
 /* ───────────────────────── 3. 自保 ───────────────────────── */
 
-section('3. 自保（踩到岩浆后退 / 有怪只叫醒 AI、不自己跑）')
+section('3. 自保（踩到危险方块只叫醒 AI、不自己移动 / 有怪只叫醒 AI、不自己跑）')
 {
   const lava = setup({ world: { pos: [10.5, 64, 20.5], ground: 63, overrides: { '10,63,20': 'lava' } }, patch: { lookAround: false } })
   lava.tick(lava.at(1000))
-  ok('脚下方块是岩浆 → 后退', lava.w.calls.controls.some(([k, v]) => k === 'back' && v === true))
-  ok('岩浆同时起跳', lava.w.calls.controls.some(([k, v]) => k === 'jump' && v === true))
-  ok('自保被记进统计', lava.state().stats.escapes >= 1)
+  const lavaMoves = () => lava.w.calls.controls.filter(([k, v]) => (k === 'back' || k === 'jump' || k === 'forward') && v === true).length
+  ok('脚下方块是岩浆 → **一步都不动**（只叫醒，用户 2026-10-21 定）', lavaMoves() === 0, JSON.stringify(lava.w.calls.controls))
+  ok('自保被记进统计（只叫醒）', lava.state().stats.escapes === 1)
   const before = lava.state().stats.escapes
   lava.tick(lava.at(1200))
-  ok('危险没消失时持续后退（不再重复计数）', lava.w.calls.controls.filter(([k, v]) => k === 'back' && v).length >= 2 && lava.state().stats.escapes === before)
+  ok('危险没消失时：仍然不动、也不重复计数', lavaMoves() === 0 && lava.state().stats.escapes === before)
 
   /* 🔴 名单统一（mc_map 第二轮）：反射层原来自己写了一份正则，**漏了灵魂火 / 灵魂营火**。
    *    现在和搭路共用 `src/bridge.mjs` 的 `BRIDGE_FATAL_NAMES`，这几个都该被认出来。 */
   for (const bad of ['soul_fire', 'soul_campfire', 'cactus', 'powder_snow']) {
     const w = setup({ world: { overrides: { '10,63,20': bad } }, patch: { lookAround: false } })
     w.tick(w.at(1000))
-    ok(`脚下方块是 ${bad} → 后退（反射层和搭路共用同一份危险名单）`,
-      w.w.calls.controls.some(([k, v]) => k === 'back' && v === true))
+    ok(`脚下方块是 ${bad} → 认出来并叫醒，但不动（反射层和搭路共用同一份危险名单）`,
+      w.w.calls.controls.filter(([k, v]) => (k === 'back' || k === 'jump' || k === 'forward') && v === true).length === 0
+      && w.state().stats.escapes >= 1)
   }
   /* 2026-10-18 审计：甜浆果丛只减速，踩上去能走过去 ⇒ 不能当岩浆一样后退，否则来回震荡。 */
   {
@@ -411,7 +412,7 @@ section('3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不抢控�
   const creeper = deaf(setup({ world: { health: 20, items: SWORD, mobs: [MOB('creeper')] }, patch: { lookAround: false } }))
   creeper.tick(creeper.at(1000))
   await flush()
-  ok('苦力怕 → 不硬刚、也不自己跑', still(creeper))
+  ok('苦力怕 → 不硬刚、也不自己跑、连退都不退（2026-10-21 起只叫醒）', still(creeper))
 
   // ④ 远程怪（骷髅）：血满 / 血少都一个待遇 —— 不还手（门槛已经删了）
   const skFull = deaf(setup({ world: { health: 20, items: SWORD, mobs: [MOB('skeleton')] }, patch: { lookAround: false } }))
@@ -569,8 +570,9 @@ section('3.5 被怪打/怪贴上来 → 只叫醒 AI（不自己跑、不抢控�
     !/fleeSpot|blindSpot|groundYAt/.test(src))
   ok('自保的限流字段改成 lastAlert*（不再叫 lastFlee*）',
     /lastAlertAt/.test(avoidBody) && !/lastFlee/.test(src))
-  ok('危险方块（岩浆/火/仙人掌）仍然会后退 —— 这条不能跟着一起去掉（走 holdCtl 声明控制位租约）',
-    /holdCtl\(sess, 'back', 320/.test(avoidBody) && /holdCtl\(sess, 'jump', 200/.test(avoidBody))
+  ok('危险方块（岩浆/火/仙人掌）**只叫醒、一步都不动**（用户 2026-10-21："改成叫醒，不自己移动"）',
+    !/holdCtl\(sess, 'back'/.test(avoidBody) && !/holdCtl\(sess, 'jump', 200/.test(avoidBody)
+    && /只叫醒 AI，不自己移动/.test(avoidBody))
   ok('危险方块那两条不再裸按控制位（裸按会被移动收尾一起松掉）',
     !/setControlState\?\.\('back', true\)/.test(avoidBody) && !/setControlState\?\.\('jump', true\)/.test(avoidBody))
 }
@@ -791,13 +793,13 @@ section('3.7 busy 期间照样检测并叫醒（先停手，但不抢控制位�
   const hn = setup({ world: { overrides: lava }, patch: { lookAround: false } })
   hn.tick(hn.at(1000))
   await flush()
-  ok('不 busy 时脚下是岩浆：照旧按 back 脱离', backPresses(hn) > 0, String(backPresses(hn)))
+  ok('不 busy 时脚下是岩浆：同样一步都不动（只叫醒）', backPresses(hn) === 0, String(backPresses(hn)))
 
   // ③ 静态：busy 只挡动作，不挡检测
   const src = strip(readFileSync(new URL('../extensions/mc_auto.mjs', import.meta.url), 'utf8'))
   ok('`if (s.busy) return` 已经不存在（剥注释后）', !/if \(s\.busy\) return/.test(src))
-  ok('改成 `const busy = Boolean(s.busy)` + 只在动作前 `if (busy) return`',
-    /const busy = Boolean\(s\.busy\)/.test(src) && /if \(busy\) return/.test(src))
+  ok('改成 `const busy = Boolean(s.busy)`（危险方块已不按控制位，busy 只剩"别打断你"的意思）',
+    /const busy = Boolean\(s\.busy\)/.test(src) && !/if \(busy\) return/.test(src))
 
   // ④ 重连必须一起复位 eatHooked（不然 eatFinish/eatFail 永久挂在死 bot 上）
   ok('离线分支同时复位 hooked 与 eatHooked',

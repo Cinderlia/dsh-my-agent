@@ -386,12 +386,17 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
 /** 动手前手里的东西 —— 只在"有东西可还"时给（空手就是 null，不用还） */
 export function heldSnapshotOf (b) {
   const it = b?.heldItem ?? null
-  if (!it?.name) return null
+  const slot0 = Number(b?.quickBarSlot)
+  const slotOk = Number.isInteger(slot0) && slot0 >= 0 && slot0 < 9
+  /* 🔴 2026-10-21（用户："搭路自动切回去…不生效"）：**空手也要记快照**。
+   *    原来空手返回 null ⇒ `bridgeAcross` 的 `if (keep)` 直接跳过还原，
+   *    搭完桥手里还攥着那摞方块 —— 用户看到的就是"没切回去"。
+   *    现在记 `{ empty: true }`，收工时切回一个空热键格（`restoreHeldOf`）。 */
+  if (!it?.name) return { empty: true, name: null, ...(slotOk ? { slot: slot0 } : {}) }
   /* 🔴 2026-10-20 审计：快照里补上**选中槽位**。`shoot` 取消拉弓是靠
    *    `setQuickBarSlot((slot+1)%9)` 做的（切槽 = 取消拉弓且不发射），只记名字的话
    *    还原时 `equip(item,'hand')` 会塞进**当前**选中槽 ⇒ 选中槽偏移一格、两格物品互换。 */
-  const slot = Number(b?.quickBarSlot)
-  return { name: it.name, ...(Number.isInteger(slot) && slot >= 0 && slot < 9 ? { slot } : {}) }
+  return { empty: false, name: it.name, ...(slotOk ? { slot: slot0 } : {}) }
 }
 
 /**
@@ -407,8 +412,25 @@ export async function restoreHeldOf (b, snap) {
   if (Number.isInteger(snap?.slot) && b?.quickBarSlot !== snap.slot && typeof b.setQuickBarSlot === 'function') {
     try { b.setQuickBarSlot(snap.slot) } catch { /* 假 bot / 不支持：跳过 */ }
   }
-  const now = b?.heldItem ?? null
-  if (!snap?.name) return { restored: false, now: now?.name ?? null }
+  const now0 = b?.heldItem ?? null
+  /* 空手起步：收工时把方块"放下"（切到一个空的热键格；不行再试 `equipEmpty()`）。
+   * 用户原话只要求"切回去"，空手也是"回去"的一种。 */
+  if (!snap?.name) {
+    if (!now0?.name) return { restored: false, now: null }
+    let emptied = false
+    try {
+      const slots = b?.inventory?.slots ?? []
+      let free = null
+      for (let i = 0; i < 9; i++) if (!slots[36 + i]) { free = i; break }
+      if (free != null && typeof b.setQuickBarSlot === 'function') { b.setQuickBarSlot(free); emptied = !b?.heldItem?.name }
+      if (!emptied && typeof b.equipEmpty === 'function') { await b.equipEmpty(); emptied = !b?.heldItem?.name }
+    } catch { /* 清不掉就算了，如实说 */ }
+    const nowE = b?.heldItem?.name ?? null
+    return emptied && !nowE
+      ? { restored: true, now: null }
+      : { restored: false, now: nowE, why: `原来就是空手，想把手里的 ${nowE ?? '东西'} 放下，没放掉` }
+  }
+  const now = now0
   if (now?.name === snap.name) return { restored: false, now: now.name }
   let item = null
   try { item = (b.inventory?.items?.() ?? []).find((i) => i?.name === snap.name) ?? null } catch { item = null }
@@ -443,9 +465,9 @@ export async function bridgeAcross (self, opts = {}, ctx = {}) {
       const r = await restoreHeldOf(b, keep)
       if (out) {
         if (r.restored) {
-          out.held = `${r.now}x${b?.heldItem?.count ?? 1}`
-          out.heldRestored = keep.name
-        } else if (out.held !== `${keep.name}x${b?.heldItem?.count ?? 1}` && r.why) {
+          out.held = r.now ? `${r.now}x${b?.heldItem?.count ?? 1}` : '空手'
+          out.heldRestored = keep.name ?? '空手'
+        } else if (out.held !== (keep.name ? `${keep.name}x${b?.heldItem?.count ?? 1}` : '空手') && r.why) {
           out.heldRestoreWhy = r.why
         }
       }

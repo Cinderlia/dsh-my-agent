@@ -71,7 +71,8 @@ export const AUTO_DEFAULTS = {
    * 运行模式（2026-10-18 用户拍板，默认 `ai-led`）：
    *   · `ai-led`   —— AI 决策：反射层只**监测事件 + 叫醒 + 记录决策**，不替它吃/捡/穿/跟/环顾，
    *                   连"危险方块后退、苦力怕后撤、水下自救"也默认不做。
-   *   · `balanced` —— AI 决策，但保留**几乎不可逆**的紧急保命：危险方块后退、苦力怕后撤、水下自救。
+   *   · `balanced` —— AI 决策，但保留**几乎不可逆**的紧急保命：水下自救。
+   *     （危险方块和苦力怕**只叫醒、不自己移动** —— 用户 2026-10-21 定，两档都一样。）
    *   · `legacy`   —— 旧的自动行为（吃/捡/穿/跟随/环顾/保命全开）。
    * 下面这些布尔项（autoEat/pickup/wearArmor/lookAround/follow/avoid/creeperFlee/waterRecover）
    * **显式写过**就优先于模式默认值（见 `behaviorOf`）。
@@ -104,7 +105,7 @@ export const AUTO_DEFAULTS = {
   lookAround: true,   // 环顾 / 看附近的玩家
   autoEat: true,      // 饿了自动吃（交给现成的 mineflayer-auto-eat）
   pickup: true,       // 走过去捡附近掉落物（交给现成的 mineflayer-collectblock）
-  avoid: true,        // 躲岩浆/火/仙人掌 + 被怪打/怪贴上来时**叫醒 AI**（不自己跑、不还手）
+  avoid: true,        // 岩浆/火/仙人掌 → **只叫醒 AI**（一步都不动）；被怪打/怪贴上来时也只叫醒（不自己跑、不还手）
   wearArmor: true,    // 空着的盔甲位就从背包里穿上（"变强"里最便宜的一步；不动位置、不打怪）
   follow: null,       // 跟随的玩家名（null = 不跟随）
   followDistance: 3,  // 跟到这个距离就停
@@ -565,6 +566,8 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       if (ex.includes(key) && typeof cfg[key] === 'boolean') out[as] = cfg[key]
     }
     over('lookAround'); over('autoEat'); over('pickup'); over('wearArmor')
+    // avoidReact / creeperFlee 现在都**不再移动位置**了（用户 2026-10-21）：前者早就不按 back，
+    // 后者只剩"举盾 + 叫醒"。留着这两个键是为了兼容老配置和 mc_auto status 的读数。
     over('avoid', 'avoidReact'); over('creeperFlee'); over('waterRecover')
     // follow：显式给了玩家名 = 明确授权的跟随任务，任何模式都允许
     out.follow = (mode === 'legacy' || ex.includes('follow')) && Boolean(cfg?.follow)
@@ -583,7 +586,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         lastToolAt: now(),   // 新会话先给一个完整窗口，别刚连上就叫醒
         inFlight: 0,
         busy: false,
-        escaping: 0,
+        dangerSeen: '',
         baseYaw: null,
         basePitch: null,
         nextLookAt: 0,
@@ -1417,18 +1420,20 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     return true
   }
 
-  /** 危险回避：踩到岩浆/火/仙人掌 → 后退（这个还是要动的，站里面会死）；
+  /** 危险方块（岩浆/火/仙人掌/甜浆果…）→ **只叫醒 AI**（用户 2026-10-21 定）；
    *  有怪/挨打 → **只叫醒 AI**（报怪的位置、血量、距离），反射层不自己跑、不抢控制权。
-   *  用户 2026-10-06："既然选择可以获取怪物位置，把受到攻击自动跑离开去掉。" */
+   *  用户 2026-10-06："既然选择可以获取怪物位置，把受到攻击自动跑离开去掉。"
+   *  🔴 2026-10-21 用户："改成叫醒，不自己移动" —— 原来踩到危险方块会按 back（+岩浆时 jump）
+   *     后退，但退的方向是反射层猜的，在窄岩架/岩浆湖边反而退进去过。现在一步都不动，
+   *     只发事件 + 叫醒，怎么脱困交给 AI 按现场判断。 */
   /**
-   * 苦力怕贴到 4 格内：**先自己退一步**，再叫醒 AI（2026-10-18 审计，用户拍板）。
+   * 苦力怕贴到 4 格内：**举盾 + 叫醒 AI**，但**不自己移动**（用户 2026-10-21 定：
+   * "改成叫醒，不自己移动"）。
    *
-   * 为什么别的怪都不动、只有它动：
-   *   · 苦力怕引信 1.5 秒、爆炸中心伤害不衰减 —— 等模型回话（几秒）人已经炸没了；
-   *   · 它贴上来时**退一步就有效**（离开爆发中心），不像骷髅你退它追；
-   *   · 仍然不是"替 AI 打架"：只按 0.7 秒后退，然后照常叫醒、把决定权交回去。
+   * 2026-10-18 那版会先按 0.7 秒 forward 后退 —— 退的方向是反射层猜的，身后是墙/岩浆/悬空
+   * 时反而更糟；现在位置完全不动，只把盾举起来（不移动、不改装备），剩下交给 AI。
    *
-   * @returns {boolean} 这次真退了没有（叫醒文案里要如实写）
+   * @returns {boolean} 这次有没有处理过（叫醒文案里要如实写）
    */
   const creeperFlee = (s, sess, cfg, t, foe) => {
     if (cfg.creeperFlee === false) return false
@@ -1437,28 +1442,8 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const cp = foe?.entity?.position
     if (!me || !cp) return false
     if (t - num(s.lastCreeperFleeAt, 0) < CREEPER_FLEE_GAP_MS) return false
-    /* 方向：背离苦力怕 2.5 格；正后方不行就左右各 52° 再试（别退进墙/岩浆/悬空）。 */
-    let dx = me.x - cp.x
-    let dz = me.z - cp.z
-    const len = Math.hypot(dx, dz) || 1
-    dx = (dx / len) * 2.5
-    dz = (dz / len) * 2.5
-    let spot = null
-    for (const a of [0, 0.9, -0.9, 1.8, -1.8]) {
-      const ca = Math.cos(a)
-      const sa = Math.sin(a)
-      const cand = me.offset(dx * ca - dz * sa, 0, dx * sa + dz * ca)
-      const feet = blockNameAt(b, cand)
-      const head = blockNameAt(b, cand.offset(0, 1, 0))
-      const floor = blockNameAt(b, cand.offset(0, -1, 0))
-      if (!feet || !head || !floor) continue
-      if (!isPassable(feet) || !isPassable(head)) continue
-      if (!isSolidBlock(floor)) continue
-      if (BRIDGE_FATAL.test(feet) || BRIDGE_FATAL.test(head) || BRIDGE_FATAL.test(floor)) continue
-      spot = cand
-      break
-    }
-    if (!spot) return false
+    /* 🔴 用户 2026-10-21："改成叫醒，不自己移动" —— 这里原来会 lookAt + 按 0.7 秒 forward，
+     *    后退方向是猜的（身后可能是墙/岩浆/悬空）。现在只举盾（不动位置、不换装备）。 */
     let shield = false
     try {
       const off = b?.inventory?.slots?.[45]?.name
@@ -1467,23 +1452,19 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         shield = true
         s.shieldOffAt = t + CREEPER_FLEE_MS
       }
-    } catch { /* 举盾失败不影响跑 */ }
-    /* 🔴 2026-10-20 审计：`lookAt` 不带 force 时，物理循环不发 look 包就永远不 settle
-     *    （站着不动/刚死时 early return）—— 这里没 await，于是留下一个永远挂着的 promise。 */
-    try { b.lookAt(spot, true) } catch { /* 只是朝向 */ }
-    holdCtl(sess, 'forward', CREEPER_FLEE_MS, () => { try { b.setControlState('forward', false) } catch { /* 忽略 */ } })
+    } catch { /* 举盾失败不影响叫醒 */ }
     s.lastCreeperFleeAt = t
     s.stats.creeperFlees = num(s.stats.creeperFlees, 0) + 1
-    s.lastAction = '躲苦力怕'
-    logLine(`mc_auto：苦力怕 ${foe.distance.toFixed(1)} 格 → 先退 ${CREEPER_FLEE_MS}ms（${shield ? '举盾 + ' : ''}再叫醒 AI）`)
+    s.lastAction = '发现苦力怕'
+    logLine(`mc_auto：苦力怕 ${foe.distance.toFixed(1)} 格 → ${shield ? '先举盾，' : ''}只叫醒 AI，不自己移动`)
     return true
   }
 
   const avoid = (s, sess, cfg, t) => {
     /* 🔴 2026-10-08 审计：以前这里是 `if (s.busy) return` —— `busy` 由 `pickup`（最长 8 秒）与
      *   `follow`（最长 3.4 秒）置位，那 8 秒里岩浆/挨打/憋气**全都不检测**，AI 一边挨打一边走 6 格
-     *   去捡东西时反射层一声不吭。`busy` 只该挡住"反射层替你按控制位"，不该挡住"看一眼并叫你"，
-     *   所以现在只把**动作**（按 back/jump）关掉，检测与 `wakeForDanger` 照跑。 */
+     *   去捡东西时反射层一声不吭。`busy` 只该挡住"反射层替你按控制位"，不该挡住"看一眼并叫你"。
+     *   2026-10-21 起反射层在危险方块上**已经不按任何控制位**了，`busy` 只剩"别打断你"的意思。 */
     const busy = Boolean(s.busy)
     const beh = behaviorOf(cfg)
     const b = sess?.bot?.bot
@@ -1501,29 +1482,15 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const bad = here.find((n) => n && DANGER.test(n))
     if (bad) {
       pushAutoEvent(s, 'damage', `danger:${bad}`, { block: bad, y: Math.round(p.y) })
-      // 只在"刚开始脱离"时计数 + 记日志：危险没消失时每 tick 都按后退，
-      // 但不要每 tick 都 +1（否则统计里 escapes 会被同一滩岩浆刷爆）
-      if (beh.avoidReact && s.escaping === 0) {
+      /* 🔴 只叫醒、不自己移动（用户 2026-10-21 定）。同一摊危险只记一次日志/计数，
+       *    换了一种危险、或者离开又踩上，才再记一次。 */
+      if (s.dangerSeen !== bad) {
+        s.dangerSeen = bad
         s.stats.escapes++
-        logLine(`mc_auto：${bad} 就在脚下/身上，${busy ? '先提醒 AI（我这一步还没跑完，不抢控制位）' : '后退脱离'}`)
+        s.stats.dangerAlerts = num(s.stats.dangerAlerts, 0) + 1
+        logLine(`mc_auto：${bad} 就在脚下/身上（只叫醒 AI，不自己移动${busy ? '；我这一步还没跑完' : ''}）`)
       }
-      if (beh.avoidReact) s.escaping = Math.max(s.escaping, 8)
-      else if (s.escaping === 0) logLine(`mc_auto：${bad} 就在脚下/身上（ai-led：只记事件，不替你后退）`)
-    }
-    if (s.escaping > 0 && !beh.avoidReact) s.escaping = 0
-    if (s.escaping > 0) {
-      s.escaping--
-      if (busy) return              // 忙着就不抢控制位（但上面的检测与日志照样做）
-      /* 🔴 2026-10-08 审计⑨：任何一次移动收尾都会 `#releaseControls()` 把七个控制位全松掉 ——
-       *    直接按 back 会被"顺手"松掉（脚边就是岩浆也照松）。用 `holdControl()` 声明**租约**：
-       *    没过期谁都别松，到期它自己松。没有这个 API（老版本/假 bot）就退回原来的写法。 */
-      holdCtl(sess, 'back', 320, () => { try { b.setControlState('back', false) } catch { /* 忽略 */ } })
-      if (/lava|fire/.test(bad ?? '')) {
-        holdCtl(sess, 'jump', 200, () => { try { b.setControlState('jump', false) } catch { /* 忽略 */ } })
-      }
-      s.lastAction = '脱离危险'
-      return
-    }
+    } else if (s.dangerSeen) s.dangerSeen = ''
     let health = 20
     try { health = num(sess.bot?.status?.()?.health, 20) } catch { return }
     // 掉血 = 挨打了（entityHurt 万一没挂上，这条兜底；远程怪的箭也是这么发现的）
@@ -2252,7 +2219,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
             idleSec: Math.round((t - s.lastToolAt) / 1000),
             inFlight: s.inFlight,
             busy: s.busy,
-            escaping: s.escaping,
+            dangerSeen: s.dangerSeen,
             lastWakeAt: s.lastWakeAt || null,
             lastWakeAgoSec: s.lastWakeAt ? Math.round((t - s.lastWakeAt) / 1000) : null,
             wakesThisHour: s.wakeTimes.filter((x) => t - x < 3_600_000).length,
@@ -2278,7 +2245,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     description: '🤖 **自主层**（让它像正常玩家）：不传参数 = 看状态。\n'
       + '**模式**（`set {"mode":"ai-led"|"balanced"|"legacy"}`，默认 `ai-led`）：'
       + '`ai-led` = AI 决策，反射层只监测事件/叫醒/记决策，不替它吃捡穿跟，连保命后退也不做；'
-      + '`balanced` = AI 决策 + 几乎不可逆的紧急保命（危险方块后退、苦力怕后撤、水下自救）；'
+      + '`balanced` = AI 决策 + 紧急保命只剩水下自救（危险方块/苦力怕只叫醒、不移动）；'
       + '`legacy` = 旧的自动行为全开。\n'
       + '**事件层**：溺水/窒息/苦力怕/挨打/被打断/停滞 → 按优先级入队去重，叫醒只给事实，每个动作记一条决策审计。\n'
       + `**空闲层**：闲 ${AUTO_DEFAULTS.idleWakeSec} 秒叫醒（每小时 ${AUTO_DEFAULTS.idleWakeMaxPerHour} 次；没动作 ⇒ 间隔翻倍，封顶 30 分钟），45s 没动手补一条"别问，直接做"。\n`
@@ -2347,7 +2314,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       const lines = [
         `🤖 自主层：${cfg.enabled ? '反射层开' : '反射层关'}｜${cfg.idleWake ? `空闲 ${cfg.idleWakeSec}s 叫醒 AI（本小时上限 ${cfg.idleWakeMaxPerHour}）` : '空闲叫醒关'}`,
         `　环顾 ${cfg.lookAround ? '开' : '关'}｜自动吃 ${cfg.autoEat ? '开' : '关'}`
-          + `｜捡东西 ${cfg.pickup ? '开' : '关'}｜自保 ${cfg.avoid ? `开（被打/憋气时叫醒 AI${cfg.dangerStopWork !== false ? ' + 先停下手里的事' : ''}，不自己跑也不还手）` : '关'}`
+          + `｜捡东西 ${cfg.pickup ? '开' : '关'}｜自保 ${cfg.avoid ? `开（被打/憋气/踩到危险方块时叫醒 AI${cfg.dangerStopWork !== false ? ' + 先停下手里的事' : ''}，不自己跑也不还手、不自己移动）` : '关'}`
           + `｜自动穿甲 ${cfg.wearArmor === false ? '关' : '开'}`
           + `｜跟随 ${cfg.follow ?? '关'}`,
         `　🎯 长期目标：${cfg.standing || DEFAULT_STANDING}`
@@ -2362,7 +2329,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
           ? `　👀 旁边：${s.playerObs.map((p) => `${p.username}(${p.distance.toFixed(1)}格，${p.moving ? '在动' : '站着'}${p.held ? `，手持 ${p.held}` : ''})`).join('、')}`
           : '　👀 旁边没有玩家')
         lines.push(`　累计：环顾 ${s.stats.looks}（其中看玩家 ${s.stats.watches}）｜吃 ${s.stats.eats}｜捡 ${s.stats.pickups}`
-          + `｜自保提醒 ${s.stats.alerts ?? 0}（叫醒 ${s.stats.dangerWakes ?? 0}）｜脱险 ${s.stats.escapes}`
+          + `｜自保提醒 ${s.stats.alerts ?? 0}（叫醒 ${s.stats.dangerWakes ?? 0}）｜危险提醒 ${s.stats.escapes}（只叫醒、不移动）`
           + `｜跟随 ${s.stats.follows}｜叫醒 ${s.stats.wakes}`
           + `（其中催促 ${s.stats.nudges ?? 0}）｜限流挡掉 ${s.stats.denied}`)
         lines.push(`　🌊 水下自救 ${s.stats.waterRecovers ?? 0} 次（出来 ${s.stats.waterEscapes ?? 0} 次）`

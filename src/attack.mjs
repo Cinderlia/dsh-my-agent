@@ -58,7 +58,7 @@ import { dropHint, entityHealth } from './world-observer.mjs'
 import { durabilityOf, EQUIP_SLOTS } from './inventory.mjs'
 import {
   assessCombat, chooseStrategy, combatOutcomeOf, combatOutcomeText, combatPlanText,
-  approachPointOf, isShield, COMBAT_PHASE_MS, HEALTH_LOW, threatScoreOf,
+  approachPointOf, isShield, COMBAT_PHASE_MS, HEALTH_LOW, threatScoreOf, EQUIP_COOLDOWN_MS,
 } from './combat-strategy.mjs'
 import { Vec3 } from 'vec3'
 import { BRIDGE_FATAL } from './bridge.mjs'
@@ -494,6 +494,9 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
   const equippedTo = []
   /** 换不上去的原因（有就写进结果的 `weaponWarn`，别让 AI 以为"它自己会换"） */
   let equipFail = null
+  /** 有更好的武器但这轮没换的原因（用户 2026-10-21："攻击自动切也不生效" ——
+   *  先分清是"没建议换"还是"被次数/冷却挡住"，别让人只能猜） */
+  let equipNote = null
   let sawDamageAny = false
   let shieldsAny = 0
   let last = null
@@ -639,6 +642,11 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     if (advisory) advice.push({ action: wanted.action, reason: wanted.reason, why: wanted.why })
     lastStep = step
     lastSnap = snap
+    if (!equipNote && snap.weapon?.name && step.action !== 'equip') {
+      equipNote = mem.equips >= 2
+        ? `背包里有更好的 ${snap.weapon.name}，但这一场已经换过 ${mem.equips} 次，不再换`
+        : `背包里有更好的 ${snap.weapon.name}，换装冷却中（${EQUIP_COOLDOWN_MS}ms）`
+    }
     actions.push(step.action)
 
     /* ── 收工 ── */
@@ -805,6 +813,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     ...(heldAtStart && heldAtStart !== (b.heldItem?.name ?? null) ? { heldBefore: `${heldAtStart}x1` } : {}),
     ...(equippedTo.length ? { equipped: equippedTo } : {}),
     ...(equipFail || lastSnap?.weaponWarn ? { weaponWarn: equipFail ?? lastSnap.weaponWarn } : {}),
+    ...(equipNote && !equippedTo.length ? { equipNote } : {}),
     /* 有没有盾（含**副手 45 格**与盔甲槽 5..8）。如实给出来：AI 需要它判断"能不能进依赖盾牌的策略"，
      * 而这正是 2026-10-17 用户实机逮到的那个 bug 的现场（副手有盾却被判成没盾）。 */
     ...(typeof lastSnap?.hasShield === 'boolean' ? { shield: lastSnap.hasShield } : {}),
