@@ -167,6 +167,8 @@ export const DEFAULT_CONFIG = {
   chatLog: true,
   /** 聊天记录保留几天（默认 7；1~90） */
   chatLogDays: 7,
+  /** 开 DSH 时查一次更新（默认开；只有显式 false 才关）。见 `src/update.mjs` 无关，逻辑在 index.js 的启动钩子 */
+  updateCheckOnStart: true,
   /** 文件分享的 base（如 `https://dsh.example.com`，可带路径前缀）；空 = 还没配 */
   expressBase: '',
 
@@ -632,6 +634,10 @@ export class PluginConfig {
     const n = Number(this.get('chatLogDays'))
     return Number.isFinite(n) && n >= 1 ? Math.min(90, Math.floor(n)) : 7
   }
+  /** 开 DSH 时查一次更新（默认开；只有显式 false 才关） */
+  get updateCheckOnStart () {
+    return this.get('updateCheckOnStart') !== false
+  }
   /** 文件分享的 base（归一化：去尾斜杠；非法/空 = `''`） */
   get expressBase () {
     return normalizeExpressBase(this.get('expressBase')) ?? ''
@@ -735,7 +741,7 @@ function validate (top, rest, value) {
     if (value !== null && typeof value !== 'string') throw new Error('memoryDir 必须是字符串（绝对路径）或 null')
     return
   }
-  if (top === 'allowAllCommands' || top === 'ensureMcPreset' || top === 'expressEnabled' || top === 'memoryPerSession' || top === 'stopOnDanger' || top === 'chatLog') {
+  if (top === 'allowAllCommands' || top === 'ensureMcPreset' || top === 'expressEnabled' || top === 'memoryPerSession' || top === 'stopOnDanger' || top === 'chatLog' || top === 'updateCheckOnStart') {
     if (typeof value !== 'boolean') throw new Error(`${top} 必须是 true/false`)
     return
   }

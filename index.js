@@ -652,6 +652,8 @@ export function apply(ctx, rawConfig) {
   const PLUGIN_ROOT = fileURLToPath(new URL('.', import.meta.url))
   const UPDATE_TTL_MS = 10 * 60 * 1000
   const updateCache = { at: 0, data: null }
+  /** 启动后多久查第一次更新：别跟插件初始化抢资源，也别让首屏等它 */
+  const START_UPDATE_CHECK_MS = 15_000
   const EXPRESS_MAX_BYTES = 32 * 1024 * 1024
 
   /** 宿主的工作区注册表（可能还没就绪 → 返回空表，别抛） */
@@ -1290,6 +1292,10 @@ export function apply(ctx, rawConfig) {
     }
     return { servers, seconds: secs, ...(lanWarnings.length ? { warnings: lanWarnings } : {}) }
   }
+
+  /* `checkUpdate` 定义在 `handleSettingsApi` 里（它要用路由那些闭包），启动钩子却在外层 ——
+   * 用这个盒子把函数递出来（用户 2026-10-21：开 DSH 就该查一次）。 */
+  const updaterRef = { check: null }
 
   const handleSettingsApi = async (req, res, path, url) => {
     const ok = (body) => sendJson(res, 200, { ok: true, ...body })
@@ -1969,6 +1975,8 @@ export function apply(ctx, rawConfig) {
       }
     }
 
+    updaterRef.check = checkUpdate
+
     /* ── 更新（用户 2026-10-20）：`GET /api/mc/update` 查 / `POST /api/mc/update/apply` 拉 ──
      * 🔴 这两条**不要求工作区**：红点要出现在"新会话页"上，那时候根本还没有工作区。 */
     if (path === '/api/mc/update' && req.method === 'GET') {
@@ -2484,6 +2492,26 @@ export function apply(ctx, rawConfig) {
       }, 'dsh-mc-agent: 未处理拒绝守卫补挂')
     }
   } catch (e) { logLine(`装未处理拒绝守卫失败（不影响使用）：${e?.message ?? e}`) }
+
+  /* ─────────── 开 DSH 时查一次更新（用户 2026-10-21：「可以做到开 dsh 检查一次吗」）───────────
+   * 只查一次、不重试，约 15 秒后跑（别跟插件初始化抢资源）；结果落进 `updateCache`，
+   * 于是红点和更新页第一次打开就是现成的，不用等 git。查失败只记 debug，绝不打扰。
+   * 关掉：配置 `updateCheckOnStart: false`，或环境变量 `DSH_MC_AGENT_UPDATE_ON_START=off`。 */
+  if (pluginConfig.updateCheckOnStart !== false && String(process.env.DSH_MC_AGENT_UPDATE_ON_START ?? '').toLowerCase() !== 'off') {
+    ctx.effect(() => {
+      const t = setTimeout(() => {
+        Promise.resolve()
+          .then(() => updaterRef.check?.(true))
+          .then((d) => {
+            if (d?.behind > 0) logLine(`发现新版本（启动检查）：落后 ${d.behind} 个提交，设置 → 更新 里可以一键更新`)
+            else if (d?.ready === false) logDebug(`启动检查更新：${d.reason ?? '拿不到远端信息'}`)
+          })
+          .catch((e) => logDebug(`启动检查更新失败（不影响使用）：${e?.message ?? e}`))
+      }, START_UPDATE_CHECK_MS)
+      t?.unref?.()
+      return () => clearTimeout(t)
+    }, 'dsh-mc-agent: 启动查一次更新')
+  }
 
   /* ─────────── 「闪退」网：uncaughtException 至少留下栈 ───────────
    * 2026-10-18：mineflayer-pathfinder 的 tick 监听在某次 `placingBlock` 为 undefined 时抛错，

@@ -143,6 +143,23 @@ ok(/安装方式/.test(cli), '多一行「安装方式」')
 ok(/info\?\.forcePull === true/.test(cli), '同版本号时允许「覆盖一次」（forcePull）')
 ok(/forcePull: false/.test(idx), '后端默认带 forcePull: false')
 
+/* ─────────────── ⑦ 开 DSH 查一次 ─────────────── */
+section('⑦ 启动时查一次更新（用户 2026-10-21）')
+ok(/const START_UPDATE_CHECK_MS = 15_000/.test(idx), '有启动检查的延时常量')
+ok(/const updaterRef = \{ check: null \}/.test(idx), 'apply 作用域有个 updaterRef 盒子')
+ok(/updaterRef\.check = checkUpdate/.test(idx), 'handleSettingsApi 里把 checkUpdate 递进盒子')
+ok(/updaterRef\.check\?\.\(true\)/.test(idx), '启动钩子调的是 force=true 的那份')
+ok(/setTimeout\(\(\) => \{[\s\S]{0,200}updaterRef\.check/.test(idx), '是用 setTimeout 推迟跑的（不阻塞启动）')
+ok(/t\?\.unref\?\.\(\)/.test(idx), '定时器 unref（别拦着进程退出）')
+ok(/return \(\) => clearTimeout\(t\)/.test(idx), 'ctx.effect 卸载时清掉定时器')
+ok(/pluginConfig\.updateCheckOnStart !== false/.test(idx), '配置 updateCheckOnStart 能关')
+ok(/DSH_MC_AGENT_UPDATE_ON_START/.test(idx), '环境变量 DSH_MC_AGENT_UPDATE_ON_START=off 也能关')
+ok(/d\?\.ready === false/.test(idx), '拿不到远端时只记 debug，不打扰用户')
+const cfgSrc = readFileSync(new URL('src/config.mjs', root), 'utf8')
+ok(/updateCheckOnStart: true/.test(cfgSrc), '配置默认值 = true')
+ok(/get updateCheckOnStart \(\)/.test(cfgSrc), '有 getter（只有显式 false 才关）')
+ok(/top === 'updateCheckOnStart'/.test(cfgSrc), 'validate 认这个布尔键')
+
 /* ─────────────── 收尾 ─────────────── */
 for (const d of TMP) { try { rmSync(d, { recursive: true, force: true }) } catch { /* 临时目录 */ } }
 console.log(`\n${fail === 0 ? '✅ 全部通过' : '❌ 有失败'}：pass=${pass} fail=${fail}`)
