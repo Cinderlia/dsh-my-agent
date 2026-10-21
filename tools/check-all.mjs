@@ -34,7 +34,7 @@ const ORDER = [
   'check-mc-craft.mjs', 'check-mc-furnace.mjs', 'check-mc-chest.mjs',
   'check-mc-observe-host.mjs', 'check-mc-view-render.mjs', 'check-mc-skin.mjs',
   'check-mc-auto.mjs', 'check-mc-deps.mjs', 'check-dep-guard.mjs',
-  'check-session-memory.mjs', 'check-rules-file.mjs', 'check-logging.mjs', 'check-watch-chat.mjs', 'check-audit-session.mjs',
+  'check-session-memory.mjs', 'check-update-copy.mjs', 'check-rules-file.mjs', 'check-logging.mjs', 'check-watch-chat.mjs', 'check-chat-log.mjs', 'check-audit-session.mjs',
   'check-module-load.mjs',
   'check-core.mjs',
   'check-standalone-import.mjs',

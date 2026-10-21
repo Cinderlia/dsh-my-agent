@@ -22,12 +22,12 @@
  * `@deepseek-ai/dsh-tools`）—— 它们是 **optional peer**（包管理器永远不装），官方 dsh-desktop 上宿主
  * 解析层也喂不进来 ⇒ 模块**链接期**就失败，宿主只报一句 `failed to import`。现在两条路都"拿不到也能活"：
  * `z` 在下面按需动态 import（拿不到就**不导出** Config）；`defineTool` 来自 src/tool-def.mjs（宿主优先 + 内置兜底）。 */
-import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync, statSync, renameSync, realpathSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync, statSync, renameSync, realpathSync, rmSync, cpSync, mkdtempSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { resolve, sep, join, isAbsolute, dirname, basename } from 'node:path'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
 import { defineTool, toolDefKind } from './src/tool-def.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
@@ -52,6 +52,7 @@ import { workerPoolStats } from './src/worker-pool.mjs'
 import { MemoryStore } from './src/memory.mjs'
 import { createInjector } from './src/inject.mjs'
 import { installRejectionGuard, refreshRejectionGuard } from './src/crash-guard.mjs'
+import { recordChat } from './src/chat-log.mjs'
 import { PluginConfig, DEFAULT_CONFIG, resolveStateDir, pickPresetTarget, pickPresetSource, isCopiedPresetDescription, PREFERRED_PRESET_SOURCES, MC_PRESET_SPEC, planPresetAction, patchPersonaInComposition, personaTextKeyOf, disableShellInComposition, patchToolGroupsIntoComposition, MC_PRESET_TOOL_GROUPS, matchCommandList, isRegexEntry } from './src/config.mjs'
 import { COMMAND_GROUPS, catalogNames, COMMANDS_THAT_MOVE_ME, splitCommands, commandNameOf, MAX_COMMANDS_PER_CALL } from './src/commands.mjs'
 import { readBossBars, formatBossBars } from './src/bossbar.mjs'
@@ -571,6 +572,30 @@ export function apply(ctx, rawConfig) {
   const pluginConfig = new PluginConfig(stateDir)
   /** 无会话上下文时用的兜底记忆库（`capabilities` / 扩展 api / 全局注入用） */
   const memory = memoryFor(null)
+  /**
+   * 把「游戏内聊天 → 记忆」的钩子挂到会话的 bot 上（用户 2026-10-20：「记忆加和玩家游戏内的聊天记录」）。
+   *
+   * 为什么挂在 `onChatLine`（而不是看门狗/工具里）：`src/chat.mjs` 的 `pushChat()` 是**所有**聊天行的
+   * 唯一入口（玩家说的、我自己 `mc_say` 说的、系统消息），钩在那儿一条不漏、也不用重复判包。
+   * 钩子只记 `player` / `self`，系统消息不进文件（那部分看门狗的事件队列已经记了）。
+   * 写盘失败只会记一行 debug 日志 —— 聊天本身绝不能被记忆搞挂。
+   */
+  const attachChatLog = (sess, agent) => {
+    try {
+      const bot = sess?.bot
+      if (!bot) return null
+      const store = memoryFor(workspaceOf(agent), agentIdOf(agent))
+      bot.onChatLine = (entry) => {
+        if (!pluginConfig.chatLog) return
+        const r = recordChat(store, entry, { keepDays: pluginConfig.chatLogDays })
+        if (r && r.written === false && r.why === 'error') logDebug(`聊天记录没写进去：${r.error}`)
+      }
+      return store.root
+    } catch (e) {
+      logDebug(`挂「聊天记录」钩子失败（不影响游戏）：${e?.message ?? e}`)
+      return null
+    }
+  }
   /** 这个会话的工作区根（mc_kit_image / 地图落盘用）；拿不到就给个兜底目录 */
   const workspaceRootFor = (agent) => workspaceOf(agent) ?? join(stateDir, 'workspace')
 
@@ -1606,7 +1631,7 @@ export function apply(ctx, rawConfig) {
     /* 下面三个在**插件作用域**（不是每个请求里）—— 见 §「更新」那段开头的说明 */
 
     /** 跑一条 git 命令（不弹窗、带超时）。返回 `{ code, out, err }`，**永不抛**。 */
-    const gitRun = async (args, timeoutMs = 20000) => {
+    const gitRun = async (args, timeoutMs = 20000, cwd = PLUGIN_ROOT) => {
       const { spawn } = await import('node:child_process')
       return await new Promise((resolvePromise) => {
         let out = ''
@@ -1615,7 +1640,7 @@ export function apply(ctx, rawConfig) {
         const fin = (r) => { if (!settled) { settled = true; resolvePromise(r) } }
         let child
         try {
-          child = spawn('git', args, { cwd: PLUGIN_ROOT, windowsHide: true })
+          child = spawn('git', args, { cwd, windowsHide: true })
         } catch (e) {
           return fin({ code: -1, out: '', err: `起不了 git：${e?.message ?? e}` })
         }
@@ -1639,6 +1664,181 @@ export function apply(ctx, rawConfig) {
       return out.join('\n').trim().slice(0, 4000)
     }
 
+    /* ── 复制安装（目录里没有 `.git`）的「覆盖式更新」────────────────────────────
+     * 用户 2026-10-20 在 Windows 服务器上遇到的：插件是**整份复制**进宿主 `node_modules` 的，
+     * 那份目录自己没 `.git` ⇒ 没有远端可比、也没法拉。做法改成：
+     * 临时 `git clone --depth 30` 一份 → 比版本/提交 → 要更新就**先整份备份**再覆盖。
+     * 🔴 覆盖只动代码与文档：`.git` / `node_modules` 一律不碰（依赖是宿主装的，动它会炸）。 */
+    const UPDATE_REMOTES = [
+      'https://gitee.com/bluezi/dsh-mc-agent.git',
+      'https://github.com/blueziii/dsh-mc-agent.git',
+    ]
+    const INSTALL_MARK = '.dsh-mc-agent-install.json'
+
+    const stampNow = () => {
+      const d = new Date()
+      const p = (n) => String(n).padStart(2, '0')
+      return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+    }
+    const readJsonFile = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')) } catch { return null } }
+    /** 版本号比较（只认数字段，`0.2.0` vs `0.10.0` 别按字符串比）。返回 -1 / 0 / 1。 */
+    const cmpVersion = (a, b) => {
+      const pa = String(a ?? '').split(/[.\-+]/).map((x) => Number.parseInt(x, 10) || 0)
+      const pb = String(b ?? '').split(/[.\-+]/).map((x) => Number.parseInt(x, 10) || 0)
+      for (let i = 0; i < Math.max(pa.length, pb.length, 3); i++) {
+        const x = pa[i] ?? 0
+        const y = pb[i] ?? 0
+        if (x !== y) return x > y ? 1 : -1
+      }
+      return 0
+    }
+    /** 取 CHANGELOG 最上面那一节（还没有正式版本号时就是 `## [未发布]` 那段）。 */
+    const topChangelogSection = (text) => {
+      const lines = String(text ?? '').split(/\r?\n/)
+      const start = lines.findIndex((l) => /^##\s+/.test(l))
+      if (start === -1) return ''
+      let end = lines.length
+      for (let i = start + 1; i < lines.length; i++) {
+        if (/^##\s+/.test(lines[i])) { end = i; break }
+      }
+      return lines.slice(start, end).join('\n').trim().slice(0, 4000)
+    }
+    /** 临时 clone 一份最新代码（gitee 优先，github 兜底）。失败返回 `{dir:null, errors}`。 */
+    const cloneLatest = async () => {
+      const base = mkdtempSync(join(tmpdir(), 'dsh-mc-agent-up-'))
+      const dir = join(base, 'repo')
+      const errors = []
+      for (const url of UPDATE_REMOTES) {
+        const r = await gitRun(['clone', '--depth', '30', '--quiet', url, dir], 120000, base)
+        if (r.code === 0) return { base, dir, url, errors }
+        errors.push(`${url}: ${(r.err || r.out || `exit ${r.code}`).trim().slice(0, 200)}`)
+        try { rmSync(dir, { recursive: true, force: true }) } catch { /* 没建出来 */ }
+      }
+      try { rmSync(base, { recursive: true, force: true }) } catch { /* 同 */ }
+      return { base: null, dir: null, url: null, errors }
+    }
+    const dropClone = (base) => { try { if (base) rmSync(base, { recursive: true, force: true }) } catch { /* 临时目录，清不掉也没事 */ } }
+
+    /** 覆盖时哪些不碰：`.git`、`node_modules`、上次的备份目录。 */
+    const copyKeepOut = (srcPath) => {
+      const name = basename(srcPath)
+      if (name === '.git' || name === 'node_modules') return false
+      if (name.startsWith('.bak-') || /\.bak-\d{8}-\d{6}$/.test(name)) return false
+      return true
+    }
+    /** 把插件目录整份备份一份（不含 node_modules/.git）。返回备份路径。 */
+    const backupPluginDir = () => {
+      const dst = `${PLUGIN_ROOT.replace(/[\\/]+$/, '')}.bak-${stampNow()}`
+      cpSync(PLUGIN_ROOT, dst, { recursive: true, force: true, filter: copyKeepOut })
+      return dst
+    }
+    /** 把 clone 出来的代码覆盖进插件目录，返回动过多少个条目。 */
+    const copyIntoPluginDir = (srcDir) => {
+      let n = 0
+      cpSync(srcDir, PLUGIN_ROOT, {
+        recursive: true,
+        force: true,
+        filter: (p) => { if (!copyKeepOut(p)) return false; n++; return true },
+      })
+      return n
+    }
+    /** 复制安装时查更新：clone 一份比提交/版本，决定能不能「覆盖式更新」。 */
+    const fillCopyUpdate = async (data) => {
+      const clone = await cloneLatest()
+      if (!clone.dir) {
+        data.ready = false
+        data.reason = `插件目录不是 git 仓库（复制安装），而且拉不到远端代码：${clone.errors.join('；').slice(0, 400)}`
+        return
+      }
+      try {
+        const pkg = readJsonFile(join(clone.dir, 'package.json')) ?? {}
+        if (pkg.name !== 'dsh-mc-agent') {
+          data.ready = false
+          data.reason = `拉到的仓库不是 dsh-mc-agent（name=${pkg.name ?? '?'}），没敢拿它覆盖。`
+          return
+        }
+        data.source = clone.url
+        data.latestVersion = String(pkg.version ?? '') || null
+        const lc = await gitRun(['rev-parse', '--short', 'HEAD'], 8000, clone.dir)
+        data.latestCommit = String(lc.out).trim() || null
+        const mark = readJsonFile(join(PLUGIN_ROOT, INSTALL_MARK)) ?? null
+        data.currentCommit = String(mark?.commit ?? '') || null
+        /* 落后几个提交：上次覆盖留下的提交号还在这份浅 clone 里就能精确算，否则只能按版本号猜 */
+        let behind = null
+        if (mark?.commit) {
+          const rg = await gitRun(['rev-list', '--count', `${mark.commit}..HEAD`], 10000, clone.dir)
+          if (rg.code === 0) behind = Math.max(0, Number(String(rg.out).trim()) || 0)
+        }
+        const vcmp = cmpVersion(data.latestVersion, data.currentVersion)
+        if (behind === null) {
+          data.behind = vcmp > 0 ? 1 : 0
+          data.canPull = vcmp > 0
+          data.forcePull = vcmp <= 0
+          data.reason = vcmp > 0
+            ? `复制安装：远端是 ${data.latestVersion}，你这里是 ${data.currentVersion}。`
+            : `复制安装：版本号一样（${data.currentVersion}），看不出有没有更新 —— 想保险可以点「覆盖到最新」（会先整份备份）。`
+        } else {
+          data.behind = behind
+          data.canPull = behind > 0
+          data.reason = behind > 0
+            ? `复制安装：落后 ${behind} 个提交。`
+            : '已经是最新（和上次覆盖时是同一个提交）。'
+        }
+        if (data.canPull || data.forcePull) {
+          const range = mark?.commit && behind !== null ? `${mark.commit}..HEAD` : ''
+          const lg = await gitRun(['log', '--no-decorate', '--pretty=%h\t%s', ...(range ? [range] : ['-n', '20'])], 10000, clone.dir)
+          data.commits = String(lg.out).split(/\r?\n/).filter(Boolean).map((line) => {
+            const i = line.indexOf('\t')
+            return i === -1 ? { hash: line.trim(), subject: '' } : { hash: line.slice(0, i), subject: line.slice(i + 1) }
+          })
+          try { data.changelog = topChangelogSection(readFileSync(join(clone.dir, 'CHANGELOG.md'), 'utf8')) } catch { data.changelog = '' }
+        }
+      } finally {
+        dropClone(clone.base)
+      }
+    }
+    /** 复制安装时真去覆盖：先备份，再覆盖，最后写"这次装的是哪个提交"的标记。 */
+    const applyUpdateCopy = async (info) => {
+      const clone = await cloneLatest()
+      if (!clone.dir) return { ok: false, error: `拉不到远端代码：${clone.errors.join('；').slice(0, 600)}` }
+      try {
+        const pkg = readJsonFile(join(clone.dir, 'package.json')) ?? {}
+        if (pkg.name !== 'dsh-mc-agent') return { ok: false, error: `拉到的仓库不是 dsh-mc-agent（name=${pkg.name ?? '?'}），没敢覆盖。` }
+        const commit = String((await gitRun(['rev-parse', 'HEAD'], 8000, clone.dir)).out).trim() || null
+        if (info.currentCommit && commit && commit === info.currentCommit) {
+          return { ok: false, error: '远端和你这里是同一个提交，不用覆盖。' }
+        }
+        let backup = null
+        try {
+          backup = backupPluginDir()
+        } catch (e) {
+          return { ok: false, error: `备份失败，先不动手：${e?.message ?? e}` }
+        }
+        let files = 0
+        try {
+          files = copyIntoPluginDir(clone.dir)
+        } catch (e) {
+          return { ok: false, error: `覆盖中途出错（备份在 ${backup}，可以手动还原）：${e?.message ?? e}` }
+        }
+        try {
+          writeFileSync(join(PLUGIN_ROOT, INSTALL_MARK), `${JSON.stringify({ commit, version: String(pkg.version ?? ''), source: clone.url, at: Date.now(), backup }, null, 2)}\n`, 'utf8')
+        } catch { /* 标记写不进去只是下次"看不出更新"，不影响插件能用 */ }
+        updateCache.at = 0
+        updateCache.data = null
+        return {
+          ok: true,
+          mode: 'copy',
+          output: `覆盖了 ${files} 个条目（旧版备份在 ${backup}）`,
+          backup,
+          commit,
+          version: String(pkg.version ?? ''),
+          needRestart: true,
+        }
+      } finally {
+        dropClone(clone.base)
+      }
+    }
+
     /**
      * 查有没有新版本。`force` = 忽略 10 分钟缓存（用户点了「检查更新」）。
      * 返回值恒是对象（`ok:false` 时 `reason` 说人话），前端直接照着渲染。
@@ -1650,6 +1850,7 @@ export function apply(ctx, rawConfig) {
         checkedAt: Date.now(),
         currentVersion: PLUGIN_VERSION,
         root: PLUGIN_ROOT,
+        mode: 'git',
         isRepo: false,
         source: null,
         remotes: [],
@@ -1664,6 +1865,7 @@ export function apply(ctx, rawConfig) {
         dirty: 0,
         dirtyFiles: [],
         canPull: false,
+        forcePull: false,
         reason: '',
       }
       const remember = () => {
@@ -1674,10 +1876,12 @@ export function apply(ctx, rawConfig) {
 
       const inside = await gitRun(['rev-parse', '--is-inside-work-tree'], 8000)
       if (inside.code !== 0 || String(inside.out).trim() !== 'true') {
-        data.ready = false
-        data.reason = `插件目录不是 git 仓库（${PLUGIN_ROOT}）—— 这种安装方式没有"新版本"可拉，只能手动覆盖。`
+        /* 用户 2026-10-20：有人是把包**复制**进宿主 node_modules 的（没有 .git）⇒ 走覆盖式更新 */
+        data.mode = 'copy'
+        await fillCopyUpdate(data)
         return remember()
       }
+      data.mode = 'git'
       data.isRepo = true
 
       const br = await gitRun(['rev-parse', '--abbrev-ref', 'HEAD'], 8000)
@@ -1744,6 +1948,7 @@ export function apply(ctx, rawConfig) {
     /** 真去拉。只在能拉时才动手；失败把 git 的原话原样给用户。 */
     const applyUpdate = async () => {
       const info = await checkUpdate(true)
+      if (info.mode === 'copy') return await applyUpdateCopy(info)
       if (!info.isRepo) return { ok: false, error: info.reason }
       if (info.behind === 0) return { ok: false, error: '已经是最新，没什么可拉的。' }
       if (info.dirty > 0) {
@@ -2748,6 +2953,8 @@ export function apply(ctx, rawConfig) {
         throw withUserHint(e, resolved.label)
       }
       sess.mode = 'active'
+      // 记忆里的聊天记录（用户 2026-10-20）：进服就把钩子挂上，之后每条公屏都进 chat-log.md
+      const chatLogRoot = attachChatLog(sess, exec?.agent)
       const ready = await sess.bot.waitForChunks()
       // 进服自动挂看门狗（用户要求：进游戏自动打开）
       const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal, watchdogGate(sess))
@@ -5066,11 +5273,12 @@ export function apply(ctx, rawConfig) {
       + '· get（默认）· set（path+value）· unset · reset · list（默认+生效）\n'
       + '可用键：`commandWhitelist`（数组；"tp" 精确、"/^gi.*/" 正则、"*" 全放行）· '
       + '`mcModePresets`（哪些 preset 算 MC 模式，应含 MC+ 的 id）· `mcPlusPresets`（MC+ 变体：开放全部工具）· '
-      + '`mcMode.allowOtherTools`（MC 模式**额外**放行的工具）· `mcMode.allowCompanionTools`（配套插件工具，默认 true：compress/decompress/acp_* 那族）· '
+      + '`mcMode.allowOtherTools`（MC 模式**额外**放行的工具）· `mcMode.allowCompanionTools`（配套插件工具，默认 true）· '
       + '`mcMode.hideAdminTools`（默认 true）· `stopOnDanger`（true = 遇险打断动作；默认 false 只提醒）· '
+      + '`chatLog`/`chatLogDays`（聊天记录进记忆 `chat-log.md`，默认开、留 7 天）· '
       + '`expressEnabled`（文件分享开关）· '
       + '`expressBase`（分享 base，如 https://example.com）· `memoryDir`（记忆根目录）· '
-      + '`memoryPerSession`（true = 每会话一份独立记忆 `<memoryDir>/sessions/<短会话 id>/`，看不到别的会话；'
+      + '`memoryPerSession`（true = 每会话一份独立记忆，看不到别的会话；'
       + '默认 false = 共用一份）。\n'
       + '改完**立即生效**，落在 `$DSH_HOME/dsh-mc-agent/config.json`。',
     parameters: {

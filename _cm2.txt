@@ -1,0 +1,19 @@
+更新：复制安装（没有 .git）也能「覆盖式更新」；同一文件里顺带提交聊天记录
+
+用户报「插件不是git安装的是直接复制的，这个更新就用不了了」——整份复制进宿主
+node_modules 的那份没有 .git，更新页只能回一句"没有新版本可拉"。
+
+- index.js：检测到不是 git 仓库就切 mode:'copy'。fillCopyUpdate 临时
+  `git clone --depth 30`（gitee → github，匿名 https）比版本/提交；有
+  .dsh-mc-agent-install.json 里的提交号就能 `rev-list --count <提交>..HEAD`
+  精确算落后几个提交，没有标记则退回按版本号判断（同版本号给一次覆盖机会）。
+  applyUpdateCopy：先整份备份成 dsh-mc-agent.bak-日期-时间 → 再覆盖 →
+  最后写标记；cpSync 跳过 .git 与 node_modules；备份失败不动手。
+- client.js：更新页认 mode:'copy'，按钮改「覆盖到最新」，多一行「安装方式」。
+- tools/check-update-copy.mjs：38 条（真起 git 仓库 + file:// 浅 clone 验数提交；
+  真 cpSync 验 .git/node_modules 没被带过去）。
+- 文档：CHANGELOG / 插件说明 / 踩坑档案 #227。
+
+同一批里还带上（之前按用户要求先没提交）：游戏内聊天 → 记忆 chat-log.md
+（src/chat-log.mjs + src/chat.mjs + src/config.mjs + check-chat-log.mjs）——
+index.js 等文件被两批改动同时碰到，没法单独提交。

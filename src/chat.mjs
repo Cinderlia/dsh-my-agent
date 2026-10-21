@@ -140,8 +140,13 @@ export function playerChatFrom (msg, plain) {
 }
 
 export function pushChat (self, kind, who, text) {
-  self.chat.push({ at: Date.now(), kind, who, text })
+  const entry = { at: Date.now(), kind, who, text }
+  self.chat.push(entry)
   if (self.chat.length > self.cfg.chatHistory) self.chat.splice(0, self.chat.length - self.cfg.chatHistory)
+  /* 🔴 记忆里的聊天记录（用户 2026-10-20）：这里是**所有**聊天行的唯一入口（玩家 / 我自己 / 系统），
+   *    钩子挂在这儿最省事。筛哪几条由钩子负责（只留 player / self）；没人挂、钩子里抛异常，
+   *    都只当没这回事 —— 记不进记忆是小事，把聊天搞挂是大事。 */
+  try { self.onChatLine?.(entry) } catch { /* 记不上不能把聊天搞挂 */ }
 }
 
 export function chatSay (self, text) {

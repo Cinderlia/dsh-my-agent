@@ -2253,10 +2253,16 @@ select[data-wc-in]{appearance:none;padding-right:22px;
       const behind = Number(info?.behind ?? 0) || 0
       const dirty = Number(info?.dirty ?? 0) || 0
       const commits = Array.isArray(info?.commits) ? info.commits : []
+      /* 复制安装（目录里没有 .git）走「覆盖式更新」：比版本/提交，动手前整份备份（用户 2026-10-20） */
+      const isCopy = info?.mode === 'copy'
+      const canApply = behind > 0 ? info?.canPull === true : info?.forcePull === true
       const rows = [
-        ['当前版本', `${info?.currentVersion ?? '—'}${info?.currentCommit ? `（${info.currentCommit}）` : ''}`],
-        ['更新源', info?.source ? `${info.source} / ${info.branch ?? '?'}` : '—'],
+        ['当前版本', `${info?.currentVersion ?? '—'}${info?.currentCommit
+          ? `（${isCopy ? '上次覆盖 ' : ''}${info.currentCommit}）`
+          : (isCopy ? '（复制安装，没有提交记录）' : '')}`],
+        ['更新源', info?.source ? (isCopy ? info.source : `${info.source} / ${info.branch ?? '?'}`) : '—'],
         ['远端最新', behind > 0 ? `${info?.latestVersion ?? '—'}（${info?.latestCommit ?? '—'}）` : '与本地一致'],
+        ['安装方式', isCopy ? '复制（没有 .git）—— 覆盖式更新' : 'git（快进拉取）'],
       ]
       return h('div', { 'data-wc-pane-page': 'update' },
         h('div', { 'data-wc-sec': '' },
@@ -2265,13 +2271,18 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             h('strong', null, `${k}：`), v)),
           behind > 0
             ? h('p', { 'data-wc-hint': '' },
-              h('strong', null, `有新版本：落后 ${behind} 个提交`), ' —— 点「立即更新」拉取。')
+              h('strong', null, `有新版本：落后 ${behind} 个提交`),
+              isCopy ? ' —— 点「覆盖到最新」（会先整份备份再覆盖）。' : ' —— 点「立即更新」拉取。')
             : h('p', { 'data-wc-hint': '' },
-              info == null ? '还没查过。' : (info.ready === false ? '查不到新版本（原因见下）。' : '已经是最新版。')),
+              info == null
+                ? '还没查过。'
+                : (info.ready === false
+                  ? '查不到新版本（原因见下）。'
+                  : (isCopy ? '和远端一致（复制安装：和上次覆盖是同一个提交）。' : '已经是最新版。'))),
           info?.ready === false && info?.reason
             ? h('p', { 'data-wc-hint': '', 'data-wc-dirty': '' }, info.reason)
             : null,
-          dirty > 0
+          dirty > 0 && !isCopy
             ? h('p', { 'data-wc-hint': '' },
               `本地有 ${dirty} 个未提交改动 —— git 会拒绝在改到一半时快进合并，`
               + '先提交或 stash 再来点更新。')
@@ -2283,18 +2294,20 @@ select[data-wc-in]{appearance:none;padding-right:22px;
             }, busyKey === 'update:check' ? '检查中…' : '检查更新'),
             h('button', {
               type: 'button', 'data-wc-btn': '', 'data-wc-tiny': '', 'data-wc-primary': '',
-              disabled: busy || behind === 0 || info?.canPull !== true,
-              title: behind === 0
+              disabled: busy || !canApply,
+              title: !canApply
                 ? '已经是最新'
-                : (info?.canPull === true ? '用 git pull --ff-only 拉取' : '现在不能拉（见上面那条原因）'),
+                : (isCopy
+                  ? '覆盖式更新：先整份备份，再用最新代码覆盖（不碰 .git / node_modules）'
+                  : (info?.canPull === true ? '用 git pull --ff-only 拉取' : '现在不能拉（见上面那条原因）')),
               onClick: () => onApply(),
-            }, busyKey === 'update:apply' ? '更新中…' : '立即更新')),
+            }, busyKey === 'update:apply' ? '更新中…' : (isCopy ? '覆盖到最新' : '立即更新'))),
           h('p', { 'data-wc-hint': '' },
             '更新完**要重启 DSH** 才生效：插件是启动时加载的，光刷新页面不算。'),
         ),
         h('div', { 'data-wc-sec': '' },
           h('div', { 'data-wc-h': '' }, '新版加了什么'),
-          behind === 0
+          behind === 0 && commits.length === 0
             ? h('p', { 'data-wc-hint': '' }, '没有新提交可看。')
             : h(React.Fragment, null,
               commits.length
@@ -2309,11 +2322,16 @@ select[data-wc-in]{appearance:none;padding-right:22px;
         h('div', { 'data-wc-sec': '' },
           h('div', { 'data-wc-h': '' }, '它是怎么工作的'),
           h('p', { 'data-wc-hint': '' },
-            '「新版本」只可能来自 git 远端：这个插件是 link 安装的（源码就在工作目录里），'
-            + 'npm 上没有这个包。'),
-          h('p', { 'data-wc-hint': '' },
-            '更新只用 git pull --ff-only（快进合并、不产生 merge commit）；有冲突或本地改动时'
-            + '直接把 git 的原话报给你，**不会偷偷 stash**。'),
+            '「新版本」只可能来自 git 远端：npm 上没有这个包（源码在 GitHub / Gitee 上，优先取 Gitee）。'),
+          isCopy
+            ? h('p', { 'data-wc-hint': '' },
+              '你这份插件是整份复制进宿主 node_modules 的（目录里没有 .git），所以没有本地远端可比：'
+              + '检查更新时会临时 clone 一份最新代码（Gitee 优先、GitHub 兜底）来比版本与提交；'
+              + '点「覆盖到最新」会先把整个插件目录备份成 `dsh-mc-agent.bak-日期-时间`，再覆盖代码和文档'
+              + '（.git 与 node_modules 一律不碰，备份目录留着，确认没问题可以自己删）。')
+            : h('p', { 'data-wc-hint': '' },
+              '更新只用 git pull --ff-only（快进合并、不产生 merge commit）；有冲突或本地改动时'
+              + '直接把 git 的原话报给你，**不会偷偷 stash**。'),
           h('p', { 'data-wc-hint': '' },
             '检查结果缓存 10 分钟；有新版本时三个「MC设置」入口的右上角都会有个红点。'),
         ),

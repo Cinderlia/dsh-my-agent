@@ -158,6 +158,15 @@ export const DEFAULT_CONFIG = {
    * ⚠️ 两种状态都仍然**只认发布区**（`.dsh-mc-agent/.express/`）。
    */
   expressEnabled: false,
+  /**
+   * 游戏内聊天自动记进记忆根 `chat-log.md`（用户 2026-10-20：「记忆加和玩家游戏内的聊天记录」）。
+   *
+   * 记的是**真人发言 + 我自己 `mc_say` 的话**（按天分段、只留最近 `chatLogDays` 天）；
+   * 系统消息不进这个文件 —— 那些看门狗的事件队列已经在记（`mc_events` / `mc_watch{action:"log"}`）。
+   */
+  chatLog: true,
+  /** 聊天记录保留几天（默认 7；1~90） */
+  chatLogDays: 7,
   /** 文件分享的 base（如 `https://dsh.example.com`，可带路径前缀）；空 = 还没配 */
   expressBase: '',
 
@@ -613,6 +622,16 @@ export class PluginConfig {
     return this.get('expressEnabled') === true
   }
 
+  /** 聊天记录开关（默认开；只有显式 false 才关） */
+  get chatLog () {
+    return this.get('chatLog') !== false
+  }
+
+  /** 聊天记录保留几天（1~90，坏值回落 7） */
+  get chatLogDays () {
+    const n = Number(this.get('chatLogDays'))
+    return Number.isFinite(n) && n >= 1 ? Math.min(90, Math.floor(n)) : 7
+  }
   /** 文件分享的 base（归一化：去尾斜杠；非法/空 = `''`） */
   get expressBase () {
     return normalizeExpressBase(this.get('expressBase')) ?? ''
@@ -716,8 +735,14 @@ function validate (top, rest, value) {
     if (value !== null && typeof value !== 'string') throw new Error('memoryDir 必须是字符串（绝对路径）或 null')
     return
   }
-  if (top === 'allowAllCommands' || top === 'ensureMcPreset' || top === 'expressEnabled' || top === 'memoryPerSession' || top === 'stopOnDanger') {
+  if (top === 'allowAllCommands' || top === 'ensureMcPreset' || top === 'expressEnabled' || top === 'memoryPerSession' || top === 'stopOnDanger' || top === 'chatLog') {
     if (typeof value !== 'boolean') throw new Error(`${top} 必须是 true/false`)
+    return
+  }
+  if (top === 'chatLogDays') {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 1 || value > 90) {
+      throw new Error('chatLogDays 必须是 1~90 的数字（保留几天聊天记录）')
+    }
     return
   }
   if (top === 'expressBase') {
