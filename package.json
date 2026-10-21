@@ -40,6 +40,7 @@
     "presets",
     "src",
     "extensions",
+    "tools/fix-mc-deps.mjs",
     "locale",
     "README.md",
     "CHANGELOG.md",
@@ -94,6 +95,8 @@
     "dev:link": "node tools/dev.mjs link",
     "dev:status": "node tools/dev.mjs status",
     "dev:stop": "node tools/dev.mjs stop",
-    "prepublishOnly": "npm run check:all"
+    "prepublishOnly": "npm run check:all",
+    "postinstall": "node tools/fix-mc-deps.mjs --auto",
+    "fix:deps": "node tools/fix-mc-deps.mjs"
   }
 }

@@ -11,6 +11,29 @@
 
 ## [未发布]
 
+### 🩹 别人 `git` 装完之后插件是 inactive —— 依赖里一行尾斜杠把我们带崩了（issue #2）
+
+有用户用 `pnpm add github:blueziii/dsh-mc-agent` 装，插件那一项直接 inactive，日志里是：
+
+```
+TypeError: createRequire.resolve.paths is not a function or its return value is not iterable
+```
+
+**不是我们的代码错**，是**依赖树里有一行写错的 `require`**：`readable-stream@4.8.0`（`process` 那几个包里也有）
+有 `require('string_decoder/')` —— **后面多了一个斜杠**。DSH 的 profile 解析器把这种名字当成包名，
+砍掉斜杠就得到内置名 `string_decoder`，于是 `resolve.paths('string_decoder')` 返回 `null`，
+下游对它 `for...of` ⇒ 抛。我们 `src/connection.mjs` 第一行就静态 `import mineflayer`
+⇒ **整条 import 链在"加载阶段"就炸**，连插件注册都轮不到。
+
+- **装完自动修**：`package.json` 加了 `postinstall`（跑 `tools/fix-mc-deps.mjs`）—— 在你自己的
+  `node_modules` 里把这几个尾斜杠改掉（只动 `string_decoder/`、`process/`、`events/` 这类**内置名**，
+  别人的包名一个字节不碰；`备份/` 目录跳过）。
+- **加载前自检 + 自愈**：`src/connection.mjs` 现在**动态** `import('mineflayer')`（`ensureMineflayer()`），
+  真撞上这颗雷就**就地修一次再重试**，其它错误照抛不误（不吞真 bug）。日志会写一句用了哪条路。
+- **手动入口**：`npm run fix:deps`（`--dry` 只报告不改）。
+- **不想让它动文件**：环境变量 `DSH_MC_AGENT_DEP_GUARD=off` 关掉自愈（只保留报错时的人话提示）。
+- 顺手把 `src/core.mjs` 里那句静态 `import mineflayer` 也拆了 —— 它会把整条链重新拉起来，光修 `connection.mjs` 不够。
+
 ### 🛶 船 / 矿车 / 刷怪蛋 / 盔甲架 现在真能放了（`mc_act {mode:"place"}`）
 
 用户 2026-10-20 公屏「现在只能做上船，但是动不了」→「还有下船」→ 实测「是不是在水里放不了」/「你对着脚下放不了」。

@@ -24,10 +24,50 @@
  *      里记下的**真参数**、试满 `maxReconnectAttempts` 就放弃（2026-10-08 审计 F1）。
  */
 
-import mineflayer from 'mineflayer'
+import { ensureDepGuard, isLandmineError, describeDepGuard } from './dep-guard.mjs'
 import { sleep } from './async-util.mjs'
 import { dashUuid } from './accounts.mjs'
 import { makeSession } from './auth-session.mjs'
+
+/**
+ * 拿 mineflayer 入口 —— **懒加载**，而且第一次失败时先修依赖树再重试一次。
+ *
+ * 🔴 为什么不能静态 `import mineflayer from 'mineflayer'`（2026-10-20，issue #2）：
+ *    `mineflayer → minecraft-protocol → readable-stream@4` 里有一行
+ *    `require('string_decoder')`（尾斜杠）。DSH 的 profile 解析器对内置名会
+ *    `resolve.paths()` 拿到 null 再 for-of，抛 `TypeError: createRequire.resolve.paths
+ *    is not a function or its return value is not iterable`，于是**整个插件 import 失败**、
+ *    那一项直接 inactive。静态 import 发生在模块求值期，我们没有任何机会先修；
+ *    改成动态 import 之后就能"撞上了 → 就地修 → 重试"。
+ *    （详见 `src/dep-guard.mjs` 与踩坑档案 #224。）
+ */
+let mineflayerCache = null
+
+/**
+ * @param {Function|null} log 可选，修依赖时会说一句
+ * @returns {Promise<Object>} mineflayer 模块（默认导出，兼容 `module.exports = …` 形状）
+ */
+export async function ensureMineflayer (log = null) {
+  if (mineflayerCache) return mineflayerCache
+  const load = async () => {
+    const mod = await import('mineflayer')
+    return mod?.default ?? mod
+  }
+  try {
+    mineflayerCache = await load()
+  } catch (err) {
+    if (!isLandmineError(err)) throw err
+    const off = String(process.env.DSH_MC_AGENT_DEP_GUARD ?? '').toLowerCase() === 'off'
+    const report = ensureDepGuard({ log, patch: !off })
+    if (typeof log === 'function') {
+      try { log('mineflayer 加载撞上「尾斜杠内置名」：' + describeDepGuard(report)) } catch {}
+    }
+    if (off || !report.patched) throw err
+    mineflayerCache = await load()
+  }
+  return mineflayerCache
+}
+
 
 /**
  * 连接到 MC 服务器。
@@ -117,6 +157,7 @@ export async function connect (self, opts = {}, ctx = {}) {
     const uuid = dashUuid(profile.id) ?? profile.id
     const previous = self.bot
 
+    const mineflayer = await ensureMineflayer(typeof self.log === 'function' ? (m) => { try { self.log(m) } catch {} } : null)
     const b = mineflayer.createBot({
       host,
       port,

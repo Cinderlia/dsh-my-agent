@@ -16,7 +16,7 @@
  *   - 给 mineflayer 传坐标一律用真 Vec3
  *   - 走路必须"一直按住"前进键
  */
-import mineflayer from 'mineflayer'
+/* 🔴 2026-10-20：不再静态 import mineflayer —— 它会把 readable-stream 整条链拉起来，而那条链上有「尾斜杠内置名」，DSH 解析器一碰就整个插件 import 失败（见 src/dep-guard.mjs / 踩坑档案 #224）。真正用 mineflayer 的地方只有 src/connection.mjs 的 ensureMineflayer()（懒加载 + 撞雷自愈）。 */
 import vec3pkg from 'vec3'
 /* 第三十一刀起 `dashUuid` / `offlineUuid` 不在这里用了：造 session 的活全在 `src\auth-session.mjs`。 */
 /* 路线图第 ④ 条的第一刀：把**纯函数**搬出去（`lossless`/`redactPath`/`resolveHarnessHome`）。
