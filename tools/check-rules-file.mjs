@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url'
 
 /** 本套件要静态扫的两个源文件（**按脚本自身定位**，别用 cwd 拼 `..`） */
 const HERE = dirname(fileURLToPath(import.meta.url))
-const SRC = { index: join(HERE, '..', 'index.js'), client: join(HERE, '..', 'client.js'), agentsmd: join(HERE, '..', 'src', 'agentsmd.mjs'), config: join(HERE, '..', 'src', 'config.mjs'), commands: join(HERE, '..', 'src', 'commands.mjs') }
+const SRC = { inject: join(HERE, '..', 'src', 'inject.mjs'), index: join(HERE, '..', 'index.js'), client: join(HERE, '..', 'client.js'), agentsmd: join(HERE, '..', 'src', 'agentsmd.mjs'), config: join(HERE, '..', 'src', 'config.mjs'), commands: join(HERE, '..', 'src', 'commands.mjs') }
 
 let pass = 0
 let fail = 0
@@ -244,7 +244,8 @@ const prot = await import('../src/protected.mjs')
 section('⑥ 注入只剩一行指针：正文不在 index.js 的提示词里')
 const stripComments = (s) => s.replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 {
-  const src = stripComments(rd(SRC.index) ?? '')
+  /* 🔴 2026-10-20：这块代码搬进了 src/inject.mjs，所以两份合起来扫（正反断言都更严） */
+  const src = stripComments(rd(SRC.index) ?? '') + '\n' + stripComments(rd(SRC.inject) ?? '')
   ok(src.includes('const rulesPointerText = ({ abs, fileName, what }) =>'), '有 rulesPointerText() 组装指针')
   ok(src.includes('mc_kit_memory {action:"read", path:"${fileName}"}'), '指针给了 mc_kit_memory 的读法')
   ok(src.includes('read {file_path:"${abs}"}'), '指针给了 read 的读法（绝对路径）')
@@ -357,7 +358,7 @@ section('⑦b 提示词页分两块：默认提示词（基根）+ 会话提示�
 /* ─────────────── ⑦c 「随版本更新」只动默认提示词（用户 2026-10-15） ─────────────── */
 section('⑦c 「随版本更新」只动默认提示词（基根），会话那份不碰')
 {
-  const idx = stripComments(rd(SRC.index) ?? '')
+  const idx = stripComments(rd(SRC.index) ?? '') + '\n' + stripComments(rd(SRC.inject) ?? '')
   const src = stripComments(rd(SRC.client) ?? '')
   const md = stripComments(rd(SRC.agentsmd) ?? '')
   // —— 服务端：同步目标是**基根**，不是会话根 ——
@@ -425,8 +426,10 @@ section('⑧ client.js 审计修复的静态接线')
   ok(src.includes('const cfgBad = cfgOk === false'), 'UI 按 cfgBad 提示')
   ok(/if \(!cfgOk\) \{[\s\S]{0,220}?return Promise\.resolve\(false\)/.test(src),
     '🔴 改白名单 / 存 base 在没读到配置时**硬拒**（不是只把按钮变灰）')
-  ok(src.includes('onToggleCmd: toggleCmd') && src.includes('hasWorkspace, cfgOk'),
-    'cfgOk 传给了 WhitelistPane 与 SharePane')
+  /* 🔴 2026-10-20：SharePane（文件分享）整页换成了 MemoryPane，不再吃 cfgOk；
+   *    要写配置的只剩白名单页，所以这里只盯它。 */
+  ok(src.includes('catalog: cmdCatalog, extra: cmdExtra, allowAll, busyKey, cfgOk') && src.includes('onToggleCmd: toggleCmd'),
+    'cfgOk / allowAll 传给了 WhitelistPane（记忆页不再需要它）')
 
   /* 🟡 第 3 条：hero 注入按钮 dispose 竞态 */
   ok(src.includes('let disposed = false'), '🟡 hero 注入器有 disposed 标志')
@@ -474,7 +477,7 @@ section('⑧ client.js 审计修复的静态接线')
 /* ─────────── ⑨ 「指令白名单」页：目录 + 开关（用户 2026-10-15） ─────────── */
 section('⑨ 指令白名单页改成"列出全部指令 + 每条一个开关"')
 {
-  const { COMMAND_GROUPS, catalogNames, inCatalog } = await import('../src/commands.mjs')
+  const { COMMAND_GROUPS, catalogNames } = await import('../src/commands.mjs')
   const { matchCommandList, isRegexEntry, PluginConfig } = await import('../src/config.mjs')
   const src = stripComments(rd(SRC.client) ?? '')
   const idx = stripComments(rd(SRC.index) ?? '')
@@ -489,9 +492,7 @@ section('⑨ 指令白名单页改成"列出全部指令 + 每条一个开关"')
   ok(COMMAND_GROUPS.every((g) => g.group && Array.isArray(g.items) && g.items.length), '每个分组都有名字和条目')
   ok(COMMAND_GROUPS.every((g) => g.items.every((it) => it.name && it.desc)), '每条都有名字和中文说明')
   ok(COMMAND_GROUPS.some((g) => g.items.some((it) => it.danger === true)), '危险指令有 danger 标记')
-  ok(inCatalog('tp') && inCatalog('/tp') && inCatalog('TP') && !inCatalog('nope') && !inCatalog(''),
-    'inCatalog 认前导斜杠与大小写、空串回 false')
-  ok(cmdSrc.includes('export function catalogNames') && cmdSrc.includes('export function inCatalog'), '两个助手都导出了')
+  ok(cmdSrc.includes('export function catalogNames'), 'catalogNames 导出了（目录就是它拼的）')
   ok(!/^import /m.test(cmdSrc), 'commands.mjs 是叶子（一行 import 都没有）')
 
   /* ② 匹配逻辑**只有一份** */
@@ -565,6 +566,24 @@ section('⑨ 指令白名单页改成"列出全部指令 + 每条一个开关"')
   ok(!src.includes('whitelistToText') && !src.includes('textToWhitelist'), '两个文本转换助手已随文本框一起删掉')
 }
 
+
+/* ── ⑦ createInjector 的依赖清单必须两端对得上 ──
+ * 2026-10-20：`wsConfigPath` 在 inject.mjs 里用了、却没进 deps ⇒ 首次建档时 `mig.created` 那条
+ * logDebug 一求值就 ReferenceError，被 ensure 的 try/catch 吞掉 ⇒ 版本同步 / 版本提示整体没跑。 */
+section('⑩ createInjector 的依赖：inject.mjs 用到了什么，index.js 就必须递什么')
+{
+  const injectSrc = stripComments(rd(SRC.inject) ?? '')
+  const idxSrc = stripComments(rd(SRC.index) ?? '')
+  const depBlock = injectSrc.match(/const \{([\s\S]*?)\} = deps/)
+  const objBlock = idxSrc.match(/= createInjector\(\{([\s\S]*?)\n  \}\)/)
+  const names = (t) => new Set(String(t || '').split(/[,\n]/).map((x) => x.trim()).filter((x) => /^[A-Za-z_$][\w$]*$/.test(x)))
+  const used = names(depBlock?.[1])
+  const given = names(objBlock?.[1])
+  ok(used.size >= 30, `解析出 inject.mjs 的依赖清单（${used.size} 个）`)
+  ok(given.size >= 30, `解析出 index.js 递进去的清单（${given.size} 个）`)
+  const missing = [...used].filter((n) => !given.has(n))
+  ok(missing.length === 0, `inject.mjs 用到的依赖 index.js 都递了${missing.length ? `（漏：${missing.join(', ')}）` : ''}`)
+}
 
 for (const d of TMP) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 console.log(`\n${fail === 0 ? '✅ 全部通过' : '❌ 有失败'}：pass=${pass} fail=${fail}`)

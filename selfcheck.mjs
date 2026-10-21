@@ -95,6 +95,12 @@ const presetByCtx = new Map()  // 模拟宿主 agentPresets：agent.ctx → pres
 const presetRows = ['minimal', 'standard', 'ptc']   // 模拟"现有哪些 preset"（官方随包那三个）
 const presetCopyCalls = []     // 自动建 preset 时对宿主 copy() 的调用
 const { mkdtempSync: mkTop, existsSync: exTop, readFileSync: rfTop } = await import('node:fs')
+
+/* 🔴 2026-10-21（用户点名：一批断言在静默失败）：提示词注入/通知台账那一整块早就搬进了
+ *    src/inject.mjs（见 src/inject.mjs 头注释 + 踩坑档案 #211）。这些断言还在扫 index.js，
+ *    搬完就全变成 ❌ —— 而且因为下面那个坑（见 tools/selfcheck 的 exit 兜底），它们连退出码都没影响。
+ *    以后凡是「这段代码在哪」的断言，一律扫**合并后的源码**。 */
+const INJ_SRC = (() => { try { return rfTop(new URL('./src/inject.mjs', import.meta.url), 'utf8') } catch { return '' } })()
 const { tmpdir: tdTop } = await import('node:os')
 const { join: jnTop } = await import('node:path')
 /** 假"用户可写 preset 根"：自动建 preset 时把目录 / preset.yml 真写在这里，好断言内容 */
@@ -323,6 +329,7 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
 {
   const { readFileSync } = await import('node:fs')
   const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+  const idxInj = idx + INJ_SRC   // 提示词注入那块在 src/inject.mjs
   console.log(`  ${!tools.has('mc_kit_share') ? '✅' : '❌'} 🔴 mc_kit_share 已移除（它只是在调宿主**另装**的 dsh-file-host，插件本身没有文件服务器）`)
   // 29 = 25 个 mc_*（mc_entities 2026-10-08 并进 mc_observe 的三段式感知，同日又加了 mc_task）+ 3 + 1
   console.log(`  ${tools.size === 29 ? '✅' : '❌'} 工具数 29（实际 ${tools.size}）：mc_* 25 + mc_kit_* 3 + mc_admin_* 1`)
@@ -349,9 +356,9 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   console.log(`  ${/realpathSync\(target\)/.test(idx) && /拒绝越界（符号链接）/.test(idx) ? '✅' : '❌'} 🔴 防穿透：段级校验 + realpath 复查（符号链接也跳不出去）`)
   // 「随版本更新」（用户 2026-09-17）：在"备好记忆目录"那两个时机执行，版本变了才替换
   // 🔴 用户 2026-10-15「对升级只动默认的，会话的不动」：同步目标从 `root`（会话根）挪到 `memoryBaseFor(cwd)`（基根）
-  console.log(`  ${/syncRulesVersion\(syncDir, PLUGIN_VERSION, \{\s*follow: workspaceConfigValues\(root\)\.rulesFollowVersion !== false,\s*backup: true\s*\}\)/.test(idx) && /const syncDir = memoryBaseFor\(cwd\)/.test(idx) ? '✅' : '❌'} 🔴 「随版本更新」只动**基根那份**（=「默认提示词」），会话那份不碰（follow 来自**本工作区** config.json，默认开；覆盖前留 .bak-<旧版本>）`)
-  console.log(`  ${/migrateWorkspaceConfig\(root, \{ seed: pluginConfig\.legacyPromptSwitches\(\) \}\)/.test(idx) ? '✅' : '❌'} 🔴 建档/迁移（旧 .rules-version 并入 config.json）**先于**版本同步（否则旧值这轮看不到）`)
-  console.log(`  ${/默认提示词\*\*（基根那份）已替换为新版本默认内容/.test(idx) ? '✅' : '❌'} 真替换时会写一行日志（便于排查"我的默认提示词怎么变了"）`)
+  console.log(`  ${/syncRulesVersion\(syncDir, PLUGIN_VERSION, \{\s*follow: workspaceConfigValues\(root\)\.rulesFollowVersion !== false,\s*backup: true\s*\}\)/.test(idxInj) && /const syncDir = memoryBaseFor\(cwd\)/.test(idxInj) ? '✅' : '❌'} 🔴 「随版本更新」只动**基根那份**（=「默认提示词」），会话那份不碰（follow 来自**本工作区** config.json，默认开；覆盖前留 .bak-<旧版本>）`)
+  console.log(`  ${/migrateWorkspaceConfig\(root, \{ seed: pluginConfig\.legacyPromptSwitches\(\) \}\)/.test(idxInj) ? '✅' : '❌'} 🔴 建档/迁移（旧 .rules-version 并入 config.json）**先于**版本同步（否则旧值这轮看不到）`)
+  console.log(`  ${/默认提示词\*\*（基根那份）已替换为新版本默认内容/.test(idxInj) ? '✅' : '❌'} 真替换时会写一行日志（便于排查"我的默认提示词怎么变了"）`)
   console.log(`  ${!/read_image \{file_path/.test(codeOnly) && !/present \{files/.test(codeOnly) ? '✅' : '❌'} 🔴 旧的"用 read_image / present 发图"提示已清干净（注释里的历史说明不算）`)
   const vp = readFileSync(new URL('./src/version-prompt.mjs', import.meta.url), 'utf8')
   console.log(`  ${/\.dsh-mc-agent\/\.express\//.test(vp) && /mc_kit_express/.test(vp) && /!\[图片名\]\(url\)/.test(vp) && /\[文件名\]\(url\)/.test(vp) ? '✅' : '❌'} 版本提示里写清交付流程（先放发布区 → mc_kit_express 拿路径 → 自己拼 ![]/[]）`)
@@ -1484,6 +1491,7 @@ console.log('\n--- 提示词注入通道（插件提示行，不再碰 systemPro
 {
   const { readFileSync } = await import('node:fs')
   const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+  const idxInj = idx + INJ_SRC   // 提示词注入那块在 src/inject.mjs
   // ① 一句话：**不再往 systemPrompt 里塞任何东西**（那既冗余，又会被 persona 的
   //    complete / includeRuntimeContext 压掉 —— 2026-09-16 真机"设置页正常、AI 什么都没收到"）。
   const spFiber = injectedFibers.find((f) => f.deps.includes('systemPrompt'))
@@ -1492,8 +1500,8 @@ console.log('\n--- 提示词注入通道（插件提示行，不再碰 systemPro
   console.log(`  ${!/systemPrompt\.(context|section)\(/.test(idx) ? '✅' : '❌'} 源码里也搜不到任何 systemPrompt 段注册`)
   console.log(`  ${!/installAgentPrompts|dsh-mc-agent:memory-index|dsh-mc-agent:mode-guidance|MC_MODE_GUIDANCE/.test(idx) ? '✅' : '❌'} 旧的 installAgentPrompts / 记忆索引段 / 模式指导段 已整段删除`)
   // ② 记忆索引改走提示行（和两个 AGENTS.md 同一条路）
-  console.log(`  ${/rel: '\.dsh-mc-agent\/README\.md'/.test(idx) && /提示词注入：\.dsh-mc-agent\/README\.md/.test(idx) ? '✅' : '❌'} 记忆索引（.dsh-mc-agent/README.md）也当**插件提示行**投递`)
-  console.log(`  ${/const noticeLedger = new WeakMap\(\)/.test(idx) && /const reconcileNotices = \(agent\)/.test(idx) ? '✅' : '❌'} 记下**实际投出去**的文件（投递台账 noticeLedger + reconcileNotices；状态页据此报真实投递，不是"打算投"）`)
+  console.log(`  ${/rel: '\.dsh-mc-agent\/README\.md'/.test(idxInj) && /提示词注入：\.dsh-mc-agent\/README\.md/.test(idxInj) ? '✅' : '❌'} 记忆索引（.dsh-mc-agent/README.md）也当**插件提示行**投递`)
+  console.log(`  ${/const noticeLedger = new WeakMap\(\)/.test(idxInj) && /const reconcileNotices = \(agent\)/.test(idxInj) ? '✅' : '❌'} 记下**实际投出去**的文件（投递台账 noticeLedger + reconcileNotices；状态页据此报真实投递，不是"打算投"）`)
   // ③ persona：用户给的**定稿原文**，一字不改
   const persona = '你在一台真实的 Minecraft Java 版服务器里扮演一名玩家：你的"身体"是一台无头机器人，能观察世界、移动、挖掘和建造。'
   const m = idx.match(/const MC_PERSONA_TEXT = '([^']*)'/)
@@ -1682,6 +1690,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   {
     const { readFileSync } = await import('node:fs')
     const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    const srcInj = src + INJ_SRC
     console.log(`  ${/planPresetAction\(\{/.test(src) && /shippedDescriptionMatch: isCopiedPresetDescription\(row\?\.description, shippedDescs\)/.test(src) ? '✅' : '❌'} 已有的 MC 模式 preset 也会走一次判定（旧版建出来的能被修好）`)
     console.log(`  ${/writeMcPresetMarker\(svc, target, \{/.test(src) && /MC_PRESET_MARKER = '\.dsh-mc-agent\.json'/.test(src) ? '✅' : '❌'} 建完留下"自建标记"（下次启动才知道这份是我们建的）`)
     // 🔴 2026-09-16 真机事故：复制 minimal 带来的 persona（含 complete:true / includeRuntimeContext:false）
@@ -1691,7 +1700,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${/patchMcPresetComposition\(svc, target, \{ key: personaTextKeyOf\(compositionOf\(rows\.get\(source\)\)\) \}\)/.test(src) && /patchMcPresetComposition\(svc, existingId, \{ key: personaTextKeyOf\(/.test(src) ? '✅' : '❌'} 新建/重建都会把 persona 换成我们的、并关掉 shell（且**带上本版本的键名**）`)
     console.log(`  ${/personaTextKeyOf\(composition\)/.test(src) && /已自动修正/.test(src) ? '✅' : '❌'} 🔴 启动自检：persona 键名与本版本不符 → **自动修正**（插件升级即修好老环境）`)
     console.log(`  ${/stillShippedPersona/.test(src) && /You are a helpful software engineer assistant/.test(src) ? '✅' : '❌'} 旧版（无标记）那份：只在"官方那句人设还在"时才动它`)
-    console.log(`  ${/runtimeContextSuppressed \? \[\]/.test(src) ? '✅' : '❌'} 状态块注释里钉住了宿主那段 contexts: runtimeContextSuppressed ? [] （这是根因）`)
+    console.log(`  ${/runtimeContextSuppressed \? \[\]/.test(srcInj) ? '✅' : '❌'} 状态块注释里钉住了宿主那段 contexts: runtimeContextSuppressed ? [] （这是根因）`)
     console.log(`  ${/notices: sent/.test(src) && /segments: \{/.test(src) ? '✅' : '❌'} 状态块报的是**实际投出去的文件**（noticesSent，不许再撒谎）`)
     // 🔴 用户："我不要模拟用户发送啊！" —— 投递的那条必须标成 plugin/notice，且**不许** steer（空闲时会起一轮）
     console.log(`  ${/kind: 'plugin:dsh-mc-agent', form: 'notice'/.test(src) && !/kind: 'plugin',/.test(src) ? '✅' : '❌'} 投递的消息标成 plugin/notice —— kind 用 **v4 规范值** plugin:dsh-mc-agent（v4 拒绝裸露 'plugin'；不归到用户头上）`)
@@ -1733,6 +1742,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   {
     const { readFileSync } = await import('node:fs')
     const src = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    const srcInj = src + INJ_SRC
     console.log(`  ${/svc\.copy\(source, target, MC_PRESET_NAME\)/.test(src) ? '✅' : '❌'} 用的是宿主官方 \`copy()\`（不手搓 composition —— 官方 authoring 不允许）`)
     console.log(`  ${/svc\.authorable === false/.test(src) ? '✅' : '❌'} 这份部署没有可写 preset 根时优雅跳过（不是崩）`)
   }
@@ -1823,13 +1833,14 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const explicit = resolveStateDir({ env: { DSH_MC_AGENT_STATE_DIR: 'S:\\s', DSH_MC_AGENT_DIR: 'T:\\tmp' }, stateDirOverride: 'T:\\tmp', home: fakeHome })
     console.log(`  ${explicit === 'S:\\s' ? '✅' : '❌'} DSH_MC_AGENT_STATE_DIR 优先级最高`)
     const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
+    const idxInj = idx + INJ_SRC   // 提示词注入那块在 src/inject.mjs
     console.log(`  ${/new PluginConfig\(stateDir\)/.test(idx) && /new AccountStore\(\{ dir: stateDir/.test(idx) ? '✅' : '❌'} index.js 里配置与账户都建在 stateDir 上（不是 stateDirOverride）`)
     console.log(`  ${/resolveStateDir\(\{ dshHomePath, stateDirOverride: process\.env\.DSH_MC_AGENT_DIR \}\)/.test(idx) ? '✅' : '❌'} 状态目录走 resolveStateDir（拿不到就 /$DSH_HOME 兜底）`)
     console.log(`  ${/copyFileSync\(from, to\)/.test(idx) && /unlinkSync\(from\)/.test(idx) ? '✅' : '❌'} 老工作区文件有一次性的"搬出工作区"迁移`)
     // 🔴 2026-09-16 抽取成标准插件：记忆/提示词必须**按会话工作区**解析（插件装哪都行）
     console.log(`  ${/const workspaceOf = \(agent\) =>/.test(idx) && /agent\?\.session\?\.header\?\.cwd/.test(idx) ? '✅' : '❌'} 工作区取自 exec.agent.session.header.cwd（不再用"插件自己在哪"）`)
     console.log(`  ${/join\(cwd, '\.dsh-mc-agent'\)/.test(idx) ? '✅' : '❌'} 记忆根 = <会话工作区>/.dsh-mc-agent`)
-    console.log(`  ${/const noticeLedger = new WeakMap\(\)/.test(idx) && /const pushNotice = \(inbox, message\)/.test(idx) ? '✅' : '❌'} 提示词按会话工作区投递到 agent.inbox（每个会话一份，插件不再碰 systemPrompt）`)
+    console.log(`  ${/const noticeLedger = new WeakMap\(\)/.test(idxInj) && /const pushNotice = \(inbox, message\)/.test(idxInj) ? '✅' : '❌'} 提示词按会话工作区投递到 agent.inbox（每个会话一份，插件不再碰 systemPrompt）`)
   // 🔴🔴 2026-09-18：npm 装的 0.1.3 在**别的机器**上提示词一条都没注入 —— 根因是
   //    `@deepseek-ai/dsh-llm` 没进依赖声明，本机靠 junction 侥幸解析到，别人解析不到 ⇒
   //    消息构造不出来。现在统一走 `src/user-message.mjs`（宿主实现优先 + 自带等价实现兜底）。
@@ -1875,9 +1886,9 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${bad.length === 0 ? '✅' : '❌'} 🔴🔴 每个 waterfall 监听器都接 next 且调用它（不交棒＝否决整条链 ⇒ 宿主 decision.kind 崩）${bad.length ? '：违规 ' + bad.map((b) => b.name).join(', ') : `（${wf.map((r) => r.name).join(', ') || '无'}）`}`)
     console.log(`  ${/if \(typeof next !== 'function'\)/.test(idx) && /const inner = next\(\)/.test(idx) ? '✅' : '❌'} pre-step 监听器：交棒拿回内层结果、原样返回（不改载荷），且对 next 缺失有兜底`)
     console.log(`  ${/return inner\.then\(\(decision\) => enterWithNotices/.test(idx) && /const inner = next\(\)/.test(idx) ? '✅' : '❌'} 🔴 交棒拿回 decision 后**当场改写本步消息**（enterWithNotices）—— 提示行与用户那句同批送出，不再晚一步`)
-    console.log(`  ${/decision\.kind !== 'enter'/.test(idx) && /messages: \[\.\.\.noticeMessagesFor\(r\.todo\), \.\.\.msgs\]/.test(idx) ? '✅' : '❌'} 只对 enter 生效，且提示行排在本步消息**最前面**`)
-    console.log(`  ${/todo: \[\]/.test(idx) ? '✅' : '❌'} 🔴 对账的每个提前返回都带 todo 字段（漏一个就是被 catch 吞掉的静默 TypeError）`)
-    console.log(`  ${/since = Array\.isArray\(ev\) \? ev\.length : 0/.test(idx) && /events\.slice\(from\)/.test(idx) ? '✅' : '❌'} 🔴 切出模式时给日志划一条线（切出再切回能重投，不被旧记录误判）`)
+    console.log(`  ${/decision\.kind !== 'enter'/.test(idxInj) && /messages: \[\.\.\.noticeMessagesFor\(r\.todo\), \.\.\.msgs\]/.test(idxInj) ? '✅' : '❌'} 只对 enter 生效，且提示行排在本步消息**最前面**`)
+    console.log(`  ${/todo: \[\]/.test(idxInj) ? '✅' : '❌'} 🔴 对账的每个提前返回都带 todo 字段（漏一个就是被 catch 吞掉的静默 TypeError）`)
+    console.log(`  ${/since = Array\.isArray\(ev\) \? ev\.length : 0/.test(idxInj) && /events\.slice\(from\)/.test(idxInj) ? '✅' : '❌'} 🔴 切出模式时给日志划一条线（切出再切回能重投，不被旧记录误判）`)
     console.log(`  ${!/if \(removed > 0\) \{\s*const l = ledgerOf/.test(idx) ? '✅' : '❌'} 🔴 切出模式时**无条件**清台账（提示行已在本步送出、队列常为空，按"队列非空"判断会漏清 ⇒ 再也不投）`)
     // 反向证明：这些断言真的能拦住事故写法
     const buggy = `ctx.on('agent/pre-step', ({ agent } = {}) => { try { reconcileNotices(agent) } catch {} })`
@@ -2209,7 +2220,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const acp = (allowList ?? []).filter((n) => /^(compress|decompress|search_context|acp_)/.test(n))
     console.log(`  ${['compress', 'decompress', 'search_context', 'acp_status', 'acp_cache'].every((n) => (allowList ?? []).includes(n)) ? '✅' : '❌'} 🔴 ACP（上下文压缩）那族默认放行：${JSON.stringify(acp)}`)
     console.log(`  ${(allowList ?? []).every((n) => !/^(pwsh|subagent|workflow)$/.test(n)) ? '✅' : '❌'} 放行 ACP 之后仍然**没有**把标准工具面打开（pwsh/subagent/workflow 仍不可见）`)
-    const companionSwitch = /allowCompanionTools === false \? \[\] : MC_COMPANION_TOOLS/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))
+    const companionSwitch = /allowCompanionTools === false \? \[\] : MC_COMPANION_TOOLS/.test(rfTop(new URL('./index.js', import.meta.url), 'utf8'))
     console.log(`  ${companionSwitch ? '✅' : '❌'} 开关 mcMode.allowCompanionTools 能整族关掉（默认 true）`)
   }
   // 🔴 宿主对不认识的名字**抛错**；要是直接放弃，隔离就等于没做（pwsh 又回来了）
@@ -2330,7 +2341,7 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${/const mcRestrictRelease = new WeakMap\(\)/.test(srcIdx) && /const liftMcModePolicy = \(agent\)/.test(srcIdx) ? '✅' : '❌'} 源码里有撤销路径（mcRestrictRelease + liftMcModePolicy）`)
     console.log(`  ${/if \(isMcModeAgent\(agent\)\) applyMcModePolicy\(agent\)[\s\S]{0,80}else liftMcModePolicy\(agent\)/.test(srcIdx) ? '✅' : '❌'} touch() 是**双向**的（是 MC 就套、不是就撤）`)
     console.log(`  ${/mcRestrictRelease\.set\(agent, release\)/.test(srcIdx) ? '✅' : '❌'} 套用时**存下** disposer（不存就没法撤）`)
-    console.log(`  ${/const deliveredRelsFor = \(agent, rels\)/.test(srcIdx) ? '✅' : '❌'} 源码里有"回读会话日志判已投递"（deliveredRelsFor）`)
+    console.log(`  ${/const deliveredRelsFor = \(agent, rels\)/.test(srcIdx + INJ_SRC) ? '✅' : '❌'} 源码里有"回读会话日志判已投递"（deliveredRelsFor）`)
   }
 
   /* ⑦d 🔴🔴 2026-09-18 **P0**：连一个不存在的服务器 → `Unhandled 'error' event` → **整个 DSH 进程死**。
@@ -2411,13 +2422,13 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     console.log(`  ${existsSync(wsReadme) ? '✅' : '❌'} README.md 不存在则写入默认骨架`)
     const seeded = existsSync(wsAgents) ? readFileSync(wsAgents, 'utf8') : ''
     console.log(`  ${/dsh-mc-agent 行事准则/.test(seeded) && /mc_capabilities/.test(seeded) ? '✅' : '❌'} 建出来的 RULES.md = 内置默认全文（${seeded.length} 字）`)
-    // 🔴 2026-10-03：同一时机也备好工作区 config.json（schema:1 + 版本同步落进去）
-    const wsCfgPath0 = join(wsRoot, 'config.json')
-    const wsCfg0 = existsSync(wsCfgPath0) ? JSON.parse(readFileSync(wsCfgPath0, 'utf8')) : null
-    console.log(`  ${wsCfg0?.schema === 1 && typeof wsCfg0.rulesVersion === 'string' && wsCfg0.rulesVersion.length > 0 ? '✅' : '❌'} 🔴 同时建出工作区 config.json（schema:1 + rulesVersion=当前版本）`)
     writeFileSync(wsAgents, 'Master 手工改过的内容\n', 'utf8')
     fire('agent/session-start', seedAgent)
     console.log(`  ${/Master 手工改过的内容/.test(readFileSync(wsAgents, 'utf8')) ? '✅' : '❌'} 已存在的 RULES.md 不会被初始化覆盖`)
+    // 🔴 2026-10-03：同一时机也备好工作区 config.json（schema:1 + 版本同步落进去）
+    const wsCfgPath0 = join(wsRoot, 'config.json')
+    const wsCfg0 = existsSync(wsCfgPath0) ? JSON.parse(readFileSync(wsCfgPath0, 'utf8')) : null
+    console.log(`  ${wsCfg0?.schema === 1 && typeof wsCfg0.rulesVersion === 'string' && wsCfg0.rulesVersion.length > 0 ? '✅' : '❌'} 🔴 同时建出工作区 config.json（schema:1 + rulesVersion=当前版本；实际 ${wsCfg0 ? JSON.stringify(wsCfg0).slice(0, 140) : '文件不存在'}）`)
     // 🔴 用户 2026-09-16："如果启动对话时设置要求注入，但是找不到文件，那就注入默认，同时重建文件。"
     //    现在这条发生在**投递时**（inbox 提示）：删掉文件、再起一个新会话 → 文件被重建 + 投递默认全文
     const { unlinkSync } = await import('node:fs')
@@ -2633,6 +2644,7 @@ console.log('\n--- MC账户：账户库 / 凭据隔离 / 工具 ---')
     const { readFileSync } = await import('node:fs')
     const { fileURLToPath } = await import('node:url')
     const idx = readFileSync(fileURLToPath(new URL('./index.js', import.meta.url)), 'utf8')
+    const idxInj = idx + INJ_SRC   // 提示词注入那块在 src/inject.mjs
     const at = idx.indexOf("path === '/api/mc/accounts' && req.method === 'POST'")
     const seg = at >= 0 ? idx.slice(at, at + 2000) : ''
     console.log(`  ${/body\.serverName/.test(seg) && /renameAuthServer/.test(seg) ? '✅' : '❌'} 建账户接口把 serverName 落进认证服务器（含改名）`)
@@ -3940,33 +3952,16 @@ console.log('\n--- 客户端 bundle（client.js 静态检查）---')
     ['地址太长就截断（完整地址留在 tooltip）', /address\.length > 26 \? address\.slice\(0, 25\) \+ '…'/.test(code) && /'data-mc-sub': '', title: address/.test(code)],
     ['CSS 也兜一层截断（max-width + ellipsis）', /\[data-mc-sub\]\{[^}]*max-width:24ch[^}]*text-overflow:ellipsis/.test(code)],
     ['拿不到地址就只显示"在游戏中"（不硬编造一个"—"）', /address \? React\.createElement\('span', \{ 'data-mc-sub'/.test(code)],
-    // ── 「文件分享」页（用户 2026-09-17）：两模式 + 在线 base（获取当前）+ 清除分享数据（要确认）──
-    ['「文件分享」页存在（开关式；不再有 mode 的 off/online/local 取值）', /function SharePane/.test(code) && /label: '启用文件分享'/.test(code) && !/id: 'local'/.test(code) && !/'data-wc-mode'/.test(code)],
-    ['标签页叫「文件分享」', /label: '文件分享'/.test(code)],
-    ['文件分享是**开关**一拨就存（乐观更新 + 失败回滚）', /setShareOn\(next\)/.test(code) && /if \(!ok\) setShareOn\(prev\)/.test(code)],
-    // 🔴 2026-10-04：不再有"模式"（在线是唯一方式）→ 等宽按钮那一套整个删掉
-    ['不再是"模式"按钮（mode 那一套已删）', /label: '启用文件分享'/.test(code) && !/data-wc-modes/.test(code) && !/data-wc-mode-on/.test(code)],
-    ['🔴 关闭时 base 那块**禁用**（输入框 + 两个按钮）', /disabled: busy \|\| !on/.test(code) && /开启文件分享后才能设置 base/.test(code)],
-    ['「获取当前」按钮：用当前地址填好并保存', /'获取当前'/.test(code) && /onClick: onUseCurrent/.test(code) && /拿不到当前地址/.test(code)],
-    ['🔴 开启且没 base → 自动"获取当前"并一起保存', /const autoBase = next === true && !shareBase/.test(code) && /cur \? \{ expressEnabled: true, expressBase: cur \}/.test(code)],
-    ['🔴 不去调就不写：不开/不点按钮时不动 base', /: apiPatch\(withSid\('\/api\/mc\/config'\), \{ expressEnabled: next \}\)\)/.test(code)],
-    // 🔴 2026-09-17 真机：模态框里调 setBaseText（它在 SharePane 内部）→ 点「在线」弹
-    //    "setBaseText is not defined"。保存后靠 load() 刷新 base → pane 的 useEffect 自己同步。
-    ['🔴 模态框不许碰 pane 内部的输入框状态（setBaseText）', !/setBaseText\(cur\)/.test(code) && /setBaseText\(base \?\? ''\)/.test(code)],
-    ['base 单独用「保存」提交（不是边打字边存）', /apiPatch\(withSid\('\/api\/mc\/config'\), \{ expressBase: String\(text \?\? ''\) \}\)/.test(code)],
-    ['在线模式却没填 base → 页面上直接说清', /还没填 base：AI 暂时只能让你去设置/.test(code)],
-    ['🔴 base 那一块**始终渲染**（关闭时禁用而非消失）', /'data-wc-h': '' \}, 'base 地址'/.test(code)],
-    ['「清除分享数据」必须二次确认（确认后才真删）', /onClick: \(\) => setConfirmClear\(true\)/.test(code) && /onClick: \(\) => \{ setConfirmClear\(false\); onClear\(\) \}/.test(code)],
-    ['🔴 清除与模式无关（关闭模式下也能点，不因没文件而禁用）', !/disabled: busy \|\| !share\?\.files/.test(code)],
-    ['不可撤销那句用 <strong>（HTML 不认 markdown 的 **）', /React\.createElement\('strong', \{\}, '全部删掉'\)/.test(code)],
-    ['UI 里没有 markdown 式 `**`（渲染出来是字面星号）', !/'[^'\n]*\*\*[^'\n]*'/.test(code)],
-    ['清除走 DELETE /api/mc/express', /apiDelete\(withSid\('\/api\/mc\/express'\)\)/.test(code)],
-    // 「随版本更新」（提示词页）：开关 + 版本提示行 + 一拨就存 + 失败回滚
-    ['「提示词」页有「随版本更新」开关', /label: '随版本更新'/.test(code) && /onToggle: \(next\) => onFollowVersion\(next\)/.test(code)],
-    ['开关说明写清"只动默认那块、会话不动"', /替换「默认提示词」那一块（会覆盖你的修改）；「会话提示词」不动/.test(code)],
-    ['页面显示"当前内容对应哪个版本"', /当前内容对应：\$\{rulesVersion \? `v\$\{rulesVersion\}` : '未知（还没同步过）'\}/.test(code)],
-    ['开关一拨就存（乐观更新 + 失败回滚）', /run\('cfg:follow', \(\) => apiPatch\(withSid\('\/api\/mc\/config'\), \{ rulesFollowVersion: next === true \}\)/.test(code) && /if \(!ok\) setFollowVersion\(prev\)/.test(code)],
-    ['页面上能看见发布区目录与大小', /data-wc-hint/.test(code) && /share\.files\} 个文件/.test(code) && /fmtBytes/.test(code)],
+    // ── 「记忆」页（用户 2026-10-20：「修改mc设置里的文件共享变为记忆，现在文件共享下的内容全部去掉，
+    //     显示该会话记忆文件位置，包括 lessons.md、world.md，和打开文件所在位置」）──
+    ['设置页第四页叫「记忆」（原来那个文件分享开关页整页下线）', /function MemoryPane/.test(code) && /id: 'memory', label: '记忆'/.test(code) && !/function SharePane/.test(code)],
+    ['文件分享那套 UI 一个都不留（开关 / base 输入 / 清除分享数据 / DELETE express）', !/label: '启用文件分享'/.test(code) && !/setShareOn\(/.test(code) && !/清除分享数据/.test(code) && !/apiDelete\(withSid\('\/api\/mc\/express'\)\)/.test(code)],
+    ['🔴 路径全由服务端推导，前端不拼也不传（GET /api/mc/memory）', /apiGet\(withSid\('\/api\/mc\/memory'\)\)/.test(code)],
+    ['🔴 打开所在位置走 POST /api/mc/memory/open（浏览器拿不到本地路径）', /apiPost\(withSid\('\/api\/mc\/memory\/open'\), name \? \{ name: String\(name\) \} : \{\}\)/.test(code)],
+    ['显示的是**该会话**那份记忆目录（按会话分开存时说清只有本会话这一份）', /按会话分开存：这里只是本会话那一份/.test(code) && /所有会话共用这一份/.test(code)],
+    ['标准四件套点名：README / world / lessons / tasks，缺的直说还没建', /\['README\.md', 'world\.md', 'lessons\.md', 'tasks\.md'\]/.test(code) && /还没建：\$\{missing\.join/.test(code)],
+    ['文件能看见大小（fmtBytes），点一下在文件夹里选中它', /fmtBytes\(f\.bytes\)/.test(code) && /onClick: \(\) => onOpen\(f\.name\)/.test(code)],
+    ['busy 时全禁用（不并发开资源管理器）', /disabled: busy \|\| !info\?\.dir/.test(code)],
     // 地址只能走 connectionView()（host/port/subserver）；`_connectionProfile` 还带账号名，别发到浏览器
     ['后端只把 connectionView() 发给前端（不发含账号的 _connectionProfile）', !/connection: (sess|this)\.bot\._connectionProfile/.test(readFileSync(new URL('./index.js', import.meta.url), 'utf8'))],
   ]
@@ -4056,9 +4051,9 @@ console.log('\n--- 依赖面 + 打包完整性（mineflayer 是**依赖**不是"
 
   const packChecks = [
     ['files 覆盖运行入口（index.js / client.js / cordis.patch.yml）', ['index.js', 'client.js', 'cordis.patch.yml'].every(covered)],
-    ['files 覆盖 selfcheck.mjs（README 让人跑它，就必须在包里）', covered('selfcheck.mjs')],
+    ['files 只带运行必需：自检（tools/ + selfcheck.mjs）不进包（2026-10-20 精简）', !covered('selfcheck.mjs') && !files.some((f) => String(f) === 'tools')],
     [`files 覆盖 src/ 下每个 .mjs（现 ${srcFiles.length} 个；新增文件忘了加会当场红）`, srcFiles.every(covered)],
-    ['files 覆盖 tools/check-core.mjs 与 extensions/', covered('tools/check-core.mjs') && covered('extensions')],
+    ['files 覆盖 extensions/ 与 tools/fix-mc-deps.mjs（装完就能修依赖树）', covered('extensions') && covered('tools/fix-mc-deps.mjs')],
     ['files 里没有运行期产物（node_modules / logs / config / accounts）', !files.some((f) => /node_modules|^logs|config\.json|accounts\.json/.test(String(f)))],
     ['files 里每个条目都真实存在', files.every((f) => existsSync(join(root, String(f))))],
     // ── 插件页本地化（见上方 locale 注释）──

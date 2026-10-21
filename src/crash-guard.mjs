@@ -76,6 +76,18 @@ export function installRejectionGuard ({ log = null, names = PATH_REJECTION_NAME
       return
     }
     st.forwarded++
+    /* 🔴 没有别的监听可转交时**不能静默丢掉**（2026-10-21 用户点名的坑）：
+     *    以前这里直接 for-of existing —— existing 为空就什么都没做，于是"顶层 await 的模块第一次抛错"
+     *    变成**悄悄停在原处**：事件循环一空就以 exit 0 结束，后面的代码一行都不跑、也没有任何输出。
+     *    自检里就这么烂了 11 条断言没人发现（显示 ❌ 但退出码 0）。
+     *    这里照 node 默认的致命行为兜底：打印栈 + 退出码 1（不 exit()，让宿主/自检自己收尾）。 */
+    if (!existing.length) {
+      const err = reason instanceof Error ? reason : new Error(String(reason))
+      try { process.stderr.write(`未处理拒绝（没有其它监听可转交，按致命处理）：${err?.stack ?? err}${'\n'}`) } catch {}
+      try { say(`未处理拒绝（无监听可转交，已按致命处理）：${String(reason?.message ?? reason).slice(0, 160)}`) } catch {}
+      process.exitCode = 1
+      return
+    }
     for (const h of existing) {
       try { h.call(process, reason, promise) } catch (e) {
         try { say(`转交未处理拒绝给原监听时出错（不影响）：${e?.message ?? e}`) } catch {}

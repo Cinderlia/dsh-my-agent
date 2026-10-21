@@ -21,7 +21,10 @@
  *    `agentPresetsSvc` / `MC_PLUS_NOTICE_TEXT` 都是在那之后才声明的）—— 挪回去会踩 TDZ。
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs'
-import { join } from 'node:path'
+// 🔴 `sep` 不能漏：`memoryDirView` 里拼目录前缀要用它。漏了会 ReferenceError，
+//    而那个错误正好被 `enterWithNotices` 的 catch 吞掉 ⇒ **提示词一条都不投**、
+//    且只在日志里留一行"提示词注入失败"（2026-10-21 才被自检抓出来）。
+import { join, sep } from 'node:path'
 
 /**
  * @param {object} deps 由 `index.js` 递进来的闭包依赖（配置、记忆根、日志、宿主工具）
@@ -46,7 +49,7 @@ export function createInjector (deps) {
     versionPromptSource, versionPromptText,
     versionPromptTitle, workspaceConfigValues,
     workspaceOf, workspaceRootFor,
-    wsCfgValues,
+    wsCfgValues, wsConfigPath,
   } = deps
 
 

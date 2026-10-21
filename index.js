@@ -4849,7 +4849,7 @@ export function apply(ctx, rawConfig) {
         syncRulesVersion, syncVersionPrompt, userMessage,
         versionPromptPath, versionPromptSource, versionPromptText,
         versionPromptTitle, workspaceConfigValues, workspaceOf,
-        workspaceRootFor, wsCfgValues,
+        workspaceRootFor, wsCfgValues, wsConfigPath,
   })
 
 
