@@ -32,7 +32,7 @@ const FILE = 'RULES.md'
 const LEGACY_FILE = 'AGENTS.md'
 const MAX_BYTES = 128 * 1024
 
-/** 默认「行事准则」（2026-10-22 第九版：与记忆根里的 `RULES.md` **同一份文本** —— 新增「自主发展与决策」一节，把"不是任务脚本、五本账、一轮一条链、同一失败方法最多两次"写死；「干活习惯」补"交互没反应先怀疑瞄准"；「舀水」改成带坐标的 `useitem` + 只舀静水） */
+/** 默认「行事准则」（2026-10-23 第十版（工具速查对齐现行接口：mc_act 补 jump、fish，attack/shoot/enchant 已拆成独立工具）：与记忆根里的 `RULES.md` **同一份文本** —— 新增「自主发展与决策」一节，把"不是任务脚本、五本账、一轮一条链、同一失败方法最多两次"写死；「干活习惯」补"交互没反应先怀疑瞄准"；「舀水」改成带坐标的 `useitem` + 只舀静水） */
 export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 
 ## 宗旨
@@ -220,7 +220,7 @@ export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 
 - **看**：\`mc_observe\`（截图 + 三段式感知）；\`mc_map\`（\`floor\` 默认看脚下一层、\`surface\` 地表、\`column\` 竖列看脚下这一格往下几格实心 / 空腔 / 水 / 岩浆）；\`mc_scan\` 找方块；\`mc_inventory\`；\`mc_status\`；\`mc_diag\` 排查"动不了"；\`mc_events\`。
 - **动**：\`mc_move\`（\`walk\` / \`fly\`（创造默认）/ \`swim\` 只上浮换气 / \`jump\`）。走远路连着叫几次 —— 一次只走 10 秒，没到就照原目标再叫。
-- **手**：\`mc_dig\`（自动换工具，挖不动会说缺什么）；\`mc_build\`；\`mc_act\`：\`break\` / \`place\` / \`bridge\` 搭路 / \`use\` / \`useitem\` / \`fish\` 钓鱼 / \`equip\` / \`toss\` / \`look\`·\`toward\` / \`dismount\`；另有 \`mc_attack\`（打怪，24 格内会追）、\`mc_shoot\`（射箭）、\`mc_station\`（附魔台·铁砧·锻造台）、\`mc_prep\`（出发前自查）、\`mc_fish\`（钓鱼）；\`mc_sequence\` 串动作。
+- **手**：\`mc_dig\`（自动换工具，挖不动会说缺什么）；\`mc_build\`；\`mc_act\`：\`break\` / \`place\` / \`bridge\` 搭路 / \`use\` / \`useitem\` / \`jump\` 原地跳一下（爬台阶/脱困） / \`fish\` 钓鱼 / \`equip\` / \`toss\` / \`look\`·\`toward\` / \`dismount\`；另有 \`mc_attack\`（打怪，24 格内会追）、\`mc_shoot\`（射箭）、\`mc_station\`（附魔台·铁砧·锻造台）、\`mc_prep\`（出发前自查）、\`mc_fish\`（钓鱼）；\`mc_sequence\` 串动作。
 - **做**：\`mc_craft\` 合成；\`mc_furnace\` 熔炼；\`mc_chest\` 存取箱子。
 - **任务与说**：\`mc_task\`；\`mc_say\`；\`mc_command\`（先确认）；\`mc_kit_memory\`；\`mc_kit_express\`；\`mc_kit_image\`。
 - **自主 / 停**：\`mc_auto\` 待机时自己安排；\`mc_stop\` 强行停下；\`mc_ping\`；\`mc_disconnect\`。

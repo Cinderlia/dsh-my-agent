@@ -25,6 +25,9 @@
   修完又发现它是**唯一返回裸字符串**的工具，被宿主判 `invalid output`。两处都修了。
 - **`mc_act {mode:"jump"}` 不再报“未知 mode”**：跳一下本属于移动，但人在 `mc_act` 里找它
   （脱困 / 爬台阶时手最顺的就是这个工具）。现在两个入口都通，返回 `rose`（实际离地高度）和身边有谁。
+- **`RULES.md` 的「工具速查」对齐了现在的接口**：`mc_act` 补 `jump` / `fish`，去掉早已拆出去的 `attack` / `shoot` / `enchant`·`anvil`·`smithing`（现在是 `mc_attack` / `mc_shoot` / `mc_station`）；
+  `mc_map` 去掉已删除的 `cave` 档，并写明默认出**字符图**、`format:"image"` 才出图；`mc_dig` 补一句“默认不挖穿挡路的方块”（矿在墙后要 `digThrough:true`）。
+  插件内置的**默认准则模板**（`src/agentsmd.mjs` 的 `DEFAULT_AGENTS_MD`）同步改成同一份文本（第十版）。
 
 ### 🔍 全量审计第二批：会骗到 AI 的路径、控制位、配置与体积
 
