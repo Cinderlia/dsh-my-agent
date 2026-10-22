@@ -186,7 +186,11 @@ export const DEFAULTS = {
   authPass: process.env.MC_AUTH_PASS ?? '',
   connectTimeoutMs: 45_000,
   moveBudgetMs: 40_000,
-  preferDoors: true, doorDigPenalty: 8,   // 优先走门/绕路：给"挖墙"加代价（2026-10-18）
+  preferDoors: true, doorDigPenalty: 8,
+  /* 2026-10-23：耕地/土径不进 A* 的落脚点（防踩坏、防挖开挡路的）。
+   * 代价：万一耕地是**唯一通路**（唯一的水井、围栏里那块地），寻路会报 NoPath 而不是硬穿。
+   * 真遇到这种地形就把它设成 false 关掉。 */
+  protectFarmland: true,   // 优先走门/绕路：给"挖墙"加代价（2026-10-18）
   chatHistory: 300,
   /* 自动重连最多试几次（以前没上限、5s→…→60s 无限重试，看门狗又让 AI 干等）。 */
   maxReconnectAttempts: 5,
@@ -477,13 +481,9 @@ export class McBot extends EventEmitter {
 
   /**
    * 移动的"当前归属者"编号。
-   *
-   * 🔴 为什么需要（2026-10-06 实机，用户原话「刚刚遇到怪了，但是他动了一下不动了，应该是 move
-   *    的时候冲突了」）：自主层被怪贴上时会自己逃（`mc_auto` 的 avoid），而 AI 那一轮可能正在
-   *    `mc_move`/`mc_dig`。两份移动同时占着**同一个** `bot.pathfinder`，而 `#walkPathfinder` 的
-   *    `finally` 原来是无条件停 pathfinder + 松控制位的 —— 先结束的那份会把另一份一起停掉。
-   *    现在每次移动开始时领一个号，收尾时只有"号还是最新的"才允许动 pathfinder / 控制位。
-   */
+   * 🔴 为什么需要（2026-10-06 实机）：自主层被怪贴上会自己逃，AI 那轮可能正在 mc_move/mc_dig，
+   *    两份移动占同一个 bot.pathfinder，先收尾的那份会把另一份一起停掉。每次移动领一个号，收尾时只有"号还是最新的"才允许动。
+  */
   _moveGen = 0
 
   /** 领一个新的移动号（旧号的那次走路收尾从此失效） */
@@ -715,6 +715,9 @@ export class McBot extends EventEmitter {
       beginMove: () => this.#beginMove(),
       stopPathing: (b) => this.#stopPathing(b),
       releaseControls: () => this.#releaseControls(),
+      /* 2026-10-23 审计：原来这里没有 cfg ⇒ movement.mjs 里 `ctx.cfg?.walkCanDig !== false` 恒真
+       * （可选链短路），A* 不挖了、手写挖台阶补救却在挖。cfg 只塞进 #moveCtx 是漏接线。 */
+      cfg: this.cfg,
     }
   }
 
@@ -799,7 +802,8 @@ export class McBot extends EventEmitter {
 
 
   /** 挂"服务端到底认没认这次破坏"的监听（`src\server-break.mjs` 的 `watchServerBreak`，完整推导在那个模块头）。
-   *  一句话：`bot.blockAt()` 是客户端预测，本地变 air 不算证据；服务端拒绝时还会用 `block_change`
+   *  一句话：mineflayer **不做客户端预测** —— 本地世界要等服务端的 `block_change` 才变，
+   *  所以"本地变 air"不能当证据（客户端只会**落后**、不会抢先）；服务端拒绝时还会用同一个包
    *  把原方块发回来"复原"—— 只有"服务端说这块变 air"才算挖掉。 */
   #watchServerBreak (b, pos) { return watchServerBreak(b, pos) }
 

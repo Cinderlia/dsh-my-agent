@@ -40,6 +40,21 @@ export const isPassable = (n) => Boolean(n) && PASSABLE.test(String(n))
  */
 export const NON_SUFFOCATING = /_(?:door|trapdoor|fence_gate|bed|slab|stairs)$|^(?:wheat|carrots|potatoes|beetroots|torchflower_crop|pitcher_crop|nether_wart|sugar_cane|kelp|kelp_plant|seagrass|tall_seagrass|sweet_berry_bush|cocoa|bamboo|bamboo_sapling|scaffolding|tripwire|redstone_wire|repeater|comparator|ladder|rail|powered_rail|detector_rail|activator_rail|cake)$/
 
+/**
+ * 能**直接走进去**的作物/贴地植物（碰撞盒是 `empty`，实体从里面穿过）。
+ *
+ * 🔴 2026-10-22 用户实机：「家里非实体方块走不了」—— 家里那片麦田，A* 死活不肯走进去，
+ *    绕路 / NoPath / 卡在田边。根因在 vendor `lib/movements.js:233` 的 `b.safe` 判定：
+ *    `boundingBox === 'empty' || b.climbable || this.carpets.has(b.type)`；
+ *    而 `carpets` 只在 `lib/movements.js:89` 按 `block.shapes[0][4] < 0.1` 自动收集 ——
+ *    小麦高度约 0.3125 > 0.1 ⇒ 不进 carpets；prismarine 给的 `boundingBox` 也不是 `'empty'`
+ *    ⇒ `safe === false` ⇒ A* 认为"这一格站不进去"，整块田变成障碍物。
+ *    所以这份名单 = "要手动补进 `carpets` 的可穿方块"，由 `src/plugins.mjs` 的
+ *    `patchPlantPassable()` 执行。
+ *    注意：**甜浆果丛不在名单里**（踩上去掉血，宁可绕开）。
+ */
+export const PLANT_PASSABLE = /^(?:wheat|carrots|potatoes|beetroots|torchflower_crop|pitcher_crop|nether_wart|sugar_cane|kelp|kelp_plant|seagrass|tall_seagrass|cocoa|bamboo|bamboo_sapling|short_grass|tall_grass|fern|large_fern|dead_bush|lily_pad|vine|glow_lichen|hanging_roots|crimson_roots|warped_roots|nether_sprouts|big_dripleaf|small_dripleaf)$/
+
 export const SOFT_ROOF = /_leaves$|_log$|_wood$|^bamboo|^snow|_snow$|cactus|^moss|^melon|^pumpkin|_sapling$|_flower$|^vine$|glow_lichen|^hanging_roots$|^big_dripleaf/
 
 /**

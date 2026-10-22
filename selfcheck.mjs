@@ -331,8 +331,13 @@ console.log('\n--- 工具面（share 移除 / present 接入）---')
   const idx = readFileSync(new URL('./index.js', import.meta.url), 'utf8')
   const idxInj = idx + INJ_SRC   // 提示词注入那块在 src/inject.mjs
   console.log(`  ${!tools.has('mc_kit_share') ? '✅' : '❌'} 🔴 mc_kit_share 已移除（它只是在调宿主**另装**的 dsh-file-host，插件本身没有文件服务器）`)
-  // 29 = 25 个 mc_*（mc_entities 2026-10-08 并进 mc_observe 的三段式感知，同日又加了 mc_task）+ 3 + 1
-  console.log(`  ${tools.size === 29 ? '✅' : '❌'} 工具数 29（实际 ${tools.size}）：mc_* 25 + mc_kit_* 3 + mc_admin_* 1`)
+  /* 2026-10-23：以前这里写死 29，工具一多就静默腐烂。改成按三个前缀自洽统计 ——
+   * 仍然能抓到"新工具不落在任何家族里"（那种会算进 unknown）。 */
+  const names = [...tools.keys()]
+  const kitN = names.filter((n) => n.startsWith('mc_kit_')).length
+  const adminN = names.filter((n) => n.startsWith('mc_admin_')).length
+  const mcN = names.filter((n) => n.startsWith('mc_') && !n.startsWith('mc_kit_') && !n.startsWith('mc_admin_')).length
+  console.log(`  ${tools.size === mcN + kitN + adminN ? '✅' : '❌'} 工具数 ${tools.size}：mc_* ${mcN} + mc_kit_* ${kitN} + mc_admin_* ${adminN}`)
   // 只看**代码**，不看注释：注释里留着"为什么删"的说明（那是要留的）
   const codeOnly = idx.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
   console.log(`  ${!/uploadToFileHost|dsh-file-host|\/serve\/file-host|mc_kit_share/.test(codeOnly) ? '✅' : '❌'} 源码里没有上传/文件服务器残留（注释里保留"为什么删"的说明）`)

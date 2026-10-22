@@ -29,7 +29,7 @@ import { callBudget } from './budget.mjs'
 import { aimAt } from './camera.mjs'
 import { CONTAINER_RE, TOGGLE_RE, cropStageOf, isEntityItem } from './block-names.mjs'
 import { entityNameOf, pickEntity } from './entity-names.mjs'
-import { heldText, equipDestOf } from './inventory.mjs'
+import { heldText, equipDestOf, durabilityOf } from './inventory.mjs'
 
 /**
  * "先瞄 → 等一拍 → 再用"里那一拍的时长（毫秒）。
@@ -159,6 +159,38 @@ export async function useBlock (b, { x, y, z, who = null } = {}, ctx = {}) {
 }
 
 /**
+ * 亲眼看"这一下到底吃/喝下去了没有"：监听**自己**的 entity_status === 9（原版"物品被消耗"）。
+ *
+ * 这是能力不是决策：它不替模型决定吃不吃，只把"究竟咽下去没"如实报回来。
+ * 以前 mc_act {mode:"useitem"} 对面包只发一个 activateItem 就立刻 deactivateItem，
+ * 等于"举了一下又放下"，模型却以为吃了（实机连着饿了两次才发现）。
+ * mineflayer-auto-eat 5.0.3 dist/new.js:110-118 判定完成也是抓这个包，不是轮询食物值。
+ */
+function watchOwnConsume (b, ms = 2_600) {
+  const id = (() => { try { return b?.entity?.id } catch { return null } })()
+  const client = b?._client
+  if (id == null || !client || typeof client.on !== 'function') return null
+  let done = false
+  let timer = null
+  let onStatus = null
+  const p = new Promise((resolve) => {
+    onStatus = (packet) => {
+      if (!packet || packet.entityId !== id) return
+      if (Number(packet.entityStatus) !== 9) return
+      done = true
+      resolve(true)
+    }
+    try { client.on('entity_status', onStatus) } catch { resolve(false) }
+    timer = setTimeout(() => { if (!done) resolve(false) }, ms)
+  })
+  p.stop = () => {
+    try { if (onStatus) client.removeListener('entity_status', onStatus) } catch {}
+    try { if (timer) clearTimeout(timer) } catch {}
+  }
+  return p
+}
+
+/**
  * 对着**空气**用**手上的东西**（右键）：扔末影之眼 / 末影珍珠 / 雪球 / 鸡蛋，拉弓射箭，喝药水。
  *
  * 为什么单独一个动作：`useBlock` 只能右键**方块或实体**（`activateBlock` / `activateEntity`），
@@ -197,12 +229,44 @@ export async function useItem (b, { hold = 0, x, y, z } = {}, ctx = {}) {
       aimedInfo = { x: Number(x), y: Number(y), z: Number(z), error: e.message }
     }
   }
+  /* "这一下到底吃下去没"的快照（能力，不是触发器：吃不吃仍由模型决定） */
+  const foodBefore = (() => { try { const v = Number(b.food); return Number.isFinite(v) ? v : null } catch { return null } })()
+  const isFood = Number.isFinite(Number(item.foodPoints))
+  /* 食物的 hold 是必需的：给 0 就等于"举起来立刻放下"，什么都吃不进去。
+   * 模型说"用面包"就是想吃，默认补 1800ms（一口约 1.6 秒），并把 autoHoldForFood 报回去。 */
+  const foodHoldMs = Math.max(0, Math.min(1_800, Math.max(0, left - 400)))
+  const autoHoldForFood = isFood && want === 0 && foodHoldMs > ms
+  const effectiveMs = autoHoldForFood ? foodHoldMs : ms
+  const consumeWatch = isFood ? watchOwnConsume(b, Math.max(1_500, effectiveMs + 900)) : null
   await t(Promise.resolve(b.activateItem()), 'act', `使用 ${item.name}`)
-  if (ms > 0) await sleep(ms)
+  if (effectiveMs > 0) await sleep(effectiveMs)
   if (want > 0 && typeof b.deactivateItem === 'function') {
     await t(Promise.resolve(b.deactivateItem()), 'act', `松开 ${item.name}`)
   }
-  const out = { used: item.name, count: item.count, heldMs: ms }
+  /* 等"咽下去了"的回执（最多再等 900ms）—— 只报事实，不改任何决策 */
+  let ate = null
+  if (consumeWatch) {
+    try { ate = await consumeWatch } catch { ate = null }
+    try { consumeWatch.stop() } catch {}
+  }
+  const foodAfter = (() => { try { const v = Number(b.food); return Number.isFinite(v) ? v : null } catch { return null } })()
+  const out = { used: item.name, count: item.count, heldMs: effectiveMs }
+  if (autoHoldForFood) out.autoHoldForFood = true
+  if (isFood) {
+    /* 2026-10-23 审计：三态。watcher 不可用（null）时以前一律报 ate:false + "没吃进去"，
+     * 而饥饿值上涨是铁证 —— 那会骗 AI 再吃一次。 */
+    const foodUp = foodBefore != null && foodAfter != null && foodAfter > foodBefore
+    out.ate = ate === true ? true : (foodUp ? true : (ate === false ? false : null))
+    if (out.ate === true && ate !== true) out.ateBy = '饥饿值上涨（没收到 entity_status）'
+    if (foodBefore != null) out.foodBefore = foodBefore
+    if (foodAfter != null) out.foodAfter = foodAfter
+    if (out.ate === false) {
+      out.ateNote = (foodBefore != null && foodBefore >= 20)
+        ? '饥饿是满的（20）—— 吃不下东西，这一下不会生效'
+        : '没收到"咽下去"的回执（entity_status 9），饥饿值也没涨 —— 这一下很可能没吃进去。食物要按住约 1.6~2 秒：再叫一次 mc_act {mode:"useitem", hold:1800}（刚才按了 ' + effectiveMs + 'ms）'
+    }
+  }
+
   if (aimedInfo) out.aimedAt = aimedInfo
   /* 🔴 2026-10-08 第五份审计报告 ⑦：`count` 是**使用前**的快照 —— 末影珍珠/雪球扔出去后
    *    仍报旧数量，模型以为手上还有 N 个。这里补一个"用完之后还剩多少"。 */
@@ -216,7 +280,10 @@ export async function useItem (b, { hold = 0, x, y, z } = {}, ctx = {}) {
   })()
   if (after != null) {
     out.left = after
-    if (after >= item.count && item.name !== 'bow' && item.name !== 'crossbow') {
+    /* 2026-10-23 审计：只有「用一下就少一个」的东西才该报"没真用出去"。
+     * 盾/望远镜/山羊角/三叉戟/工具/桶 用完数量不变本来就是正常的。 */
+    const REUSABLE = /^(bow|crossbow|shield|spyglass|goat_horn|trident|flint_and_steel|fishing_rod|shears|elytra|carrot_on_a_stick|warped_fungus_on_a_stick|.*_axe|.*_hoe|.*_pickaxe|.*_shovel|.*_sword|bucket|water_bucket|lava_bucket|milk_bucket|powder_snow_bucket)$/
+    if (after >= item.count && !REUSABLE.test(item.name)) {
       out.note = `手上还是 ${after} 个（没少）—— 这一下可能没真用出去（服务端不回执这类动作，用 mc_inventory 复核）`
     }
   }
@@ -259,6 +326,62 @@ export async function interact (self, args = {}) {
     return { mode, ...(await self.lookAt({ who: args.who })), position: self.position }
   }
   throw new Error(`未知 mode：${mode}（可用 look / place / break / toward）`)
+}
+
+/**
+ * 盔甲/盾的「哪件更好」对照 —— **只给结论和依据，不替 AI 做决定**。
+ *
+ * 为什么需要（2026-10-22）：我的钻石胸甲只剩 36%、护腿 32%，箱子里还有铁甲；
+ *   到底该不该换？以前 mc_act{mode:"equip"} 只会闷头换掉，把「换亏了」这件事藏起来。
+ * 对照 mineflayer-armor-manager 的做法（它只有 isNewArmorBetter = rank(新) > rank(旧)，
+ *   **完全不看耐久和附魔** —— 快碎的合金会顶掉满耐久的钻石）——这里把它漏的三样补上：
+ *   ① 材质等级；② 剩余耐久百分比；③ 附魔总等级。
+ * 不自动换：换不换是策略（AI）的事，插件只负责把三样事实摆出来。
+ */
+const ARMOR_RANK = ['leather', 'golden', 'chainmail', 'iron', 'turtle', 'diamond', 'netherite']
+const ARMOR_ZH = { leather: '皮革', golden: '金', chainmail: '锁链', iron: '铁', turtle: '海龟壳', diamond: '钻石', netherite: '下界合金' }
+export function armorRankOf (name) {
+  const n = String(name ?? "")
+  for (let i = ARMOR_RANK.length - 1; i >= 0; i--) if (n.startsWith(ARMOR_RANK[i])) return i
+  return -1
+}
+/** 附魔总等级（读不到附魔就当 0 —— 不能让「读不到」变成「更差」） */
+function enchSumOf (it) {
+  let sum = 0
+  try {
+    for (const e of it?.enchants ?? []) sum += Number(e?.lvl ?? e?.level ?? 0) || 0
+  } catch { /* 读不到就算了 */ }
+  return sum
+}
+/**
+ * 比两件：返回 { better, why, next, cur }。
+ * better：'next' 新的更好 / 'cur' 身上那件更好 / 'tie' 打平。
+ * 判序：材质等级 → 剩余耐久% → 附魔总等级（前一档分出胜负就不看后面的）。
+ */
+export function armorCompare (next, cur) {
+  const dur = (it) => { const x = durabilityOf(it); return x ? x.pct : null }
+  const fmt = (it) => {
+    if (!it) return "空"
+    const r = armorRankOf(it.name)
+    const dp = dur(it)
+    const zh = r >= 0 ? "（" + (ARMOR_ZH[ARMOR_RANK[r]] || "?") + "）" : ""
+    const dt = dp == null ? "" : " 耐久 " + Math.round(dp * 100) + "%"
+    return it.name + zh + dt
+  }
+  const rn = armorRankOf(next?.name); const rc = armorRankOf(cur?.name)
+  const dn = dur(next); const dc = dur(cur)
+  const en = enchSumOf(next); const ec = enchSumOf(cur)
+  let better = "tie"
+  const why = []
+  if (!cur) { better = "next"; why.push("身上那格本来是空的") }
+  else if (rn > rc) { better = "next"; why.push("材质更高（" + (ARMOR_ZH[ARMOR_RANK[rn]] || "?") + " > " + (ARMOR_ZH[ARMOR_RANK[rc]] || "?") + "）") }
+  else if (rn < rc) { better = "cur"; why.push("材质更低（" + (ARMOR_ZH[ARMOR_RANK[rn]] || "?") + " < " + (ARMOR_ZH[ARMOR_RANK[rc]] || "?") + "）—— 换上去是降级") }
+  else if (dn != null && dc != null && Math.abs(dn - dc) >= 0.15) {
+    better = dn > dc ? "next" : "cur"
+    why.push("同材质比耐久：" + Math.round(dn * 100) + "% vs " + Math.round(dc * 100) + "%")
+  } else if (en !== ec) { better = en > ec ? "next" : "cur"; why.push("同材质同耐久比附魔：总等级 " + en + " vs " + ec) }
+  else { why.push("三样都打平") }
+  return { better, why: why.join("；"), next: fmt(next), cur: fmt(cur) }
 }
 
 /**
@@ -315,6 +438,8 @@ export async function equip (self, { name = null, to = null } = {}, ctx = {}) {
   await t(b.equip(item, d), 'equip', isHand ? `手持 ${name}` : `${d} ← ${name}`)
   const now = readSlot(slot)
   const got = isHand ? b.heldItem?.name === item.name : now?.name === item.name
+  /* 盔甲/盾：换之后把「哪件更好」摆出来（判据见 armorCompare 注释） */
+  const against = isHand ? null : armorCompare(item, before)
   const held = heldText(b)
   return {
     to: d,
@@ -324,6 +449,7 @@ export async function equip (self, { name = null, to = null } = {}, ctx = {}) {
     equipped: got,
     ...(isHand ? {} : { now: now ? `${now.name}x${now.count}` : '空' }),
     ...(before && before.name !== now?.name ? { swappedOut: `${before.name}x${before.count}` } : {}),
+    ...(against && against.cur !== '空' ? { compare: against } : {}),
     ...(beforeHeld !== held ? { beforeHeld } : {}),
     held,
     ...(got
@@ -655,10 +781,14 @@ export async function anvilTable (self, args = {}, ctx = {}) {
     const newName = args.name == null ? '' : String(args.name).trim()
     if (!newName) throw new Error('rename 要给 name（新名字），例如 mc_station {kind:"anvil", action:"rename", item:"diamond_sword", name:"屠龙刀"}')
     if (newName.length > 35) throw new Error(`名字太长（${newName.length} 个字），铁砧最多 35 个`)
+    /* 2026-10-23 审计：背包里本来就有同名物时，`find(customName===newName)` 会误判成改名成功。
+     * 改成「同名件数必须比改名前多」。 */
+    const namedCount = () => b.inventory.items().filter((it) => it.customName === newName).length
+    const namedBefore = namedCount()
     let err = null
     try { await t(Promise.resolve(table.rename(first, newName)), 'act', `改名成「${newName}」`) } catch (e) { err = e }
     await sleep(200)
-    const got = b.inventory.items().find((it) => it.customName === newName) ?? null
+    const got = namedCount() > namedBefore ? (b.inventory.items().find((it) => it.customName === newName) ?? null) : null
     await close()
     if (err && !got) throw new Error(`改名没成：${err.message}`)
     return {
@@ -677,6 +807,14 @@ export async function anvilTable (self, args = {}, ctx = {}) {
   const pick2 = findInv(want2, s1)
   if (!pick2) throw new Error(`背包里没有第二件 ${want2}（第一件在槽 ${s1}）`)
   const second = pick2.item
+  /* 2026-10-23 审计：合并成没成不能只看"有没有抛错"（服务端拒了——材料对不上/超 39 级——也不抛）。
+   * 用「同名件数减少 + 总剩余耐久上升」复核。 */
+  const durSig = () => {
+    const mine = b.inventory.items().filter((it) => it.name === first?.name)
+    const dur = mine.reduce((s0, it) => s0 + Math.max(0, Number(it.maxDurability ?? 0) - Number(it.durabilityUsed ?? 0)), 0)
+    return { n: mine.length, dur }
+  }
+  const sig0 = durSig()
   let err = null
   try { await t(Promise.resolve(table.combine(first, second, null)), 'act', '铁砧合并') } catch (e) { err = e }
   await sleep(250)
@@ -693,8 +831,11 @@ export async function anvilTable (self, args = {}, ctx = {}) {
     }
   }
   const desc = describeItem(got)
+  const sig1 = durSig()
+  const merged = !err && sig1.n < sig0.n && sig1.dur >= sig0.dur
   return {
-    at, action, first: first?.name ?? null, second: want2, combined: true, got: desc,
+    at, action, first: first?.name ?? null, second: want2, combined: merged, got: desc,
+    ...(merged ? {} : { why: `件数 ${sig0.n}→${sig1.n}、总剩余耐久 ${sig0.dur}→${sig1.dur}：看不出合并真的发生了（服务端可能拒了：材料对不上 / 超过 39 级）` }),
     ...(got ? {} : { note: '合并命令发出去了，但没能在背包里复核到结果 —— 用 mc_inventory 看一眼' }),
     text: `⚒️ 铁砧合并完成：${first?.name ?? ''} + ${want2}`
       + (desc ? ` → **${desc}**` : '（没复核到结果，用 mc_inventory 看一眼）'),
@@ -769,12 +910,15 @@ export async function smithingTable (self, args = {}, ctx = {}) {
     await t(Promise.resolve(b.moveSlotItem(slot, dest)), 'act', `把 ${what} 放进槽 ${dest}`)
     await sleep(120)
   }
+  /* 2026-10-23 审计：盔甲纹饰的成品与底座同名 ⇒ 旧的 `some(name===gotName)` 恒真，永远报"进了背包"。
+   * 先记一份「名字 → 件数」的签名，最后比件数。 */
+  const bagSig0 = (() => { const m = new Map(); try { for (const it of b.inventory.items()) m.set(it.name, (m.get(it.name) ?? 0) + it.count) } catch {} return m })()
   await move(tpl.slot, 0, tpl.item.name)
   await move(baseSlot, 1, base?.item?.name ?? wantBase ?? '底座')
   await move(add.slot, 2, wantAdd)
 
   // 等成品（服务端一个 tick 就算出来）—— 2026-10-15 异步方案 ②：收口到 `waitUntil`
-  await waitUntil(() => slotName(3), { ms: 1_200, pollMs: 80, label: '等铁砧成品' })
+  await waitUntil(() => slotName(3), { ms: 1_200, pollMs: 80, label: '等锻造台成品' })
   const out = table.slots?.[3] ?? null
   if (!out) {
     await close()
@@ -790,7 +934,7 @@ export async function smithingTable (self, args = {}, ctx = {}) {
   try { await t(Promise.resolve(b.putAway(3)), 'act', '把成品拿回背包') } catch (e) { takeErr = e }
   await sleep(150)
   const gotName = out.name
-  const inBag = b.inventory.items().some((it) => it.name === gotName)
+  const inBag = b.inventory.items().filter((it) => it.name === gotName).length > (bagSig0.get(gotName) ?? 0)
   await close()
   return {
     at, base: base?.item?.name ?? wantBase ?? null, addition: wantAdd, template: tpl.item.name,

@@ -56,7 +56,16 @@ export function inWaterNow (b) {
   try { if (b?.entity?.isInWater) return true } catch { /* 往下退 */ }
   try {
     const eye = b?._getBlockAtEyeLevel?.()?.name
-    return eye === 'water' || eye === 'flowing_water'
+    if (eye === 'water' || eye === 'flowing_water') return true
+  } catch { /* 往下退 */ }
+  /* 2026-10-22 实机（用户：卡在水面）：浮在水面头露出时眼高那格是空气，只看眼睛会判成没在水里，
+     于是 swimUp 说"我本来就没在水里"、walkToOnce 走 pathfinder（A* 不认水，moved 0）、
+     dig-guard 见 onGround=false 拒掉所有挖掘，实测卡死约 10 分钟。
+     补一层：脚所在那格是水也算在水里（entity.position 就是脚底）。 */
+  try {
+    const feet = b?.entity?.position?.floored?.()
+    const n = feet && typeof b?.blockAt === 'function' ? b.blockAt(feet)?.name : null
+    return n === 'water' || n === 'flowing_water' || n === 'bubble_column'
   } catch { return false }
 }
 
@@ -100,6 +109,32 @@ export function dropsNear (b, radius = 12) {
  * 只在"没捡到东西 / 打死怪之后"调用，捡到手就不提醒（服务端把掉落物实体移出视野有延迟，
  * 刚捡完那一下它还挂在 `bot.entities` 里，提醒会变成假警报）。
  */
+/**
+ * 掉落物清单（带坐标）：`[{ name?, x, y, z, dist }]`，最近的在前。
+ *
+ * 🔴 为什么不能只给一句"地上还有 N 个"（`dropHint` 就是那样）：
+ *   2026-10-22 我在下界打死两只烈焰人，两次都**没拿到烈焰棒** ——
+ *   结果里只有"地上还有掉落物"这句话，**没有它在哪**，等再问的时候东西已经没了。
+ *   "要不要走过去、值不值得下那个崖"是 AI 的决策，但"东西在哪"必须是插件给的**事实**。
+ *   名字取不到就省略（`getDroppedItem` 要看 mineflayer 版本，取不到不该让整条报错）。
+ */
+export function dropListOf (b, { radius = 12, limit = 5 } = {}) {
+  const list = []
+  for (const { e, d } of dropsNear(b, radius)) {
+    if (list.length >= limit) break
+    let name = null
+    try { name = b?.getDroppedItem?.(e)?.name ?? null } catch { name = null }
+    const p = e?.position
+    if (!p) continue
+    list.push({
+      ...(name ? { name } : {}),
+      x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z),
+      dist: Math.round(d * 10) / 10,
+    })
+  }
+  return list
+}
+
 export function dropHint (b, { radius = 12 } = {}) {
   const drops = dropsNear(b, radius)
   if (!drops.length) return null
@@ -146,4 +181,38 @@ export function stateNameOf (b, stateId) {
     const e = b?.registry?.blocksByStateId?.[Number(stateId)]
     return e?.name ?? null
   } catch { return null }
+}
+
+/** 世界上下界（读 bot.game.minY / bot.game.height；读不到就按 1.18+ 的默认 -64..320）。
+ *  为什么要它：`blockAt()` 在 **y 越界** 时同样返回 null / air —— 那不是"区块没加载"，
+ *  是"世界根本没有这一层"，两者混在一起会让扫描结果骗人。 */
+export function worldBoundsOf (b) {
+  const g = b?.game ?? {}
+  const minY = Number.isFinite(Number(g.minY)) ? Number(g.minY) : -64
+  const h = Number.isFinite(Number(g.height)) && Number(g.height) > 0 ? Number(g.height) : 384
+  return { minY, maxY: minY + h - 1 }
+}
+
+/**
+ * 这一格**客户端到底知不知道**（只读，不 await）。
+ *
+ * 2026-10-23 检查（用户："看一下客户端的代码"）后核实的模型事实：
+ *   · prismarine-chunk 1.18+ 的 ChunkColumn 构造时就把**全部 section 预先分配好**
+ *     （实测 1.21.4：numSections=24、缺失下标 0），所以"section 缺失导致方块更新被静默丢弃"
+ *     这条路**不存在**；
+ *   · y 在上下界之外时 getBlockStateId 直接回 0（= 空气），getBlock 也照常给 air ——
+ *     **读不出"越界"这个状态**，只能按 bot.game 的上下界自己判；
+ *   · 只有**整列没下发**时 bot.blockAt() 才是 null，那才是真的"还没加载"。
+ *
+ * @returns {{known: boolean, name: (string|null), why: 'ok'|'no-column'|'out-of-world'}}
+ */
+export function blockKnownAt (b, pos) {
+  if (!pos) return { known: false, name: null, why: 'no-column' }
+  const y = Number(pos.y)
+  const { minY, maxY } = worldBoundsOf(b)
+  if (!Number.isFinite(y) || y < minY || y > maxY) return { known: false, name: null, why: 'out-of-world' }
+  let blk = null
+  try { blk = b?.blockAt?.(pos) ?? null } catch { blk = null }
+  if (!blk) return { known: false, name: null, why: 'no-column' }
+  return { known: true, name: blk.name, why: 'ok' }
 }

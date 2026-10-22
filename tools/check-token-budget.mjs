@@ -243,7 +243,8 @@ if (statusLean) {
     { armed: true, stats: { fired: 3 }, lastWakeKind: 'chat', pending: 0 })
   ok(typeof t === 'string', '默认视图返回字符串（不是对象）', typeof t)
   ok(t.length > 60 && t.length < 320, '默认视图长度 60–320 字符', `实际 ${t.length}`)
-  ok(t.includes('血 18.5/20') && t.includes('yaw -90.12'), '默认视图含血量与朝向（浮点已收成 2 位）')
+  /* 2026-10-23 审计：朝向统一改成度数（mc_observe 也是度数），浮点不再出现。 */
+  ok(t.includes('血 18.5/20') && /朝 yaw \d{1,3}° \/ pitch -?\d{1,3}°/.test(t), '默认视图含血量与朝向（朝向已改度数，且归一化到 0..360）', t)
   ok(t.includes('Bluezi') && t.includes('我: 来了'), '默认视图含玩家与最近聊天（自己说的标"我"）')
   ok(t.includes('已唤醒 3 次'), '默认视图带看门狗一句')
   ok(!t.includes('mentionPatterns') && !t.includes('observeWindowMs'), '默认视图不夹带看门狗开关明细')

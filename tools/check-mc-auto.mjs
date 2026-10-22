@@ -1408,10 +1408,12 @@ section('12. 事件 / 决策审计 / 三种模式（2026-10-18 用户方案 P0+P
 
   const h = setup({ timing: false, patch: { enabled: true, mode: 'ai-led' } })
   const b0 = h.auto.behaviorOf(h.cfg())
-  ok('ai-led：不环顾/不吃/不捡/不穿/不跟/不保命',
+  /* 2026-10-23 审计：ai-led 的 waterRecover 改成 false —— ai-led 承诺「连保命后退也不做」，
+   * 而 true 时反射层会自己规划出水路线并抢 jump 控制位（和 AI 的寻路抢 goal）。 */
+  ok('ai-led：不环顾/不吃/不捡/不穿/不跟/不保命（含水下自救也不自己走）',
     b0.mode === 'ai-led' && b0.lookAround === false && b0.autoEat === false && b0.pickup === false
     && b0.wearArmor === false && b0.follow === false && b0.avoidReact === false
-    && b0.creeperFlee === false && b0.waterRecover === true, JSON.stringify(b0))
+    && b0.creeperFlee === false && b0.waterRecover === false, JSON.stringify(b0))
 
   h.auto.setConfig(h.agent, { autoEat: true }, { persist: false })
   const b1 = h.auto.behaviorOf(h.cfg())
@@ -1491,7 +1493,7 @@ section('龙息云提醒（2026-10-19 用户：「现在不会躲龙息，检测
   ok('steer 的 summary 能认出 fireball', /summary: ball/.test(autoSrc))
   ok('每 tick 先查龙息（排在威胁清单之前）',
     autoSrc.indexOf('const breath = breathNear(b, BREATH_NEAR_R)') > 0
-    && autoSrc.indexOf('const breath = breathNear(b, BREATH_NEAR_R)') < autoSrc.indexOf('const foes = hostilesNear(b, RANGED_NEAR_RADIUS)'))
+    && autoSrc.indexOf('const breath = breathNear(b, BREATH_NEAR_R)') < autoSrc.indexOf('const foes = hostilesNear(b, RANGED_NEAR_RADIUS, { hurtRecently })'))
   ok('踩进云里（<=3 格）直接 return，不排别的险情', /if \(breath\.distance <= 3\) return/.test(autoSrc))
   ok('有专属节流常量 BREATH_WAKE_GAP_MS', /const BREATH_WAKE_GAP_MS = \d+/.test(autoSrc))
   ok('事件入队 kind=breath（决策审计里能看到）', /pushAutoEvent\(s, 'breath'/.test(autoSrc))

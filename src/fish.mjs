@@ -38,7 +38,11 @@ export async function fishOnce (b, { timeoutMs = 8000 } = {}) {
   const held = b.heldItem
   let rod = isRod(held) ? held : null
   if (!rod) {
-    const items = b.inventory?.items ?? []
+    /* 🔴 2026-10-23 实机（创造服点了 mc_fish 直接抛 `items.find is not a function`）：
+     *    `b.inventory.items` 是 **mineflayer 的方法**（`bot.inventory.items()`），
+     *    这里当数组用了 ⇒ 对函数调 `.find` 必然抛错，等于钓鱼功能整个不可用。 */
+    const raw = b.inventory?.items
+    const items = typeof raw === 'function' ? raw.call(b.inventory) : (Array.isArray(raw) ? raw : [])
     rod = items.find((i) => isRod(i)) ?? null
     if (!rod) return { ok: false, reason: 'no-rod', message: '手上和背包里都没有 fishing_rod —— 先 mc_craft {name:"fishing_rod"}' }
     await b.equip(rod, 'hand')

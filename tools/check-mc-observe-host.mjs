@@ -323,7 +323,9 @@ console.log('— ④ execute 输出（含真实渲染 + 附件 + 落盘）—')
   ok(out.percept.sensed.ray && out.percept.sensed.ray.error,
     '假 world 没有 raycast ⇒ 程序射线如实记成 { error }，不炸', JSON.stringify(out.percept.sensed.ray))
   ok(out.percept.uncertain.some((t) => /程序射线没跑出来/.test(t)), '不确定清单里点出"程序射线没跑出来"')
-  ok(out.percept.uncertain.some((t) => /客户端预测/.test(t)), '不确定清单里点名"客户端预测的方块世界"')
+  /* 2026-10-23 审计：措辞从「客户端预测」改成「服务端下发的镜像，更新会晚一拍」——
+   * mineflayer 根本不做预测，客户端只会**落后**，不会抢先。 */
+  ok(out.percept.uncertain.some((t) => /服务端下发的镜像/.test(t)), '不确定清单里点名「本地方块世界是服务端下发的镜像」')
   ok(out.percept.uncertain.some((t) => /重建/.test(t)), '不确定清单里说明图是按方块数据重建的')
 
   // 静态：别调裸 `bot.entities(...)`（那是映射对象）、射线要喂真 Vec3

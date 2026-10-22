@@ -149,6 +149,7 @@ export const COMBAT_OUTCOME_TEXT = {
   unreachable: '🚧 够不着',
   aborted: '🛑 被打断',
   timeout: '⏱ 这一轮时间到了',
+  vanished: '⚠️ 目标不见了（打掉过血，但没读到死亡 —— 可能被打死、也可能被阳光烧掉或走出区块）',
   unknown: '❓ 说不清结果',
 }
 
@@ -502,6 +503,10 @@ export function chooseStrategy (s, mem = {}) {
 export function combatOutcomeOf (r = {}) {
   if (r.killed === true) return 'killed'
   if (r.aborted === true) return 'aborted'
+  /* 🔴 2026-10-23 实机（用户："打掉了 14.6 血却报够不着"）：目标中途消失、
+   *    但这一轮确实打掉过血时，不能报 unreachable —— AI 读到"够不着"会继续追一个
+   *    已经不在的怪。单列一个 vanished，把"打了血但没看到死亡"如实说出来。 */
+  if (r.gone === true && r.sawDamage === true) return 'vanished'
   if (r.unreachable === true) return 'unreachable'
   /* 🔴 审计 F5：`timedOut` 必须排在 `sawDamage` 前面。攻击循环结束那一刻常同时带着
    *    「打中过」和「时间到了」；以前先判 damaged ⇒ 报"打到了"、被判成功，

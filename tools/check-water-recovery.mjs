@@ -357,7 +357,7 @@ section('⑧ 接线：移动层自动接管、反射层通知 AI、都不另起�
   ok(/walkTo: \(s, p, o = \{\}\) => walkTo\(/.test(mv) && /swimUp: \(s, o\) => swimUp\(/.test(mv),
     '🔴 执行器**就是这一层已有的 walkTo / swimUp**（不另起一套按键控制 / 移动代次 / 资源锁）')
   ok(/noWaterRecover: true/.test(mv), '🔴 防递归：恢复过程中再走路时不许再次触发恢复')
-  ok(/if \(swim\.stuck && ctx\.noWaterRecover !== true && ctx\.waterRecover !== false && self\.msLeft\(\) > 1_500\)/.test(mv),
+  ok(/if \(swim\.stuck && swim\.reason !== 'preempted' && ctx\.noWaterRecover !== true && ctx\.waterRecover !== false && self\.msLeft\(\) > 1_500\)/.test(mv),
     '🔴 游不动了 + 还有时间就走自救；`waterRecover:false` 能关掉（2026-10-19 用户：给 ai 开关、默认开）；'
     + '`noWaterRecover:true` 时不再递归（2026-10-20 审计：这个防递归开关以前**从来没被读过**）')
   ok(/budgetMs: Math\.min\(12_000, Math\.max\(0, self\.msLeft\(\) - 900\)\)/.test(mv),

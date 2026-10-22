@@ -293,7 +293,7 @@ async function shootInner (b, args = {}, ctx = {}) {
   const { held, equipped } = await holdWeapon(b, String(weapon))
 
   /* ② 箭：没有就别拉弓（服务端会白拉，白白吃掉这一轮的时间） */
-  const arrowsBefore = arrowsIn(b)
+  let arrowsBefore = arrowsIn(b)
   const creative = infiniteArrows(b)
   /* 无限附魔的弓：生存也不耗箭 ⇒ 箭数变化不能当证据（`noConsume` 管判据，`creative` 只管结果里那一行） */
   const noConsume = creative || infinityBow(b)
@@ -494,10 +494,14 @@ async function shootInner (b, args = {}, ctx = {}) {
     }
     await sleep(LOOK_SETTLE_MS)
     /* 放箭**之前**记下附近已有的箭（地上躺着的、别人射的）——放完新冒出来的那支才是我的 */
+    /* 2026-10-23 审计：连射时 `arrowsBefore` 只在循环外取一次 ⇒ 第二发报「用了 2 支」、第三发报 3……
+     * 每发之前重取**本发**基准 `shotBefore`（判"这一箭有没有真射出去"），
+     * 而 `arrowsBefore` 保持循环前那次（结果里 `arrows.before → after` 的**总量**要算得对）。 */
+    const shotBefore = noConsume ? arrowsBefore : arrowsIn(b)
     const arrowsSeenBefore = arrowEntityIdsNear(b)
     await t(b.deactivateItem(), 'use', '放箭')
-    const after = await arrowsAfterRelease(b, arrowsBefore, noConsume, ctx.pollMs)
-    const used = arrowsBefore - after
+    const after = await arrowsAfterRelease(b, shotBefore, noConsume, ctx.pollMs)
+    const used = shotBefore - after
     /* 🔴 箭数没变时的**旁证**：天上多了一支新箭 ⇒ 这一箭确实射出去了。
      *    无限弓的附魔形状认不出来时（见 `itemHasInfinity` 的说明），全靠这一条兜底，
      *    否则会出现"明明射中了、工具却说没射出去"的假失败，连射当场停掉。 */

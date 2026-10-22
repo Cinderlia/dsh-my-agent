@@ -23,7 +23,9 @@
  *    更刺眼的是 `RANGED_RE` 早就把 `bogged`/`evoker`/`illusioner`/`breeze` 算成"远程怪"了，
  *    也就是说**代码自己知道它们会远程打你，却不认为它们是敌人**。 */
 export const HOSTILE_RE = /zombie|skeleton|creeper|spider|witch|enderman|slime|pillager|vindicator|ravager|phantom|drowned|husk|stray|blaze|ghast|hoglin|piglin|wither|warden|silverfish|guardian|shulker|endermite|magma_cube|vex|zoglin|bogged|evoker|illusioner|breeze|giant|ender_dragon/i
-export const RANGED_RE = /skeleton|stray|bogged|pillager|vindicator|witch|blaze|ghast|guardian|shulker|llama|illusioner|evoker|breeze|wither|drowned/i
+/* 2026-10-23 审计：去掉 vindicator（近战斧）与 llama（中立）—— 它们混进远程会让
+ * AI 以为隔墙有射手，也会让 attack 的「远程就别追」判错。要与 mc_auto.mjs 的 RANGED 逐字一致。 */
+export const RANGED_RE = /skeleton|stray|bogged|pillager|witch|blaze|ghast|guardian|shulker|illusioner|evoker|breeze|wither|drowned/i
 
 /**
  * **中立**怪 —— 你不惹它，它不惹你（用户 2026-10-17 实机："怪物好像不显示中立"）。

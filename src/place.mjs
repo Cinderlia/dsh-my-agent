@@ -106,6 +106,11 @@ export async function placeWhileJumping (b, refBlock, face, { tries = 3 } = {}) 
 export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {}) {
   const b = self.requireBot()
   const pos = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z))
+  /* 2026-10-23 审计（挖掘层报告第 12 条）：传半格 y（63.5）以前静默 floor，AI 不知道方块其实落在 63。
+   * 传进来的不是整数就如实报一声（结果对象里 `snapped`）。 */
+  const snapped = Number(x) !== pos.x || Number(y) !== pos.y || Number(z) !== pos.z
+    ? { asked: { x: Number(x), y: Number(y), z: Number(z) }, used: { x: pos.x, y: pos.y, z: pos.z } }
+    : null
   const want = name ? String(name) : null
   /* 🔴 船 / 矿车 / 刷怪蛋 / 盔甲架 是**实体**，不是方块 —— 走 mineflayer 的 placeEntity 那套
    *    （见下面 `placeEntityItem`）。旧代码一律当方块放，服务端收到的是"对着水右键放方块"，
@@ -274,6 +279,7 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
     at: { x: pos.x, y: pos.y, z: pos.z },
     now,
     held: heldText(b),
+    ...(snapped ? { snapped } : {}),
     /* 这一块是"跳起来放到自己脚下"放成的 ⇒ 报出来，模型才知道自己刚垫高了一格。 */
     ...(isOwnCell ? { pillar: true } : {}),
     ...(ok ? {} : {
@@ -359,13 +365,17 @@ export async function placeEntityItem (self, { x, y, z, name = null } = {}, ctx 
   const KEY = /boat|raft|minecart|armor_stand|armorstand|end_crystal|ender_crystal/i
   const fresh = () => Object.values(b.entities ?? {}).filter((e) => e && e !== b.entity && !before.has(String(e.id)))
   let hit = null
+  let stranger = null
   const waitSpawn = async (ms) => {
     const t0 = Date.now()
     while (Date.now() - t0 < ms) {
       const cands = fresh().filter((e) => {
         try { return e.position.distanceTo(pos) <= 4 } catch { return false }
       })
-      hit = cands.find((e) => KEY.test(String(e.name ?? ''))) ?? cands[0] ?? null
+      /* 2026-10-23 审计：以前 `?? cands[0]` 把「4 格内任何一个新实体」（掉落物、路过的怪、别的玩家）
+       * 都当成我放出来的东西 ⇒ 报 placed:true，AI 之后上船永远上不去。现在只认名字像的。 */
+      const named = cands.find((e) => KEY.test(String(e.name ?? '')))
+      if (named) { hit = named; stranger = null } else if (!stranger && cands[0]) stranger = cands[0]
       if (hit) return hit
       await sleep(80)
     }
@@ -390,6 +400,7 @@ export async function placeEntityItem (self, { x, y, z, name = null } = {}, ctx 
     return {
       placed: false, name: want, at: { x: pos.x, y: pos.y, z: pos.z }, held: heldText(b),
       sent: via,
+      ...(stranger ? { sawInstead: String(stranger.name ?? '?') } : {}),
       hint: `${via} 都发了，但 1.5 秒内**没看到新实体** —— 常见原因：离得远（要 4.5 格内、眼睛看得见）、`
         + `目标格被占（船要放水里/水边，别对着自己脚下）、或者服务端把这次放置吞了。`
         + `先 mc_move 到水边换个点位再试，别对着同一点反复发。`,

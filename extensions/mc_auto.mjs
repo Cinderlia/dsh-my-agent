@@ -154,7 +154,9 @@ const RANGES = {
 
 /** 三档模式各自的行为默认值（用户 2026-10-18 拍板：默认 ai-led） */
 const MODE_DEFAULTS = {
-  'ai-led': { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: false, creeperFlee: false, waterRecover: true },
+  /* 2026-10-23 审计：ai-led 承诺「连保命后退也不做」，但 waterRecover:true 会自己规划出水路线
+   * （walkTo）并抢 jump 控制位 —— 与工具描述直接矛盾，还会和 AI 的寻路抢 goal。改 false。 */
+  'ai-led': { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: false, creeperFlee: false, waterRecover: false },
   balanced: { lookAround: false, autoEat: false, pickup: false, wearArmor: false, follow: false, avoidReact: true, creeperFlee: true, waterRecover: true },
   legacy: { lookAround: true, autoEat: true, pickup: true, wearArmor: true, follow: true, avoidReact: true, creeperFlee: true, waterRecover: true },
 }
@@ -294,7 +296,9 @@ const NOT_DROP = /boat|minecart|armor_stand|item_frame|painting|arrow|snowball|e
  * 它们隔着十几格就能打到你，所以威胁半径放宽（见 RANGED_NEAR_RADIUS）。
  * 🔴 这里**只用来判威胁半径**，不判"打不打得过" —— 反射层不还手了（见下）。
  */
-const RANGED = /skeleton|stray|bogged|pillager|vindicator|witch|blaze|ghast|guardian|shulker|llama|illusioner|evoker|breeze|wither|drowned/i
+/* 2026-10-23 审计：vindicator（卫道士）是纯近战，llama（羊驼）只会吐 1 格口水；
+ * 把它们算进远程怪会把威胁半径抬到 22 格 ⇒ 真正的远程被稀释，AI 白躲。 */
+const RANGED = /skeleton|stray|bogged|pillager|witch|blaze|ghast|guardian|shulker|illusioner|evoker|breeze|wither|drowned/i
 /** 远程怪的威胁半径：它们从 16~22 格就开始开火，只按 8 格扫根本来不及 */
 const RANGED_NEAR_RADIUS = 22
 /** 盔甲槽：mineflayer 玩家背包里 5=头 6=胸 7=腿 8=脚 */
@@ -384,7 +388,7 @@ const playersNear = (b, radius) => {
 }
 
 /** 附近的敌对实体（按距离排序） */
-const hostilesNear = (b, radius) => {
+const hostilesNear = (b, radius, opts = {}) => {
   const me = b?.entity?.position
   if (!me) return []
   const out = []
@@ -395,9 +399,14 @@ const hostilesNear = (b, radius) => {
      *    走过去时被当成"怪贴脸"，4 格内抢控制权、停任务、每步中断，可 `attack` 又不打它们。
      *    现在中立怪只有**真的在打我**（它的 target 是我）才算威胁。 */
     const stance = hostilityOf(nm, e.kind)
+    /* 🔴 2026-10-23 审计（战斗层报告 C[7]）：`e.target` 在 mineflayer 上**根本不存在**
+     *    （服务端不下发实体攻击目标），所以上面那行判据恒为 false —— 于是"末影人/猪灵正在打我"
+     *    永远不算威胁，掉血时反而落进"挨了打但看不到怪 → 隔墙远程怪"那一支，把 AI 引去隔着墙找箭。
+     *    现在补一条**能观测到**的判据：中立怪 + 我最近刚掉过血 + 它就在贴身距离 ⇒ 当威胁。 */
     const targetingMe = e.target === b.entity || (e.target != null && e.target.id != null && e.target.id === b.entity?.id)
-    if (stance !== 'hostile' && !(stance === 'neutral' && targetingMe)) continue
     const d = e.position.distanceTo(me)
+    const suspect = stance === 'neutral' && opts.hurtRecently === true && d <= 4
+    if (stance !== 'hostile' && !(stance === 'neutral' && (targetingMe || suspect))) continue
     if (d <= radius) out.push({ entity: e, distance: d, name: nm || String(e.type ?? '?') })
   }
   return out.sort((a, c) => a.distance - c.distance)
@@ -544,13 +553,23 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     return cfg
   }
 
+  /* 2026-10-23 审计（战斗层报告第 1 条，高）：以前这里把**整个 cfg**（所有默认值 + 运行时值）
+   * 都写进 auto.json，而 loadConfig 把文件里的每个键都当"用户显式写过" ⇒ 只要 `mc_auto set` 过一次，
+   * 文件里就躺着一整套 ai-led 的 false，之后切 legacy 也回不到自动吃/捡/穿甲，而且插件不报原因。
+   * 现在只落两类键：
+   *   ① `__explicit`（用户真的钉过的）—— 模式默认值不该盖掉的就是它们；
+   *   ② `mode` / `enabled` / `standing` / `follow` 这几个"状态位"，它们本来就该跨重启保留。
+   */
+  const PERSIST_ALWAYS = ['mode', 'enabled', 'standing', 'follow']
   const saveConfig = (dir, cfg) => {
     try {
       if (!dir) return false
       mkdirSync(dir, { recursive: true })
-      // `__explicit` 只是内存里的"哪些键是用户显式写的"，别写进文件
-      const { __explicit, ...rest } = cfg
-      writeFileSync(join(dir, 'auto.json'), JSON.stringify(rest, null, 2), 'utf8')
+      const ex = Array.isArray(cfg.__explicit) ? cfg.__explicit : []
+      const keys = new Set([...ex, ...PERSIST_ALWAYS].filter((k) => k in cfg && k !== '__explicit'))
+      const slim = {}
+      for (const k of keys) slim[k] = cfg[k]
+      writeFileSync(join(dir, 'auto.json'), JSON.stringify(slim, null, 2), 'utf8')
       return true
     } catch { return false }
   }
@@ -1122,7 +1141,8 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     if (!agent || typeof agent.steer !== 'function') return 'none'
     const { threat = null, foes = [], health = 20, ranged = false, hurt = false, blind = false, ball = null,
       drown = false, air = null, submerged = false, subSec = 0, gap = DANGER_WAKE_GAP_MS,
-      waterRecover = false, fell = null, fellFrom = null, suffocate = null, breath = null } = info ?? {}
+      waterRecover = false, fell = null, fellFrom = null, suffocate = null, breath = null,
+      block = null } = info ?? {}
     if (t - num(s.lastDangerWakeAt, 0) < gap) return 'throttled'
     /* 🔴 危险叫醒用**自己的**配额（2026-10-18 审计）：和空闲叫醒共用一份时，
      *    空闲空转能把 120 次烧光，真有怪时反而不叫。 */
@@ -1141,7 +1161,21 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const stopLine = stopped === null
       ? ''
       : `⏸ 我已经先把手里的活停下了（寻路 / 采集 / 控制位都松开了${stopped}）—— 现在你说了算。`
-    if (ball) {
+    /* 🔴 2026-10-23 审计（战斗层报告 C[4]）：踩到岩浆/火/仙人掌以前**只 pushAutoEvent**、
+     *    不叫醒 AI —— 要等空闲那一次叫醒，而空闲叫醒和它共用一份配额、120 秒就过期。
+     *    现在给它一条专属报法（仍然只叫醒，不替 AI 移动）。 */
+    if (block) {
+      L.push(`【自保：脚下是危险方块 ${block}｜血 ${Math.round(health)}/20】`)
+      L.push('')
+      L.push(`站/挨在 **${block}** 上面会持续掉血。反射层**不会替你走出去**（只叫醒，不移动）。`)
+      if (stopLine) L.push(stopLine)
+      L.push(`我：血 ${Math.round(health)}/20，手上 ${held}，在 ${me ? `(${Math.round(me.x)}, ${Math.round(me.y)}, ${Math.round(me.z)})` : '?'}`)
+      L.push('')
+      L.push('**下一步你来定**（选一个直接做，不用问我）：')
+      L.push(`· 挪开：\`mc_move\` 到旁边 3~5 格的普通地面；走不动就 \`mc_act {"mode":"place","name":"cobblestone","x":${Math.round(me?.x ?? 0)},"y":${Math.floor(me?.y ?? 64)},"z":${Math.round(me?.z ?? 0)}}\` 先垫脚`)
+      L.push('· 是火/岩浆又下不去：先 \`mc_build\` 拿石头铺一条 1 格宽的路走过去')
+      L.push('· 血少先吃；确认脚下是什么用 `mc_scan`/`mc_map {mode:"floor"}`')
+    } else if (ball) {
       /* 火球还在飞（`dragon_fireball`）：**落地才会变成上面那团云**，所以现在躲还来得及。 */
       const esc = ball.escape
       L.push(`【自保：龙息火球飞过来了｜血 ${Math.round(health)}/20】`)
@@ -1512,6 +1546,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         s.stats.escapes++
         s.stats.dangerAlerts = num(s.stats.dangerAlerts, 0) + 1
         logLine(`mc_auto：${bad} 就在脚下/身上（只叫醒 AI，不自己移动${busy ? '；我这一步还没跑完' : ''}）`)
+        let hNow = 20
+        try { hNow = num(sess.bot?.status?.()?.health, 20) } catch { hNow = 20 }
+        s.stats.alerts++
+        wakeForDanger(s, sess, cfg, t, { health: hNow, block: bad })
       }
     } else if (s.dangerSeen) s.dangerSeen = ''
     let health = 20
@@ -1563,8 +1601,10 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       pushAutoEvent(s, 'suffocate', `head:${Math.round(p.x)},${Math.round(p.y + 1)},${Math.round(p.z)}`,
         { name: suffocant, health: Math.round(health) })
     }
-    /* 节流窗口内也别往下走：下面"挨了打但看不到怪"会把窒息误判成远程怪。 */
-    if (suffocant && t - num(s.lastSuffocateAt, 0) <= SUFFOCATE_GAP_MS) return
+    /* 节流窗口内也别往下走：下面「挨了打但看不到怪」会把窒息误判成远程怪。
+     * 2026-10-23 审计：原来是裸 `return` —— 被沙埋的这 8 秒里，苦力怕贴脸/骷髅在射/正在掉血
+     * 全被一起跳过，恰好是最该说话的时候。改成只抑制那一支，威胁判定照跑。 */
+    const suffocateThrottled = Boolean(suffocant) && t - num(s.lastSuffocateAt, 0) <= SUFFOCATE_GAP_MS
     if (suffocant && t - num(s.lastSuffocateAt, 0) > SUFFOCATE_GAP_MS) {
       const r = wakeForDanger(s, sess, cfg, t, {
         health,
@@ -1599,7 +1639,8 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       // 濒死（氧气 ≤ 4 / 头在水下且已经在掉血或超过 12 秒）时**只按住 jump 抬一下**：
       // 和"脚下是岩浆/火"那条同类（站里面会死），不横向移动、不抢 AI 的决策；出水路线仍由 AI 定。
       const desperate = (air != null && air <= 4) || (submerged && (hurtRecently || subSec >= 12))
-      if (desperate && t - num(s.drownJumpAt, 0) > 1_500) {
+      /* 按 jump 抬一下也算「替 AI 移动」⇒ 挂在 waterRecover 开关下（ai-led 默认关）。 */
+      if (desperate && beh.waterRecover && t - num(s.drownJumpAt, 0) > 1_500) {
         s.drownJumpAt = t
         holdCtl(sess, 'jump', 600, () => { try { b.setControlState('jump', false) } catch { /* 忽略 */ } })
       }
@@ -1676,7 +1717,12 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       if (breath.distance <= 3) return      // 脚下就是云：别再排别的险情
     }
 
-    const foes = hostilesNear(b, RANGED_NEAR_RADIUS).filter((f) => {
+    /* 🔴 2026-10-23 审计（战斗层报告 C[3]）：`avoid` 是个**总闸** —— 关掉它连"踩岩浆/溺水/窒息"
+     *    的提醒一起没了，而 `avoidReact` 在 `MODE_DEFAULTS` 里躺着、没有任何代码读它（死键）。
+     *    现在给它活的意义：`avoidReact:false` 只关**打怪/挨打**这一路的提醒，
+     *    危险方块、摔伤、溺水、窒息照旧叫醒。默认 undefined ⇒ 与以前完全一致。 */
+    if (cfg.avoidReact === false) return
+    const foes = hostilesNear(b, RANGED_NEAR_RADIUS, { hurtRecently }).filter((f) => {
       if (f.distance <= 8) return true
       if (!RANGED.test(f.name)) return false
       return !losBlocked(b, eyeOf(f.entity.position), eyeOf(e.position))
@@ -1684,7 +1730,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const threat = foes[0] ?? null
 
     // 挨了打却看不到怪（隔墙/超远射）：不自己动，把"上次看到它在哪"报给 AI 让它定位
-    if (!threat) {
+    if (!threat && !suffocateThrottled) {
       if (!hurtRecently) return
       /* P0-B：**先判摔伤，再判远程怪** —— 两者在插件里长得一模一样（血掉了 + 附近没怪），
        * 只有垂直位移能分开。判反了的代价是让 AI 去找一个不存在的敌人（2026-10-17 实机）。 */
@@ -1982,8 +2028,18 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
     const evs = pendingEvents(s, t)
     if (!evs.length) return false
     if (t - num(s.lastEventWakeAt, 0) < Math.max(MIN_IDLE_SEC, cfg.minIdleGapSec) * 1000) return false
-    s.wakeTimes = s.wakeTimes.filter((x) => t - x < 3_600_000)
-    if (s.wakeTimes.length >= cfg.idleWakeMaxPerHour) { s.stats.denied++; return false }
+    /* 2026-10-23 审计：事件叫醒原来一律吃「空闲」配额（120/h），空闲空转能把它烧光，
+     * 之后真危险（脚下岩浆、苦力怕、火球）被静默拒绝，只 +denied。按事件的最高优先级选额度。 */
+    const DANGER_KINDS = new Set(['danger', 'damage', 'drowning', 'fireball', 'creeper', 'suffocate', 'threat', 'fall'])
+    const dangerish = evs.some((e) => DANGER_KINDS.has(String(e.kind ?? '')))
+    if (dangerish) {
+      s.dangerWakeTimes = (s.dangerWakeTimes ?? []).filter((x) => t - x < 3_600_000)
+      if (s.dangerWakeTimes.length >= cfg.dangerWakeMaxPerHour) { s.stats.denied++; return false }
+      s.dangerWakeTimes.push(t)
+    } else {
+      s.wakeTimes = s.wakeTimes.filter((x) => t - x < 3_600_000)
+      if (s.wakeTimes.length >= cfg.idleWakeMaxPerHour) { s.stats.denied++; return false }
+    }
     const lines = eventLines(evs, t)
     if (!lines.length) return false
     const text = `【自主行动轮｜检测到 ${evs.length} 件事】\n`
@@ -1993,7 +2049,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       + `🎯 长期目标：${cfg.standing}\n`
     try {
       s.lastEventWakeAt = t
-      s.wakeTimes.push(t)
+      if (!dangerish) s.wakeTimes.push(t)
       beginDecision(s, evs, t)
       agent.steer(userMessage({
         content: [{ type: 'text', text }],

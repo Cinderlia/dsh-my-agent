@@ -321,6 +321,9 @@ export function inventoryView (b) {
   for (const i of all) totals.set(i.name, (totals.get(i.name) ?? 0) + i.count)
   const items = [...totals].map(([name, count]) => ({ name, count }))
   const held = b.heldItem ? `${b.heldItem.name}x${b.heldItem.count}` : null
+  /* 🔴 2026-10-23 审计复查：报告 D[9] 说这两句口径重复、可以删一处 —— **不能删**。
+   *    `check-core-inventory.mjs` 是照着"必须明说别再加一遍"写的（2026-10-08 实机：AI 把
+   *    手上那叠和背包合计加了两遍，以为有 4 块木头、其实只有 2 块）。留着。 */
   const lines = [held ? `手上：${held}（这一叠已经算在下面的合计里，别再加一遍）` : '手上：空']
   lines.push(items.length ? `背包（同名已合计、**含手上那叠**）：${items.map((i) => `${i.name}x${i.count}`).join('、')}` : '背包：空')
   /* 🔴 2026-10-08 第五份审计旁注：`all.length` 是**叠数**（`items()` 一叠一条、不含 0-8 那九格），

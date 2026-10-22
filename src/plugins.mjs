@@ -22,6 +22,7 @@ import { scaffoldingItemIds } from './place-items.mjs'
 import { patchDigTime } from './dig-speed.mjs'
 import { applyProfile, classifyTerrainCached, profileFor } from './terrain.mjs'
 import { avoidBlockIds } from './bridge.mjs'
+import { PLANT_PASSABLE } from './block-names.mjs'
 /* 门的判断/去重/冷却只有一份（`src/movement.mjs`）：上半格可能没有 `open` 属性，
  * 必须统一下半块判断；两处各写一份就会各按一次（踩坑 #175/#176）。 */
 import { DOOR_PRESS_COOL_MS, doorBaseKey, doorFaceOf, doorOpenStateOf } from './movement.mjs'
@@ -404,7 +405,12 @@ export async function setupPathfinder (self, { spec = null } = {}) {
     // 🔴 4000 太短了 —— 2026-10-06 实机挖树时频繁 "Took to long to decide path to goal!"，
     //    collectBlock 因此整批失败（改成逐个喂之后至少不会再一坏全坏）。8000 让"目标在高处、
     //    要垫脚才够得着"这类难想的目标有机会想出来，同时仍能及时放弃。
-    b.pathfinder.thinkTimeout = Number(self.cfg.pfThinkTimeoutMs ?? 8000)
+    /* 🔴 2026-10-22 用户「还是能卡住」：8000ms 是**纯算路**时间，而 A* 在这 8 秒里
+     *   一个控制位都不按（vendor index.js:475 直接 return）—— 一次 mc_move 总共才 10~11 秒，
+     *   于是"叫了 move、人就站着不动 10 秒"。改 3500ms：超时返回的是
+     *   `reconstructPath(bestNode)`（**半截路也照样能走**），先走起来比想满更划算。
+     *   真需要长考的目标由脱困阶梯重试，而不是一次性把整轮预算烧在算路上。 */
+    b.pathfinder.thinkTimeout = Number(self.cfg.pfThinkTimeoutMs ?? 3500)
     b.pathfinder.tickTimeout = 40
     b.pathfinder.searchRadius = Number(self.cfg.pfSearchRadius ?? 192)
     self._pf = mod
@@ -614,6 +620,37 @@ export function patchHarmfulFloorMoves (mv, { penalty = 60 } = {}) {
   return mv
 }
 
+/**
+ * 把"能直接走进去"的作物/贴地植物补进 `mv.carpets`。
+ *
+ * 🔴 2026-10-22 用户实机：「家里非实体方块走不了」—— 家里那片麦田 A* 死活不肯走进去
+ *    （表现：`blockedAhead: farmland / headroom 0`、`NoPath`、绕着田转圈）。
+ *    根因在 vendor `lib/movements.js:233`：
+ *    `b.safe = (b.boundingBox === 'empty' || b.climbable || this.carpets.has(b.type)) && !blocksToAvoid.has(...)`
+ *    而 `carpets` 只在 `lib/movements.js:89` 按 `block.shapes[0][4] < 0.1` 自动收集：
+ *    地毯（0.0625）进得去，**小麦（≈0.3125）进不去**；prismarine 给作物的 `boundingBox`
+ *    也不是 `'empty'` ⇒ `safe === false` ⇒ A* 把整块田当墙。
+ *    这里按名字把 `PLANT_PASSABLE`（`src/block-names.mjs`）里的方块塞进 `carpets`，
+ *    人就能像正常玩家一样从麦田里走过去。
+ *    ⚠️ 只动 `carpets`（"这一格能不能站"），不动 `blocksToAvoid`；甜浆果丛不在名单里（踩了掉血）。
+ */
+export function patchPlantPassable (mv, b) {
+  if (!mv || !(mv.carpets instanceof Set)) return 0
+  const B = b?.registry?.blocksArray
+  if (!Array.isArray(B)) return 0
+  let added = 0
+  for (const blk of B) {
+    const nm = String(blk?.name ?? '')
+    if (!nm || !Number.isFinite(blk.id)) continue
+    if (!PLANT_PASSABLE.test(nm)) continue
+    if (mv.carpets.has(blk.id)) continue
+    mv.carpets.add(blk.id)
+    added++
+  }
+  if (added) mv.__dshPlantPassable = added
+  return added
+}
+
 export function movements (self, { terrain = null } = {}) {
   const b = self.bot
   const { Movements } = self._pf ?? {}
@@ -655,6 +692,23 @@ export function movements (self, { terrain = null } = {}) {
    * （`movements.js:233` 的 `b.safe`），上游只放了 fire/cobweb/web/lava ——
    * 把仙人掌 / 细雪 / 甜浆果丛 / 岩浆块 / 营火补上，A* 会主动绕开。 */
   for (const id of avoidBlockIds(b)) mv.blocksToAvoid.add(id)
+  /* 2026-10-23 用户实机（「收小麦为什么挖土」「你一直在挖耕地，实际是拆了」）：
+   *   下面是**田被毁掉的两条路**，都从"能不能站"这里堵：
+   *     ① 站在耕地上时 pathfinder 会跳，跳起再落下（fallDistance > 0.5）就把耕地踩成泥土
+   *        —— 原版 FarmBlock.onLandedUpon 的规则，玩家/生物都一样；
+   *     ② canDig 默认真，绕不过去就直接挖穿，挖的正是耕地/泥土。
+   *   耕地和土径**一律不进 A* 的落脚点** ⇒ 人只会在田埂/田外站着伸手收（收获判定是
+   *   眼睛→方块中心 ≤ 4.5，站边上照样收得到），既踩不到也挖不到。
+   *   挖穿那条另外还有 mc_dig 的 noDig 默认值兜（2026-10-23 同批改的）。 */
+  if (self.cfg?.protectFarmland !== false) {
+    try {
+      const reg = b.registry?.blocksByName
+      for (const nm of ['farmland', 'dirt_path']) {
+        const id = reg?.[nm]?.id
+        if (typeof id === 'number') mv.blocksToAvoid.add(id)
+      }
+    } catch { /* registry 形状不对就不加，不影响别的 */ }
+  }
   /* 🔴 2026-10-19 用户：「还有把末影传送门视为危险方块」——
    *    `blocksToAvoid` 是"这格**能不能站**"（`movements.js:233`），里面一旦混进传送门，
    *    A* 就永不生成"站进门里"的节点，人只会在门外打转（末地/下界都进不去）。
@@ -683,6 +737,9 @@ export function movements (self, { terrain = null } = {}) {
    * 为什么光有 `blocksToAvoid` 不够，见 `patchHarmfulFloorMoves` 的注释（那名单管"能不能站"，
    * 而岩浆块是实心的、人站在它上面，脚那格永远是空气 ⇒ 那条路从来就没生效过）。 */
   patchHarmfulFloorMoves(mv, { penalty: Number(self.cfg.walkHarmfulFloorPenalty ?? 60) })
+  /* 作物/花草：「这一格能站进去」（`carpets`）—— 见 `patchPlantPassable` 的注释
+   * （用户 2026-10-22：「家里非实体方块走不了」，整片麦田被 A* 当成墙）。 */
+  patchPlantPassable(mv, b)
   return mv
 }
 

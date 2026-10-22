@@ -260,8 +260,8 @@ ok(/const noDig = mode === 'walk-nodig' \? true : args\.noDig !== false/.test(mc
   '默认不挖：只有显式 noDig:false 才允许挖（mode:"walk-nodig" 恒为 true）')
 const seqSrc = readFileSync(join(HERE, '..', 'src', 'sequence.mjs'), 'utf8')
 ok(/noDig: s\.noDig !== false/.test(seqSrc), 'mc_sequence 的 move 步骤默认也不挖（和 mc_move 一致）')
-ok(countOf(mcIndexSrc, 'noDig, intent: args.intent') === 2,
-  'noDig 传进了两条 walkTo（walk 与「swim 给坐标」那条）', String(countOf(mcIndexSrc, 'noDig, intent: args.intent')))
+ok(countOf(mcIndexSrc, 'noDig, intent: intentArgOf(args.intent)') === 2,
+  'noDig 传进了两条 walkTo（walk 与「swim 给坐标」那条）', String(countOf(mcIndexSrc, 'noDig, intent: intentArgOf(args.intent)')))
 ok(countOf(mvSrc, 'noDig = false } = {}, ctx = {})') === 3,
   'walkTo / walkToOnce / walkPathfinder 三个函数都收 noDig', String(countOf(mvSrc, 'noDig = false } = {}, ctx = {})')))
 ok(countOf(mvSrc, 'if (noDig) mv') === 3,

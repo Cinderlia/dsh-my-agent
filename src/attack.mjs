@@ -54,7 +54,8 @@
 import { sleep } from './async-util.mjs'
 import { callBudget } from './budget.mjs'
 import { HOSTILE_RE, RANGED_RE, JUNK_RE, NAME_ALIAS, entityNameOf, nameFieldsOf, hostilityOf } from './entity-names.mjs'
-import { dropHint, entityHealth } from './world-observer.mjs'
+import { dropHint, dropListOf, entityHealth } from './world-observer.mjs'
+import { swingCooldownMsOf } from './combat-timing.mjs'
 import { durabilityOf, EQUIP_SLOTS } from './inventory.mjs'
 import {
   assessCombat, chooseStrategy, combatOutcomeOf, combatOutcomeText, combatPlanText,
@@ -405,6 +406,10 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     /* 打死了 ⇒ 掉落物就掉在原地。用户 2026-10-08 原话："打完动物以后老是忘记走过去拾取" ——
      * 只**点一句**，不替它走过去（先捡哪个、走多远是决策，而且这一轮的预算基本已经花完了）。 */
     const pickup = killed ? dropHint(b) : null
+    /* 🔴 2026-10-22（下界连丢两根烈焰棒）：只给一句"地上还有 N 个"不够 ——
+     *   **东西在哪**才是 AI 决策的依据（值不值得下那个崖 / 隔了几格）。
+     *   这里只报事实，不替 AI 走过去。 */
+    const drops = killed ? dropListOf(b, { radius: 10, limit: 4 }) : []
     /* 已经给出更具体的原因（血掉太猛 / 追不上）就别用"没打死"把它盖掉 */
     if (!gone && !pvpErr && !hardHurt && !chaseGiveUp) {
       note = inRange
@@ -417,6 +422,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
       ...(hpBefore != null && hpAfter != null && hpBefore !== hpAfter ? { targetHealth: `${hpBefore} → ${hpAfter}` } : {}),
       ...(note ? { note } : {}),
       ...(pickup ? { pickup } : {}),
+      ...(drops.length ? { drops } : {}),
       ...(pvpErr ? { error: pvpErr } : {}),
       ...(shields ? { shieldBlocks: shields } : {}),
       /* 内部字段（下划线开头，不进最终返回值）：给策略层判断用 */
@@ -442,13 +448,17 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
       if (lastHp2 != null && hp < lastHp2) sawDamage2 = true
       lastHp2 = hp
     }
+    /* 挥砍节奏按**手里那把**算（剑 700ms / 斧 1250ms / 镐 850ms / 空手 250ms，含 1 tick 余量，见 src/combat-timing.mjs）。
+     * 旧版写死 620ms：拿斧或铲时每次都在冷却没满时挥 —— 那一刀是**打折伤害**。 */
+    let swing = swingCooldownMsOf(b)
     while (Date.now() - t0 < bd) {
       if (ctx.abortSignal?.aborted) break
       if (!b.entities?.[target.id] || target.isValid === false) break
       if (distOf(target) > 4.5) break
       await ctx.t(Promise.resolve(b.attack(target)), 'attack', `攻击 ${label}`)
       swings++
-      await sleep(620)
+      swing = swingCooldownMsOf(b)
+      await sleep(swing.ms)
       sample()
       if (Number.isFinite(hpStart) && Number.isFinite(Number(b.health)) && hpStart - Number(b.health) >= 4) {
         hardHurt = true
@@ -465,6 +475,10 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     /* 🔴 同 pvp 分支：`gone` ≠ `killed`（怪可能只是走远/区块卸载）。 */
     const killed = gone && sawDamage2
     const pickup = killed ? dropHint(b) : null
+    /* 🔴 2026-10-22（下界连丢两根烈焰棒）：只给一句"地上还有 N 个"不够 ——
+     *   **东西在哪**才是 AI 决策的依据（值不值得下那个崖 / 隔了几格）。
+     *   这里只报事实，不替 AI 走过去。 */
+    const drops = killed ? dropListOf(b, { radius: 10, limit: 4 }) : []
     const inRange = distOf(target) <= 4.5
     eatBack(ae)
     /* 🔴 2026-10-20 审计（真 bug）：下面原来两次 spread `note`，后一个会把前一个**整个盖掉**
@@ -474,8 +488,10 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     if (hardHurt) notes.push(`这一轮挨了 ${(hpStart - Number(b.health)).toFixed(0)} 点伤害 —— 血掉太快，提前收手`)
     return {
       attacked: label, distance: d, swings, killed, gone, health: b.health,
+      ...(swing ? { swingMs: swing.ms, swingWeapon: swing.weapon } : {}),
       ...(notes.length ? { note: notes.join('；') } : {}),
       ...(pickup ? { pickup } : {}),
+      ...(drops.length ? { drops } : {}),
       _sawDamage: sawDamage2, _inRange: inRange, _gone: gone, _killed: killed, _hardHurt: hardHurt,
     }
   }
@@ -643,8 +659,12 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     lastStep = step
     lastSnap = snap
     if (!equipNote && snap.weapon?.name && step.action !== 'equip') {
+      /* 2026-10-23 审计：mem.equips 换武器失败时会被写成哨兵 99，直接读出来就变成
+       * 「这一场已经换过 99 次」（排查时误以为策略在疯狂横跳）。这里只报真正的原因。 */
       equipNote = mem.equips >= 2
-        ? `背包里有更好的 ${snap.weapon.name}，但这一场已经换过 ${mem.equips} 次，不再换`
+        ? (equipFail
+          ? `背包里有更好的 ${snap.weapon.name}，但这一场换不上（${equipFail}），不再换`
+          : `背包里有更好的 ${snap.weapon.name}，但这一场已经换过 2 次（上限 2），不再换`)
         : `背包里有更好的 ${snap.weapon.name}，换装冷却中（${EQUIP_COOLDOWN_MS}ms）`
     }
     actions.push(step.action)

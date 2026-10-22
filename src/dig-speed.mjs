@@ -214,7 +214,12 @@ export function digMsFor (b, blk, itemType = null) {
      *    `mc_dig oak_log` —— 真 digTime 是 3 秒 ×5 = **15 秒**，这里按站着估成 3 秒 ⇒ 放行 ⇒
      *    `bot.dig()` 挂满 11 秒预算（连 `finishDigging` 都没到点，方块还在），只回一句"超时"。
      *    正解是落地再挖（见 `#waitGrounded`）。 */
-    const notOnGround = fallingNow(b)
+    /* 2026-10-23 审计（挖掘层报告第 3 条）：这里原来用 `fallingNow(b)`（= 离地**且**竖直速度明显为负），
+     * 而服务端判的是 `if (!this.onGround()) f /= 5.0F` —— 刚起跳、下台阶、被水冲的那几拍，
+     * 我们按"站着"估，估出来的时间最多**短 5 倍** ⇒ 到点 STOP ⇒ 方块"复原"。
+     * 现在：只要 `onGround !== true` 就按慢 5 倍估（宁可多等，不要半路停止）。
+     * 旧注释里担心的"贴着斜坡瞬间 onGround=false ⇒ 白拒一次"，代价只是偶尔多等一会儿，比挖一半强。 */
+    const notOnGround = b?.entity?.onGround !== true
     /* 🔴 2026-10-08 第五份审计报告 ④：以前**附魔传空数组** —— 上游 `bot.digTime`（digging.js:228-256）
      *    会把**手持物品的附魔**和**头盔的附魔**（水下速掘 Aqua Affinity）都算进去。
      *    漏掉附魔 ⇒ 拿效率镐时我们估的 ms 偏大 ⇒ `breakBlock`/`dig` 会**白拒**一次本来挖得完的挖掘

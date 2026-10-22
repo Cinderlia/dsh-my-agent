@@ -18,6 +18,7 @@
  */
 
 import { Vec3 } from 'vec3'
+import { worldBoundsOf } from './world-observer.mjs'
 import { isAir, isLiquid, isPassable, isSolidBlock, glyphOf, colorOf, FLOOR_LABEL, FLOOR_GLYPH } from './block-names.mjs'
 import { rgbaOfNames } from './worker-tasks.mjs'
 import { runInWorker } from './worker-pool.mjs'
@@ -71,7 +72,13 @@ export function floorCell (b, x, layerY, z, { depth = 4 } = {}) {
     kind: 'unknown', supported: false, hazard: null, loaded: false,
   }
   const blk = b.blockAt(new Vec3(x, layerY, z))
-  if (!blk) return cell                        // ① 未加载：如实说"不知道"
+  if (!blk) {                                  // ① 未加载：如实说"不知道"
+    /* 2026-10-23：y 在世界上下界之外同样读成 null —— 那是"根本没有这一层"，
+       不是"再等等就加载"，单独标出来。 */
+    const bd = worldBoundsOf(b)
+    if (!(layerY >= bd.minY && layerY <= bd.maxY)) cell.outOfWorld = true
+    return cell
+  }
   cell.floor = blk.name
   cell.loaded = true
   const nm = blk.name
@@ -378,15 +385,34 @@ export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24 } = {}) 
   }
 }
 
+/** 行内游程压缩：同一字符连续 ≥4 个写成 `X*n`（`*` 不是任何 glyph，所以不会歧义）。
+ *  2026-10-23 审计：一次 mc_map 的 84% 字符量都在这张图上，实测 1055 → 613。 */
+export function rleGlyphs (line) {
+  let out = ''
+  let i = 0
+  while (i < line.length) {
+    const c = line[i]
+    let n = 1
+    while (i + n < line.length && line[i + n] === c) n++
+    out += n >= 4 ? c + '*' + n : c.repeat(n)
+    i += n
+  }
+  return out
+}
+
 /** 字符地形图（无视觉也能读） */
 export function glyphMapText (names, step = 2, selfIndex = null) {
   const out = []
   for (let y = 0; y < names.length; y += step) {
     let line = ''
     for (let x = 0; x < names[y].length; x += step) {
-      line += (selfIndex && y === selfIndex.y && x === selfIndex.x) ? '@' : glyphOf(names[y][x])
+      /* 2026-10-23 审计：`x`/`y` 是**按 step 递增**的原始下标，而 selfIndex 用的是 radius；
+       * 以前要求严格相等 ⇒ radius 不是 step 整数倍时永远画不出 `@`（字符图变无锚点地图）。
+       * 改成「落在自己那格半径 step 内」。 */
+      const isSelf = selfIndex && Math.abs(y - selfIndex.y) < step && Math.abs(x - selfIndex.x) < step
+      line += isSelf ? '@' : glyphOf(names[y][x])
     }
-    out.push(line)
+    out.push(rleGlyphs(line))
   }
   return out.join('\n')
 }

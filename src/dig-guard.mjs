@@ -16,6 +16,7 @@
  */
 import { sleep, abortError, waitUntil } from './async-util.mjs'
 import { heldText } from './inventory.mjs'
+import { inWaterNow, fallingNow } from './world-observer.mjs'
 
 /** mineflayer-collectblock 现在还有任务在跑吗（`targets` 是它自己的 Targets 实例） */
 export function collectBusy (b) {
@@ -117,6 +118,12 @@ export async function waitGrounded (b, { maxMs = 1_200, signal = null } = {}) {
   /* 只有**明确读到 `onGround === false`** 才等：假件（套件里的测试机器人）没有物理字段，
    * 不能因为读不到就把它拦下来。 */
   if (!ent || ent.onGround !== false) return true
+  /* 2026-10-22 实机（用户：卡在水面）：在水里 onGround 永远是 false，这里一等就超时返回 false，
+     于是 mc_dig / mc_act break / mc_sequence break 全被判"还在空中就挖不了"，人在水里丢掉所有退路。
+     水不算空中：泡在水里掉不下去，也没有空中挖慢 5 倍的惩罚动机。 */
+  if (inWaterNow(b)) return true
+  /* 判据跟 dig-speed.mjs 估时用的对齐：真在下落（fallingNow）才算空中。 */
+  if (!fallingNow(b)) return true
   const cap = Math.max(0, Math.min(Number.isFinite(Number(maxMs)) ? Number(maxMs) : 1_200, 2_000))
   /* 2026-10-15 异步方案 ②：手写轮询收口到 `waitUntil`（查中止 / 算 deadline / 别睡穿预算 只有一份实现） */
   const r = await waitUntil(() => ent.onGround !== false, { ms: cap, pollMs: 80, signal, label: '落地' })

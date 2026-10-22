@@ -20,13 +20,45 @@ import { isAir } from './block-names.mjs'
 import { heldText, countOf } from './inventory.mjs'
 import { callSecText } from './budget.mjs'
 import { dangerNow, dangerText, dangerNotice, healthOf, noticeKey } from './danger.mjs'
+import { heldSnapshotOf, restoreHeldOf } from './bridge.mjs'
 
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 /**
  * 批量放置：从 (x1,y1,z1) 到 (x2,y2,z2) 的实心长方体。
  * 逐个调用 placeBlock（会自己走近/垫脚），count 上限保护。
  */
-export async function build (self, { x1, y1, z1, x2, y2, z2, name = null, max = 64 } = {}) {
+/* ===== 收工把手换回来（用户 2026-10-22：「搭路自动切回…不生效」） =====
+ * 和 walkTo 同理：放方块要把方块 equip 到手上（src/place.mjs:211/228），
+ * 放完不换回来 => mc_build 收工手里还攥着一摞圆石。
+ * 这里在**所有返回路径**上统一还原（照 bridgeAcross 的写法，收尾只写一处）。
+ */
+export async function build (self, opts = {}) {
+  const b = self.requireBot()
+  const keep = heldSnapshotOf(b)
+  let out = null
+  try {
+    out = await buildInner(self, opts)
+    return out
+  } finally {
+    if (keep && out) {
+      let r = { restored: false, now: b?.heldItem?.name ?? null }
+      try { r = await restoreHeldOf(b, keep) } catch { /* 换不回来是小事 */ }
+      /* 🔴 2026-10-23 实机：以前只在 `restored === true` 时改 `out.held`，而
+       *    `restoreHeldOf` 在"手本来就是那件"时回 `restored:false`（无需还原）——
+       *    于是报告里留着我换方块时的旧值，看着像没换回来。现在一律按**现在手上真实的**回报。 */
+      const nowName = b?.heldItem?.name ?? null
+      const wantName = keep.name ?? null
+      out.held = nowName ? (nowName + 'x' + (b?.heldItem?.count ?? 1)) : '空手'
+      if (nowName === wantName) {
+        out.heldRestored = wantName ?? '空手'
+      } else {
+        out.heldRestoreWhy = r?.why ?? `想换回 ${wantName ?? '空手'} 没成功（现在是 ${nowName ?? '空手'}）`
+      }
+    }
+  }
+}
+
+async function buildInner (self, { x1, y1, z1, x2, y2, z2, name = null, max = 64 } = {}) {
   const pts = []
   const [ax, bx] = [Math.min(x1, x2), Math.max(x1, x2)]
   const [ay, by] = [Math.min(y1, y2), Math.max(y1, y2)]

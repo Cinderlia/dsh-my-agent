@@ -97,12 +97,12 @@ const watchOpts = (clock) => ({ arrive: 1.6, ty: 64, now: clock.now, setTimer: c
 /* ═══════════════ ① 阶梯：纯函数 ═══════════════ */
 section('① 脱困阶梯的顺序与命名（纯函数）')
 {
-  ok(Array.isArray(MOVE_ESCAPES) && MOVE_ESCAPES.length === 3, '阶梯就是三级', JSON.stringify(MOVE_ESCAPES))
+  ok(Array.isArray(MOVE_ESCAPES) && MOVE_ESCAPES.length === 4 && MOVE_ESCAPES[3] === 'breakAhead', '阶梯四级，最后一级是真挖开挡路那格', JSON.stringify(MOVE_ESCAPES))
   ok(MOVE_ESCAPES[0] === 'repath' && MOVE_ESCAPES[1] === 'jump' && MOVE_ESCAPES[2] === 'backoff',
     '🔴 顺序 = 用户要求的「重算路径 → 跳跃脱困 → 后退再寻路」', MOVE_ESCAPES.join(' → '))
   ok(escapeStepOf(0) === 'repath' && escapeStepOf(1) === 'jump' && escapeStepOf(2) === 'backoff',
     'escapeStepOf(n) 按序给动作')
-  ok(escapeStepOf(3) === null && escapeStepOf(99) === null, '🔴 走完阶梯返回 null（= 该认输了，不无限重试）')
+  ok(escapeStepOf(4) === null && escapeStepOf(99) === null, '🔴 走完阶梯返回 null（= 该认输了，不无限重试）')
   ok(escapeTextOf('repath') === '重算路径' && escapeTextOf('jump') === '跳跃脱困' && escapeTextOf('backoff') === '后退再寻路',
     'escapeTextOf 的中文名（日志与返回值文案用）')
   ok(escapeTextOf('随便什么') === '放弃', '不认识的级别 → 放弃')
@@ -528,7 +528,11 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   // ── P1：到达判定分两轴 ──
   ok(/const vertBad = vert < -vertTol \|\| vert > vertTol/.test(src), '🔴 垂直窗口按意图给（near ±1.5 / stand ±0.6）')
   ok(/if \(!onSpot && \(mine === false \|\| left > arriveUsed \+ 1\.0 \|\| vertBad\)\)/.test(src), '🔴 高度不对也算"没到"（水平到了、人却在目标上下）')
-  ok(/const onSpot = left <= 0\.5 && !vertBad/.test(src), '站在目标点上（≤0.5 格）直接算到（GoalNear 半径内的合理圈）')
+  /* 2026-10-23 审计 A[10]：`sp` 是方块**角**坐标，站在那一格正中间水平就已 0.707 ⇒ `left <= 0.5` 是死条件。
+   * 现在 onSpot 按**格心**单独量（`cHoriz`），`left`/`horiz` 口径不动。 */
+  ok(/const cHoriz = Math\.hypot\(end\.x - \(Number\(sp\.x\) \+ 0\.5\), end\.z - \(Number\(sp\.z\) \+ 0\.5\)\)/.test(src)
+    && /const onSpot = cHoriz <= 0\.75 && !vertBad/.test(src),
+  '站在目标点上（按格心 ≤0.75 格）直接算到（GoalNear 半径内的合理圈）')
   ok(src.indexOf('const mine = !fp') < src.indexOf('if (!onSpot && (mine === false || left > arrive'), '🔴 先判"是不是我的目标"，再看距离（别人到点不许误报成功）')
   ok(/horiz: Number\(horiz\.toFixed\(2\)\), vert: Number\(vert\.toFixed\(2\)\)/.test(src), '两个轴分开报给模型')
   ok(/高度不对/.test(src), 'hint 里点明是"高度不对"（不是"还差 N 格"）')
@@ -570,7 +574,8 @@ section('⑨ noTower（逃跑时关掉"原地垫高"）')
   const src = read('../src/movement.mjs')
   ok(/if \(noTower\) mv\.allow1by1towers = false/.test(src), '🔴 关的是 allow1by1towers 这一个开关')
   ok(!/mv\.scafoldingBlocks = \[\]/.test(src), '🔴 绝不清空 scafoldingBlocks（那会把 1×1 柱子的 move 一起剪掉，掉坑里出不来）')
-  ok(/noTower = true, intent = 'near', waterRecover, noDig = false \} = \{\}, ctx = \{\}\)/.test(src), 'walkTo 也接 noTower，且**默认 true**（不垫柱 —— 2026-10-18 实机：垫柱放错就摔死）')
+  /* 2026-10-22：walkTo 已拆成「包装层 + walkToUnguarded」，断言改查后者（同样带 towerFallback）。 */
+  ok(src.includes(`noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false } = {}, ctx = {})`), 'walkTo 也接 noTower，且**默认 true**（不垫柱 —— 2026-10-18 实机：垫柱放错就摔死）')
   /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高"）：战斗层**不再自己撤退**，
    *    所以"撤退要关掉垫脚"这条已经没有对象了 —— 反过来要守住"不许再出现撤退执行"。 */
   const atk = read('../src/attack.mjs')
@@ -935,6 +940,34 @@ section('⑧′⁗ 卡住恢复：门"通不通"要看门现在的状态，不�
     ok(g5.length === 2 && g5.every((m) => m.cost === 63),
       '🔴 满地板都是岩浆块（下界玄武岩三角洲）⇒ **不许删 move**：全加价但路还在，否则 NoPath 原地不动')
   }
+  {
+    /* 🔴 回归（2026-10-22 用户实机「家里非实体方块走不了」）：
+     * vendor `b.safe` 要求 `boundingBox === 'empty' || climbable || carpets.has(type)`，
+     * 而 `carpets` 只按 `shapes[0][4] < 0.1` 自动收集 —— 小麦（≈0.3125）进不去
+     * ⇒ 整片麦田被 A* 当成墙。`patchPlantPassable` 按名字把它们塞进 `carpets`。 */
+    const { patchPlantPassable } = await import(new URL('../src/plugins.mjs', import.meta.url))
+    const reg = {
+      blocksArray: [
+        { id: 1, name: 'wheat' },
+        { id: 2, name: 'carrots' },
+        { id: 3, name: 'short_grass' },
+        { id: 4, name: 'sweet_berry_bush' },
+        { id: 5, name: 'stone' },
+        { id: 6, name: 'oak_planks' },
+      ],
+    }
+    const mvP = { carpets: new Set([6]) }
+    const addedN = patchPlantPassable(mvP, { registry: reg })
+    ok(addedN === 3 && mvP.carpets.has(1) && mvP.carpets.has(2) && mvP.carpets.has(3),
+      '🔴 作物/草补进 carpets（A* 才肯从麦田里走过去）', `added=${addedN}`)
+    ok(!mvP.carpets.has(4), '甜浆果丛**不**补进去（踩了掉血，宁可绕）')
+    ok(!mvP.carpets.has(5), '普通石头当然不补')
+    ok(mvP.carpets.has(6), '原有的 carpets 不动')
+    ok(patchPlantPassable(mvP, { registry: reg }) === 0, '再跑一次不再加（幂等）')
+    ok(patchPlantPassable({}, { registry: reg }) === 0 && patchPlantPassable(null, null) === 0,
+      '没有 carpets / 没有 registry 也不炸')
+    ok(mvP.__dshPlantPassable === 3, '记下加了几种（排查用）', String(mvP.__dshPlantPassable))
+  }
   const plug2 = read('../src/plugins.mjs')
   ok(/const isDoorSupport = \(node, p\)/.test(plug2) && /isDoorSupport\(node, p\)\) \{[\s\S]{0,160}?continue/.test(plug2),
     '🔴 规划层：门脚支撑块也剔出 toBreak 并退工钱')
@@ -945,6 +978,12 @@ section('⑧′⁗ 卡住恢复：门"通不通"要看门现在的状态，不�
     '🔴 movements() 里真的挂上了这个补丁（写了函数没人调 = 白改）')
   ok(/const floor = nameAt\(node, dx, dy - 1, dz\)/.test(plug2),
     '🔴 判据看的是落脚点**下面那一格**（`m.y - 1`）—— 看脚那格的话岩浆块永远看不出来')
+  ok(/export const PLANT_PASSABLE = /.test(read('../src/block-names.mjs')),
+    '🔴 规划层：作物/花草有"能站进去"的名单 PLANT_PASSABLE（2026-10-22 用户实机「家里非实体方块走不了」）')
+  ok(/patchPlantPassable\(mv, b\)/.test(plug2),
+    '🔴 movements() 里真的挂上了 patchPlantPassable（写了函数没人调 = 白改）')
+  ok(/mv\.carpets\.add\(blk\.id\)/.test(plug2),
+    '补的是 vendor 的 `carpets`（"这一格能不能站"），不是 blocksToAvoid')
   const src = read('../src/movement.mjs')
   ok(/const doorAlreadyOpen = doorOpened === 0 && doorAheadOpen\(b, target\)/.test(src),
     '🔴 恢复分支把"门本来就开着"算作通')
@@ -1063,8 +1102,11 @@ section('⑧‴ 失败结果"可操作"：眼前挡路的那格 + 泳也算三�
 
   // 接线：mc_move 真的把 intent 传下去了
   const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
-  ok((idx.match(/intent: args\.intent/g) ?? []).length >= 2 && /intent: \{ type: 'string'/.test(idx),
-    'mc_move 的 intent 参数接到了两条 walkTo 出口上')
+  /* 2026-10-23 审计：入口现在走 `intentArgOf(args.intent)` 做枚举校验（未知值直接抛错），
+   * 断言的判据跟着改。 */
+  ok((idx.match(/intent: intentArgOf\(args\.intent\)/g) ?? []).length >= 2
+    && /function intentArgOf/.test(idx) && /intent: \{ type: 'string'/.test(idx),
+    'mc_move 的 intent 参数接到两条 walkTo 出口上，且未知值会被拒')
 }
 /* ── ⑫ 门：规划允许穿门 + 执行层自己按开 + 卡住补救不砸门（2026-10-18 实机） ── */
 {

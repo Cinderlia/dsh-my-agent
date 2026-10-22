@@ -597,8 +597,7 @@ export class Watchdog {
       const due = this.config.followUpAfterSec * 1000
       if (since >= due && !this._followedUp) {
         this._followedUp = true
-        this.#inject(`【提醒】距上次被叫醒已 ${Math.round(since / 1000)}s，对方没有再说话。`
-          + '你可以：① 主动说点什么/做个动作；② 判断没事就继续挂机（不必回复）。', 'followUp')
+        this.#inject(`【提醒】距上次叫醒 ${Math.round(since / 1000)}s，对方没再说话：① 主动做点什么 ② 没事就继续挂机（不必回复）`, 'followUp')
       }
     }
   }
@@ -625,10 +624,11 @@ export class Watchdog {
       const extra = i.calledBy?.length ? `　← 命中叫法：${i.calledBy.join('/')}` : (i.near ? '　← 就在我旁边' : '')
       return `· [${tags}] ${i.text}${extra}`
     })
+    /* audit 2026-10-22（减少 token 消耗）：这条尾巴每次叫醒都发一遍，一次会话几十次就是
+     *   几千字符。压成一行短标签 —— 里面那些用法（mc_events / mc_say）AI 本来就知道。 */
     const body = `【MC 看门狗｜${allReasons.map((r) => LABEL[r] ?? r).join(' + ')}】\n`
       + lines.join('\n')
-      + `\n\n（这是同一个对话里的提醒。用 mc_events 可取完整事件队列；`
-      + `需要回应就 mc_say，需要行动就 mc_move / mc_act / mc_build。）`
+      + '\n（看门狗提醒；要完整事件用 mc_events）'
 
     this.#inject(body, allReasons.join('+'))
     this.lastWakeAt = now

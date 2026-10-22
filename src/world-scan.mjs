@@ -19,6 +19,7 @@
 import { Vec3 } from 'vec3'
 import { isAir, cropStageOf } from './block-names.mjs'
 import { entityNameOf, HOSTILE_RE, RANGED_RE, hostilityOf } from './entity-names.mjs'
+import { worldBoundsOf } from './world-observer.mjs'
 
 export function scanAround (b, { radius = 16, height = 4, name = null, limit = 10, y = null } = {}) {
   /* 半径默认 16 = **1 区块**（2026-10-13 用户要求，先定 32 后改回 16）：一次扫 33×33 格，
@@ -34,12 +35,20 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
   const counts = new Map()
   const found = []
   let unloaded = 0
+  /* 2026-10-23：越界（y 在世界上下界之外）和未加载（那一列没下发）分开数 ——
+     前者永远不会变，不是"再等等就有"。 */
+  let outOfWorld = 0
+  const bounds = worldBoundsOf(b)
   for (let dx = -R; dx <= R; dx++) {
     for (let dz = -R; dz <= R; dz++) {
       for (let dy = -H; dy <= H; dy++) {
         const pos = new Vec3(c.x + dx, cy + dy, c.z + dz)
         const blk = b.blockAt(pos)
-        if (!blk) { unloaded++; continue }
+        if (!blk) {
+          if (pos.y < bounds.minY || pos.y > bounds.maxY) outOfWorld++
+          else unloaded++
+          continue
+        }
         if (isAir(blk.name)) continue
         if (name) {
           if (blk.name === name) {
@@ -71,7 +80,7 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
     const crops = top.map((f) => cropStageOf(name, f.state)).filter(Boolean)
     return {
       found: top.map((f) => f.pos),
-      total: found.length, unloaded,
+      total: found.length, unloaded, outOfWorld,
       nearest: found.length ? found[0].pos : null,
       /* 竖向窗口的**真实中心**（给了 `y` 就是那个 y，没给就是我的脚底）——
        * 让人一眼看出"这一扫覆盖的是哪一层"，别再拿它当"整座山都没有"的证据 */
@@ -103,7 +112,7 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
   const totalCount = [...counts.values()].reduce((a, v) => a + v, 0)
   const pctOf = (v) => (totalCount > 0 ? Math.round((v / totalCount) * 1000) / 10 : 0)
   return {
-    center: { x: c.x, y: cy, z: c.z }, radius: R, height: H, unloaded,
+    center: { x: c.x, y: cy, z: c.z }, radius: R, height: H, unloaded, outOfWorld,
     total: totalCount,
     counts: [...counts.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 25)
       .map(([n, v]) => ({ name: n, count: v, pct: pctOf(v) })),

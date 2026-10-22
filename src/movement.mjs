@@ -21,7 +21,7 @@ import { callBudget, callSecText, budgetSecText, CALL_BUDGET_MS } from './budget
 import { inWaterNow } from './world-observer.mjs'
 import { heldText, invSnap, invUsed } from './inventory.mjs'
 import { isAir, isLiquid, isPassable, isSolidBlock } from './block-names.mjs'
-import { BRIDGE_FATAL } from './bridge.mjs'
+import { BRIDGE_FATAL, heldSnapshotOf, restoreHeldOf } from './bridge.mjs'
 import { classifyTerrainCached } from './terrain.mjs'
 import { recoverFromWater } from './water-recovery.mjs'
 /* 🔴 2026-10-16 审计（P1，四类耗时）：`goto` 这一段的墙钟**几乎全是"等寻路"** ——
@@ -173,16 +173,30 @@ export async function jump (self, ctx = {}) {
    *    ⇒ 会把"接管者"（另一次移动/反射层）正按着的 jump 松掉。现在领号，只在还是自己时才松。 */
   const gen = bumpGen()
   const hold = Math.max(60, Math.min(320, left - 120))
+  /* 🔴 2026-10-23 审计（移动层报告 A[8]）：以前按满 320ms 就报成功 —— 头顶只有 1 格净空、
+   *    站在半砖上、或者服务端没认这一下时，人**一格都没起来**，AI 却以为爬台阶爬上了。
+   *    现在在按住结束那一刻（约 320ms，正常已经在上升段）量一下高度，据实回报。 */
+  const y0 = Number.isFinite(b?.entity?.position?.y) ? b.entity.position.y : null
   b.setControlState('jump', true)
+  let rose = null
   try {
     await raceAbort(sleep(hold), self.abortSignal, '跳跃')
+    if (y0 != null && Number.isFinite(b?.entity?.position?.y)) rose = Number((b.entity.position.y - y0).toFixed(3))
   } finally {
     if (self._moveGen === gen) { try { b.setControlState('jump', false) } catch { /* 忽略 */ } }
   }
   // 落地缓冲（别超过本轮剩余时间）
   const rest = Math.max(0, Math.min(200, self.msLeft() - 60))
   if (rest > 0) await raceAbort(sleep(rest), self.abortSignal, '跳跃')
-  return { position: self.position }
+  const jumped = rose == null ? null : rose > 0.05
+  return {
+    position: self.position,
+    ...(rose == null ? {} : { rose }),
+    ...(jumped === false ? {
+      jumped: false,
+      note: '按了跳但**没离地**（rose≈0）—— 头顶净高不够 / 卡在半砖上 / 服务端没认。别当"跳上去了"用',
+    } : { jumped }),
+  }
 }
 
 /**
@@ -316,6 +330,37 @@ export const SWIM_PROGRESS_EPS = 0.2       // 一个窗口至少靠近这么多�
 /** 水流横向漂移的判定阈值（格/窗口）：超过它就反压一档方向键 */
 export const SWIM_DRIFT_EPS = 0.35
 export const SWIM_FIXUPS = 2               // 纠偏最多试两次，再不行就交给水下自救
+/* ── 跨调用记账：游泳"看着在游、其实没挪"（2026-10-22 实机：卡在水面）────────────
+ * 只游不救的死循环：每个 600ms 窗口都"靠近了 >=0.2 格"（沿池壁斜漂、水流推着走）⇒
+ * `stallWins` 每次被清零 ⇒ 不 break ⇒ 预算吃满 ⇒ 回来时 msLeft 约等于 0 ⇒
+ * `walkToOnce` 里 `msLeft() > 1_500` 那道门永远不开 ⇒ 自救一次都不跑。
+ * ⇒ 记在 `self._waterStall` 上，**下一次**调用一进水里就先自救（恢复要 4.4 秒起，一轮凑不出来）。 */
+export const WATER_STALL_LIMIT = 2          // 连续几次"几乎没挪"就认卡
+export const WATER_STALL_MOVE_EPS = 1.2     // 一轮连这么多格都没挪出去 = 没进展（同 WATER_PROGRESS_EPS）
+export const WATER_STALL_TTL_MS = 60_000    // 记账过期时间（离开水很久了就别再算数）
+
+/** 记一轮游泳的结果，返回累计的"没进展"次数。到达 / 出水 / 真挪出去了都清零。 */
+export function noteWaterSwim (self, { arrived = false, moved = 0, outOfWater = false } = {}) {
+  if (!self) return 0
+  const prev = Number(self._waterStall?.n) || 0
+  const gained = Number(moved) || 0
+  const n = (arrived || outOfWater || gained >= WATER_STALL_MOVE_EPS) ? 0 : prev + 1
+  self._waterStall = { n, at: Date.now() }
+  return n
+}
+
+/** 上一轮（含）是不是已经连着 `WATER_STALL_LIMIT` 次几乎没游动。 */
+export function waterStallReached (self) {
+  const st = self?._waterStall
+  if (!st) return false
+  if (Date.now() - (Number(st.at) || 0) > WATER_STALL_TTL_MS) return false
+  return (Number(st.n) || 0) >= WATER_STALL_LIMIT
+}
+
+/** 清账（真要再攒够两次才又认卡 —— 别变成"每次调用都先自救"的新循环）。 */
+export function resetWaterStall (self) {
+  if (self) self._waterStall = { n: 0, at: Date.now() }
+}
 export const SWIM_MIN_AIR = 6              // 气低于这个数，不管目标在哪都先上浮
 export const SWIM_VERT_EPS = 0.6           // 目标比脚高/低这么多，才算"要去上一层/下一层"
 
@@ -402,8 +447,23 @@ export async function walkSwim (self, target, { arrive = 1.6, budget = self.cfg.
       const me = b.entity.position
       const left = me.distanceTo(goal)
       moved = r2(start.distanceTo(me))
+      /* 🔴 2026-10-22 实机（另一个会话卡在水里动不了 @ (8,18,2)）：
+       *    泳路径按 **3D 距离** 判到达，而"往上爬一格"的 3D 距离只有 1.41 < arrive 1.6 ——
+       *    于是第一次就 arrived:true / moved 0.48，之后每次都 ms:0 moved:0 arrived:true，
+       *    AI 反复叫同一个目标永远不动（实测连叫 3 次全 moved:0）。
+       *    现在：只有**已经出水**、或**目标格本身就是水**（游到水里某个点）才算到达；
+       *    否则继续游（上浮/前进交给下面的 jump 逻辑），绝不"人还在水里却说我到了"。 */
+      /* 2026-10-23 审计：上面那条「人在水里就不算到」判太狠 —— 目标跟我在**同一高度**时
+       * （平游到水里的另一个点、或测试里原地齐平的目标），永远到不了，只能耗满预算。
+       * 那条规则本来要防的是「目标在上方、我沉在水里够不着却报到了」，所以补一条竖向判据：
+       * 高度差 ≤ 0.6 格就算真到了。 */
       if (left <= arrive) {
-        return { arrived: true, position: at(me), ms: Date.now() - t0, moved, via: 'swim', remaining: r2(left) }
+        let goalIsWater = false
+        try { goalIsWater = isLiquid(b.blockAt(new Vec3(goal.x, goal.y, goal.z))?.name) } catch { /* 读不到就按干地算 */ }
+        const dyGoal = Math.abs(Number(me.y) - Number(goal.y))
+        if (!inWaterNow(b) || goalIsWater || dyGoal <= 0.6) {
+          return { arrived: true, position: at(me), ms: Date.now() - t0, moved, via: 'swim', remaining: r2(left) }
+        }
       }
       // 每 250ms 重新对准：水流、撞岸、浮起来都会把朝向推偏（只对准一次会游歪）
       try { await b.lookAt(goal.offset(0, 1.0, 0), true) } catch { /* 假 bot 没有 lookAt */ }
@@ -549,8 +609,50 @@ export function routeTrack (self, target, info) {
   }
 }
 
-export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, intent = 'near', waterRecover, noDig = false } = {}, ctx = {}) {
-  let info = await walkToOnce(self, target, { arrive, budget, noTower, intent, waterRecover, noDig }, ctx)
+/* ===== 收工把手换回来（用户 2026-10-22：「搭路自动切回…不生效」） =====
+ * 走路时垫方块**不是本文件干的**：是 pathfinder 自己做的
+ * （vendor/mc-deps/node_modules/mineflayer-pathfinder/index.js:548，放之前 bot.equip(block,'hand')）。
+ * 放完**上游不会换回来**，所以走完一段垫过方块的路，手里就一直攥着圆石/泥土 ——
+ * 下一场架拿着方块挥、下一次挖拿着方块刨。以前这里只在结果里报 held/heldBefore
+ * （那只是**记账**，看着像处理过，其实手没换回去）。
+ * bridge / shoot 早就有这一层了；这里照 bridgeAcross 的写法，在**所有返回路径**
+ * （成功 / 超时 / 半路停 / 抛错）上统一还原，而不是每个 return 前各写一遍。
+ * 注意：只在手真的变了时才动手（restoreHeldOf 自己会先比名字），没垫方块的路不付代价。
+ */
+export async function walkTo (self, target, opts = {}, ctx = {}) {
+  const b = self.requireBot()
+  const keep = heldSnapshotOf(b)
+  let out = null
+  try {
+    out = await walkToUnguarded(self, target, opts, ctx)
+    return out
+  } finally {
+    /* 2026-10-23 审计（移动层报告第 4 条）：原来是 `keep && out` —— 抛错时 `out` 是 null，
+     * 于是**失败那次不还原**，手里一直攥着垫脚用的圆石/泥土（vendor 垫方块时会 equip 且不换回）。
+     * 与 bridge.mjs 的写法对齐：只要当初有快照就还原。 */
+    if (keep) {
+      let r = { restored: false, now: b?.heldItem?.name ?? null }
+      /* 换不回来是件小事（路已经走完了），别把整次走路判成失败 */
+      try { r = await restoreHeldOf(b, keep) } catch { /* 保持原样 */ }
+      /* 🔴 2026-10-23 实机：以前只在 `restored === true` 时改 `out.held`，而
+       *    `restoreHeldOf` 在"手本来就是那件"时回 `restored:false`（无需还原）—— 于是报告里
+       *    留着我垫方块时的旧值，看着像没换回来。现在一律按**现在手上真实的**回报。 */
+      if (out) {
+        const nowName = b?.heldItem?.name ?? null
+        const wantName = keep.name ?? null
+        out.held = nowName ? (nowName + 'x' + (b?.heldItem?.count ?? 1)) : '空手'
+        if (nowName === wantName) {
+          out.heldRestored = wantName ?? '空手'
+        } else {
+          out.heldRestoreWhy = r?.why ?? `想换回 ${wantName ?? '空手'} 没成功（现在是 ${nowName ?? '空手'}）`
+        }
+      }
+    }
+  }
+}
+
+async function walkToUnguarded (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false } = {}, ctx = {}) {
+  let info = await walkToOnce(self, target, { arrive, budget, noTower, towerFallback, intent, waterRecover, noDig }, ctx)
   /* 🔴 2026-10-20（实机连撞两次）：vendor 的 `goal_reached` 是**全局**事件（`lib/goto.js:60` 不看 goal），
    *    别的寻路（自主层逃跑/跟随、或者上一次走路的残留 promise）到点时会顺手把**我这次** goto 一起
    *    resolve ⇒ 本次调用 45~85ms 就返回 goal-reached-elsewhere，人一步没动。以前只能让 AI 再手动叫
@@ -558,7 +660,7 @@ export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.mo
    *    NoPath / stuck / call-over 重试是同参数撞墙，没意义。 */
   if (!info.arrived && info.reason === 'goal-reached-elsewhere' && self.msLeft() > 1_200) {
     try { ctx.stopPathing?.(self.requireBot()) } catch {}
-    const retried = await walkToOnce(self, target, { arrive, budget, noTower, intent, waterRecover, noDig }, ctx)
+    const retried = await walkToOnce(self, target, { arrive, budget, noTower, towerFallback, intent, waterRecover, noDig }, ctx)
     info = { ...retried, retriedElsewhere: true }
   }
   const route = routeTrack(self, target, info)
@@ -566,17 +668,62 @@ export async function walkTo (self, target, { arrive = 1.6, budget = self.cfg.mo
   return { ...info, route, hint: `${info.hint ? info.hint + '\n' : ''}${route.hint}` }
 }
 
-async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, intent = 'near', waterRecover, noDig = false } = {}, ctx = {}) {
+async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false } = {}, ctx = {}) {
   const b = self.requireBot()
   endHoverFlight(b)   // 悬停着就别想蹦/走：先恢复重力（否则走路全废，见 endHoverFlight）
   /* 🔴 2026-10-19 用户：「水下自救要让 ai 能开关」+「要默认开」——
    *    默认走自救，调用方显式 `waterRecover: false` 才关。 */
+  /* 🔴 2026-10-22（卡水那次连带的第二个坑）：intent:'stand' 要求**真的站到那一格上**，
+   *    可 arrive 默认 1.6 是 3D 距离 —— 相邻一格(1.41)、上一格(1.41) 全在半径内，
+   *    于是"叫它爬一格上岸"直接报到了、一步没走。stand 收到 0.6。 */
+  if (intent === 'stand' && arrive > 0.6) arrive = 0.6
   if (waterRecover !== undefined) ctx = { ...ctx, waterRecover: waterRecover !== false }
   // 🔴 在水里：A* 不把水当节点（见 #walkSwim 的注释），实机表现是"4 秒挪 1 格"。
   //    先直接游；上了岸、还有时间，再把剩下的路交给 pathfinder 走完。
   //    ⚠️ 判据用 `#inWaterNow`：`entity.isInWater` 在泡水柱里会读出 undefined（实机踩过）。
-  if (inWaterNow(b)) {
+  /* 🔴 2026-10-22 第二次实机（另一个会话 @ (8,18,2)：**站在实心地面上、泡在 1 格深的水里**）：
+   *    mc_diag 明确报 `onGround:true, inWater:true`，可泳路径连跑 4.6s 是 `moved:0 / movedVertical:0`、
+   *    换方向、强制上浮（fixups:2）全无效 —— 因为人本来就是站着的，游泳控制器按"浮着"那套推，
+   *    一点位移都出不来。站在实心地上时**交给 pathfinder 走**（浅水它本来就会蹚过去）。
+   *    只有真的悬在水里（onGround 不是 true）才走游泳。 */
+  if (inWaterNow(b) && b.entity?.onGround !== true) {
+    /* 2026-10-22（用户：卡在水面）：已经连续两轮几乎没挪动 ⇒ **这一轮先自救再游**。
+     * 正常游泳一秒不少：真游出距离 / 出水 / 到达都会把账清零（见 noteWaterSwim）。
+     * noWaterRecover 防递归、waterRecover:false 由调用方显式关（开关权在 AI 手里）。 */
+    const startPos = b.entity.position.clone?.() ?? b.entity.position
+    /* 🔴 2026-10-23 审计（移动层报告 A[6]）：以前只看"这一轮挪没挪动"，**氧气完全不参与** ——
+     *    沉在底下沿水底一点点挪也是"有进展"，等氧气见底才开始掉血，AI 到死都收不到"该上去换气"。
+     *    现在：氧气掉到 120（上限 300，约 40%）以下就先浮上去换一口，再接着走。
+     *    `waterRecover:false`（AI 明确关掉自救）时不做。 */
+    let airFirst = null
+    const airNow = Number.isFinite(b.oxygenLevel) ? b.oxygenLevel : null
+    if (airNow != null && airNow <= 120 && ctx.waterRecover !== false) {
+      try { airFirst = await swimUp(self, { hold: 1_200 }, ctx) } catch { airFirst = null }
+    }
+    let preRecover = null
+    if (waterStallReached(self) && ctx.noWaterRecover !== true && ctx.waterRecover !== false && self.msLeft() > 4_500) {
+      preRecover = await recoverFromWater(self, { budgetMs: Math.min(8_000, Math.max(0, self.msLeft() - 1_000)) }, recoverCtxOf(self, ctx))
+      /* 试过一次就别再赖着这条判据：自救没成功也要回去正常游，否则会变成"每次都先自救"的新循环 */
+      resetWaterStall(self)
+      if (!inWaterNow(b)) {
+        const me = b.entity.position
+        return {
+          arrived: false,
+          position: { x: Math.floor(me.x), y: Math.floor(me.y), z: Math.floor(me.z) },
+          remaining: Number(Math.hypot(me.x - target.x, me.z - target.z).toFixed(2)),
+          moved: Number(startPos.distanceTo(me).toFixed(2)),
+          via: 'water-recover',
+          stuck: false,
+          outOfWater: true,
+          waterRecover: preRecover,
+          hint: `前面连续 ${WATER_STALL_LIMIT} 次几乎没游动，所以这一轮我**先自己上岸了**（${preRecover?.note ?? ''}）—— 原来的目标还要不要接着走，你看一眼再定。`,
+        }
+      }
+    }
     const swim = await walkSwim(self, target, { arrive, budget, intent }, ctx)
+    if (airFirst) swim.airFirst = Number(airFirst.rose ?? 0)
+    /* 记一笔"这一轮到底有没有挪动"（跨调用记账，见文件头的 WATER_STALL_*） */
+    noteWaterSwim(self, { arrived: swim.arrived === true, moved: Number(swim.moved) || 0, outOfWater: !inWaterNow(b) })
     const canWalk = self.pfReady && typeof b.pathfinder?.goto === 'function'
     /* 🔴 用户点名的"水下寻路"就接在这里（2026-10-15）：**游不动了**（还泡在水里、没到目标）
      * 就交给恢复控制器 —— 它负责**找出口、选路线、复核进度**；
@@ -592,7 +739,9 @@ async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveB
      *    条件里只有 `ctx.waterRecover !== false`。于是"恢复→walkTo→还在水里→再恢复"可以
      *    一层层套下去，每层吃掉 900ms+，一次 10 秒的 `mc_move` 被吃光，最后返回的是最内层的 hint。
      *    现在真读它：恢复过程中（`recoverCtxOf` 传了 `noWaterRecover:true`）不再触发第二次恢复。 */
-    if (swim.stuck && ctx.noWaterRecover !== true && ctx.waterRecover !== false && self.msLeft() > 1_500) {
+    /* 2026-10-23 审计（移动层报告第 3 条）：`preempted` 是「被另一次移动接管」，不是「游不动」——
+     * 以前会在被接管后还白烧最多 12 秒水下自救。与下面 pathfinder 分支对齐。 */
+    if (swim.stuck && swim.reason !== 'preempted' && ctx.noWaterRecover !== true && ctx.waterRecover !== false && self.msLeft() > 1_500) {
       const rec = await recoverFromWater(self, { budgetMs: Math.min(12_000, Math.max(0, self.msLeft() - 900)) }, recoverCtxOf(self, ctx))
       const out = !inWaterNow(b)
       return {
@@ -608,7 +757,7 @@ async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveB
     if (swim.arrived || !swim.outOfWater || !canWalk) return swim
     const left = self.msLeft()
     if (left < 500) return swim
-    const rest = await ctx.walkPathfinder(target, { arrive, noTower, intent, noDig, budget: Math.max(0, Math.min(callBudget(budget), left)), budgetAsked: callBudget(budget) })
+    const rest = await ctx.walkPathfinder(target, { arrive, noTower, towerFallback, intent, noDig, budget: Math.max(0, Math.min(callBudget(budget), left)), budgetAsked: callBudget(budget) })
     return { ...rest, swam: true, swimMoved: swim.moved, swimMs: swim.ms }
   }
   if (!self.pfReady || typeof b.pathfinder?.goto !== 'function') {
@@ -639,9 +788,10 @@ async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveB
       hint: `这一轮的走路时间已经用完了（单次调用最多 ${budgetSecText()}）—— 直接再叫一次 mc_move 往同一个目标走，会接着走。`,
     }
   }
-  return await ctx.walkPathfinder(target, {
+  const pfOut = await ctx.walkPathfinder(target, {
     arrive,
     noTower,
+    towerFallback,
     noDig,
     intent,
     // 🔴 单次调用 ≤11 秒：预算收进 CALL_BUDGET_MS，且不超过本轮剩余时间。
@@ -650,6 +800,30 @@ async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveB
     budget: Math.max(0, Math.min(callBudget(budget), leftMs)),
     budgetAsked: callBudget(budget),
   })
+  /* 🔴 2026-10-22 用户「还是能卡住」——**站在实心地面上泡在 1 格深的水里**那条分支
+   *   （上一版为了修「游泳控制器推不动」改成交给 pathfinder）没有自救兜底：
+   *   pathfinder 也动不了时就直接报失败，`recoverFromWater` 一次都不会跑。这里补上。 */
+  if (inWaterNow(b) && pfOut && pfOut.stuck === true && pfOut.reason !== 'preempted'
+      && Number(pfOut.moved ?? 0) < 0.6
+      && ctx.noWaterRecover !== true && ctx.waterRecover !== false && self.msLeft() > 2_000) {
+    const rec = await recoverFromWater(self, { budgetMs: Math.min(9_000, Math.max(0, self.msLeft() - 800)) }, recoverCtxOf(self, ctx))
+    const out = !inWaterNow(b)
+    if (out) {
+      return {
+        ...pfOut,
+        stuck: false,
+        outOfWater: true,
+        waterRecover: rec,
+        hint: `寻路在水里也走不动，所以我自己找路上了岸（${rec?.note ?? ''}）—— 原来的目标还要不要接着走，你看一眼再定。`,
+      }
+    }
+    return {
+      ...pfOut,
+      waterRecover: rec,
+      hint: `还在水里${rec?.ok ? '（能喘口气了，但没出去）' : ''}，没找到出口（${rec?.reason ?? 'unknown'}）：${rec?.note ?? ''}`,
+    }
+  }
+  return pfOut
 }
 
 /**
@@ -805,7 +979,9 @@ export async function flyTo (self, x, y, z, { budget = CALL_BUDGET_MS } = {}, ct
   }
   const p = b.entity.position
   const distance = Number(p.distanceTo(target).toFixed(2))
-  const arrived = distance <= 2.5
+  /* 2026-10-23 审计（移动层报告第 2 条）：循环是 `mag <= 1.5` 收工，到达却按 2.5 判 ——
+   * 撞地形提前 break 时停在 2.0~2.5 格也报 arrived:true。统一成 1.5。 */
+  const arrived = distance <= 1.5
   return {
     position: { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) },
     distance, arrived, ms: Date.now() - t0,
@@ -863,7 +1039,7 @@ export const MOVE_BACK_MS = 420         // 后退脱困按住 back 多久
  * 一个 goto 里失效这么多次，说明"光重算没用"（世界在变 / 一直被人挡），换策略才有意义。 */
 export const MOVE_RESET_LIMIT = 4
 /** 脱困阶梯（第 1 级 = `MOVE_ESCAPES[0]`）。走完还没进展 ⇒ 报 `unreachable`。 */
-export const MOVE_ESCAPES = ['repath', 'jump', 'backoff']
+export const MOVE_ESCAPES = ['repath', 'jump', 'backoff', 'breakAhead']
 /* 🔴 2026-10-18（实机，AI 原话：「窄隧道和 1 格台阶上它基本走不动，10 秒原地蹭 0.8 格」）：
  *    在 1×2 高的**窄隧道**里遇到 1 格台阶时，A* 上不去 —— 站上台阶要 3 格净高，而这里只有 2 格；
  *    vendor 的 `JumpUp` 只查"头顶有没有空"，**不会计划去挖那个天花板**。于是 `goto` 找不出路：
@@ -1082,6 +1258,8 @@ export async function walkThroughDoor (b, target, { budgetMs = 1_600, radius = 3
     const start = b.entity.position.clone()
     const before = Math.hypot(target.x - start.x, target.z - start.z)
     try { await b.lookAt(center, true) } catch {}
+    /* 🔴 2026-10-23 审计（A[5]）：按 forward 不看 `_moveGen`，被接管后仍会无条件松手。 */
+    const gen0 = b?._moveGen
     b.setControlState('forward', true)
     const t0 = Date.now()
     try {
@@ -1096,7 +1274,7 @@ export async function walkThroughDoor (b, target, { budgetMs = 1_600, radius = 3
         if (Math.hypot(toTargetX, toTargetZ) < 1.2) break           // 已经到目标附近
       }
     } finally {
-      try { b.setControlState('forward', false) } catch {}
+      if (b?._moveGen === gen0) { try { b.setControlState('forward', false) } catch {} }
     }
     const end = b.entity.position.clone()
     const after = Math.hypot(target.x - end.x, target.z - end.z)
@@ -1196,6 +1374,9 @@ export const CARVE_PROTECTED = new RegExp('(' + [
   '^vault$', '^beacon$', '^lectern$', '^brewing_stand$', '^cauldron$', '^hopper$',
   '^dispenser$', '^dropper$', '^respawn_anchor$', '^nether_portal$', '^end_portal',
   '_door$', '_trapdoor$', '_fence_gate$',
+  /* 2026-10-23 用户实机（收小麦/挖矿乱挖）：麦田被"挖掉"的正是这条路（挖开挡路的台阶/天花板）。
+   *   耕地和土径一旦被挖，整块田就废了，补不回原来那层。宁可卡住报 blockedAhead，也不替用户做这个决定。 */
+  '^(farmland|dirt_path)$',
 ].join('|') + ')')
 /**
  * 2026-10-18 审计 P1-1：走不到的时候，把"竖井里到底有什么"一次给全。
@@ -1252,6 +1433,7 @@ export function shaftInfoOf (b, target) {
 
 export const MOVE_CARVE_CELLS = 2       // 一次最多往前看几格
 export const MOVE_CARVE_TRIES = 2       // 一次 walkPathfinder 里最多补挖几次
+export const MOVE_CARVE_RESETS = 4      // 挖开挡路方块之后"阶梯清零重走"最多几次（防挖了又挖不认输）
 
 /** 第 `n` 级脱困动作（0 起）；超出阶梯返回 `null`（= 该认输了）。 */
 export function escapeStepOf (n) { return MOVE_ESCAPES[n] ?? null }
@@ -1261,7 +1443,8 @@ export function escapeTextOf (step) {
   return step === 'repath' ? '重算路径'
     : step === 'jump' ? '跳跃脱困'
       : step === 'backoff' ? '后退再寻路'
-        : '放弃'
+        : step === 'breakAhead' ? '挖开挡路那格再走'
+          : '放弃'
 }
 
 /**
@@ -1483,18 +1666,41 @@ export function moveProgressWatcher (b, target, {
  * ⚠️ 三级动作**都不换 goal 对象** —— vendor 的 `goto` 监听 `goal_updated`，换了对象
  *    就直接以 `GoalChanged` 拒绝（`lib/goto.js:35`），等于把这次走路判死。
  */
-export async function escapeMove (b, goal, step, ctx = {}) {
+export async function escapeMove (b, goal, step, ctx = {}, extra = {}) {
   try { ctx.stopPathing?.(b) } catch {}
   await sleep(60)                       // 让 pathfinder 的 physicsTick 把控制位松开
+  /* 🔴 2026-10-23 审计（移动层报告 A[5]）：这里按 jump/back 时**不看 `_moveGen`** ——
+   *    按住的那 320/420ms 里如果被接管（反射层、另一次 move、玩家指令），醒来无条件松手
+   *    会把接管者正按着的键松掉。现在记下进来时的号，只在号还是自己的时候才松。 */
+  const gen0 = b?._moveGen
+  const mine = () => b?._moveGen === gen0
   if (step === 'jump') {
     try { b.setControlState('jump', true) } catch {}
     await sleep(MOVE_JUMP_MS)
-    try { b.setControlState('jump', false) } catch {}
+    if (mine()) { try { b.setControlState('jump', false) } catch {} }
   } else if (step === 'backoff') {
     // 贴墙/贴角时原地重算还是同一条死路 —— 先退开半步再重算
     try { b.setControlState('back', true) } catch {}
     await sleep(MOVE_BACK_MS)
-    try { b.setControlState('back', false) } catch {}
+    if (mine()) { try { b.setControlState('back', false) } catch {} }
+  }
+  else if (step === 'breakAhead') {
+    /* 2026-10-22 用户「还是能卡住」：前三级（重算 / 跳 / 后退）都不改地形 ——
+     *   被 1 格台阶或头顶那格实心**围死**时，三级走完就只剩「认输」。
+     *   这一级真动手：朝目标方向挖开挡在脚上/头顶的那一格（同样只挖实心、底下要有支撑、
+     *   不碰门/水/岩浆/黑曜石），挖开了由调用方把阶梯清零重走。 */
+    /* 🔴 2026-10-22（check-move-progress ⑧″ 抓到）：这里以前只挡 `extra.noDig`，
+     *    **不认 `walkCanDig` / `walkCarveStep`** —— 配置把寻路挖块关掉之后，
+     *    脱困阶梯第 4 级照样挖，挖到了就把阶梯清零重走 ⇒ 挖穿一路、永不认输（死循环）。
+     *    判据必须和 `carveStepAhead` 那段（walkPathfinder 里）**完全一致**：一个口诀没有两处。 */
+    const carveOff = extra.noDig === true
+      || ctx?.cfg?.walkCanDig === false
+      || ctx?.cfg?.walkCarveStep === false
+    if (carveOff || extra.target == null) return { dug: 0 }
+    try {
+      const n = await carveStepAhead(b, extra.target, { ignoreRange: true })
+      return { dug: Number(n) || 0 }
+    } catch { return { dug: 0 } }
   }
   // 'repath' 不做额外动作：重新 `goto` 本身就是一次重算
 }
@@ -1574,12 +1780,17 @@ export async function stepIntoPortal (b, cell, { ms = 700, signal = null } = {})
    *   `await lookingTask.promise`，那个 promise 只在物理循环发出 look 包时 finish；站着不动时
    *   物理循环 early return（physics.js:158-162）⇒ **永远挂着**，下面"照样顶"的分支根本走不到。 */
   try { await b.lookAt(new Vec3(cell.x + 0.5, b.entity.position.y + 1.1, cell.z + 0.5), true) } catch { /* 转不过去也照样顶 */ }
+  /* 🔴 2026-10-23 审计（A[5]）：同样补上 `_moveGen` 守卫 —— 传送那一下如果被接管，
+   *    醒来无条件松 forward/sprint 会踩掉接管者的控制位。 */
+  const gen0 = b?._moveGen
   try {
     b.setControlState('forward', true)
     b.setControlState('sprint', true)
     await raceAbort(sleep(ms), signal, '走进传送门')
   } catch { /* 被打断就把控制位松开 */ } finally {
-    try { b.setControlState('forward', false); b.setControlState('sprint', false) } catch { /* 忽略 */ }
+    if (b?._moveGen === gen0) {
+      try { b.setControlState('forward', false); b.setControlState('sprint', false) } catch { /* 忽略 */ }
+    }
   }
   return { entered: teleported() || Boolean(inPortalNow(b)) }
 }
@@ -1600,7 +1811,7 @@ export function goalPointFor ({ target, ty, arriveUsed, portal = null } = {}) {
   }
 }
 
-export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null, noTower = true, intent = 'near', noDig = false } = {}, ctx = {}) {
+export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null, noTower = true, towerFallback = true, intent = 'near', noDig = false } = {}, ctx = {}) {
   const b = self.bot
   endHoverFlight(b)   // 悬停着就别想蹦/走：先恢复重力（否则走路全废，见 endHoverFlight）
   /* 2026-10-18 审计 P1-2：意图决定"到"的标准（arrive / 允许高差） */
@@ -1806,6 +2017,13 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   const goalFix = sp.adjusted
     ? {
       goalAdjusted: { x: sp.x, y: sp.y, z: sp.z },
+      /* 🔴 2026-10-23 实机：目标格站不住时这里会把它挪到邻居 —— 只报 goalAdjusted/goalAskedAt
+       *    太隐晦（模型不知道"为什么改"）。补一条结构化原因，和 arrived:false/goal-not-standable 配对。 */
+      goalMoved: {
+        from: sp.from ?? { x: Math.floor(Number(target.x)), y: Math.floor(Number(target.y)), z: Math.floor(Number(target.z)) },
+        to: { x: sp.x, y: sp.y, z: sp.z },
+        why: 'target-not-standable',
+      },
       goalAskedAt: sp.from ?? { x: Math.floor(Number(target.x)), y: Math.floor(Number(target.y)), z: Math.floor(Number(target.z)) },
     }
     : {}
@@ -1857,6 +2075,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         if (again?.passed) self.log(`🚪 门没开透，补按 ${opened} 下后走过去了（${again.door ?? '门'}）`)
       } catch {}
     }
+    let carveResets = 0   // 挖开挡路方块后"阶梯清零重走"的次数（上限 MOVE_CARVE_RESETS）
     let attempt = 0
     for (;;) {
       if (attempt > 0) {
@@ -1864,7 +2083,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         if (!step) {
           /* 阶梯走完还是没进展：**如果目标在上方、头顶又是空的**，先试一次垫柱兜底
            * （2026-10-19 实机：`noTower` 默认之后，楼梯/竖井这类"往上一格"目标反而更难上）。 */
-          if (!towerTried) {
+          if (!towerTried && towerFallback) {
             const p0 = b.entity?.position
             const upGap = p0 ? Number(target?.y) - p0.y : 0
             const nameAt = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z))?.name ?? null } catch { return null } }
@@ -1872,6 +2091,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
             if (p0 && upGap >= 1.5 && !hardAt(Math.floor(p0.y) + 2) && !hardAt(Math.floor(p0.y) + 3)) {
               towerTried = 1
               const mv3 = ctx.movements(terrain)
+              if (!mv3) throw new Error('pathfinder 的 Movements 造不出来（插件没挂上？）')
               mv3.allow1by1towers = true
               if (noDig) mv3.canDig = false
               b.pathfinder.setMovements(mv3)
@@ -1902,7 +2122,14 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         }
         repathCount++
         self.log(`🔁 走不动了 → 第 ${attempt} 级脱困：${escapeTextOf(step)}（累计重算 ${repathCount} 次）`)
-        await escapeMove(b, goal, step, ctx)
+        const em = await escapeMove(b, goal, step, ctx, { target, noDig })
+        if (step === 'breakAhead' && Number(em?.dug) > 0) {
+          carved += Number(em.dug)
+          carveResets++
+          if (carveResets <= MOVE_CARVE_RESETS) attempt = 0
+          else self.log(`⛏ 已经"挖开重走" ${carveResets} 次还是走不动 —— 不再清零阶梯，按认输处理`)
+          self.log(`⛏ 脱困时挖开了 ${em.dug} 格挡路方块 —— 重算再走`)
+        }
         /* 地形局部重估（2026-10-18 审计 P1）：上一轮可能挖开了台阶/垫了方块/被浆果丛卡过 ——
          * 世界变了，出发时那份地形判断就不再可靠。只重判脚下这一圈（缓存键含坐标），
          * 类别真变了才重建 `Movements`，没有变化就完全不动。 */
@@ -1986,7 +2213,10 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
             const end = b.entity.position
             const dNow = Math.hypot(end.x - target.x, end.z - target.z)
             const obstacle = obstacleAheadOf(b, target)
-            if (dNow <= MOVE_CARVE_RADIUS || obstacle) {
+            /* 2026-10-22：卡住时**第一次总试一下挖**。旧条件要求「离目标 ≤4.5 格 或 眼前正好
+             *   有可挖的障碍」，而最容易卡死的情形（人被完全围住 / 目标在斜上方）两个都不满足 ——
+             *   于是一次都没挖就进了脱困阶梯。 */
+            if (obstacle || dNow <= MOVE_CARVE_RADIUS || carveTries === 0) {
               carveTries++
               try { ctx.stopPathing?.(b) } catch {}
               await sleep(60)
@@ -2030,7 +2260,13 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     //    （目标格被占住 / 站在半砖上 / 只到附近），盲信就又变成"谎报 arrived"。
     /* 站在目标点上（≤0.5 格）就不必再问 `isEnd`：GoalNear 的半径本来就允许这一圈。
      * 反过来，只要离得远、又不满足当前 goal，就一律先按"不是我的目标"处理。 */
-    const onSpot = left <= 0.5 && !vertBad
+    /* 🔴 2026-10-23 审计（移动层报告 A[10]）：`sp` 是**方块角坐标**，站在那一格正中间时
+     *    水平距离就已经是 0.707 —— 于是 `left <= 0.5` 永远不成立，`onSpot` 是个死条件
+     *    （"我确实站在目标格上"这条路根本走不到）。这里单独按**格心**量一次，只给 `onSpot` 用；
+     *    `left` / `horiz` 保持原口径不动（那些阈值是照着角坐标调出来的，改了会把之前修好的
+     *    "假到达"又放回来）。 */
+    const cHoriz = Math.hypot(end.x - (Number(sp.x) + 0.5), end.z - (Number(sp.z) + 0.5))
+    const onSpot = cHoriz <= 0.75 && !vertBad
     if (!onSpot && (mine === false || left > arriveUsed + 1.0 || vertBad)) {
       // 🔴 先分清"插件真的早报"还是"别人的 goal_reached 把我这次 goto 一起 resolve 了"。
       //    vendor 的 lib/goto.js:60 监听的是 bot 上的**全局** `goal_reached`，`goalReached()`
@@ -2108,6 +2344,27 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       let step = { entered: false }
       try { step = await stepIntoPortal(b, portal, { ms: 700, signal: self.abortSignal }) } catch { step = { entered: false } }
       portalInfo = { name: portal.name, at: { x: portal.x, y: portal.y, z: portal.z }, entered: step.entered === true }
+    }
+    /* 🔴 2026-10-23 实机（用户实测 mc_move 到 (-290,64,803)：那一格下面是空气）：
+     *    目标格站不住时 standPointFor 会把它挪到旁边能站的格 —— 挪到的正好是我**脚下这一格**
+     *    时，A* 一步不走、这里就回 arrived:true + moved:0。模型看到“到了”以为真到了，
+     *    实际原地没动（和 2026-10-22 那条“假成功”是同一种坑）。
+     *    判据：目标被挪过（sp.adjusted）且这一趟**几乎没位移** ⇒ 目标格站不住 = 不可达，
+     *    显式报失败，让模型换个目标点（别拿 arrived:true 骗它）。 */
+    const spMoved = deltaOf(end)
+    if (sp.adjusted && Number(spMoved.moved3d) < 0.6 && !portal) {
+      return {
+        arrived: false,
+        position: at(end),
+        ms: Date.now() - t0,
+        remaining: Number(left.toFixed(2)),
+        ...spMoved,
+        via: 'pathfinder', stuck: true, reason: 'goal-not-standable',
+        ...roadInfo(), ...moveInfo(), ...fellInfo(end),
+        hint: `目标格站不住（下面没有方块 / 被方块占着）：我把落点就近挪到了 `
+          + `(${sp.x}, ${sp.y}, ${sp.z})，而那正好是我脚下这一格 —— 一步没走，所以**不算到达**。`
+          + `要真去那儿，先确认那格脚下有方块；想让我铺过去就用 mc_build 或 mc_act{mode:"bridge"}。`,
+      }
     }
     return {
       arrived: true,

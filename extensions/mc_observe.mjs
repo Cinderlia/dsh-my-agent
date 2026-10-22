@@ -568,7 +568,12 @@ export async function apply (api) {
 
         // ③ 不确定清单：按重要性排，太多时留前 5 条 + 最后那条（重建画面）
         const uncertain = []
-        uncertain.push('方块世界是**客户端预测**的 —— 服务端没认的破坏会"复原"（看着挖掉了其实没挖）')
+        /* 2026-10-23 审计：下面这两条**永远为真**，以前占着「最多 6 条」的名额，把会变的条目挤掉。
+         * 现在单独放末尾、不参与名额；措辞也纠正 —— mineflayer 不做客户端预测，只会比服务端晚一拍。 */
+        const CONST_DISCLAIMERS = [
+          '本地方块世界是服务端下发的镜像，更新会晚一拍（看到的方块不代表"现在"）',
+          wantImage ? '图是按方块数据重建的，不是真实画面（无光照/粒子/手臂）' : '结构化字段是这一轮现采的（看 capturedAt）',
+        ]
         if (wantImage && out.image.unloadedPct > 0) uncertain.push(`${out.image.unloadedPct}% 的画面是没加载的区块（那儿看不见，程序也不知道是什么）`)
         if (wantImage && cross?.unknown) uncertain.push('准星撞在未加载区块上，那块是什么不知道')
         if (noHp > 0) uncertain.push(`${noHp} 个实体读不到血量`)
@@ -578,10 +583,8 @@ export async function apply (api) {
         if (!wantImage) uncertain.push('这次**没截图**（`image:false`）—— 没有"图里看到"这一路，全靠游戏数据；要看画面再调一次（不带 image:false）')
         if (ray?.error) uncertain.push(wantImage ? '程序射线没跑出来，准星对着什么只有渲染那份说了算' : '程序射线没跑出来，这次又没截图 —— 准星对着什么完全不知道')
         else if (ray && !ray.error && wantImage && cross && !cross.unknown && ray.block && ray.block !== cross.name) uncertain.push(`两套射线不一致：程序说 ${ray.block}，渲染说 ${cross.name}（以程序为准）`)
-        uncertain.push(wantImage
-          ? '图是**按方块数据重建**的，不是游戏真实画面（没有真实光照/粒子/手臂动作）'
-          : '结构化字段是**这一轮现采**的（看 capturedAt），别把几轮前的工具结果当成"现在"')
         const shown = uncertain.length > 6 ? [...uncertain.slice(0, 5), uncertain[uncertain.length - 1]] : uncertain
+        for (const c of CONST_DISCLAIMERS) shown.push(c)
 
         if (wantImage) {
           lines.push(
@@ -592,8 +595,10 @@ export async function apply (api) {
               + ` · 图右下角手里是 ${out.held ?? '空手'} · 脚下 ${out.surroundings.underFeet}`
               + (out.surroundings.inWater ? ' · 泡在水里' : '')
               + (out.image.centerSoft ? ` · 射线先穿过 **${out.image.centerSoft.name}**（${out.image.centerSoft.dist} 格，不是没东西）` : ''),
+            /* 2026-10-23 审计：这一段和下面「程序检测到」的实体清单重复报同一批（132+202 字符）。
+             * 图这行只留"**图里画出来的**是谁、在画面哪一侧、有没有被准星压着" —— 名字/坐标/血量看下面那行。 */
             visEnts.length
-              ? `   · 图里 ${visEnts.length} 个实体：${visEnts.map((x) => `${x.name}（${x.label}${x.hostile ? '·敌对' : ''}·${lookOf(x)}）${x.distance} 格 ${dirOf(x.screen.xPct)}${x.underCrosshair ? '·准星正对' : ''}`).join(' · ')}`
+              ? `   · 图里 ${visEnts.length} 个实体：${visEnts.map((x) => `${x.name}@${dirOf(x.screen.xPct)}${x.underCrosshair ? '·准星正对' : ''}`).join(' · ')}`
               : (drawEntities
                   ? `   · 图里看不到实体（附近 ${near.length} 个被方块挡住或在画面外${nearSkipped ? `，另有 ${nearSkipped} 个更远的没画` : ''}）`
                   : '   · 这次没收集实体（`entities:false`）'),
@@ -618,7 +623,7 @@ export async function apply (api) {
             + (out.air != null ? ` · 氧气 ${out.air}` : '') + (out.submerged ? '（头在水下）' : '')
             + ` · 模式 ${out.gamemode ?? '?'} · 手持 ${out.held ?? '空手'}`,
           `   · 🎒 背包：${invText}`,
-          `   · 🛡 装备栏：${eqText ?? '读不到'}（这几格不在背包里，穿/脱用 mc_act {mode:"equip"}）`,
+          `   · 🛡 装备栏：${eqText ?? '读不到'}`,
           ...(out.durability ? [`   · ${out.durability}`] : []),
           `   · 脚下 ${out.surroundings.underFeet} · 脚内 ${out.surroundings.feetBlock} · 头上一格 ${out.surroundings.headBlock} · 正前方一格 ${out.surroundings.ahead}`
             + (out.surroundings.inWater ? ' · 泡在水里' : ''),
@@ -680,7 +685,7 @@ export async function apply (api) {
         )
         lines.push(visEnts.length
           ? '👥 视野里 ' + visEnts.length + ' 个实体：' + visEnts.map((x) =>
-            `${x.name}（${x.label}${x.hostile ? '·敌对' : ''}·${lookOf(x)}）${x.distance} 格 ${dirOf(x.screen.xPct)}`
+            `${x.name}（${x.label}${x.hostile && !String(x.label).includes('敌对') ? '·敌对' : ''}·${lookOf(x)}）${x.distance} 格 ${dirOf(x.screen.xPct)}`
             + (x.underCrosshair ? '·准星正对' : '')).join(' · ')
           : (near.length
               ? `👥 视野里看不到实体（附近 ${near.length} 个被方块挡住或在画面外${nearSkipped ? `，另有 ${nearSkipped} 个更远的没画` : ''}）`
@@ -698,7 +703,8 @@ export async function apply (api) {
           lines.push('⚠️ 未加载像素偏多：区块可能还没加载完，可以稍等再 mc_observe 一次。')
         }
       }
-      if (out.image?.file) lines.push(`💾 已落盘 ${out.image.file}（渲染 ${renderMs}ms）`)
+      /* 2026-10-23：默认落盘路径（.out/）对决策没意义，只在用户点名 out 时才报。 */
+      if (out.image?.file && !String(out.image.file).includes('/.out/')) lines.push(`💾 已落盘 ${out.image.file}（${renderMs}ms）`)
       if (out.image?.attachmentError) lines.push(`⚠️ 内联图片失败：${out.image.attachmentError}`)
       out.text = lines.join('\n')
 

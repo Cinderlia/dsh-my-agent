@@ -225,11 +225,15 @@ export function predictImpact (b, pos, vel, { maxBlocks = 96, step = 0.5 } = {})
     const y = Math.floor(blk.position?.y ?? (pos.y + uy * t)) + 1   // 云长在落点上方那一层
     const z = Math.floor(blk.position?.z ?? (pos.z + uz * t))
     const distanceToMe = me ? Math.round(Math.hypot(me.x - x, me.z - z) * 10) / 10 : null
+    /* 2026-10-23 审计：只算水平距离，会把「在我头顶十几格的恶魂/烈焰人喷的那一下」报成
+     * 「砸我脚下」（同一 x/z 而已）。云只影响落点上下各 1 层，所以高差必须一起判。 */
+    const dyMe = me ? Math.abs(me.y - y) : null
     return {
       x, y, z,
       blocks: Math.round(t * 10) / 10,
       distanceToMe,
-      hitsMe: distanceToMe != null && distanceToMe <= 3.5,   // 云半径 3 格
+      ...(dyMe != null ? { dyMe: Math.round(dyMe * 10) / 10 } : {}),
+      hitsMe: distanceToMe != null && distanceToMe <= 3.5 && (dyMe == null || dyMe <= 3),   // 云半径 3 格 + 高差 3 格
     }
   }
   return null

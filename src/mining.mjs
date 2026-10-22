@@ -21,10 +21,10 @@ import vec3pkg from 'vec3'
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 
 import { sleep, DESYNC_HINT } from './async-util.mjs'
-import { isAir, isLiquid, isSolidBlock } from './block-names.mjs'
+import { isAir, isLiquid, isSolidBlock, isPassable } from './block-names.mjs'
 import { heldText, canHarvestNow, toolKinds, countOf, durWarnText } from './inventory.mjs'
 import { digMsFor } from './dig-speed.mjs'
-import { blockReachOf, slowDigWhy, stateNameOf, dropHint } from './world-observer.mjs'
+import { blockReachOf, slowDigWhy, stateNameOf, dropHint, dropListOf } from './world-observer.mjs'
 import { classifyRestore } from './server-break.mjs'
 import { callBudget, callSecText } from './budget.mjs'
 import { dangerNow, dangerText, dangerNotice, healthOf, noticeKey } from './danger.mjs'
@@ -61,6 +61,16 @@ const VEIN_HAVE = {
   redstone_ore: ['redstone'],
   deepslate_redstone_ore: ['redstone'],
   ancient_debris: ['ancient_debris'],
+}
+
+/** 掉落物的人话坐标（给多块挖矿的"没捡到"那句话用）；一个都没有回空串 */
+function dropsWhereText (b, radius = 8) {
+  const list = dropListOf(b, { radius, limit: 3 })
+  if (!list.length) return ''
+  return list.map((d) => {
+    const nm = d.name ? d.name + ' ' : ''
+    return `${nm}@ (${d.x},${d.y},${d.z}) ${d.dist} 格`
+  }).join('、')
 }
 
 /**
@@ -232,6 +242,7 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
       ...(digMs != null ? { digMs } : {}),
       note: `服务端把这块**改回了 ${back}**（复原）—— 这次破坏服务端没认（多半是我离得远，或客户端区块旧了）。`
         + '先 `mc_move` 走到它旁边（3 格以内）再叫一次。'
+        + slowDigWhy(b)
         + DESYNC_HINT,
     }
   }
@@ -252,6 +263,9 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
   /* 真挖掉了 ⇒ 掉落物就在脚边。用户 2026-10-08 原话："挖完方块…老是忘记走过去拾取"。
    * 只**点一句**（`mc_act{break}` 这条路从来不自己捡），让模型知道这活还没完。 */
   const pickup = localGone ? dropHint(b) : null
+  /* 🔴 和 mc_attack 一个口径：只说"地上还有东西"不够，**在哪**才是能不能捡的依据
+   *   （2026-10-22 下界连丢两根烈焰棒就是栽在这上面）。捡不捡仍由 AI 决定。 */
+  const drops = localGone ? dropListOf(b, { radius: 8, limit: 4 }) : []
   /* 这一下把工具磨掉多少 —— 只在快坏时给（理由见 `dig` 收工段那段注释：
    * 全好时不说，坏的时候必须说，否则"镐子中途爆了"和"挖得好好的"长得一模一样）。 */
   const toolWear = durWarnText(b)
@@ -265,6 +279,7 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
     ...(t.changed ? { tool: `${t.heldBefore} → ${t.held}` } : {}),
     ...(digMs != null ? { digMs } : {}),
     ...(pickup ? { pickup } : {}),
+    ...(drops.length ? { drops } : {}),
     /* 服务端把这一格发成了**液体**（冰挖掉就是水，海草/海带也是）⇒ 破坏**成功**了，只是液体立刻涌了进来。
      * 单独说一句，免得模型把它当成"服务端复原 / 没挖掉"再挖一次。 */
     ...(rest?.kind === 'liquid' ? {
@@ -301,7 +316,16 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
  * 判据：模块不 import `core.mjs`、不 import 游戏库（只认 `b.blockAt` / `b.dig` / `b.findBlocks` / `b.game`）。
  * ──────────────────────────────────────────────────────────────────────────── */
 
-export async function dig (self, { name = null, pos = null, maxDistance = 6, count = 1, allowDangerous = false } = {}, ctx = {}) {
+export async function dig (self, {
+  name = null, pos = null, maxDistance = 6, count = 1, allowDangerous = false,
+  /* 2026-10-23 用户实机（「挖矿老是乱挖 / 够得到还搭方块」）：
+   *   noDig：走过去这一路允不允许挖穿挡路的方块。默认 true（只绕路、不挖墙）——
+   *     以前是 false，为了够到墙后的矿，pathfinder 会顺手把一路石头泥土全挖了，
+   *     在用户眼里就是"乱挖"。确实要挖穿（矿在墙后）就显式 noDig:false 再叫一次。
+   *   towerFallback：走不通时允不允许"垫一格方块往上"。默认 false —— 以前这个兜底
+   *     无视 noTower 一律会跑，于是"明明够得到"也会原地搭柱子。 */
+  noDig = true, towerFallback = false,
+} = {}, ctx = {}) {
   const b = self.requireBot()
   const out = []
   const held0 = heldText(b)
@@ -361,9 +385,24 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
    * findBlocks 的返回顺序不保证是最近的，第一个够不着就能把整轮 11 秒吃光。
    */
   const distOf = (blk) => { try { return b.entity.position.distanceTo(blk.position) } catch { return Infinity } }
+  /* 2026-10-23 用户实机（「挖矿老是乱挖 / 明明够得到还搭方块」）：
+   *   原来只按**脚到方块**的距离排 —— 墙后面那格永远"更近"，于是挑中的目标 A* 根本没路
+   *   （能站的格子在墙的另一侧），绕死 → 脱困阶梯 → 垫柱搭方块。
+   *   现在分三层挑：① 已经够得着（眼睛→方块中心 ≤ 4.5）一步都不用走；
+   *                ② 同一层（|dy| ≤ 2）走过去不用爬高爬低；③ 剩下一律按距离。
+   *   同一层里仍是"近的先挖"，矿脉一片一片挖的手感不变。 */
+  const mineReachLimit = b.game?.gameMode === 'creative' ? 5.0 : 4.5
+  const tierOf = (blk) => {
+    let reach = Infinity
+    try { reach = blockReachOf(b, blk) } catch {}
+    if (Number.isFinite(reach) && reach <= mineReachLimit) return 0
+    const dy = Math.abs(Number(blk?.position?.y) - Number(b.entity?.position?.y ?? 0))
+    return Number.isFinite(dy) && dy <= 2 ? 1 : 2
+  }
   if (targets.length > 1) {
     const pinned = pos ? targets[0] : null
-    const rest = targets.filter((t) => t !== pinned).sort((a, c) => distOf(a) - distOf(c))
+    const rest = targets.filter((t) => t !== pinned)
+      .sort((a, c) => (tierOf(a) - tierOf(c)) || (distOf(a) - distOf(c)))
     targets.length = 0
     targets.push(...(pinned ? [pinned, ...rest] : rest))
   }
@@ -487,7 +526,16 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
         continue
       }
       if (blockReachOf(b, fresh) > reachMax) {
-        const w = await self.walkTo({ x: p.x + 0.5, y: p.y, z: p.z + 0.5 }, { arrive: 2.2, budget })
+        /* 2026-10-23：落点以前是**矿块自己那一格**（嵌在石头里），由 standPointFor 挪到
+         *   "离矿最近的可站格" —— 那个格子可能在墙的**另一侧**，A* 永远没路，于是绕死/垫柱。
+         *   改成先自己算：矿块周围能站、且眼睛够得着（≤ reachMax）的格子里挑**离我最近**的，
+         *   落点天然在墙的这一侧；一个候选都没有才退回老写法。 */
+        const cell = mineApproachCell(b, p, reachMax)
+        /* 口径和以前一致：x/z 取**格中心**（+0.5），y 是脚那一格。 */
+        const stand = cell
+          ? { x: cell.x + 0.5, y: cell.y, z: cell.z + 0.5 }
+          : { x: p.x + 0.5, y: p.y, z: p.z + 0.5 }
+        const w = await self.walkTo(stand, { arrive: 2.2, budget, noDig, towerFallback })
         fresh = b.blockAt(p)
         /* 🔴 2026-10-15 审计：`b.blockAt(p)` 在**区块卸载**时返回 null，而以前 `!fresh` 和
          *    `fresh.name !== nm` 走同一条路 ⇒ 把"读不到"当成"走过去顺手挖掉了"，`okCount++`
@@ -498,6 +546,13 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
           continue
         }
         if (fresh.name !== nm) {
+          /* 2026-10-23 审计：名字变了不等于「我挖掉了」——可能被别的实体替换/炸掉。
+           * 只有变成空气/液体才算这一格真被我挖掉了。 */
+          if (!isAir(fresh.name) && !isLiquid(fresh.name)) {
+            out.push(`走到 ${nm} @ ${p} 时那里已经是 ${fresh.name}（不是空气）—— **这一格没算挖掉**，`
+              + '不是我挖的（被替换 / 炸掉 / 区块更新过了），要它的话指个新目标')
+            continue
+          }
           okCount++
           if (task) self.tasks.progress(task.taskId, { add: 1 })
           out.push(`走过去的时候顺手挖掉了 ${nm} @ ${p} → 现在 ${fresh.name}`)
@@ -505,7 +560,8 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
           if (got > 0) out.push(`　（顺手捡回 ${got} 个掉落物）`)
           else {
             const hint = dropHint(b)
-            if (hint) out.push(`　（${hint}）`)
+            const where = dropsWhereText(b)
+            if (hint) out.push(`　（${hint}${where ? '：' + where : ''}）`)
           }
           continue
         }
@@ -513,7 +569,8 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
           const away = blockReachOf(b, fresh)
           out.push(`够不着 ${nm} @ ${p}（眼睛到方块中心 ${away.toFixed(1)} 格，`
             + `${w?.arrived ? '走过去也只到这么远' : '走过去也没走到'}）—— `
-            + '先 `mc_move` 到它旁边（或换个近一点的目标）再叫我挖：站远了挖服务端不认，方块会"复原"')
+            + '先 `mc_move` 到它旁边（或换个近一点的目标）再叫我挖：站远了挖服务端不认，方块会"复原"。'
+            + (noDig ? '（这条路被方块挡着走不过去的话，带 `digThrough:true` 叫我，我挖穿过去）' : ''))
           continue
         }
       }
@@ -530,7 +587,7 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
           // 空中挖慢 5 倍 ⇒ 先等落地（否则预算全喂给一次注定超时的挖掘）
           if (!await ctx.waitGrounded(b, Math.min(1_500, Math.max(0, leftOf() - 800)))) {
             out.push(`—— 我还在空中（没落地）就挖不了 ${nm}：空中挖方块慢 5 倍，先落稳（或 \`mc_move {mode:"jump"}\` 换个落脚点）再叫一次 mc_dig`)
-            break
+            continue
           }
           await ctx.equipFor(b, fresh, `换工具挖 ${nm}`)
           const oneMs = digMsFor(b, fresh, b?.heldItem?.type ?? null)
@@ -583,7 +640,8 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
                * why：用户 2026-10-08 原话"挖完方块或者打完动物以后老是忘记走过去拾取" ——
                * 捡东西是**决策**，插件替不了，但结果里必须让它知道这活还没完。 */
               const hint = dropHint(b)
-              if (hint) out.push(`　（${hint}）`)
+              const where = dropsWhereText(b)
+              if (hint) out.push(`　（${hint}${where ? '：' + where : ''}）`)
             }
           } else out.push(`没挖成 ${nm} @ ${p}（原地挖完了，但那里**还是 ${now}**）`
             + ' —— 服务端没认这次破坏（失步 / 领地保护 / 工具不对）：先 `mc_scan` 复核。'
@@ -621,4 +679,38 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
     ctx.verdictLine(out, okCount, targets.length)
     return ctx.withHeld(out, b, held0)
   }
+}
+
+/**
+ * 挑一个"走到那里就够得着 p 这块矿"的落脚点（2026-10-23，用户「够得到还搭方块」）。
+ * 候选 = 矿块周围一圈（含上下）的可站格，过滤条件是眼睛→矿块中心 ≤ reachMax，
+ * 最后挑**离自己最近**的那个：离我近 ⇒ 天然在墙的这一侧 ⇒ A* 有路。
+ * 返回 {x,y,z}（格坐标，y 是脚那一格）或 null（让调用方退回老写法）。
+ */
+function mineApproachCell (b, p, reachMax) {
+  const me = b?.entity?.position
+  if (!me || !p) return null
+  const at = (x, y, z) => { try { return b.blockAt(new Vec3(x, y, z)) } catch { return null } }
+  const standable = (x, y, z) => {
+    const u = at(x, y - 1, z); const a = at(x, y, z); const c = at(x, y + 1, z)
+    if (!u || !a || !c) return false
+    if (isAir(u.name) || isLiquid(u.name)) return false
+    return isPassable(a.name) && isPassable(c.name)
+  }
+  const px = Math.floor(p.x); const py = Math.floor(p.y); const pz = Math.floor(p.z)
+  const center = new Vec3(p.x + 0.5, p.y + 0.5, p.z + 0.5)
+  let best = null; let bestD = Infinity
+  for (const dy of [0, -1, 1]) {
+    for (const dx of [-1, 0, 1]) {
+      for (const dz of [-1, 0, 1]) {
+        if (!dx && !dz && !dy) continue
+        const x = px + dx; const y = py + dy; const z = pz + dz
+        if (!standable(x, y, z)) continue
+        if (new Vec3(x + 0.5, y + 1.62, z + 0.5).distanceTo(center) > reachMax) continue
+        const d = me.distanceTo(new Vec3(x + 0.5, y, z + 0.5))
+        if (d < bestD) { bestD = d; best = { x, y, z } }
+      }
+    }
+  }
+  return best
 }

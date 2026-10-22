@@ -2806,7 +2806,9 @@ export function apply(ctx, rawConfig) {
       const p = s.position ?? {}
       bits.push(
         `我在 (${p.x}, ${p.y}, ${p.z})`,
-        `朝 yaw ${round2(s.yaw)} / pitch ${round2(s.pitch)}`,
+        /* 2026-10-23 审计：mc_observe 用度（yaw=180°）、mc_status 原来用弧度（yaw 3.14），
+         * 同一个朝向两个口径会让模型读错。统一成度。 */
+        `朝 yaw ${Math.round((((s.yaw * 180) / Math.PI) % 360 + 360) % 360)}° / pitch ${Math.round((s.pitch * 180) / Math.PI)}°`,
         `血 ${round2(s.health)}/20`, `食 ${s.food}`, `手 ${s.held ?? '空'}`,
         `${s.gamemode ?? '?'} / ${s.dimension ?? '?'} / 时间 ${s.time ?? '?'}`,
       )
@@ -2831,7 +2833,12 @@ export function apply(ctx, rawConfig) {
     /* 🔴 2026-10-19 用户点的坑"读不到末影龙血量"：龙/凋灵的血只在 Boss Bar 里，
      *    实体列表读不到 ⇒ 有血条就把"还剩几成 / 多少点"直接放状态条第二行。 */
     if (s.online && s.bossBars?.length) lines.push(`🗡 ${formatBossBars(s.bossBars)}`)
-    if (s.online && s.players?.length) lines.push(`👥 ${s.players.join('、')}`)
+    /* 2026-10-23 审计：以前把**全部**在线玩家名都打出来（大服能到 800 字符，且绝大多数与本轮决策无关）。
+     * 只报人数 + 前 4 个名字，剩下的省略号带过。 */
+    if (s.online && s.players?.length) {
+      const more = s.players.length > 4 ? ` 等 ${s.players.length} 人` : ''
+      lines.push(`👥 ${s.players.slice(0, 4).join('、')}${more}`)
+    }
     if (sess.events?.length) lines.push(`📨 有 ${sess.events.length} 条事件没看（mc_events）`)
     if (w) {
       const fired = Number(w.stats?.fired ?? 0)
@@ -2846,6 +2853,36 @@ export function apply(ctx, rawConfig) {
     return lines.join('\n')
   }
 
+  /* audit 2026-10-22（用户：全量审计 + 减少 token 消耗）：坐标参数一律走 numOf/coordOf/boxOf。
+   *   以前直接写 Number(args.x) —— 传 "12abc" / {} / null 只会得到 NaN，一路灌进 GoalNear(NaN)，
+   *   最后回报一句 NoPath。AI 看到的是谜语，而不是「你 x 写错了」。现在缺参 / 非数字 / Infinity
+   *   全都当场抛中文错，省掉一整轮试错。 */
+  /* 2026-10-23 审计（移动层报告第 9 条）：`intent` 写错一个词原来会**静默回落 near**
+   * （movement.mjs 的 intentOf 注释里明说"不报错"），于是 `intent:"stand"` 写成
+   * `"stan"` / `"stand on block"` 时 AI 以为是"站那一格上"，实际按 1.6 格判"到了"。
+   * 入口这里直接报错，列出四个合法值 —— 与「非法输入要明确报错」的原则一致。 */
+  const INTENT_VALUES = new Set(['near', 'stand', 'interact', 'same-level'])
+  function intentArgOf (v) {
+    if (v == null) return undefined
+    const t = String(v).trim()
+    if (INTENT_VALUES.has(t)) return t
+    throw new Error('参数 intent 只能是 near / stand / interact / same-level（现在是 "' + t + '"）')
+  }
+
+  function numOf (v, label) {
+    const n = Number(v)
+    if (!Number.isFinite(n)) throw new Error('参数 ' + label + ' 必须是数字，收到的是 ' + JSON.stringify(v ?? null))
+    return n
+  }
+  function coordOf (args) {
+    return { x: numOf(args?.x, 'x'), y: numOf(args?.y, 'y'), z: numOf(args?.z, 'z') }
+  }
+  function boxOf (args) {
+    return {
+      x1: numOf(args?.x1, 'x1'), y1: numOf(args?.y1, 'y1'), z1: numOf(args?.z1, 'z1'),
+      x2: numOf(args?.x2, 'x2'), y2: numOf(args?.y2, 'y2'), z2: numOf(args?.z2, 'z2'),
+    }
+  }
   ctx.tools.register(asTool({
     name: 'mc_status',
     description: '看我在 Minecraft 里的状态：在线 / 坐标 / 朝向 / 血量 / 饱食度 / 手持物 / 模式（active 或 standby）/ 看门狗是否在守 / 最近 3 条聊天。\n'
@@ -3594,7 +3631,9 @@ export function apply(ctx, rawConfig) {
        *    现在给一份紧凑文本：一行图例 + 字符图 + 一行图信息。
        * 🔴 2026-10-08：顺手修掉图例里 `[object Object]` 的老 bug（`legend` 是 `{name,count}` 对象，
        *    以前直接 `.join(' ')`）。洞穴层视图的图例带 `glyph`，所以两种形状都渲染。 */
-      const legendText = hm.legend.slice(0, 15)
+      /* 2026-10-23 审计（感知层报告 D[3]）：图例只留前 8 种（默认半径 32 时 15 种要 225 字符），
+       * 剩下的都是极少数方块，`mc_scan` 要看占比时再看。 */
+      const legendText = hm.legend.slice(0, 8)
         .map((e) => (e?.glyph ? `${e.glyph}${e.name}×${e.count}` : `${e?.name ?? '?'}×${e?.count ?? 0}`))
         .join(' ')
       const lines = [
@@ -3606,7 +3645,8 @@ export function apply(ctx, rawConfig) {
       if (hm.mode === 'floor') {
         const t = hm.counts ?? {}
         lines.push(`能站 ${t.walkable ?? 0} 格 ｜ 墙 ${t.blocked ?? 0} ｜ 会掉下去 ${t.drop ?? 0} ｜ 液体 ${t.liquid ?? 0} ｜ 未加载 ${t.unknown ?? 0}`)
-        lines.push('（· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载；想看地表图就 mode:"surface"）')
+        /* 2026-10-23 审计：符号说明与工具 description 重复，改成最短形式并顺手说明游程压缩。 */
+        lines.push('（·能站 #墙 v掉下去 ~水 ≈岩浆 ?未加载 ｜ X*n = 连续 n 个 X）')
       }
       /* 2026-10-15：`purpose` 的紧凑摘要（导航/危险）—— 让模型不用自己从几十行字符图里数 */
       for (const l of nav.lines) lines.push(l)
@@ -3700,21 +3740,21 @@ export function apply(ctx, rawConfig) {
       if (mode === 'swim') {
         // 给了坐标 = 游过去（walkTo 在水里会自动走"直接游"那条）；没给 = 只上浮换气
         if (args.x !== undefined && args.y !== undefined && args.z !== undefined) {
-          return { ...withOutcome(await sess.bot.walkTo({ x: Number(args.x), y: Number(args.y), z: Number(args.z) }, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: args.intent, waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined }), { expect: 'moved' }), ...aroundOf(sess) }
+          return { ...withOutcome(await sess.bot.walkTo(coordOf(args), { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: intentArgOf(args.intent), waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined }), { expect: 'moved' }), ...aroundOf(sess) }
         }
         return { ...withOutcome(await sess.bot.swimUp({ hold: callBudget(args.budgetMs ?? 9_000) }), { expect: 'moved' }), ...aroundOf(sess) }
       }
       if (args.x === undefined || args.y === undefined || args.z === undefined) {
         throw new Error('walk/fly 需要 x/y/z；只想跳一下请给 mode:"jump"，在水里上浮请给 mode:"swim"')
       }
-      const target = { x: Number(args.x), y: Number(args.y), z: Number(args.z) }
+      const target = coordOf(args)
       const creative = sess.bot.bot?.game?.gameMode === 'creative'
       const use = (mode === 'walk-nodig' ? 'walk' : mode) || (creative ? 'fly' : 'walk')
       // 🔴 2026-10-08 审计⑤：fly 以前不传 budgetMs —— 写 budgetMs:2000 也照样跑满 10 秒
       if (use === 'fly') return { ...withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
       if (use === 'boat') return { ...withOutcome(await sess.bot.driveBoat(target, { arrive: args.intent === 'stand' ? 1.2 : 2, budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
       if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / walk-nodig / fly / jump / swim / boat）`)
-      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: args.intent, waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined }), { expect: 'moved' }), ...aroundOf(sess) }
+      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: intentArgOf(args.intent), waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined }), { expect: 'moved' }), ...aroundOf(sess) }
     },
   }))
 
@@ -3734,6 +3774,7 @@ export function apply(ctx, rawConfig) {
       + '· useitem 用手上的东西：扔眼睛/雪球；**带 x/y/z 会先瞄准、停 450ms 再用**（舀水/骨粉/补种都带坐标）\n'
       + '· equip 装备(name)：护甲自动穿、盾进副手\n'
       + '· toss 丢弃(name,count)\n'
+      + '· jump 原地跳一下（爬台阶/脱困，不需要坐标）\n'
       + '· dismount 从船/矿车/坐骑上下来（开船用 mc_move boat）',
     parameters: {
       mode: { type: 'string', description: '见上面各 mode（默认 look）' },
@@ -3754,6 +3795,10 @@ export function apply(ctx, rawConfig) {
       const bot = sess.bot
       const mode = String(args.mode ?? 'look')
       switch (mode) {
+        /* 🔴 2026-10-23 实机（用户直接把『未知 mode："jump"』贴回来）：跳一下属于移动，
+         *    但人在 mc_act 里找它（脱困 / 爬台阶时手最顺的就是这个工具）。与其报错让人换工具，
+         *    直接把 jump 接过来 —— 和 mc_move {mode:"jump"} 走同一条路（同一个 bumpGen）。 */
+        case 'jump':    return { mode, ...(await bot.jump()), ...aroundOf(sess) }
         case 'look':    return { mode, ...(await bot.lookAt(args)) }
         case 'toward':  return { mode, ...(await bot.interact(args)) }
         case 'place':   return withOutcome({ mode, ...(await bot.placeBlock(args)) }, { expect: 'placed' })
@@ -3775,7 +3820,7 @@ export function apply(ctx, rawConfig) {
         /* 用户 2026-10-20：「还有下船」—— 上船一直有（`use`→`activateEntity`），下来没有：
          * `bot.dismount()` 只发包不确认，实现在 `src/boat.mjs`（发完轮询 `bot.vehicle`）。 */
         case 'dismount': return { mode, ...(await bot.dismountVehicle()) }
-        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/fish/equip/toss/dismount；射箭/打怪/自查/方块台另见 mc_shoot / mc_attack / mc_prep / mc_station）`)
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/fish/equip/toss/jump/dismount；走路/飞/游泳用 mc_move，射箭/打怪/自查/方块台另见 mc_shoot / mc_attack / mc_prep / mc_station）`)
       }
     },
   }))
@@ -3801,7 +3846,11 @@ export function apply(ctx, rawConfig) {
       const r = await fishOnce(sess.bot.requireBot(), { timeoutMs: budget })
       const head = r.ok ? '🎣 上鱼了' : '🎣 没上鱼'
       const tail = r.bobber ? `\n浮标在 (${r.bobber.x}, ${r.bobber.y}, ${r.bobber.z})` : ''
-      return `${head}：${r.message}${tail}`
+      /* 🔴 2026-10-23 实机：这里返回**裸字符串**，宿主校验 `output` 的 `{type:'object'}` 直接拒掉，
+       *    报「tool "mc_fish" returned invalid output: "value" must be an object」——
+       *    等于钓鱼整个不可用（连人都没开始钓就被拦）。其它工具返回的是对象，只有这里裸串。
+       *    统一成 `{ text }`（`text()` 的 render 会优先取 `value.text`）。 */
+      return { text: `${head}：${r.message}${tail}`, ...r }
     },
   }))
 
@@ -3972,10 +4021,9 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const sess = getSession(exec)
       return sess.bot.build({
-        x1: Number(args.x1), y1: Number(args.y1), z1: Number(args.z1),
-        x2: Number(args.x2), y2: Number(args.y2), z2: Number(args.z2),
+        ...boxOf(args),
         name: args.name ? String(args.name) : null,
-        max: Math.min(Math.max(Number(args.max ?? 64), 1), 256),
+        max: Math.min(Math.max(args.max == null ? 64 : numOf(args.max, 'max'), 1), 256),
       })
     },
   }))
@@ -3990,16 +4038,24 @@ export function apply(ctx, rawConfig) {
       maxDistance: { type: 'number', description: '搜索半径（默认 16；树/矿脉远的话给大一点，上限看场景）' },
       count: { type: 'number', description: '挖几个（默认 1，上限 16；一次挖不完就再叫一次）' },
       allowDangerous: { type: 'boolean', description: '允许挖自己脚下的支撑（默认拦，下面没落脚点就掉下去）' },
+      digThrough: {
+        type: 'boolean',
+        description: '允不允许**挖穿挡路的方块**走过去（默认 false = 只绕路、不挖墙）。'
+          + '矿在墙后面、绕不过去、工具提示"够不着"时才传 true。',
+      },
     },
     output: text(),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
       const pos = (args.x !== undefined && args.y !== undefined && args.z !== undefined)
-        ? { x: Number(args.x), y: Number(args.y), z: Number(args.z) } : null
+        ? coordOf(args) : null
       const lines = await sess.bot.dig({
         name: args.name ? String(args.name) : null, pos,
-        maxDistance: args.maxDistance ?? 16, count: args.count,
+        /* 2026-10-23：默认搜索半径 16 → 8。16 格外的矿一律要被走过去，而"走过去"正是
+         *   乱挖/垫柱的来源；8 格内的矿基本都在身边，挖起来干脆。远处的先 mc_move 靠近。 */
+        maxDistance: args.maxDistance ?? 8, count: args.count,
+        noDig: args.digThrough !== true,
         /* 🔴 2026-10-20 审计：`allowDangerous` 在上面声明了、`dig()` 也认这个参数，
          *    但这里**从来没传过** —— 于是"带 allowDangerous:true 就能挖脚下"这句
          *    写进报错文案的逃生阀**永远是 false**，AI 照着做也没用。 */
@@ -5509,6 +5565,46 @@ export function apply(ctx, rawConfig) {
     return Object.keys(out).length ? out : null
   }
 
+  /* audit 2026-10-22（用户：全量审计 + 减少 token 消耗）：mc_diag 两处浪费
+   *   1) 断线分支完全无视 only，照样塞 perf / terrainCache / workers 和整份 promptInjection
+   *      （实测一次约 5 KB），而断线时 AI 只想知道我在不在线；
+   *   2) promptInjection 里的 versionPrompt 同时给 text 和 defaultText，两者一模一样时白白翻倍。
+   *   现在：断线分支同样按 only 分节；注入段只给 head（前 120 字）+ chars + sameAsDefault，
+   *   想要正文让 AI 自己 read 那个文件（提示词里本来就写了以文件为准）。 */
+  function diagSlimInjection (inj) {
+    if (!inj || typeof inj !== 'object') return inj
+    const out = { ...inj }
+    const vp = out.versionPrompt
+    if (vp && typeof vp === 'object' && ('text' in vp || 'defaultText' in vp)) {
+      const text = String(vp.text ?? '')
+      const def = String(vp.defaultText ?? '')
+      const slim = { ...vp }
+      delete slim.text
+      delete slim.defaultText
+      slim.head = text.slice(0, 120)
+      slim.chars = text.length
+      slim.sameAsDefault = text === def
+      out.versionPrompt = slim
+    }
+    return out
+  }
+  function diagOffline (args, sess, b, injection, perf, terrainCache, workers) {
+    const asked = String(args?.only ?? '').split(/[,，s]+/).map((x) => x.trim().toLowerCase()).filter(Boolean)
+    const all = asked.includes('all')
+    const want = (k) => all || asked.includes(k)
+    const out = {
+      online: false, ghost: Boolean(b?.entity) && b?._client?.ended === true,
+      lastError: sess.bot.lastError, mode: sess.mode,
+      hint: '连接已经结束了（bot.entity 只是 mineflayer 的残留）——要回到游戏里请重新 mc_connect',
+    }
+    if (want('prompt')) out.promptInjection = diagSlimInjection(injection)
+    if (want('perf')) out.perf = perf
+    if (want('terrain')) out.terrainCache = terrainCache
+    if (want('workers')) out.workers = workers
+    const known = ['state', 'perf', 'crafting', 'scheduler', 'watching', 'prompt', 'terrain', 'workers', 'connection']
+    if (!all && asked.length) out.availableSections = known
+    return out
+  }
   ctx.tools.register(asTool({
     name: 'mc_diag',
     /* 🔴 2026-10-17（用户实机：`mc_diag` 一次输出几万字符，AI 只想知道其中一节）：
@@ -5534,12 +5630,7 @@ export function apply(ctx, rawConfig) {
        *    继续调 mc_move/mc_dig（那些抛"机器人不在线"），**唯独不会去 mc_connect**。
        *    现在和 `status()` 同一套判据（`bot.online`）。 */
       if (!sess.bot.online || !b?.entity) {
-        return {
-          online: false, ghost: Boolean(b?.entity) && b?._client?.ended === true,
-          lastError: sess.bot.lastError, mode: sess.mode, promptInjection: injection,
-          perf, terrainCache, workers,
-          hint: '连接已经结束了（bot.entity 只是 mineflayer 的残留）——要回到游戏里请重新 mc_connect',
-        }
+        return diagOffline(args, sess, b, injection, perf, terrainCache, workers)
       }
       const full = {
         online: true, version: b.version, physicsEnabled: b.physicsEnabled,
@@ -5564,7 +5655,7 @@ export function apply(ctx, rawConfig) {
          * 排查"两个动作互相踩"（合成 / 熔炼 / 开箱子抢同一个窗口、走路被挖矿抢控制位）用。 */
         scheduler: sess.bot.actionSnapshot(),
         watching: sess.watchdog?.status() ?? null,
-        promptInjection: injection,
+        promptInjection: diagSlimInjection(injection),
         /* 2026-10-15：性能监测 —— `verdict` 里就是"哪个动作该搬 Worker"的中文结论 */
         perf,
       }

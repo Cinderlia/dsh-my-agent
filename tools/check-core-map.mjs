@@ -492,7 +492,7 @@ try {
     [core, /static glyphMap \(names, step = 2, selfIndex = null\) \{ return glyphMapText\(names, step, selfIndex\) \}/, 'core：static glyphMap() 留成薄包装'],
     [core, /mapImage \(opts = \{\}\) \{ return mapImageOf\(this\.requireBot\(\), opts\) \}/, 'core：mapImage() 留成薄包装'],
     [strip(idx), /mode: \{ type: 'string'/, 'index：mc_map 有 mode 参数'],
-    [strip(idx), /const legendText = hm\.legend\.slice\(0, 15\)/, 'index：图例渲染抽成 legendText'],
+    [strip(idx), /const legendText = hm\.legend\.slice\(0, 8\)/, 'index：图例渲染抽成 legendText（只留前 8 种）'],
     [strip(idx), /e\?\.glyph \? `\$\{e\.glyph\}\$\{e\.name\}×\$\{e\.count\}`/, 'index：图例渲染认 glyph（地板层的图例带字形）'],
     /* ── 2026-10-15：地板层视图（用户需求）── */
     [names, /export const FLOOR_GLYPH = \{/, 'block-names：地板层字形表'],
