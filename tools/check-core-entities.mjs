@@ -404,6 +404,78 @@ section('⑩ 作物成熟度 —— mc_scan{name} 带出 age / maxAge / ripe（�
   }
 }
 
+/* ─────────── ⑪ 方块占比（用户 2026-10-22："扫一次输出草方块 10%、泥土 20%、石头 70%"）─────────── */
+section('⑪ 方块占比 —— mc_scan 不给 name 时，counts 里带 pct（分母 = 非空气方块总数）')
+{
+  const { scanAround } = await import(new URL('../src/world-scan.mjs', import.meta.url))
+  /** 把 mix 里的方块按顺序铺满 (-10..10)² 的一块平地（一格一个，不会重叠）；
+   *  没铺到的位置全是 air（blockAt 缺省返回 air）。 */
+  const mkMix = (mix) => {
+    const blocks = {}
+    const side = 11
+    let i = 0
+    for (const [name, n] of mix) {
+      for (let k = 0; k < n; k++, i++) {
+        /* 从原点往 +x/+z 铺（0..10）：小半径（radius 4）也能整片扫到，
+         * 100 个刚好占满 11×10，落在 radius 10 的窗口里。 */
+        blocks[`${i % side},64,${Math.floor(i / side)}`] = { name, props: {} }
+      }
+    }
+    return {
+      entity: { position: new Vec3(0, 64, 0) },
+      blockAt: (p) => blocks[`${p.x},${p.y},${p.z}`] ?? { name: 'air' },
+    }
+  }
+
+  {   /* 主线：草 10 / 泥土 20 / 石头 70 —— 用户举例的那组 */
+    const r = scanAround(mkMix([['grass_block', 10], ['dirt', 20], ['stone', 70]]), { radius: 10, height: 1 })
+    const by = Object.fromEntries(r.counts.map((c) => [c.name, c.pct]))
+    ok(r.total === 100, '总数 total = 100 个实方块（空气不算进去）', String(r.total))
+    ok(by.grass_block === 10 && by.dirt === 20 && by.stone === 70,
+      '🔴 占比就是用户要的形状：草 10% / 泥土 20% / 石头 70%', JSON.stringify(by))
+    ok(r.counts[0].name === 'stone', '按占比降序排（第一行就是最多的那种）', JSON.stringify(r.counts.map((c) => c.name)))
+    const sum = Math.round(r.counts.reduce((a, c) => a + c.pct, 0) * 10) / 10
+    ok(sum === 100, 'pct 加起来 = 100%（不留缺口）', String(sum))
+  }
+  {   /* 空气不进分母：同一批方块，把扫描窗口放大 4 倍，比例不变、total 不变 */
+    const bot = mkMix([['dirt', 3], ['stone', 1]])
+    const a = scanAround(bot, { radius: 4, height: 1 })
+    const b = scanAround(bot, { radius: 16, height: 4 })
+    ok(a.total === 4 && b.total === 4, '🔴 空气不算——窗口放大只会多扫空气，total 不变', `${a.total} / ${b.total}`)
+    ok(b.counts[0].pct === 75 && b.counts[1].pct === 25, '比例照旧 75% / 25%', JSON.stringify(b.counts))
+  }
+  {   /* 除不尽：1:1:1 → 33.3 各，允许 0.1 的舍入误差 */
+    const r = scanAround(mkMix([['stone', 1], ['dirt', 1], ['sand', 1]]), { radius: 4, height: 1 })
+    ok(r.counts.every((c) => c.pct === 33.3), '三分之一保留一位小数（33.3）不是整数糊过去', JSON.stringify(r.counts.map((c) => c.pct)))
+  }
+  {   /* 空场景：不许除零变 NaN */
+    const r = scanAround(mkMix([]), { radius: 4, height: 1 })
+    ok(r.total === 0 && Array.isArray(r.counts) && r.counts.length === 0,
+      '🔴 周围什么都没有 ⇒ total=0、counts 空数组（不除零、不出 NaN）', JSON.stringify({ total: r.total, counts: r.counts }))
+  }
+  {   /* 单一种类 = 100% */
+    const r = scanAround(mkMix([['stone', 5]]), { radius: 4, height: 1 })
+    ok(r.counts.length === 1 && r.counts[0].pct === 100, '只有一种方块 ⇒ 100%', JSON.stringify(r.counts))
+  }
+  {   /* 静态接线：pct 是 scanAround 算的，不是让 AI 自己除 */
+    const scanSrc = readFileSync(new URL('../src/world-scan.mjs', import.meta.url), 'utf8')
+    ok(/const totalCount = \[\.\.\.counts\.values\(\)\]\.reduce/.test(scanSrc), 'world-scan.mjs 自己算 totalCount')
+    ok(/pct: pctOf\(v\)/.test(scanSrc), 'counts 每条都带 pct（由 pctOf 折出来）')
+    ok(/total: totalCount,/.test(scanSrc), '返回值里带 total（方便核对覆盖了多少个实方块）')
+    const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+    ok(/fmtPct\(c\.pct\)/.test(idx), 'index.js 的计数文案真用了 pct')
+    ok(/其余 \$\{restKinds\} 种共/.test(idx), '只列 10 种时，把剩下那些种的占比也交代一句')
+    /* 🔵 2026-10-22 用户第三轮："去掉 1% 的限制，显示前 10 种，再加个输入，可以显示后 10 种" */
+    ok(!/MIN_PCT/.test(idx), '1% 的门槛已撤（不再按占比筛种类）')
+    ok(/const TOP_N = 10/.test(idx), '固定只列 10 种')
+    ok(/const shown = tail \? r\.counts\.slice\(-TOP_N\)\.reverse\(\) : r\.counts\.slice\(0, TOP_N\)/.test(idx),
+      '默认前 10；tail:true 取最后 10 种（反转成从少到多）')
+    ok(/tail: \{ type: 'boolean'/.test(idx) && /args\.tail/.test(idx),
+      'mc_scan 真加了 tail 入参')
+    ok(/最少的 \$\{shown\.length\} 种，从少到多/.test(idx), 'tail 模式的标题说清"最少的 N 种"')
+  }
+}
+
 // ── 收尾 ────────────────────────────────────────────────────────────────────
 for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 console.log(`\ncheck-core-entities：pass=${pass} fail=${fail}`)

@@ -143,14 +143,20 @@ for (const s of table) {
 const totalPayload = mcSpecs.reduce((a, s) => a + payload(s), 0)
 console.log(`   ${'─'.repeat(56)}\n   合计 ${totalPayload} 字符 ≈ ${(totalPayload / 2.6 / 1000).toFixed(1)}K token（33 个工具的 JSON 还含键名/缩进，实测 22,595 字符）`)
 
-/* 上限：基线 + 约 10% 余量（改瘦了不会失败，改胖了会）。 */
+/* 单个工具的肥瘦：仍然卡（一个工具塞到 2000 字符说明该拆了）。
+ * 总量：**不再判失败**（用户 2026-10-22：「把18000的限制先去掉」——要加工具就加，
+ * 别为凑数字砍掉说明），只留一条参考线，超了打一行 ⚠️ 提醒自己。 */
 const PER_TOOL_MAX = 1_600
-const TOTAL_MAX = 18_000
+const TOTAL_SOFT = 18_000
 section('2. 体积上限')
 const fat = table.filter((s) => payload(s) > PER_TOOL_MAX)
 ok(fat.length === 0, `每个 mc_* 工具的"描述+参数说明" ≤ ${PER_TOOL_MAX} 字符`,
   fat.length ? `超了：${fat.map((s) => `${s.name}(${payload(s)})`).join('、')}` : `最肥的 ${table[0]?.name} = ${payload(table[0])}`)
-ok(totalPayload <= TOTAL_MAX, `mc_* 总体积 ≤ ${TOTAL_MAX} 字符`, `实际 ${totalPayload}`)
+if (totalPayload > TOTAL_SOFT) {
+  console.log(`  ⚠️ mc_* 总体积 ${totalPayload} 字符，已超参考线 ${TOTAL_SOFT}（不判失败 —— 2026-10-22 用户要求去掉这条限制）`)
+} else {
+  console.log(`  · mc_* 总体积 ${totalPayload} 字符（参考线 ${TOTAL_SOFT}，未超）`)
+}
 
 /* ────────────────── 3. "结果别回 JSON"的静态判据 ────────────────── */
 

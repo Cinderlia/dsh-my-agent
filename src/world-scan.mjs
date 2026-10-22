@@ -94,9 +94,19 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
       }),
     }
   }
+  /* 🔵 2026-10-22 用户："加个功能，扫描周围 16 格的方块占比，例如扫一次输出
+   *    草方块 10%、泥土 20%、石头 70%"。以前只给 `count`，比例得自己拿总数去除 ——
+   *    多一步算术就多一次出错机会，我常常干脆不算。
+   *    分母 = **非空气方块总数**（空气在上面就被 `isAir` 挡掉了）：地表附近空气占九成，
+   *    算进去的话任何方块都变成 0.x%，看着像"没有"。
+   *    `total` 一起给出来，方便核对"这一扫到底覆盖了多少个实方块"。 */
+  const totalCount = [...counts.values()].reduce((a, v) => a + v, 0)
+  const pctOf = (v) => (totalCount > 0 ? Math.round((v / totalCount) * 1000) / 10 : 0)
   return {
     center: { x: c.x, y: cy, z: c.z }, radius: R, height: H, unloaded,
-    counts: [...counts.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 25).map(([n, v]) => ({ name: n, count: v })),
+    total: totalCount,
+    counts: [...counts.entries()].sort((a, b2) => b2[1] - a[1]).slice(0, 25)
+      .map(([n, v]) => ({ name: n, count: v, pct: pctOf(v) })),
   }
 }
 

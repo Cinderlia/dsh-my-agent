@@ -10,10 +10,11 @@ import { join } from 'node:path'
 const render = await import(new URL('../extensions/mc_view-render.mjs', import.meta.url).href)
 const { encodePng } = await import(new URL('../src/png.mjs', import.meta.url).href)
 const { makeSkin } = await import(new URL('../extensions/mc_skin.mjs', import.meta.url).href)
+const { TextureAtlas, textureCandidates } = await import(new URL('../src/textures.mjs', import.meta.url).href)
 const outDir = mkdtempSync(join(tmpdir(), 'mc-view-render-'))
 const {
   cameraBasis, renderView, compassOf, castRay, colorOf, ruleOf, isAirName, isWaterName, isLavaName,
-  entityStyle, entityBoxOf, entityParts, selfTest, VIEW_DEFAULTS,
+  entityStyle, entityBoxOf, entityParts, selfTest, VIEW_DEFAULTS, fluidSurfaceHeight,
 } = render
 
 let pass = 0
@@ -447,6 +448,170 @@ console.log('— 8.5 非实体方块（火把/花草）也要画出来 —')
   ok(noSoft.stats.centerSoft === null, '没有软方块时 centerSoft = null', JSON.stringify(noSoft.stats.centerSoft))
 
   writeFileSync(join(outDir, 'view-soft-blocks.png'), encodePng(base.width, base.height, withSoft.rgba))
+}
+
+console.log('— 8.6 官方贴图库（TextureAtlas）接进渲染 —')
+{
+  // 假库：stone 上半红下半蓝（测 v 方向），grass_block_top 是灰度图（测染色）
+  const mkAtlas = () => {
+    const names = ['stone', 'grass_block_top']
+    const data = new Uint8Array(names.length * 16 * 16 * 4)
+    for (let y = 0; y < 16; y++) {
+      for (let x = 0; x < 16; x++) {
+        const o = (0 * 256 + y * 16 + x) * 4
+        data[o] = y < 8 ? 220 : 20
+        data[o + 1] = 30
+        data[o + 2] = y < 8 ? 20 : 220
+        data[o + 3] = 255
+      }
+    }
+    for (let i = 0; i < 256; i++) {
+      const o = (1 * 256 + i) * 4
+      data[o] = 128; data[o + 1] = 128; data[o + 2] = 128; data[o + 3] = 255
+    }
+    return new TextureAtlas({ tag: 'fake', names, gray: [0, 1], data })
+  }
+  const atlas = mkAtlas()
+
+  // ① 采样：顶面 v 朝上、侧面 v 朝下（贴图第 0 行在最上面）
+  const top = atlas.sample('stone', 1, 1, 0.5, 0.1)
+  const side = atlas.sample('stone', 2, -1, 0.5, 0.1)
+  ok(top && top[0] > 200 && top[2] < 40, '顶面 v=0.1 取到贴图上部（红）', JSON.stringify(top))
+  ok(side && side[2] > 200 && side[0] < 40, '侧面 v=0.1 翻过来取到贴图下部（蓝）', JSON.stringify(side))
+
+  // ② 灰度贴图按调色板 tint 上色
+  const tinted = atlas.sample('grass_block_top', 1, 1, 0.5, 0.5, [80, 200, 60])
+  ok(tinted && tinted[1] > tinted[0] && tinted[1] > tinted[2], '灰度贴图被 tint 染成绿色',
+    JSON.stringify(tinted))
+  const notGray = atlas.sample('stone', 1, 1, 0.5, 0.1, [80, 200, 60])
+  const noTint = atlas.sample('stone', 1, 1, 0.5, 0.1, null)
+  ok(notGray && noTint && same(notGray, noTint), '非灰度贴图不吃 tint（给不给 tint 都一样）',
+    `${JSON.stringify(notGray)} vs ${JSON.stringify(noTint)}`)
+
+  // ③ 没有的方块 → null，并记进 missing
+  ok(atlas.sample('emerald_block', 1, 1, 0.5, 0.5, [0, 255, 0]) === null, '库里没有的方块返回 null')
+  ok(atlas.stats().missing.includes('emerald_block'), 'missing 记下了 emerald_block', JSON.stringify(atlas.stats()))
+
+  // ④ 接进渲染：不传 atlas = 调色板；传了 = 用贴图
+  const build = (name) => ({
+    getBlock (pos) {
+      const { y, z } = pos.floored()
+      if (y === 0) return { name, boundingBox: 'block' }
+      if (z === -6) return { name: 'stone', boundingBox: 'block' }
+      return { name: 'air', boundingBox: 'empty' }
+    },
+  })
+  const base = { origin: [0, 1.3, 0], yaw: 0, pitch: -0.35, width: 192, height: 108, distance: 48, texture: true }
+  const plain = renderView({ ...base, world: build('stone') })
+  const texd = renderView({ ...base, world: build('stone'), atlas })
+  ok(plain.stats.textured === 0, '没给 atlas → 一个像素都不算贴图', String(plain.stats.textured))
+  ok(texd.stats.textured > 1000, '给了 atlas → 大部分像素走贴图', String(texd.stats.textured))
+  ok(texd.stats.textured <= texd.stats.pixels, '贴图像素数不可能超过总像素', `${texd.stats.textured}/${texd.stats.pixels}`)
+  let diff = 0
+  for (let i = 0; i < texd.rgba.length; i += 4) {
+    if (texd.rgba[i] !== plain.rgba[i] || texd.rgba[i + 1] !== plain.rgba[i + 1] || texd.rgba[i + 2] !== plain.rgba[i + 2]) diff++
+  }
+  ok(diff > 1000, '贴图确实改变了画面', String(diff))
+
+  // ⑤ 库里没有的方块：画面回退到调色板，但要记进 atlasMissing
+  const miss = renderView({ ...base, world: build('emerald_block'), atlas })
+  ok(miss.stats.textured > 0 && miss.stats.textured < texd.stats.textured,
+    '没贴图的地面回退调色板（只有石头墙走贴图，贴图像素变少）',
+    `${miss.stats.textured} < ${texd.stats.textured}`)
+  ok(miss.stats.atlasMissing.includes('emerald_block'), 'atlasMissing 记下了 emerald_block',
+    JSON.stringify(miss.stats.atlasMissing))
+  ok(atlas.stats().hits > 0, 'atlas 统计里有命中', JSON.stringify(atlas.stats()))
+}
+
+console.log('— 8.6b 方块名 → 贴图名的兜底映射 —')
+{
+  const cand = (n, axis = 1, step = 1, props = null) => textureCandidates(n, axis, step, props)
+  ok(cand('oak_wood').includes('oak_log'), 'oak_wood 退到 oak_log')
+  ok(cand('stripped_warped_hyphae').includes('stripped_warped_stem'), 'hyphae 退到 stem')
+  ok(cand('brick_stairs', 0).includes('bricks'), 'brick_stairs 退到 bricks')
+  ok(cand('stone_brick_wall', 0).includes('stone_bricks'), 'stone_brick_wall 退到 stone_bricks')
+  ok(cand('white_carpet').includes('white_wool'), 'white_carpet 退到 white_wool')
+  ok(cand('waxed_exposed_copper').includes('exposed_copper'), '打蜡铜块剥前缀')
+  ok(cand('waxed_weathered_cut_copper_stairs', 0).includes('weathered_cut_copper'), '打蜡风化剪制台阶剥前缀')
+  ok(cand('red_bed').includes('item:red_bed'), '红床用 item 贴图')
+  ok(cand('blue_shulker_box').includes('entity:shulker/shulker_blue'), '蓝色潜影盒用 entity 贴图')
+  ok(cand('chest').includes('entity:chest/normal'), '箱子用 entity 贴图')
+  ok(cand('water_cauldron').includes('cauldron_top'), '炼药锅顶面用 cauldron_top')
+  ok(cand('white_candle_cake', 0).includes('cake_side'), '蜡烛蛋糕侧面用 cake_side')
+  ok(cand('grass_block', 1).includes('grass_block_top'), '草方块顶面仍是 grass_block_top')
+
+  // 前缀兜底：库里没有精确名时，用「以它开头」的贴图
+  const fake = new TextureAtlas({ tag: 'fake', names: ['fire_0', 'stone', 'smelt_result'], gray: [0, 0, 0], data: Buffer.alloc(3 * 16 * 16 * 4, 128) })
+  ok(fake.resolve('stone', 1, 1) === 1, '精确名优先于兜底')
+  ok(fake.resolve('smelt', 1, 1) === 2, '前缀兜底命中 smelt_result', String(fake.resolve('smelt', 1, 1)))
+  ok(fake.resolve('netherite_block', 1, 1) === -1, '真没有的方块仍然返回 -1')
+  ok(fake.stats().missing.includes('netherite_block'), '真没有的记进 missing')
+}
+
+console.log('— 8.7 水/岩浆：静止 vs 流动贴图 + 液面高度 —')
+{
+  // ① 贴图分流：level>0 或 falling 就是流动
+  ok(textureCandidates('water', 1, 1, { level: 0 })[0] === 'water_still', '静止水（level=0）用 water_still')
+  ok(textureCandidates('water', 1, 1, { level: 5 })[0] === 'water_flow', '流动水（level=5）用 water_flow')
+  ok(textureCandidates('water', 1, 1, { falling: true })[0] === 'water_flow', 'falling=true 用 water_flow')
+  ok(textureCandidates('water', 1, 1)[0] === 'water_still', '读不到属性时按静止水画')
+  ok(textureCandidates('lava', 1, 1, { level: 2 })[0] === 'lava_flow', '流动岩浆用 lava_flow')
+  ok(textureCandidates('stone', 1, 1, { level: 5 })[0] === 'stone', '普通方块不吃液体逻辑')
+
+  // ② 水的贴图是灰度图，要靠调色板染成蓝的；静止和流动两张亮度不同，能区分
+  const wnames = ['water_still', 'water_flow']
+  const wdata = new Uint8Array(wnames.length * 1024)
+  for (let t = 0; t < wnames.length; t++) {
+    const lum = t === 0 ? 180 : 90
+    for (let i = 0; i < 256; i++) {
+      const o = (t * 256 + i) * 4
+      wdata[o] = lum; wdata[o + 1] = lum; wdata[o + 2] = lum; wdata[o + 3] = 255
+    }
+  }
+  const wat = new TextureAtlas({ tag: 'water', names: wnames, gray: [0, 0], data: wdata })
+  const STILL = wat.sample('water', 1, 1, 0.5, 0.5, [58, 110, 214], { level: 0 })
+  const FLOW = wat.sample('water', 1, 1, 0.5, 0.5, [58, 110, 214], { level: 4 })
+  ok(STILL && STILL[2] > STILL[0] + 60, '静止水被调色板染成蓝', JSON.stringify(STILL))
+  ok(FLOW && STILL && FLOW[2] < STILL[2], '流动水和静止水取到不同的贴图', `${JSON.stringify(FLOW)} vs ${JSON.stringify(STILL)}`)
+
+  // ③ 液面高度
+  ok(fluidSurfaceHeight({ name: 'stone' }) === 1, '非液体液面 = 1（整块）')
+  ok(Math.abs(fluidSurfaceHeight({ name: 'water' }) - 0.875) < 1e-9, '静止水液面 0.875')
+  const lv4 = fluidSurfaceHeight({ name: 'water', getProperties: () => ({ level: 4 }) })
+  ok(lv4 > 0.12 && lv4 < 0.875, '流动水（level=4）液面更低', String(lv4))
+  ok(fluidSurfaceHeight({ name: 'water' }, { name: 'water' }) === 1, '上面还有水 ⇒ 液面就是满的')
+
+  // ④ 射线停在水面，不是方块顶面
+  const fluidWorld = (level, extraLayer) => ({
+    getBlock (pos) {
+      const { y } = pos.floored()
+      if (y === 10 || (extraLayer && y === 11)) {
+        return { name: 'water', boundingBox: 'empty', getProperties: () => ({ level }) }
+      }
+      if (y < 10) return { name: 'stone', boundingBox: 'block' }
+      return { name: 'air', boundingBox: 'empty' }
+    },
+  })
+  const down = (w) => castRay(w, 0.5, 14, 0.5, 0, -1, 0, 40)
+  const still = down(fluidWorld(0, false))
+  ok(still && still.name === 'water', '射线打在水上', JSON.stringify(still && still.name))
+  ok(still && Math.abs((14 - still.dist) - 10.875) < 0.02, '静止水停在液面 y≈10.875（不是方块顶 11）',
+    still && String(14 - still.dist))
+  const flow = down(fluidWorld(7, false))
+  ok(flow && Math.abs((14 - flow.dist) - (10 + 1 / 9)) < 0.02, '流动水（level=7）水面更低 y≈10.11',
+    flow && String(14 - flow.dist))
+  const full = down(fluidWorld(0, true))
+  ok(full && Math.abs((14 - full.dist) - 11.875) < 0.02, '上面还有一层水 ⇒ 停在 y≈11.875', full && String(14 - full.dist))
+
+  // ⑤ 接进渲染：水面是蓝的
+  // 水面在 y=10.875，人得站在它上面往下看（origin y=11.3）
+  const base2 = { origin: [0, 11.3, 0], yaw: 0, pitch: -0.9, width: 192, height: 108, distance: 48, texture: true }
+  const waterWorld = fluidWorld(0, false)
+  const wimg = renderView({ ...base2, world: waterWorld, atlas: wat })
+  ok(wimg.stats.textured > 100, '水面走了贴图', String(wimg.stats.textured))
+  let blue = 0
+  for (let i = 0; i < wimg.rgba.length; i += 4) if (wimg.rgba[i + 2] > wimg.rgba[i] + 40) blue++
+  ok(blue > 500, '画面里有大片蓝色（水）', String(blue))
 }
 
 console.log('— 9. 性能（默认 192×108 + 更大档）—')

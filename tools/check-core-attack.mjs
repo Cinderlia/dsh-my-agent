@@ -3,7 +3,7 @@
  * check-core-attack.mjs —— 「打怪 / 采集挑目标 / 真重连」的回归检查
  *
  * 背景（用户 2026-10-08 转来游戏里 AI 的四条实机反馈）：
- *   ① `mc_act {mode:"attack", who:"zombie"}` 报 `附近找不到 "zombie"`，不给 who 才打得着；
+ *   ① `mc_attack {, who:"zombie"}` 报 `附近找不到 "zombie"`，不给 who 才打得着；
  *   ② `mc_dig` 挑到够不着的目标就把整轮 11 秒吃光（只能自己改用 mc_sequence 连着 break）；
  *   ③ 挖着挖着报"那里本来就是空气"，重连也清不掉 —— 因为**已连着时 mc_connect 是空操作**。
  *   ④ 顺手抓到的：不给 who 时会先打到脚边的掉落物（AI 自己都发现了）。
@@ -409,7 +409,7 @@ section('⑥ 真打得到 —— 等目标死 / 等预算用完（旧写法 awai
     const mc = mkMc(f); mc.mcPlugins = { pvp: true }
     const r = await mc.attack({ who: 'zombie', budget: 400 })
     ok(r.killed === false && r.via === 'pvp', '还在 ⇒ killed:false', JSON.stringify(r))
-    ok(/还没打死/.test(String(r.note)) && /再叫一次 mc_act\{attack\}/.test(String(r.note)),
+    ok(/还没打死/.test(String(r.note)) && /再叫一次 mc_attack/.test(String(r.note)),
       '在攻击距离内 ⇒ 报"打了 N 秒还没打死，再叫一次接着打"', String(r.note))
     ok(r.waitedMs >= 350, '确实等到了预算用完', `waitedMs=${r.waitedMs}`)
   }
@@ -526,7 +526,7 @@ section('⑤ 静态接线')
   has(minNo, 'DESYNC_HINT', 'mining：失步文案统一走 DESYNC_HINT（劝退 force 重连）')
   has(idxNo, 'if (args.force)     opts.force     = true', 'index：mc_connect 把 force 传下去')
   has(idxNo, 'force:     { type:', 'index：mc_connect 暴露 force 参数')
-  has(idxNo, '中英文都认', 'index：mc_act 描述写明 attack 认中英文名')
+  has(idxNo, '中英文都认', 'index：mc_attack 描述写明认中英文名')
   has(atkNo, 'await b.pvp.attack(target)', 'attack.mjs：pvp 还是用 attack(target) 设目标（会自己追过去）')
   has(atkNo, 'if (!b.entities?.[target.id] || target.isValid === false) break',
     'attack.mjs：自己等目标消失（pvp.attack 立刻 resolve，不能 await 完就 stop）')
@@ -1203,7 +1203,7 @@ section('⑨ 放风筝 —— 只对近战怪、退到安全落脚点、没退�
   {   /* 静态接线：index.js 得真有这个参数、描述里得提一句（不然模型永远不知道有它） */
     const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
     ok(/kite: \{ type: 'boolean'/.test(idx), 'mc_act 参数里有 kite（boolean）')
-    ok(/kite 放风筝/.test(idx), 'mc_act 描述里写了 kite 放风筝（模型才知道有这个模式）')
+    ok(/kite.*放风筝/.test(idx), 'mc_attack 描述里写了 kite 放风筝')
   }
 }
 

@@ -198,7 +198,7 @@ export async function runSequence (self, steps, { stopOnError = true, budgetMs =
       stoppedAt: next, remaining: steps.length - next,
       hint: danger
         ? `⚠️ 第 ${next + 1} 步**没做** —— 先处理眼前这个（${dText}）：`
-          + '`mc_act {mode:"attack"}` 打掉它，或者 `mc_move` 躲开、`mc_act {mode:"equip"}` 换上装备。'
+          + '`mc_attack` 打掉它，或者 `mc_move` 躲开、`mc_act {mode:"equip"}` 换上装备。'
           + `安全了再叫一次 mc_sequence，steps 从第 ${next + 1} 步往后发。`
         : aborted
           ? `被中断了（第 ${next + 1} 步还没做）—— 要接着做就再叫一次 mc_sequence，steps 从第 ${next + 1} 步往后发。`

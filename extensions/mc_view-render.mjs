@@ -460,6 +460,33 @@ export function makePos () {
  * @returns null（没命中=天空）| { unknown:true, dist }（撞到未加载区块）
  *          | { name, dist, axis, step, block, bx, by, bz }（axis: 0=x 1=y 2=z；step: 沿该轴的前进方向）
  */
+/** 读方块属性（mineflayer 的 getProperties 在不同版本名字不一样）。 */
+function blockProps (b) {
+  if (!b) return null
+  try {
+    const p = typeof b.getProperties === 'function' ? b.getProperties() : null
+    if (p && typeof p === 'object') return p
+  } catch { /* 读不到就当没属性 */ }
+  return b.properties ?? null
+}
+
+/**
+ * 液体的液面高度（相对方块底面，0..1）。不是液体 = 1（整块）。
+ * MC 的水静止时 14/16，流动时按 level 往下掉（(8-level)/9），所以瀑布/活水的水面比满格低。
+ */
+export function fluidSurfaceHeight (b, above = null) {
+  const n = b?.name
+  if (!isWaterName(n) && !isLavaName(n)) return 1
+  if (above && (isWaterName(above.name) || isLavaName(above.name))) return 1
+  const p = blockProps(b)
+  const lvl = Number(p?.level ?? 0)
+  const base = isLavaName(n) ? 0.9 : 0.875
+  if (!Number.isFinite(lvl) || lvl <= 0) return base
+  return Math.max(0.12, (8 - Math.min(8, lvl)) / 9)
+}
+
+const FLUID_ABOVE = makePos()
+
 export function castRay (world, ox, oy, oz, dx, dy, dz, maxDist, scratch, maxSteps = VIEW_DEFAULTS.maxSteps, soft = null) {
   // 把"几乎为 0"的分量按 0 处理：否则 yaw 正好 ±90° 时 cos(yaw)≈6e-17 会让射线
   // 在第一步就沿另一轴漂一格（tMax≈0），画面出现一格错位。
@@ -519,6 +546,15 @@ export function castRay (world, ox, oy, oz, dx, dy, dz, maxDist, scratch, maxSte
         if (!soft.has(sk)) soft.set(sk, { name: n, dist: t, block: b, x, y, z })
       }
       continue
+    }
+    // 液体：液面比整格低（流动水按 level 缩水），所以从上方看应该停在液面而不是方块顶面
+    if (isWaterName(n) || isLavaName(n)) {
+      FLUID_ABOVE.x = x; FLUID_ABOVE.y = y + 1; FLUID_ABOVE.z = z
+      const h = fluidSurfaceHeight(b, world.getBlock(FLUID_ABOVE))
+      if (h < 1 && dy < 0) {
+        const tTop = (y + h - oy) / dy
+        if (tTop > t && tTop <= maxDist) return { name: n, dist: tTop, axis: 1, step: 1, block: b, bx: x, by: y, bz: z }
+      }
     }
     return { name: n, dist: t, axis, step, block: b, bx: x, by: y, bz: z }
   }
@@ -1179,6 +1215,7 @@ export function renderView (opts) {
     time = 6000,
     dimension = 'overworld',
     held = null,
+    atlas = null, // 官方贴图库（src/textures.mjs 的 TextureAtlas）；null = 用调色板
   } = opts
   if (!world || !origin) throw new Error('renderView 需要 world 与 origin')
 
@@ -1194,7 +1231,9 @@ export function renderView (opts) {
   const aoCache = new Map()
   const counts = new Map()
   const soft = new Map() // 被穿过的非实体方块（火把/花草/作物…），像素循环后再补画
-  const stats = { sky: 0, unknown: 0, hit: 0, pixels: width * height, top: [], softTop: [], softDrawn: 0, centerSoft: null, entityPixels: 0, entitiesDrawn: 0, skinned: 0 }
+  const stats = { sky: 0, unknown: 0, hit: 0, pixels: width * height, top: [], softTop: [], softDrawn: 0, centerSoft: null, entityPixels: 0, entitiesDrawn: 0, skinned: 0, textured: 0, atlasMissing: [] }
+  // 贴图查不到时退回调色板：记下前几个缺的方块名，方便补 SPECIAL 映射
+  const atlasMissing = new Set()
   const ox = origin[0]
   const oy = origin[1]
   const oz = origin[2]
@@ -1282,6 +1321,17 @@ export function renderView (opts) {
         let base = texture
           ? patternPixel(rule, hit.axis, hit.step, lu, lv, hit.bx, hit.by, hit.bz)
           : rule.color
+        // 官方贴图优先：查得到就用真贴图；查不到（自定义方块、版本改名）静默退回调色板
+        if (texture && atlas !== null) {
+          const tex = atlas.sample(hit.name, hit.axis, hit.step, lu, lv, rule.color, blockProps(hit.block))
+          if (tex !== null) {
+            base = tex
+            stats.textured++
+          } else if (atlasMissing.size < 8 && !atlasMissing.has(hit.name)) {
+            atlasMissing.add(hit.name)
+            stats.atlasMissing.push(hit.name)
+          }
+        }
         let light = shadeOf(hit.axis, hit.step)
         // 朝阳面微亮
         if (skyOn && sky.daylight > 0.2) {

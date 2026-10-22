@@ -100,7 +100,7 @@ export const NAME_ALIAS = {
   雪傀儡: 'snow_golem', 鱿鱼: 'squid', 鲑鱼: 'salmon', 鳕鱼: 'cod', 蜜蜂: 'bee', 海豚: 'dolphin',
   羊驼: 'llama', 熊猫: 'panda', 狐狸: 'fox', 鹦鹉: 'parrot', 蝙蝠: 'bat',
   // 末地战（用户 2026-10-19「hawkeye 主要是水晶和末影龙」）：中文叫法得认，否则
-  // `mc_act {mode:"shoot", who:"末影龙"}` 会报「附近找不到」。
+  // `mc_shoot {who:"末影龙"}` 会报「附近找不到」。
   末影龙: 'ender_dragon', 龙: 'ender_dragon', 末影水晶: 'ender_crystal', 水晶: 'ender_crystal',
 }
 

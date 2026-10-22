@@ -265,7 +265,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     }
     throw new Error(`4.5 格内没有能打的实体${near ? `（24 格内最近的是 ${near}）` : ''}`
       + ' —— 掉落物 / 经验球不算，动物与玩家要贴到 4.5 格内；'
-      + '要打远处的怪就先 `mc_move` 过去（或 `mc_act {mode:"attack", who:"zombie"}`，那个会追 24 格）。')
+      + '要打远处的怪就先 `mc_move` 过去（或 `mc_attack {who:"zombie"}`，那个会追 24 格）。')
   }
   let label = entityNameOf(target)
   let d = Number(distOf(target).toFixed(1))
@@ -408,7 +408,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     /* 已经给出更具体的原因（血掉太猛 / 追不上）就别用"没打死"把它盖掉 */
     if (!gone && !pvpErr && !hardHurt && !chaseGiveUp) {
       note = inRange
-        ? `打了 ${(waitedMs / 1000).toFixed(1)} 秒还没打死（这一轮的时间到了）—— 再叫一次 mc_act{attack} 接着打`
+        ? `打了 ${(waitedMs / 1000).toFixed(1)} 秒还没打死（这一轮的时间到了）—— 再叫一次 mc_attack 接着打`
         : `追了 ${(waitedMs / 1000).toFixed(1)} 秒还没进到攻击距离（3.5 格）—— 走不过去 / 被方块挡住 / 目标跑太快；`
           + '先 mc_move 到它旁边，或者换个近一点的目标'
     }

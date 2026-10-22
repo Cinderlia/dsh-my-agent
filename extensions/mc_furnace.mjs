@@ -303,7 +303,7 @@ export function hintFor (name) {
   if (n === 'cobbled_deepslate' || n === 'deepslate') return `深层石头：\`mc_dig {name:"${n}",count:8}\`（y 很低的洞里）`
   if (/_log$|_wood$/.test(n)) return `原木：\`mc_dig {name:"${n}",count:3}\`（砍你附近那种树）`
   if (/^(beef|porkchop|chicken|mutton|rabbit|cod|salmon|potato)$/.test(n)) {
-    return '食物：`mc_act {mode:"attack"}` 打牛/猪/鸡/羊，或者钓鱼、种马铃薯'
+    return '食物：`mc_attack {}` 打牛/猪/鸡/羊，或者钓鱼、种马铃薯'
   }
   if (n === 'clay_ball') return '黏土球：挖水底的黏土块（`mc_dig {name:"clay",count:8}`）'
   if (n === 'ancient_debris') return '远古残骸：去下界 y≈15 挖（要钻石镐），烧成下界合金碎片'

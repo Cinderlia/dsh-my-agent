@@ -76,6 +76,86 @@ export function standableY (b, x, y, z) {
   for (let d = 1; d <= 2; d++) if (canStand(gy + d)) return gy + d
   return gy
 }
+/** 那一格「人能不能站」：脚下有实地 + 本格与头顶都能通行。
+ *  （`standableY` 的老判据，抽出来给 `standPointFor` 复用 —— 2026-10-22 用户第三条寻路反馈） */
+export function canStandAtWorld (b, gx, gy, gz) {
+  const at = (xx, yy, zz) => {
+    try { return b.blockAt(new Vec3(xx, yy, zz)) } catch { return null }
+  }
+  const u = at(gx, gy - 1, gz); const a = at(gx, gy, gz); const c = at(gx, gy + 1, gz)
+  if (!u || !a || !c) return false
+  if (isAir(u.name) || isLiquid(u.name)) return false
+  return isPassable(a.name) && isPassable(c.name)
+}
+
+/**
+ * 🔴 2026-10-22 用户第三条反馈（原文）：「goal 点选在了不可站立的格子 …… A* 永远算不出
+ *    "站上去"的终点 —— 要么绕死，要么原地不动」。
+ *    实测场景：把目标设成 (-10,79,41)/(-10,79,42) 这种**门框内侧**格（被门碰撞箱占着、
+ *    或头顶只有 1 格净空），`standableY` 只会在**同一根柱子**上上下找 4/2 格，找不到就
+ *    原样把不可站的 y 丢给 A* ⇒ 终点永远不成立。
+ *
+ *    这里补**水平邻域**：本格站不住就往外找一圈（同层 8 邻 → y±1 的 8 邻），
+ *    挑最近的可站格当落点，并如实把"改了去哪"报回去（`adjustedFrom`）。
+ *    只挪 1 格，不会把目标搬到别的地方；邻域里一个能站的都没有才退回原值。
+ */
+export function standPointFor (b, x, y, z) {
+  const gx = Math.floor(Number(x)); const gy = Math.floor(Number(y)); const gz = Math.floor(Number(z))
+  if (!Number.isFinite(gx) || !Number.isFinite(gy) || !Number.isFinite(gz)) {
+    return { x: gx, y: gy, z: gz, adjusted: false }
+  }
+  /* ① 原格能站：一格都不挪（绝大多数情况走这条） */
+  if (canStandAtWorld(b, gx, gy, gz)) return { x: gx, y: gy, z: gz, adjusted: false }
+  /* ② 本柱上下各一格（台阶/半砖那种差一层的目标） */
+  for (const dy of [-1, 1]) {
+    if (canStandAtWorld(b, gx, gy + dy, gz)) {
+      return { x: gx, y: gy + dy, z: gz, adjusted: true, from: { x: gx, y: gy, z: gz } }
+    }
+  }
+  /* ③ 水平邻域：先同层，再上下各一层（门框内侧、只有 1 格净空的格子走这条） */
+  for (const dy of [0, -1, 1]) {
+    for (const [dx, dz] of NEIGHBOR8) {
+      if (canStandAtWorld(b, gx + dx, gy + dy, gz + dz)) {
+        return { x: gx + dx, y: gy + dy, z: gz + dz, adjusted: true, from: { x: gx, y: gy, z: gz } }
+      }
+    }
+  }
+  /* ④ 实在没有：退回老规矩（本柱往下 4 格 / 往上 2 格，给"目标 y 在半空"兜底） */
+  const sy = standableY(b, gx, gy, gz)
+  return { x: gx, y: sy, z: gz, adjusted: sy !== gy, from: sy !== gy ? { x: gx, y: gy, z: gz } : undefined }
+}
+
+/** 8 邻（先正交后对角，走得短） */
+const NEIGHBOR8 = [
+  [1, 0], [-1, 0], [0, 1], [0, -1],
+  [1, 1], [1, -1], [-1, 1], [-1, -1],
+]
+
+/**
+ * 🔴 2026-10-22 用户第二条反馈：「起点落在"半格"里，A* 认为我卡在方块内部 —— 站在耕地、
+ *    箱子顶、门格上时，坐标是 y=78 而脚下那格其实是 farmland（0.9375 格高），起点被判定
+ *    成"嵌在方块里"，寻路第一步就无解 ⇒ 直接 `moved: 0` + `arrived: true` 的假成功」。
+ *
+ *    `bot.entity.position` 是**脚底浮点**（站 farmland 上 y=78.9375），`Math.floor` 会把它
+ *    算成 78 —— 而 78 那格正是 farmland 自己。这里把那一位补回来：脚所在的格子如果被
+ *    实心方块占着（站不进去），就取它上面那一格。
+ */
+export function standFeetY (b, pos) {
+  const gx = Math.floor(Number(pos?.x ?? 0)); const gz = Math.floor(Number(pos?.z ?? 0))
+  const gy = Math.floor(Number(pos?.y ?? 0))
+  const at = (xx, yy, zz) => {
+    try { return b.blockAt(new Vec3(xx, yy, zz)) } catch { return null }
+  }
+  const here = at(gx, gy, gz)
+  if (!here) return gy
+  /* 本格被实心且不能穿过的方块占着 = 人实际站在它上面 */
+  if (isSolidBlock(here.name) && !isPassable(here.name)) {
+    const above = at(gx, gy + 1, gz)
+    if (!above || isPassable(above.name)) return gy + 1
+  }
+  return gy
+}
+
 /** 原地跳一下（爬台阶用） */
 export async function jump (self, ctx = {}) {
   const bumpGen = ctx.bumpGen ?? (() => ++self._moveGen)
@@ -987,7 +1067,12 @@ export async function walkThroughDoor (b, target, { budgetMs = 1_600, radius = 3
       await openNearbyDoor(b, radius).catch(() => 0)
       await sleep(160)
     }
-    if (doorOpenStateOf(doorFaceOf(b, dir) ?? dir) !== 'open') return { passed: false, why: 'closed', door: face?.name }
+    /* 🔴 2026-10-22 用户第一条反馈（「门被当成实心方块 / 硬挤过去」）：以前这里是
+     *    `!== 'open'` 就判死 —— 可 `doorOpenStateOf` 读不出状态时返回的是 **undefined**
+     *    （方块属性还没同步、或者门本来就被人开着），于是"未知"被当成"关着"，
+     *    走门流程直接放弃、退回去让 A* 硬挤。现在只认**明确 closed**，未知就照常往前走，
+     *    过没过由物理位移判定。 */
+    if (doorOpenStateOf(doorFaceOf(b, dir) ?? dir) === 'closed') return { passed: false, why: 'closed', door: face?.name }
     /* 🔴 `doorBaseKey()` 返回的是 **字符串** `"x,y,z"`（给去重用的），不是对象 ——
      * 第一版拿它当 `{x,y,z}` 用 ⇒ 中心点变 NaN ⇒ `lookAt(NaN)` ⇒ 物理把位置算成 NaN
      * （实机表现为 bot 位置直接变 NaN、寻路全废）。这里直接取下半块的 `position`。 */
@@ -1529,6 +1614,10 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   const t0 = Date.now()
   const start = b.entity.position.clone()
   const at = (p) => ({ x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) })
+  /* 🔴 2026-10-22 用户第二条反馈：站在 farmland / 箱子顶 / 门格这类"非满格"方块上时，
+   *    `bot.entity.position.y` 是 78.9375，`Math.floor` 会把起点算成 78 —— 而 78 那格
+   *    正是 farmland 自己，A* 判定成"人嵌在方块里"，第一步就无解。这里补回实际站的那一格。 */
+  const startY = standFeetY(b, start)
   const startRemaining = Math.hypot(start.x - target.x, start.z - target.z)
   /* P0-A（2026-10-17 实机）：`moved` 只有**水平**位移（`Math.hypot(dx, dz)`）—— 那天在要塞里垫
    * 柱子时放方块被拒（vendor `mineflayer-pathfinder/index.js:563` 的 `place_error`：先
@@ -1577,13 +1666,31 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   }
   /* 🔴 目标 y 可能是半空（地图/扫描给的是"地表高度"、树冠、别人站的 y）—— 直接朝那个 y 走，
    *    pathfinder 会一路垫方块往上爬（"搭路一直搭到空气上"）。收到底面再走。 */
-  const ty = standableY(b, target.x, target.y, target.z)
+  /* 🔴 2026-10-22 用户第三条反馈：目标格站不住（门框内侧、只有 1 格净空）时，
+   *    `standableY` 只在本柱上下找，找不到就把不可站的 y 原样丢给 A* ⇒ 终点永不成立。
+   *    `standPointFor` 会往水平邻域找最近的可站格，并把"改去哪"如实报回去。 */
+  const sp = standPointFor(b, target.x, target.y, target.z)
+  const ty = sp.y
   /* 🔴 2026-10-19 用户：「还有把末影传送门视为危险方块」—— 真正的原因是**目标半径**：
    *    `GoalNear(…, max(0, round(arrive-0.6)))` 默认半径 1，人在门外 1 格就满足 ⇒
    *    "到了但没进去"。目标（或它旁边）是传送门时把半径收到 **0**（必须站在那一格上），
    *    并在到了之后补一步"迈进去"（`stepIntoPortal`）。 */
   const portal = portalAt(b, Math.floor(target.x), ty, Math.floor(target.z))
-  const gp = goalPointFor({ target, ty, arriveUsed, portal })
+  let gp = goalPointFor({ target: { x: sp.x, z: sp.z }, ty, arriveUsed, portal })
+  /* 🔴 2026-10-22 用户第二条的另一半：`GoalNear` 半径默认 1 格是**三维球**，
+   *    人站在半格里（起点被算作 y 下层）时起点本身就在球内 ⇒ A* 一步不走就报"到了"
+   *    （`moved: 0` + `arrived: true` 的假成功）。离得还远就把半径收到 0，逼它真走。 */
+  if (!gp.portal && gp.radius > 0) {
+    const horiz0 = Math.hypot(start.x - gp.x, start.z - gp.z)
+    if (horiz0 > arriveUsed + 0.5) {
+      try {
+        const probe = new goals.GoalNear(gp.x, gp.y, gp.z, 0)
+        if (probe.isEnd(new Vec3(Math.floor(start.x), startY, Math.floor(start.z)))) {
+          gp = { ...gp, radius: 0, tightened: true }
+        }
+      } catch { /* 假 bot 没有真 goals：忽略 */ }
+    }
+  }
   const goal = new goals.GoalNear(gp.x, gp.y, gp.z, gp.radius)
   // 地形分类（导航 P2，用户 m02868 的"地形分类 + 路径评分"）：
   // **只换权重，不换算法** —— 台阶上把挖穿调便宜一点、沟边把垫方块调便宜一点、
@@ -1695,8 +1802,16 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
    *  会被读成"我现在脚边是这个"：从沟边跨到平地上，它仍写着 `gap`，属**主动误导**。 */
   /* 穿门结果（在 `try` 之前就要声明：`moveInfo()` 闭包要读它） */
   let doorWalk = null
+  /** 目标被就近挪过就说清楚（站不住的目标格 → 旁边能站的格）。 */
+  const goalFix = sp.adjusted
+    ? {
+      goalAdjusted: { x: sp.x, y: sp.y, z: sp.z },
+      goalAskedAt: sp.from ?? { x: Math.floor(Number(target.x)), y: Math.floor(Number(target.y)), z: Math.floor(Number(target.z)) },
+    }
+    : {}
   const moveInfo = (opts = {}) => ({
     ...(doorWalk ? { doorWalk } : {}),
+    ...goalFix,
     ...(terrain.kind === 'flat' || terrain.kind === 'unknown' ? {}
       : { [opts.arrived ? 'terrainAtStart' : 'terrain']: terrain.kind }),
     ...(() => {
@@ -1736,7 +1851,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
         const opened = await openNearbyDoor(b)
         const leftMs2 = Math.max(400, Math.min(1_200, budget - (Date.now() - t0) - 600))
         const again = await walkThroughDoor(b, target, { budgetMs: leftMs2 })
-        doorWalk = { ...again, retry: true, opened: Number(opened) || 0 }
+        /* `retry` 只在**真按了门**时才标：门本来就开着时 `opened` 是 0，
+         * 以前照样标 `retry: true`，读数会让人以为"补按过一次"（2026-10-22 用户看日志提的）。 */
+        doorWalk = { ...again, opened: Number(opened) || 0, ...(Number(opened) > 0 ? { retry: true } : { alreadyOpen: true }) }
         if (again?.passed) self.log(`🚪 门没开透，补按 ${opened} 下后走过去了（${again.door ?? '门'}）`)
       } catch {}
     }
@@ -1893,11 +2010,11 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     }
     const end = b.entity.position
     // 复核距离要用**收过的 ty**（不然目标 y 在半空时，明明站到它脚下了也会被判成"还差 9 格"）
-    const left = end.distanceTo(new Vec3(target.x, ty, target.z))
+    const left = end.distanceTo(new Vec3(sp.x, ty, sp.z))
     /* P1：**到达判定分两轴看** —— 只看三维距离会漏掉一种假成功：水平已经到位、垂直却差着一两格
      * （站在目标正上方/正下方，比如目标格旁边有个坑），三维距离照样小于阈值 ⇒ 被报成"到了"。
      * 水平仍用 `arrive + 1.0`（宽松，允许"到附近"）；垂直卡在 ±1.5 格（一步台阶以内）。 */
-    const horiz = Math.hypot(end.x - target.x, end.z - target.z)
+    const horiz = Math.hypot(end.x - sp.x, end.z - sp.z)
     const vert = end.y - ty
     const vertBad = vert < -vertTol || vert > vertTol
     /* 🔴 2026-10-18 审计（用户转来的报告 Bug 1）：判"到没到"**不能先看距离、后看"是不是我的目标"**。

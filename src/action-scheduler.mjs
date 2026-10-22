@@ -120,7 +120,9 @@ export function modeFromEnv () {
   return MODES.includes(v) ? v : DEFAULT_MODE
 }
 
-/** `mc_act` 十几个动作共用一个工具名 ⇒ 按 `mode` 分资源 */
+/** `mc_act` 几个动作共用一个工具名 ⇒ 按 `mode` 分资源。
+ *  2026-10-22：`shoot` / `attack` / `prep` / `enchant` / `anvil` / `smithing` 已拆成独立工具
+ *  （`mc_shoot` / `mc_attack` / `mc_prep` / `mc_station`），资源登记跟着搬到 `TOOL_SPEC`。 */
 const ACT_MODE_RES = {
   look: [],
   toward: ['movement'],
@@ -128,15 +130,9 @@ const ACT_MODE_RES = {
   break: ['interaction'],
   use: ['interaction'],
   useitem: ['interaction'],
-  /* 🔴 战斗现在会**中途换武器**（策略层决定换，走 `ctx.equipTo`）⇒ 它确实占着背包，
-   *    不登记 `inventory` 的话，enforce 模式下"战斗换剑"和"mc_craft 拿材料"会同时动背包。
-   *    不登记 `interaction`：v1 的战斗层不进食、不使用方块（见 combat-strategy.mjs 的说明）。 */
-  attack: ['combat', 'movement', 'inventory'],
+  fish: ['interaction', 'inventory'],
   equip: ['inventory'],
-  toss: ['inventory'],
-  enchant: ['inventory', 'interaction'],
-  anvil: ['inventory', 'interaction'],
-  smithing: ['inventory', 'interaction']
+  toss: ['inventory']
 }
 
 /**
@@ -157,6 +153,16 @@ export const TOOL_SPEC = {
   mc_chest: { resources: ['inventory', 'interaction'] },
   mc_give: { resources: ['inventory'] },
   mc_act: { pick: (args) => ACT_MODE_RES[String(args?.mode ?? 'look').trim().toLowerCase()] ?? [] },
+  /* 🔴 战斗会**中途换武器**（策略层决定换，走 `ctx.equipTo`）⇒ 它确实占着背包，
+   *    不登记 `inventory` 的话，enforce 模式下"战斗换剑"和 `mc_craft` 拿材料会同时动背包。
+   *    不登记 `interaction`：v1 的战斗层不进食、不使用方块（见 combat-strategy.mjs 的说明）。 */
+  mc_attack: { resources: ['combat', 'movement', 'inventory'] },
+  /* 射箭：换弓（背包）+ 拉弓瞄准（交互），射完还要转头找下一个目标 */
+  mc_shoot: { resources: ['combat', 'inventory', 'interaction'] },
+  /* 只读自查（数装备/等级/眼），跟 mc_status 一类，不占资源 */
+  mc_prep: { resources: [] },
+  mc_station: { resources: ['inventory', 'interaction'] },
+  mc_fish: { resources: ['interaction', 'inventory'] },
   /* 台账动作（list/get/plan/step/…）是纯记账，不占资源；只有 `run` 真的会动手，
    * 而它内部又是**子步骤**（同一个 actionId），所以这里占的是"任务执行中"这块地。 */
   mc_task: {

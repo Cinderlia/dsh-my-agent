@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 射箭自检 —— `src/shoot.mjs` / `mc_act {mode:"shoot"}`
+ * 射箭自检 —— `src/shoot.mjs` / `mc_shoot {}`
  *
  * 用户 2026-10-19：「hawkeye 主要是水晶和末影龙」—— 也就是末地战那两个用法：
  *   · 末影水晶：**坐标**目标（柱顶那颗），静止；
@@ -327,7 +327,7 @@ section('⑫ 箭数回包慢 200ms：不能当成"没射出去"')
 
 section('⑭ 同步 void 动作（真 mineflayer 的形状）不能炸')
 {
-  /* 2026-10-19 实机现场：`mc_act {mode:"shoot"}` 直接回
+  /* 2026-10-19 实机现场：`mc_shoot {}` 直接回
    *   `Error: Cannot read properties of undefined (reading 'then')`
    * 根因是 `t(b.activateItem())` —— 真 mineflayer 这两个方法是同步 void，
    * 传 undefined 进 withBudget → raceAbort 里 `promise.then` 当场炸。

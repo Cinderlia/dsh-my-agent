@@ -35,8 +35,27 @@ import { equipmentOf, equipmentText, toolDurability, durabilityText } from '../s
 import { EXPRESS_DIR, OUT_DIR } from '../src/express.mjs'
 import { withTimeout, CALL_MS, CALL_BUDGET_MS } from '../src/core.mjs'
 import { VIEW_DEFAULTS, compassOf, isAirName, makePos, renderView } from './mc_view-render.mjs'
+import { ensureAtlas } from '../src/textures.mjs'
 import { createSkinStore } from './mc_skin.mjs'
 import { clamp } from './mc_util.mjs'
+
+/* ── 官方贴图库（src/textures.mjs）────────────────────────────────────────────
+ * 第一次渲染时从本机客户端 jar 里建一次（之后走磁盘缓存，秒开）；拿不到就 null，
+ * 渲染器自动退回调色板。**不能让它拖垮 11 秒预算**：只等 ATLAS_WAIT_MS，超时就
+ * 这一张先用调色板，后台继续建，下一张就有贴图了。 */
+let atlasPromise = null
+let atlasReady = null
+const ATLAS_WAIT_MS = 2500
+async function atlasForRender () {
+  if (process.env.DSH_MC_TEXTURES === 'off') return null
+  if (atlasReady !== null) return atlasReady
+  if (atlasPromise === null) {
+    atlasPromise = ensureAtlas({ log: (m) => { try { console.error('[textures]', m) } catch { /* 忽略 */ } } })
+      .then((a) => { atlasReady = a; return a })
+      .catch(() => null)
+  }
+  try { return await withTimeout(atlasPromise, ATLAS_WAIT_MS, '读方块贴图') } catch { return null }
+}
 
 export const name = 'mc_observe'
 
@@ -277,10 +296,11 @@ export async function apply (api) {
       }
 
       const t0 = Date.now()
+      const atlas = wantImage ? await atlasForRender() : null
       const frame = wantImage
         ? renderView({
             world: bot.world, origin, yaw, pitch, width, height, fov, distance, crosshair,
-            entities: near, time: s.time, dimension: s.dimension, held: s.held, skins,
+            entities: near, time: s.time, dimension: s.dimension, held: s.held, skins, atlas,
           })
         : null
       const renderMs = Date.now() - t0
@@ -380,6 +400,12 @@ export async function apply (api) {
                * 渲染器在像素循环后按碰撞盒单独补画（stats.softTop）。 */
               softBlocks: (frame.stats.softTop ?? []).map((t) => `${t.name} ${pct(t.pixels)}%`),
               centerSoft: frame.stats.centerSoft ?? null,
+              /* 官方贴图：texturedPct = 命中真贴图的像素占比（剩下的是调色板兜底）；
+               * atlas = 贴图库从哪来（null = 没找到客户端 jar ⇒ 纯调色板）。 */
+              texturedPct: pct(frame.stats.textured ?? 0),
+              atlas: atlas
+                ? { tiles: atlas.size, tag: atlas.tag, missing: (frame.stats.atlasMissing ?? []).slice(0, 5) }
+                : null,
             }
           : null,
       }

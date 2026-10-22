@@ -443,7 +443,7 @@ export async function dig (self, { name = null, pos = null, maxDistance = 6, cou
          *    想恢复旧行为（立刻停手）把 config.stopOnDanger 设成 true。 */
         if (stopOnDanger) {
           out.push(`⚠️ ${dangerText(danger)} —— 先别挖了（挖到 ${okCount}/${targets.length}），`
-            + '`mc_act {mode:"attack"}` 打掉它，或者 `mc_move` 躲开；安全了再叫一次 mc_dig')
+            + '`mc_attack` 打掉它，或者 `mc_move` 躲开；安全了再叫一次 mc_dig')
           break
         }
         const k = noticeKey(danger)

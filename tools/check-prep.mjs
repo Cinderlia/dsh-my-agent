@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 出发前自查自检 —— `src/prep.mjs` / `mc_act {mode:"prep", for:"nether"|"end"}`
+ * 出发前自查自检 —— `src/prep.mjs` / `mc_prep {, for:"nether"|"end"}`
  *
  * 用户 2026-10-19：「把附魔台 / 青金石 / 书架也加进前置清单」。规矩写进 `RULES.md` 只是文字，
  * 这个模式把它变成**数真状态**的自查。这一套钉死八件事：
@@ -178,15 +178,17 @@ section('⑨ 食物判据：白名单漏了也不许报"没吃的"')
   ok(r.checks.find((c) => c.id === 'food').ok === true, '背包里 12 块熟牛肉 ⇒ 吃的够', '')
 }
 
-section('⑩ 静态：mc_act 接了 prep')
+section('⑩ 静态：prep 是独立工具 mc_prep')
 {
   const { readFileSync } = await import('node:fs')
   const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
   ok(/import \{ prepCheck \} from '\.\/src\/prep\.mjs'/.test(idx), 'index.js 导入了 prepCheck', '')
-  ok(/case 'prep':\s+return withOutcome\(\{ mode, \.\.\.\(prepCheck\(bot\.requireBot\(\)/.test(idx), 'case prep 走 requireBot + prepCheck', '')
-  ok(/· prep\s+出发前自查/.test(idx), 'mc_act 描述里有 prep 一行', '')
-  ok(/for: \{ type: 'string', description: 'prep 查哪/.test(idx), '参数表有 for', '')
-  ok(/smithing\/prep\/toss/.test(idx), '未知 mode 的提示里带上 prep', '')
+  ok(/name: 'mc_prep',/.test(idx), 'index.js 注册了独立工具 mc_prep', '')
+  ok(!/case 'prep':/.test(idx), 'mc_act 里的 case prep 已搬走', '')
+  ok(/case 'prep':/.test(idx) === false && /return withOutcome\(\{ \.\.\.\(prepCheck\(sess\.bot\.requireBot\(\)/.test(idx), 'mc_prep 的 execute 走 prepCheck(requireBot())', '')
+  ok(/出发前自查/.test(idx), 'mc_prep 的描述里写了"出发前自查"', '')
+  ok(/for: \{ type: 'string', description: '查哪趟/.test(idx), '参数表有 for', '')
+  ok(/mc_shoot \/ mc_attack \/ mc_prep \/ mc_station/.test(idx), 'mc_act 未知 mode 的提示指向拆出去的四个工具', '')
 }
 
 console.log(`\n${fail ? '❌' : '✅'} ${pass} 通过 / ${fail} 失败`)

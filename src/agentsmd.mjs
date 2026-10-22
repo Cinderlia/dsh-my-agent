@@ -220,7 +220,7 @@ export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 
 - **看**：\`mc_observe\`（截图 + 三段式感知）；\`mc_map\`（\`floor\` 默认看脚下一层、\`surface\` 地表、\`column\` 竖列看脚下这一格往下几格实心 / 空腔 / 水 / 岩浆）；\`mc_scan\` 找方块；\`mc_inventory\`；\`mc_status\`；\`mc_diag\` 排查"动不了"；\`mc_events\`。
 - **动**：\`mc_move\`（\`walk\` / \`fly\`（创造默认）/ \`swim\` 只上浮换气 / \`jump\`）。走远路连着叫几次 —— 一次只走 10 秒，没到就照原目标再叫。
-- **手**：\`mc_dig\`（自动换工具，挖不动会说缺什么）；\`mc_build\`；\`mc_act\`：\`attack\` / \`break\` / \`place\` / \`bridge\` 搭路 / \`use\` / \`useitem\` / \`equip\` / \`toss\` / \`look\`·\`toward\` / \`enchant\`·\`anvil\`·\`smithing\`；\`mc_sequence\` 串动作。
+- **手**：\`mc_dig\`（自动换工具，挖不动会说缺什么）；\`mc_build\`；\`mc_act\`：\`break\` / \`place\` / \`bridge\` 搭路 / \`use\` / \`useitem\` / \`fish\` 钓鱼 / \`equip\` / \`toss\` / \`look\`·\`toward\` / \`dismount\`；另有 \`mc_attack\`（打怪，24 格内会追）、\`mc_shoot\`（射箭）、\`mc_station\`（附魔台·铁砧·锻造台）、\`mc_prep\`（出发前自查）、\`mc_fish\`（钓鱼）；\`mc_sequence\` 串动作。
 - **做**：\`mc_craft\` 合成；\`mc_furnace\` 熔炼；\`mc_chest\` 存取箱子。
 - **任务与说**：\`mc_task\`；\`mc_say\`；\`mc_command\`（先确认）；\`mc_kit_memory\`；\`mc_kit_express\`；\`mc_kit_image\`。
 - **自主 / 停**：\`mc_auto\` 待机时自己安排；\`mc_stop\` 强行停下；\`mc_ping\`；\`mc_disconnect\`。
@@ -306,7 +306,7 @@ export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 **附魔台放在家外面**（他 2026-10-19 要求）：在屋外单独圈一小块（3×3 露天或搭个小棚），**别塞屋里** —— 附魔台要摆书架、以后还要铁砧，屋里放不下还挡路；位置离房子走几步就到，别远到懒得去。
 
 **末地之前备齐**：**12 末影之眼**（烈焰粉 + 末影珍珠）、**弓 + 一两组箭**、**床**（炸龙，别在龙旁边睡）、方块（垫高打水晶）、**南瓜头**（**必备**，防末影人瞪眼）、满血满食。末影珍珠打末影人掉 —— 后期该打就打。
-出门前用 \`mc_act {mode:"prep", for:"end"}\` 自查一遍（附魔 / 末影之眼 / 弓箭 / 床 / 方块 / 满血满食）。
+出门前用 \`mc_prep {, for:"end"}\` 自查一遍（附魔 / 末影之眼 / 弓箭 / 床 / 方块 / 满血满食）。
 
 **打龙**：① 先**射掉所有末影水晶**（柱顶那几颗）；② 水晶清完再打龙，龙俯冲时**躲开、等它停在池子上再打**；③ 龙血归零后看提示确认**真的打死了**；④ **龙蛋**用活塞或火把挖，别用手打（会掉进传送门）。打完记一笔并跟他说。
 

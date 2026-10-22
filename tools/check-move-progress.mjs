@@ -1704,5 +1704,55 @@ section('⑱ 门失败兜底 / 斜向障碍 / 上方目标垫柱兜底')
   ok(/allow1by1towers = true/.test(src) && /目标在上方、头顶有空/.test(src), '上方目标走不通时允许垫一格往上')
 }
 
+/* ═══════════════ ⑲ 实机反馈（2026-10-22）：目标站不住就挪旁边、起点别嵌在半格里 ═══════════════ */
+section('⑲ 目标落点修正 / 起点半格修正')
+{
+  const src = read('../src/movement.mjs')
+  const { standPointFor, standFeetY, canStandAtWorld } = mod
+  /* 假世界：地面在 y<=63（stone），y>=64 是空气；额外指定的格覆盖 */
+  const mk = (solid = {}) => ({
+    blockAt: (v) => {
+      const k = `${v.x},${v.y},${v.z}`
+      if (solid[k]) return { name: solid[k] }
+      return { name: v.y <= 63 ? 'stone' : 'air' }
+    },
+  })
+  /* ① 正常可站格：一格都不挪 */
+  const b1 = mk()
+  const r1 = standPointFor(b1, 0.5, 64.9, 0.5)
+  ok(r1.x === 0 && r1.y === 64 && r1.z === 0 && r1.adjusted === false,
+    '可站的目标格原样保留（不白挪）', JSON.stringify(r1))
+  /* ② 目标格在本柱两格高的实心柱里 ⇒ 同层 8 邻找一个能站的 */
+  const b2 = mk({ '0,64,0': 'stone', '0,65,0': 'stone' })
+  const r2 = standPointFor(b2, 0.5, 64.5, 0.5)
+  ok(r2.adjusted === true, '目标站在实心方块里 ⇒ 就近挪，而不是把不可站的 y 丢给 A*', JSON.stringify(r2))
+  ok(r2.y === 64 && Math.abs(r2.x) + Math.abs(r2.z) === 1,
+    '挪到同一层、8 邻中最近的一格（水平一格）', JSON.stringify(r2))
+  ok(canStandAtWorld(b2, r2.x, r2.y, r2.z) === true, '挪过去那格确实站得住')
+  ok(r2.from && r2.from.x === 0 && r2.from.y === 64, '原目标格记在 from 里（好如实报"改了去哪"）')
+  /* ③ 本柱只高一层（石头台）⇒ 直接站上去，不往水平挪 */
+  const b3 = mk({ '0,64,0': 'stone' })
+  const r3 = standPointFor(b3, 0.5, 64.5, 0.5)
+  ok(r3.x === 0 && r3.z === 0 && r3.y === 65 && r3.adjusted === true,
+    '本柱高一格 ⇒ 往上站一层（不水平乱挪）', JSON.stringify(r3))
+  /* ④ 起点半格：站在 farmland（y=63 那格）上，脚坐标 63.9375 */
+  const b4 = mk({ '0,63,0': 'farmland' })
+  ok(standFeetY(b4, { x: 0.5, y: 63.9375, z: 0.5 }) === 64,
+    '站 farmland/箱子顶这类半格上 ⇒ 起点取上一格（不再嵌在方块里）')
+  ok(standFeetY(b4, { x: 0.5, y: 64.0, z: 0.5 }) === 64, '正常站在空气格里 ⇒ 起点不变')
+  /* ⑤ 接线：walkPathfinder 真的用上了 */
+  ok(/const sp = standPointFor\(b, target\.x, target\.y, target\.z\)/.test(src),
+    'walkPathfinder 真的用了 standPointFor')
+  ok(/const startY = standFeetY\(b, start\)/.test(src), 'walkPathfinder 真的修正了起点 y')
+  ok(/goalAdjusted/.test(src) && /goalAskedAt/.test(src), '目标被挪过会如实报回去')
+  ok(/tightened: true/.test(src) && /radius: 0/.test(src),
+    '起点已经在 GoalNear 球里时把半径收到 0（治"moved:0 却 arrived:true"）')
+  /* ⑥ 门：规划层允许穿门、执行层有按门的人 */
+  const plug = readFileSync(new URL('../src/plugins.mjs', import.meta.url), 'utf8')
+  ok(/mv\.canOpenDoors = true/.test(plug), 'A* 规划里门不是墙（canOpenDoors 已开）')
+  ok(/mv\.openable\.add\(blk\.id\)/.test(plug), '木门/活板门/栅栏门进了 openable')
+  ok(/openNearbyDoor\(b\)/.test(src), '执行层每 400ms 找身边关着的门按一下')
+}
+
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

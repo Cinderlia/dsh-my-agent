@@ -778,7 +778,7 @@ export async function setupPlugins (self, { spec = null } = {}) {
     }
   } catch (e) { self.log('pvp 挂载失败：' + e.message) }
 
-  /* ③.5 射箭弹道（`mc_act {mode:"shoot"}` 用）。**每次射之前还会再 bind 一遍**
+  /* ③.5 射箭弹道（`mc_shoot` 用）。**每次射之前还会再 bind 一遍**
    *      （`src\shoot.mjs`：它的 bot 是模块级单例，同进程连第二个号就会拿错坐标）。 */
   try {
     const fn = await loadMcDep('hawkeye', { log, logWarn })

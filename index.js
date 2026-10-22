@@ -34,6 +34,7 @@ import { defineTool, toolDefKind } from './src/tool-def.mjs'
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
 import { runText } from './src/task-exec.mjs'
 import { prepCheck } from './src/prep.mjs'
+import { fishOnce } from './src/fish.mjs'
 import { PRIORITY, DEFAULT_WAIT_MS } from './src/action-scheduler.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -3356,14 +3357,15 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register(asTool({
     name: 'mc_scan',
-    description: '扫描我周围方块：给 name 就找这种方块的位置；不给就返回方块统计。'
+    description: '扫描我周围方块：给 name 就找这种方块的位置；不给就返回方块占比（分母不含空气）。'
       + '\n· 竖向窗口默认以脚底为中心 ±height；看高处传 `y` 指定中心。',
     parameters: {
       radius: { type: 'number', description: '水平半径（默认 16，上限 48）' },
       height: { type: 'number', description: '垂直范围 ±（默认 4，上限 16）' },
       y: { type: 'number', description: '可选：竖向窗口的中心高度（绝对 y；默认我脚底）' },
       name: { type: 'string', description: '可选：只找这种方块（如 oak_log）' },
-      limit: { type: 'number', description: 'name 模式下最多返回几个（默认 10）' },
+      limit: { type: 'number', description: 'name 模式最多返回几个（默认 10）' },
+      tail: { type: 'boolean', description: '占比看最少的 10 种（默认最多的 10 种）' },
     },
     output: text(),
     async execute(args, exec) {
@@ -3379,14 +3381,32 @@ export function apply(ctx, rawConfig) {
        *    `JSON.stringify(…, null, 2)` 打印（半径 40 时约 970 字），一半是缩进和键名。
        *    计数模式改**一行式**（有 `text` 就走它），结构化字段仍然留在返回值里给程序用。 */
       if (r && !args.name && Array.isArray(r.counts)) {
-        const list = r.counts.slice(0, 14).map((c) => `${c.name}×${c.count}`).join('、')
-        const more = r.counts.length > 14 ? ` 等 ${r.counts.length} 种` : ''
-        const total = r.counts.reduce((a, c) => a + c.count, 0)
+        /* 🔵 2026-10-22 用户："扫描周围的方块占比，例如草方块 10%、泥土 20%、石头 70%"。
+         *    以前是 `name×count`，比例得自己除。现在直接带百分比（分母 = 非空气方块总数，
+         *    由 world-scan.mjs 算好）。只列前 14 种，所以把"剩下那些种加起来多少"也折算成一句，
+         *    免得把前 14 种当成全部。 */
+        /* 🔵 2026-10-22 用户第二轮："去掉 1% 的限制，显示前 10 种，再加个输入，可以显示后 10 种"。
+         *    ⇒ 不再按占比筛（小零碎也是信息），固定列 10 种；tail:true 翻过来看最少的 10 种。
+         *    没显示的那一头折算成一句"其余 N 种共 X%"，免得把 10 种当成全部。 */
+        const TOP_N = 10
+        const fmtPct = (v) => (v == null ? '' : (v > 0 && v < 0.1 ? '<0.1%' : `${v}%`))
+        const tail = Boolean(args.tail)
+        const shown = tail ? r.counts.slice(-TOP_N).reverse() : r.counts.slice(0, TOP_N)
+        const shownPct = shown.reduce((a, c) => a + (c.pct ?? 0), 0)
+        const restPct = Math.round((100 - shownPct) * 10) / 10
+        const restKinds = r.counts.length - shown.length
+        const list = shown.map((c) => `${c.name}×${c.count} ${fmtPct(c.pct)}`).join('、')
+        const more = restKinds > 0 ? ` 等 ${r.counts.length} 种` : ''
+        const total = Number.isFinite(r.total) ? r.total : r.counts.reduce((a, c) => a + c.count, 0)
+        const head = tail
+          ? `🧱 周围 ${r.radius} 格（上下 ${r.height}）共 ${total} 个方块（最少的 ${shown.length} 种，从少到多）：`
+          : `🧱 周围 ${r.radius} 格（上下 ${r.height}）共 ${total} 个方块：`
         return {
           ...r,
-          text: `⛏ 周围 ${r.radius} 格（上下 ${r.height}）约 ${total} 个方块：${list || '（空的）'}${more}`
+          text: `${head}${list || '（空的）'}${more}`
+            + `${restPct > 0.05 && restKinds > 0 ? `；其余 ${restKinds} 种共 ${fmtPct(restPct)}` : ''}`
             + `${r.unloaded ? `；另有 ${r.unloaded} 格未加载（不算空）` : ''}`
-            + ' — 要坐标就给 name 点名',
+            + (tail ? '' : ' — 要看最少的 10 种就传 tail:true；要坐标就给 name 点名'),
         }
       }
       /* 🔴 2026-10-20 审计（用户："减少 token 消耗"）：`name` 模式原来回裸对象 ⇒ 宿主
@@ -3712,36 +3732,20 @@ export function apply(ctx, rawConfig) {
       + '· break 破坏 (x,y,z)：自动换对的工具\n'
       + '· use 用方块/实体(who)：门/按钮/拉杆/喂动物；都不给=用手上的\n'
       + '· useitem 用手上的东西：扔眼睛/雪球；**带 x/y/z 会先瞄准、停 450ms 再用**（舀水/骨粉/补种都带坐标）\n'
-      + '· shoot 射箭。水晶 x/y/z，龙 who:"ender_dragon"；射完报 around\n'
-      + '· attack 打实体（who 中英文都认，24 格内会追；不给按 priority 挑；kite 放风筝）\n'
       + '· equip 装备(name)：护甲自动穿、盾进副手\n'
-      + '· enchant 附魔台 option 0-2；anvil 铁砧；smithing 锻造台\n'
-      + '· prep 出发前自查 for:nether/end\n'
       + '· toss 丢弃(name,count)\n'
       + '· dismount 从船/矿车/坐骑上下来（开船用 mc_move boat）',
     parameters: {
       mode: { type: 'string', description: '见上面各 mode（默认 look）' },
-      who: { type: 'string', description: '玩家/实体名（look/toward/use/attack）' },
-      kite: { type: 'boolean', description: 'attack 放风筝：近战怪打一下退一步' },
-      priority: { type: 'string', description: 'attack 选目标：threat(默认)/nearest/weakest(血最少)' },
+      who: { type: 'string', description: '玩家/实体名（look/toward/use）' },
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       allowDangerous: { type: 'boolean', description: 'break：允许挖自己脚下的支撑（默认拦）' },
-      name: { type: 'string', description: '方块或物品名（place/equip/toss/anvil/smithing 用）' },
+      name: { type: 'string', description: '方块或物品名（place/equip/toss 用）' },
       to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand；只给=脱掉' },
-      count: { type: 'number', description: 'toss 丢几个（默认 1）；shoot 连射几箭（默认 1，≤5）' },
-      /* ⚠️ `for` 是 JS 保留字，解构时必须 `args.for`，不能写 `const { for } = args` */
-      for: { type: 'string', description: 'prep 查哪趟：nether（默认）/ end' },
-      waitTime: { type: 'number', description: 'shoot 拉弓多久再放（默认 1200ms）' },
-      weapon: { type: 'string', description: 'shoot 用什么射（默认 bow；可 crossbow/trident）' },
-      aim: { type: 'number', description: 'shoot 瞄点高度（相对脚底格数，负数往下）；不给=自动（龙 +2.8、普通怪瞄头）' },
-      maxDist: { type: 'number', description: 'shoot 只射这么近（格）' },
+      count: { type: 'number', description: 'toss 丢几个（默认 1）' },
       hold: { type: 'number', description: 'useitem 按住毫秒（拉弓 1000）' },
       approach: { type: 'boolean', description: 'toward 走近吗（默认 true）' },
       budgetMs: { type: 'number', description: 'toward 走近毫秒（默认 10000）' },
-      option: { type: 'number', description: 'enchant 第几项（0/1/2）' },
-      item: { type: 'string', description: 'enchant/anvil/smithing 哪件（默认手上）' },
-      action: { type: 'string', description: 'anvil：combine（默认）/ rename' },
-      template: { type: 'string', description: 'smithing 的模板（默认自己挑）' },
     },
     output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
     timeoutMs: CALL_MS + 1_000,
@@ -3765,27 +3769,39 @@ export function apply(ctx, rawConfig) {
           return withOutcome({ mode, ...(await bot.useBlock(args)) })
         }
         case 'useitem': return { mode, ...(await bot.useItem(args)) }
-        /* 射箭（用户 2026-10-19：「hawkeye 主要是水晶和末影龙」）—— 弹道在 `src\shoot.mjs`：
-         * 换弓回读 → 数箭 → hawkeye 算 yaw/pitch → 拉满 → 再瞄一次 → 放 → 数箭确认。
-         * 算不出来（落点误差 > 4 格）就如实报"太远/角度刁"，不瞎射。 */
-        /* 用户 2026-10-20：「shoot 完显示周围实体，和 attack 一样」—— 射完顺手报 12 格内身边有谁
-         * （`around`，和 mc_move / mc_sequence 同一个字段）。射完正是「有没有别的怪摸过来」要命的时候，
-         * 加一次只读快照，附近没人就一个字段都不多（常态零额外 token）。 */
-        case 'shoot':   return { ...withOutcome({ mode, ...(await bot.shoot({ who: args.who, x: args.x, y: args.y, z: args.z, count: args.count, waitTime: args.waitTime, lead: args.lead, weapon: args.weapon, aim: args.aim, maxDist: args.maxDist })), ...bossBarsField(bot) }), ...aroundOf(sess) }
-        case 'attack':  return withOutcome({ mode, ...(await bot.attack(args)), ...bossBarsField(bot) })
+        case 'fish':    return { mode, ...(await fishOnce(bot.requireBot())) }
         case 'equip':   return { mode, ...(await bot.equip({ name: args.name, to: args.to })) }
-        case 'enchant': return { mode, ...(await bot.enchantTable({ option: args.option, item: args.item, x: args.x, y: args.y, z: args.z })) }
-        case 'anvil':   return { mode, ...(await bot.anvilTable({ action: args.action, item: args.item, name: args.name, x: args.x, y: args.y, z: args.z })) }
-        case 'smithing': return { mode, ...(await bot.smithingTable({ item: args.item, name: args.name, template: args.template, x: args.x, y: args.y, z: args.z })) }
         case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
         /* 用户 2026-10-20：「还有下船」—— 上船一直有（`use`→`activateEntity`），下来没有：
          * `bot.dismount()` 只发包不确认，实现在 `src/boat.mjs`（发完轮询 `bot.vehicle`）。 */
         case 'dismount': return { mode, ...(await bot.dismountVehicle()) }
-        /* 出发前自查（用户 2026-10-19：「把附魔台 / 青金石 / 书架也加进前置清单」）——
-         * 规矩写在 RULES.md 里模型不一定照做，这里**数真状态**：附魔、附魔台、书架、青金石、等级… */
-        case 'prep':    return withOutcome({ mode, ...(prepCheck(bot.requireBot(), { for: args.for })) })
-        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/shoot/attack/equip/enchant/anvil/smithing/prep/toss/dismount）`)
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/fish/equip/toss/dismount；射箭/打怪/自查/方块台另见 mc_shoot / mc_attack / mc_prep / mc_station）`)
       }
+    },
+  }))
+
+  /* 钓鱼（用户 2026-10-22：「加一个钓鱼的功能」，随后「加工具，不要管预算」）——
+   * 手里有竿就抛，盯浮标有没有明显往下沉（那就是咬钩），沉了收竿。
+   * 实现在 `src/fish.mjs`：单次最多盯 8 秒，没咬钩浮标留在水里，**再叫一次接着盯**，不必重新抛。 */
+  ctx.tools.register(asTool({
+    name: 'mc_fish',
+    description: '**钓鱼**：自动抛竿 → 盯浮标 → 咬钩就收竿（浮标明显往下沉才算咬钩）。\n'
+      + '· 手上有 fishing_rod 就用手上那把；没有就从背包换出来，都没有会告诉你先 `mc_craft {name:"fishing_rod"}`。\n'
+      + '· **一次只盯 8 秒**：没咬钩返回 `reason:"timeout"`，浮标还在水里 —— 再叫一次 `mc_fish` 接着盯，不用重新抛。\n'
+      + '· 抛竿了却没浮标 ⇒ 前方不是水面（走到水边 2~4 格、看得见水面再钓）。\n'
+      + '· 收竿后战利品掉在水边，要自己走过去踩上捡。',
+    parameters: {
+      timeoutMs: { type: 'number', description: '最多盯多久（毫秒，默认 8000，夹在 1000~10000）' },
+    },
+    output: text(),
+    timeoutMs: CALL_MS + 3_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const budget = Math.min(Math.max(Number(args.timeoutMs ?? 8000), 1_000), 10_000)
+      const r = await fishOnce(sess.bot.requireBot(), { timeoutMs: budget })
+      const head = r.ok ? '🎣 上鱼了' : '🎣 没上鱼'
+      const tail = r.bobber ? `\n浮标在 (${r.bobber.x}, ${r.bobber.y}, ${r.bobber.z})` : ''
+      return `${head}：${r.message}${tail}`
     },
   }))
 
@@ -3807,6 +3823,103 @@ export function apply(ctx, rawConfig) {
       const sess = getSession(exec)
       if (args.clearAll) return sess.bot.clearInventory()
       return sess.bot.giveItem({ name: args.name, count: args.count, slot: args.slot, force: args.force })
+    },
+  }))
+
+  /* 射箭（2026-10-22 用户：「这些拆了」——从 mc_act 独立出来）——
+   * 弹道在 `src/shoot.mjs`：换弓回读 → 数箭 → hawkeye 算 yaw/pitch → 拉满 → 再瞄一次 → 放 → 数箭确认。
+   * 用户 2026-10-19：「hawkeye 主要是水晶和末影龙」；2026-10-20：「shoot 完显示周围实体，和 attack 一样」。 */
+  ctx.tools.register(asTool({
+    name: 'mc_shoot',
+    description: '**射箭**：自动换弓、算弹道、拉满、放箭，射完报 12 格内身边有谁。\n'
+      + '· 射水晶给 `x/y/z`；打龙 `who:"ender_dragon"`（自动瞄 +2.8 格）。\n'
+      + '· 落点误差 > 4 格会拒射并说明"太远/角度刁"，不瞎射。',
+    parameters: {
+      who: { type: 'string', description: '目标实体名（如 ender_dragon）' },
+      x: { type: 'number', description: '目标 x（射水晶/坐标用）' }, y: { type: 'number' }, z: { type: 'number' },
+      count: { type: 'number', description: '连射几箭（默认 1，≤5）' },
+      waitTime: { type: 'number', description: '拉弓多久再放（默认 1200ms）' },
+      weapon: { type: 'string', description: '用什么射（默认 bow；可 crossbow/trident）' },
+      aim: { type: 'number', description: '瞄点高度（相对脚底格数，负数往下）；不给=自动（龙 +2.8、普通怪瞄头）' },
+      maxDist: { type: 'number', description: '只射这么近的目标（格）' },
+      lead: { type: 'boolean', description: '移动目标的提前量（默认开）' },
+    },
+    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    timeoutMs: CALL_MS + 1_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const bot = sess.bot
+      return { ...withOutcome({ ...(await bot.shoot({ who: args.who, x: args.x, y: args.y, z: args.z, count: args.count, waitTime: args.waitTime, lead: args.lead, weapon: args.weapon, aim: args.aim, maxDist: args.maxDist })), ...bossBarsField(bot) }), ...aroundOf(sess) }
+    },
+  }))
+
+  /* 打实体（2026-10-22 用户：「这些拆了」）—— 目标选择/风筝/追击自成一族。 */
+  ctx.tools.register(asTool({
+    name: 'mc_attack',
+    description: '**打实体**：中英文名都认，24 格内会追上去；不给 who 就按 priority 挑。\n'
+      + '· `kite:true` 放风筝：近战怪打一下退一步。\n'
+      + '· 血 < 12、身边两只以上怪、或者碰上苦力怕/骷髅/女巫/末影人 —— 先撤，别硬打。\n'
+      + '· 打完顺手报 Boss 血条（有 boss 在场时）。',
+    parameters: {
+      who: { type: 'string', description: '玩家/实体名（中英文都认）' },
+      priority: { type: 'string', description: '选目标：threat(默认)/nearest/weakest(血最少)' },
+      kite: { type: 'boolean', description: '放风筝：近战怪打一下退一步' },
+    },
+    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    timeoutMs: CALL_MS + 1_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const bot = sess.bot
+      return withOutcome({ ...(await bot.attack(args)), ...bossBarsField(bot) })
+    },
+  }))
+
+  /* 出发前自查（2026-10-22 用户：「这些拆了」）—— 它是**只读**的，跟动手类不是一族。 */
+  ctx.tools.register(asTool({
+    name: 'mc_prep',
+    description: '**出发前自查**：数真状态（装备/附魔/附魔台/书架/青金石/等级/末影之眼…），不靠记忆。\n'
+      + '· `for:"nether"`（默认）查下界门槛；`for:"end"` 查末地门槛。',
+    parameters: {
+      /* ⚠️ `for` 是 JS 保留字，解构时必须写 `args.for`，不能 `const { for } = args` */
+      for: { type: 'string', description: '查哪趟：nether（默认）/ end' },
+    },
+    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    timeoutMs: CALL_MS + 1_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      return withOutcome({ ...(prepCheck(sess.bot.requireBot(), { for: args.for })) })
+    },
+  }))
+
+  /* 附魔台 / 铁砧 / 锻造台（2026-10-22 用户：「这些拆了」）—— 三个都是"对着方块 UI 操作"，
+   * 共用"走到方块 → 打开 → 操作 → 确认"的骨架，合成一个工具、用 kind 分。 */
+  ctx.tools.register(asTool({
+    name: 'mc_station',
+    description: '**对着方块 UI 操作**：附魔台 / 铁砧 / 锻造台走同一个骨架。\n'
+      + '· `kind:"enchant"`：`option` 选第几项（0/1/2），`item` 哪件（默认手上）。\n'
+      + '· `kind:"anvil"`：`action:"combine"`（默认）或 `"rename"`；`name` 是重命名/合并用的名字。\n'
+      + '· `kind:"smithing"`：`item` + `name` + `template`（不给模板就自己挑）。\n'
+      + '· 给了 x/y/z 就直奔那个方块，不给就近找。',
+    parameters: {
+      kind: { type: 'string', description: 'enchant / anvil / smithing' },
+      item: { type: 'string', description: '哪件物品（默认手上）' },
+      name: { type: 'string', description: 'anvil 重命名/合并的名字；smithing 的材料名' },
+      option: { type: 'number', description: 'enchant 第几项（0/1/2）' },
+      action: { type: 'string', description: 'anvil：combine（默认）/ rename' },
+      template: { type: 'string', description: 'smithing 的模板（默认自己挑）' },
+      x: { type: 'number', description: '方块坐标 x（可选，和 y/z 一起给）' }, y: { type: 'number' }, z: { type: 'number' },
+    },
+    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    timeoutMs: CALL_MS + 1_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      const bot = sess.bot
+      const kind = String(args.kind ?? 'enchant')
+      const at = { x: args.x, y: args.y, z: args.z }
+      if (kind === 'enchant') return { kind, ...(await bot.enchantTable({ option: args.option, item: args.item, ...at })) }
+      if (kind === 'anvil') return { kind, ...(await bot.anvilTable({ action: args.action, item: args.item, name: args.name, ...at })) }
+      if (kind === 'smithing') return { kind, ...(await bot.smithingTable({ item: args.item, name: args.name, template: args.template, ...at })) }
+      throw new Error(`未知 kind："${kind}"（可用 enchant / anvil / smithing）`)
     },
   }))
 

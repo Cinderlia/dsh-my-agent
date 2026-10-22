@@ -348,7 +348,7 @@ export async function equip (self, { name = null, to = null } = {}, ctx = {}) {
  * 🔴 `bot.openBlock(block)`（`inventory.js:405`）= `bot.activateBlock` + `await once(bot,'windowOpen')`
  * ⇒ **已经有窗口开着时服务端会忽略这次使用，`openBlock` 就挂死**。所以先关掉别的窗口。
  *
- * 用法：`mc_act {mode:"enchant"}` 只看选项；`{mode:"enchant", option:0}` 真附魔。
+ * 用法：`mc_station {kind:"enchant"}` 只看选项；`mc_station {kind:"enchant", option:0}` 真附魔。
  * 自动做四件事：① 关掉别的窗口再 `openEnchantmentTable`；② 槽 0 空就把手上那件（或 `item`
  * 点名的那件）放进去；③ 槽 1 空就从背包补一块青金石；④ 附完把附魔好的那件拿回背包
  * （青金石不用管，关窗口时服务端会自己退回背包）。
@@ -466,7 +466,7 @@ export async function enchantTable (self, args = {}, ctx = {}) {
   if (option == null) {
     return {
       ...base,
-      ...(optsReady() ? {} : { note: '三个选项还没全到（窗口刚开，服务端要一个 tick 才发属性包）—— 再叫一次 mc_act {mode:"enchant"}' }),
+      ...(optsReady() ? {} : { note: '三个选项还没全到（窗口刚开，服务端要一个 tick 才发属性包）—— 再叫一次 mc_station {kind:"enchant"}' }),
       text: `🔮 附魔台 (${at})：槽 0 = ${target ?? '空'}，槽 1 = ${lapis ?? '空'}\n${opts.map(optLine).join('\n')}`,
     }
   }
@@ -476,7 +476,7 @@ export async function enchantTable (self, args = {}, ctx = {}) {
     return {
       ...base,
       enchanted: false,
-      note: '三个选项还没到齐（窗口刚开，服务端要一个 tick 才发属性包），这一轮没动手 —— 再叫一次 mc_act {mode:"enchant", option:' + option + '}（窗口还开着）',
+      note: '三个选项还没到齐（窗口刚开，服务端要一个 tick 才发属性包），这一轮没动手 —— 再叫一次 mc_station {kind:"enchant", option:' + option + '}（窗口还开着）',
     }
   }
   /* 🔴 2026-10-15 审计（报告 C 第 2 条）：到齐 ≠ 这一项能用。`level < 0` = 服务端说"这一项不可用"，
@@ -616,8 +616,8 @@ function describeItem (it) {
  * 挂上去的（上游 `mineflayer\lib\plugins\anvil.js`）。
  *
  * 用法：
- *   `{mode:"anvil", action:"combine", item:"iron_pickaxe", name:"iron_pickaxe"}` —— 两把合成一把更耐久的
- *   `{mode:"anvil", action:"rename",  item:"diamond_sword", name:"屠龙刀"}` —— 改名
+ *   `mc_station {kind:"anvil", action:"combine", item:"iron_pickaxe", name:"iron_pickaxe"}` —— 两把合成一把更耐久的
+ *   `mc_station {kind:"anvil", action:"rename",  item:"diamond_sword", name:"屠龙刀"}` —— 改名
  * 经验不够 / 这两件根本合不了，上游会直接抛错（不会白扣等级）。
  */
 export async function anvilTable (self, args = {}, ctx = {}) {
@@ -653,7 +653,7 @@ export async function anvilTable (self, args = {}, ctx = {}) {
 
   if (action === 'rename') {
     const newName = args.name == null ? '' : String(args.name).trim()
-    if (!newName) throw new Error('rename 要给 name（新名字），例如 {mode:"anvil", action:"rename", item:"diamond_sword", name:"屠龙刀"}')
+    if (!newName) throw new Error('rename 要给 name（新名字），例如 mc_station {kind:"anvil", action:"rename", item:"diamond_sword", name:"屠龙刀"}')
     if (newName.length > 35) throw new Error(`名字太长（${newName.length} 个字），铁砧最多 35 个`)
     let err = null
     try { await t(Promise.resolve(table.rename(first, newName)), 'act', `改名成「${newName}」`) } catch (e) { err = e }
@@ -672,7 +672,7 @@ export async function anvilTable (self, args = {}, ctx = {}) {
   // combine：第二件（跳过第一件那格，免得两件挑到同一格）
   const want2 = args.name ? String(args.name) : null
   if (!want2) {
-    throw new Error('combine 要给 name（第二件），例如 {mode:"anvil", action:"combine", item:"iron_pickaxe", name:"iron_pickaxe"}（两把合成一把更耐久的）')
+    throw new Error('combine 要给 name（第二件），例如 mc_station {kind:"anvil", action:"combine", item:"iron_pickaxe", name:"iron_pickaxe"}（两把合成一把更耐久的）')
   }
   const pick2 = findInv(want2, s1)
   if (!pick2) throw new Error(`背包里没有第二件 ${want2}（第一件在槽 ${s1}）`)
@@ -708,7 +708,7 @@ export async function anvilTable (self, args = {}, ctx = {}) {
  * ⇒ 这里自己按槽位来：槽 0 = 模板、槽 1 = 底座、槽 2 = 附加，成品在槽 3（`minecraft:smithing`）。
  * 三样都放好之后服务端一个 tick 就把成品算出来，我们读出来再 `putAway(3)` 拿回背包。
  *
- * 用法：`{mode:"smithing", item:"diamond_chestplate", name:"netherite_ingot"}` —— 模板没给就自己
+ * 用法：`mc_station {kind:"smithing", item:"diamond_chestplate", name:"netherite_ingot"}` —— 模板没给就自己
  * 从背包里挑（优先下界合金升级模板；背包里只有一种纹饰模板时用它；有多种就报错让你点名 template）。
  */
 export async function smithingTable (self, args = {}, ctx = {}) {
