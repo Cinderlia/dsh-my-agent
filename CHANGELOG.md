@@ -11,6 +11,24 @@
 
 ## [未发布]
 
+### 📖 行事准则第十一版：把「实际有、但准则里没写」的工具和参数补齐
+
+- **工具速查短到 AI 只能猜参数**：以前只列工具名和几个常见 mode，`mc_move` 的 `boat` / `walk-nodig` /
+  `intent`（`stand` 精确站格、`interact` 停在能右键的位置）/ `noDig`（**默认不挖**）/ `allowTower`，
+  `mc_act` 的 `equip` 装到哪一格（`to`）/ `bridge` 桥下有岩浆或深空只警告 / `useitem` 的 `hold`，
+  `mc_attack` 的 `priority` / `kite`，`mc_shoot` 的 `weapon` / `aim` / `lead` / `count`，
+  `mc_station` 的三种 `kind` 与附魔 `option`，`mc_prep` 的 `for`，`mc_fish` 的 `timeoutMs`，
+  `mc_task` 的十个 `action`，`mc_map` 的 `purpose` / `format` / `target`，`mc_scan` 的 `y` / `tail`……
+  都得现查工具描述，AI 常常干脆不用这些功能。现在按「工具级 + 关键参数/模式」写清。
+- **有两个工具一个字都没提**：`mc_sessions`（列活跃会话，诊断"是不是别的会话连着同一个 bot"）、
+  `mc_admin_config`（指令白名单 / MC 模式工具范围 / 记忆目录 / 分享开关 / 每会话独立记忆 ——
+  **MC 模式里调不动**，得请用户到普通会话改）。
+- **`mc_give` 以前只有名字**：补上"只有创造模式"、`slot` 那格被占要 `force`、`clearAll` 清空背包。
+- **`mc_sequence` / `mc_task` 被截断时不知道从哪续**：补 `stoppedAt` + `remaining`（从停的那步往后重发）
+  和 `list/run/get/resume/note/done/cancel/forget/plan/step` 全部入口。
+- **`chat-log.md` 没人知道它存在**：插件一直在把玩家和你在游戏里的每句话按天记进记忆根（留 7 天，
+  系统消息不算），准则里补一句"被叫醒、隔天回来、想不起他说过什么，就翻它"。
+- 每条工具说明都对着 `index.js` / `extensions/*.mjs` 里的真实参数逐条核过，没有照名字编。
 ### 🧹 「刚挖掉的方块读成空气」不再留幽灵空位 & 「反复报到点了」说明白
 
 - **挖掉却没挖掉（服务端静默拒绝）**：mineflayer 一到破坏动画结束就把**本地**那格改成空气，
