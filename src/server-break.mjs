@@ -131,6 +131,31 @@ export function watchServerBreak (b, pos) {
  *   · `kind === 'other'`  服务端说那一格是别的方块 ⇒ 多半是客户端区块旧了（desync），建议 force 重连
  *   `null` = 没有复原包，调用方按原来的三态走。
  */
+/**
+ * 把**本地**那一格改回挖之前的样子（不做任何网络请求）。
+ *
+ * 为什么要它（2026-10-23 实机，用户转来的报告「刚挖掉的方块读成空气，得换目标或绕一下才行」）：
+ *   `mineflayer/lib/plugins/digging.js` 的 `finishDigging()` 到点就 `bot._updateBlockState(pos, 0)`，
+ *   **根本不等服务端**。服务端要是**静默**拒了这次破坏（不发复原包），本地就永久留着一个“幽灵空位”：
+ *   寻路觉得那儿是通的、地图画成空气、`mc_scan` 也当它没了 —— 等真走过去才发现是实心墙。
+ *   所以“没收到服务端回包”这种情况必须把本地改回去，别让幻影坑继续骗后续的判断。
+ *
+ * @param {object} b mineflayer bot
+ * @param {{x:number,y:number,z:number}} pos 方块坐标
+ * @param {number} stateId 挖之前那个方块的状态 id（`block.stateId`）
+ * @returns {boolean} 是否真的写回去了（没 stateId / 没世界 / 该列没下发 ⇒ false）
+ */
+export function restoreLocalBlock (b, pos, stateId) {
+  const st = Number(stateId)
+  /* 只要 bot 和坐标在就试 —— 不要求 `b.world` 存在：`_updateBlockState` 不依赖它，
+   * 要求了反而会让“有入口却因为没有 world 而不写回”变成静默失败（2026-10-23 自测撞到）。 */
+  if (!Number.isFinite(st) || !b || !pos) return false
+  try {
+    if (typeof b._updateBlockState === 'function') { b._updateBlockState(pos, st); return true }
+    if (typeof b.world.setBlockStateId === 'function') { b.world.setBlockStateId(pos, st); return true }
+  } catch { /* 列没下发 / 版本差异 —— 写不回去就算了，别把挖掘本身搞崩 */ }
+  return false
+}
 export function classifyRestore (watch) {
   if (!watch?.watching) return null
   const st = watch.restored?.() ?? null

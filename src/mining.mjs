@@ -25,7 +25,7 @@ import { isAir, isLiquid, isSolidBlock, isPassable } from './block-names.mjs'
 import { heldText, canHarvestNow, toolKinds, countOf, durWarnText } from './inventory.mjs'
 import { digMsFor } from './dig-speed.mjs'
 import { blockReachOf, slowDigWhy, stateNameOf, dropHint, dropListOf } from './world-observer.mjs'
-import { classifyRestore } from './server-break.mjs'
+import { classifyRestore, restoreLocalBlock } from './server-break.mjs'
 import { callBudget, callSecText } from './budget.mjs'
 import { dangerNow, dangerText, dangerNotice, healthOf, noticeKey } from './danger.mjs'
 
@@ -262,6 +262,10 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
   }
   /* 真挖掉了 ⇒ 掉落物就在脚边。用户 2026-10-08 原话："挖完方块…老是忘记走过去拾取"。
    * 只**点一句**（`mc_act{break}` 这条路从来不自己捡），让模型知道这活还没完。 */
+  /* 🔴 2026-10-23：本地已经被 `digging.js` 清成空气、服务端却**一声不响**（既没破坏包也没复原包）⇒
+   *    把本地那一格改回去。否则这一格会变成“本地空气 / 服务端实心”的幽灵空位，
+   *    寻路和地图都以为那儿通了（实机表现：得换目标或绕一下才走得动）。 */
+  const rolledBack = (localGone && confirmed === false) ? restoreLocalBlock(b, pos, Number(blk?.stateId)) : false
   const pickup = localGone ? dropHint(b) : null
   /* 🔴 和 mc_attack 一个口径：只说"地上还有东西"不够，**在哪**才是能不能捡的依据
    *   （2026-10-22 下界连丢两根烈焰棒就是栽在这上面）。捡不捡仍由 AI 决定。 */
@@ -270,7 +274,8 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
    * 全好时不说，坏的时候必须说，否则"镐子中途爆了"和"挖得好好的"长得一模一样）。 */
   const toolWear = durWarnText(b)
   return {
-    broken: localGone ? name : false,
+    broken: rolledBack ? false : (localGone ? name : false),
+    ...(rolledBack ? { localRestored: true } : {}),
     confirmed,
     at: { x: pos.x, y: pos.y, z: pos.z },
     now,
@@ -290,6 +295,7 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
       note: '本地世界已经清掉了，但**没收到服务端的破坏回包** —— 服务端很可能拒了这次破坏'
         + '（领地保护 / 权限 / 反作弊 / 太远），客户端这边却把方块写成空气了。'
         + '用 `mc_scan` 或 `mc_observe` 再确认一下，**别在空气上盖房、别走进你以为挖穿的墙**。'
+        + (rolledBack ? '（我已经把本地那一格改回原样，免得寻路把它当成空洞）' : '')
         + DESYNC_HINT,
     } : {}),
     ...(localGone ? {} : {
@@ -627,10 +633,16 @@ export async function dig (self, {
             else if (confirmed) {
               out.push(`挖掉 ${nm} @ ${p}（原地，不用走过去）→ 现在 ${now}（服务端已确认`
                 + `${rest?.kind === 'liquid' ? '：液体立刻涌了进来，这次破坏是成功的' : ''}）`)
-            } else out.push(`本地读到 ${nm} @ ${p} 已经变成 ${now}，但**没收到服务端的破坏回包**`
-              + ' —— 服务端很可能拒了这次破坏（够不着 / 领地保护 / 权限 / 反作弊）：别当成挖掉了，'
-              + '先 `mc_scan` 复核。'
-              + DESYNC_HINT)
+            } else {
+              /* 🔴 2026-10-23 同上（`breakBlock` 那条路）：本地 air 是 `digging.js` 自己写上去的，
+               *    服务端静默拒绝时这一格会变成“本地空气 / 服务端实心”的幽灵空位 —— 寻路会往那儿走。 */
+              const back = restoreLocalBlock(b, p, Number(fresh?.stateId))
+              out.push(`本地读到 ${nm} @ ${p} 已经变成 ${now}，但**没收到服务端的破坏回包**`
+                + ' —— 服务端很可能拒了这次破坏（够不着 / 领地保护 / 权限 / 反作弊）：别当成挖掉了，'
+                + '先 `mc_scan` 复核。'
+                + (back ? '（我已经把本地那一格改回原样，免得寻路把它当成空洞）' : '')
+                + DESYNC_HINT)
+            }
             /* 🔴 原地挖绕过了 collectBlock（它平时挖完还会把掉落物捡回来）⇒ 得自己去捡，
              *    否则"挖到 3 根原木、背包里只有 1 根"（2026-10-08 实机）。 */
             const got = await ctx.grabDrops(b)

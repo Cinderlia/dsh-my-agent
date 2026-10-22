@@ -2366,11 +2366,26 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           + `要真去那儿，先确认那格脚下有方块；想让我铺过去就用 mc_build 或 mc_act{mode:"bridge"}。`,
       }
     }
+    /* 🔴 2026-10-23 实机（用户转来的报告：「同一个目标点会反复报到点了但其实没到」）：
+     *    起步时人已经落在到达圈里（`remaining <= arrive`）时，寻路一步都不用挪，照样回 `arrived:true`。
+     *    模型看到“到了”以为走到位了，下次再叫同一个点还是“到了 + moved 0” —— 于是**反复**。
+     *    口径不变（到了就是到了），但必须把“本来就站在圈里”说明白，否则它永远不知道该换 `intent:"stand"`。 */
+    const moved3dTotal = Number(deltaOf(end).moved3d) || 0
+    const alreadyThere = moved3dTotal < 0.6 && Number.isFinite(Number(startRemaining))
+      && Number(startRemaining) <= arriveUsed + 0.05
     return {
       arrived: true,
       position: at(end),
       ms: Date.now() - t0,
       ...(portalInfo ? { portal: portalInfo } : {}),
+      /* 起步就在到达圈里 ⇒ 说明白“一步没挪”，并给出精确到格的办法（否则模型会一直重叫同一个点）。 */
+      ...(alreadyThere && !(portalInfo && !portalInfo.entered)
+        ? { hint: `我**本来就站在**这个点的到达圈里（起步时差 ${Number(startRemaining).toFixed(1)} 格，`
+          + `这一趟一步没挪）—— 所以这不是“走过去”，是“本来就在”。`
+          + `要精确站到 (${sp.x}, ${sp.y}, ${sp.z}) 那一格上，用 \`intent:"stand"\`（判定半径 0.6 格）；`
+          + '只是想“到附近”就够了的话，这条已经满足，别再重叫同一个点。' }
+        : {}),
+      ...(alreadyThere ? { alreadyThere: true } : {}),
       ...deltaOf(end),
       /* 到了也报 `remaining`（实机第 6 跑：`walkTo` 明明到了、`remaining` 却是 undefined，
        * 测试脚本只能打 `-`，看着像"谎报到达"）。 */
