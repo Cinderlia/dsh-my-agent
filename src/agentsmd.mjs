@@ -32,7 +32,10 @@ const FILE = 'RULES.md'
 const LEGACY_FILE = 'AGENTS.md'
 const MAX_BYTES = 128 * 1024
 
-/** 默认「行事准则」（2026-10-23 第十二版：工具速查**瘦身** —— 只留"有什么、什么时候用、权限边界、会毁东西的坑"，
+/** 默认「行事准则」（2026-10-23 第十三版：工具速查补两条**会把 AI 带偏的返回语义** ——
+ *   `mc_move` 的 `alreadyThere`（本来就站在圈里 ≠ 走到了）与 `goal-not-standable`；
+ *   `mc_dig` 的 `localRestored`（服务端静默拒绝时本地已回滚，别在空气上盖房）。
+ *   2026-10-23 第十二版：工具速查**瘦身** —— 只留"有什么、什么时候用、权限边界、会毁东西的坑"，
  * 参数名/默认值/上限全部交给工具自己的 description（那里与代码同源，不会像常驻文档一样漂移）。
  * 第十一版把 39 个工具的参数抄了进来，重复且每轮多花约 1K token（用户 2026-10-20 已定过"减少 token 消耗"的调子）。
  */
@@ -224,8 +227,8 @@ export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 > **参数名 / 默认值 / 上限都在工具自己的描述里**，这里只给"有什么、什么时候用" —— 要确切参数就去看那个工具的描述，别猜。
 
 - **看**：\`mc_observe\`（看一眼；\`image:false\` 只给状态，**不算看过画面**）；\`mc_map\`（脚下 / 地表 / 竖列三种视角）；\`mc_scan\` 找方块；\`mc_inventory\`；\`mc_status\`；\`mc_diag\` 排查"动不了"；\`mc_events\` 攒着的聊天与系统事件；\`mc_sessions\`（是不是别的会话连着同一个 bot）。
-- **动**：\`mc_move\` 六个 mode —— \`walk\` / \`walk-nodig\` / \`fly\` / \`jump\` / \`swim\` / \`boat\`（先 \`use\` 上船，下船用 \`dismount\`）。**一次只走 10 秒**，没走到就照原目标再叫一次。
-- **手**：\`mc_dig\` / \`mc_build\` / \`mc_act\`（\`break\` \`place\` \`bridge\` \`use\` \`useitem\` \`equip\` \`toss\` \`look\` \`toward\` \`jump\` \`fish\` \`dismount\`）/ \`mc_give\`（**只有创造模式**）。\`mc_attack\` 打怪 / \`mc_shoot\` 射箭 / \`mc_station\` 附魔台·铁砧·锻造台 / \`mc_prep\` 出发前自查 / \`mc_fish\` 钓鱼 —— 这五个是**独立工具，不在 \`mc_act\` 里**，别硬套。
+- **动**：\`mc_move\` 六个 mode —— \`walk\` / \`walk-nodig\` / \`fly\` / \`jump\` / \`swim\` / \`boat\`（先 \`use\` 上船，下船用 \`dismount\`）。**一次只走 10 秒**，没走到就照原目标再叫一次 返回里有 \`alreadyThere:true\` = **你本来就站在到达圈里、这一趟一步没挪**（不是"走到了"）——要精确站到那一格上用 \`intent:"stand"\`，只是想"到附近"就别再重叫同一个点；目标格站不住时落点会被挪，挪完一步没走会报 \`reason:"goal-not-standable"\`（别当成到了）。
+- **手**：\`mc_dig\`（默认**不挖穿挡路的方块**，矿在墙后要加 \`digThrough:true\`；「本地清了但**没收到服务端回包**」= 服务端八成拒了，这时我**已经把本地那一格改回原样**并报 \`localRestored\` —— 别在空气上盖房、别走进你以为挖穿的墙，用 \`mc_scan\` 复核）/ \`mc_build\` / \`mc_act\`（\`break\` \`place\` \`bridge\` \`use\` \`useitem\` \`equip\` \`toss\` \`look\` \`toward\` \`jump\` \`fish\` \`dismount\`）/ \`mc_give\`（**只有创造模式**）。\`mc_attack\` 打怪 / \`mc_shoot\` 射箭 / \`mc_station\` 附魔台·铁砧·锻造台 / \`mc_prep\` 出发前自查 / \`mc_fish\` 钓鱼 —— 这五个是**独立工具，不在 \`mc_act\` 里**，别硬套。
 - **做**：\`mc_craft\` 合成（自动补齐中间产物，缺工作台只报不替你放）；\`mc_furnace\` 烧炼（装好就返回；要看烧好没就再问一次）；\`mc_chest\` 存取箱子（受"看图"门禁）。
 - **任务与说**：\`mc_task\` 多条任务、记进度、续做；\`mc_say\` 说话（单行）；\`mc_command\` 服务器指令（**先确认有权限**）；\`mc_kit_memory\` 记 / 查笔记；\`mc_kit_image\` 画图；\`mc_kit_express\` 把图或文件发给用户看。
 - **自主 / 停 / 设置**：\`mc_auto\` 待机时自己安排；\`mc_stop\` 强行停下；\`mc_ping\` 探服；\`mc_disconnect\` 下线；\`mc_watch\` 看门狗与日志；\`mc_config\` 调唤醒与距离；\`mc_admin_config\`（指令白名单、MC 模式能用哪些工具、记忆目录、分享开关 —— **MC 模式里调不动，要请用户到普通会话改**）。
