@@ -32,7 +32,10 @@ const FILE = 'RULES.md'
 const LEGACY_FILE = 'AGENTS.md'
 const MAX_BYTES = 128 * 1024
 
-/** 默认「行事准则」（2026-10-23 第十一版（工具速查补全全部 39 个工具的关键 mode / 参数：move 补 boat·walk-nodig·intent·noDig·allowTower，act 补 equip 的 to·bridge 只警告·useitem 的 hold，另补之前没写的 mc_give / mc_sequence / mc_station / mc_task / mc_auto / mc_admin_config / mc_sessions 等入口）：与记忆根里的 `RULES.md` **同一份文本** —— 新增「自主发展与决策」一节，把"不是任务脚本、五本账、一轮一条链、同一失败方法最多两次"写死；「干活习惯」补"交互没反应先怀疑瞄准"；「舀水」改成带坐标的 `useitem` + 只舀静水） */
+/** 默认「行事准则」（2026-10-23 第十二版：工具速查**瘦身** —— 只留"有什么、什么时候用、权限边界、会毁东西的坑"，
+ * 参数名/默认值/上限全部交给工具自己的 description（那里与代码同源，不会像常驻文档一样漂移）。
+ * 第十一版把 39 个工具的参数抄了进来，重复且每轮多花约 1K token（用户 2026-10-20 已定过"减少 token 消耗"的调子）。
+ */
 export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 
 ## 宗旨
@@ -218,21 +221,22 @@ export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 
 ## 工具速查
 
-> **参数以工具自己的描述为准。** 下面只是常用形态，版本不同可能多一个少一个 —— 不确定就看工具描述或 \`mc_capabilities\`。
+> **参数名 / 默认值 / 上限都在工具自己的描述里**，这里只给"有什么、什么时候用" —— 要确切参数就去看那个工具的描述，别猜。
 
-- **看**：\`mc_observe\`（截图 + 三段式感知；\`image:false\` 只回结构化状态、**不算看过画面**，\`percept:false\` 省 token，\`fov\` 越小越望远，\`distance\` 默认 48）；\`mc_map\`（\`floor\` 默认脚下一层 / \`surface\` 地表 / \`column\` 竖列；\`purpose\` overview·navigation·hazards；\`format\` chars·image·both）；\`mc_scan\`（\`name\` 找方块；\`radius\` 默认 16、\`height\` 默认 ±4、\`y\` 指定窗口；\`tail:true\` 看最少的 10 种）；\`mc_inventory\`；\`mc_status\`（\`verbose:true\` 要明细）；\`mc_events\`（\`peek:true\` 只看不消费；\`kind\` chat/system/damage/lifecycle；\`waitSec\` ≤5）；\`mc_diag\`（\`only\` 细分，\`all\` 全给）；\`mc_sessions\`（列活跃会话，查"是不是别的会话连着同一个 bot"）。
-- **动**：\`mc_move\` 的 mode —— \`walk\`（默认；\`noDig\` **默认不挖**，要挖穿挡路的写 \`false\`）/ \`walk-nodig\` / \`fly\`（创造默认）/ \`jump\`（原地跳，不用坐标）/ \`swim\`（不给坐标=只上浮换气）/ \`boat\`（先 \`use\` 上船，下船用 \`mc_act {mode:"dismount"}\`）。\`intent\` 定停哪：\`near\` 默认 / \`stand\` 站准那格 / \`interact\` 停在 2.2 格（能右键）/ \`same-level\`；\`budgetMs\` ≤10000；\`allowTower\` 默认**不许**垫 1×1 柱。走远路连着叫几次 —— 一次只走 10 秒。
-- **手**：\`mc_dig\`（\`count\` ≤16、\`maxDistance\`、\`allowDangerous\` 默认拦挖脚下支撑、\`digThrough\`；自动换工具，挖不动会说缺什么）；\`mc_build\`（两角坐标 + \`name\`，\`max\` 防手滑，没放完重发会跳过已对的）；\`mc_act\` 的 mode —— \`break\` / \`place\` / \`bridge\`（**下面有岩浆或 >64 格深空只警告不拦**；脚下悬空·区块没加载·血 <8 就停）/ \`use\`（不给 who 也不给坐标 = 用手上的）/ \`useitem\`（带 x/y/z 会先 look、停 450ms 再用；\`hold\` 按住毫秒，拉弓 1000）/ \`fish\` / \`equip\`（\`to\` 装到 head/torso/legs/feet/off-hand，**只给 to 就是脱掉**）/ \`toss\` / \`jump\` / \`look\` / \`toward\` / \`dismount\`；\`mc_attack\`（\`priority\` threat/nearest/weakest；\`kite\` 放风筝；24 格内会追）；\`mc_shoot\`（\`weapon\` bow/crossbow/trident；\`aim\` 相对脚底格数；\`lead\` 移动目标提前量默认开；\`maxDist\`；\`count\` ≤5）；\`mc_station\`（\`kind\` enchant/anvil/smithing；附魔 \`option\` 0/1/2；铁砧 \`action\` combine/rename；锻造台给 \`template\`）；\`mc_prep\`（\`for:"nether"\` 默认 / \`"end"\`）；\`mc_fish\`（\`timeoutMs\` 默认 8000；没咬钩浮标还在水里，再叫一次接着盯）；\`mc_sequence\`（\`steps\` 里的 \`op\` 见工具表；超时回 \`stoppedAt\`+\`remaining\`，从停的那步往后重发）；\`mc_give\`（**只有创造模式**；\`slot\` 那格有东西会拒、\`force:true\` 强塞；\`clearAll:true\` 清空背包）。
-- **做**：\`mc_craft\`（\`count\` 是"背包里**一共**要到几个"，\`more:true\` 才是"再做 N 个"；\`table\`/\`list\`/\`dryRun\`；缺工作台只报、不替你放）；\`mc_furnace\`（\`count\` 一次最多 8；\`fuel\` 指定燃料；\`takeOnly\` 只取已烧好的；\`maxWaitSec\` 默认 0 = 装好就返回、最多 10）；\`mc_chest\`（\`list\`/\`put\`/\`take\`；\`all:true\` 全搬、\`keep\` 是"绝不搬"的名单；\`dryRun\`；受看图门禁）。
-- **任务与说**：\`mc_task\`（\`action\` list/run/get/resume/note/done/cancel/forget/plan/step；\`steps\` 写 \`[{id,op,args}]\`）；\`mc_say\`（单行，≤220 字）；\`mc_command\`（**先确认有权限**；可一次多行、一行一条，白名单在设置里）；\`mc_kit_memory\`（\`action\` index/kinds/record/read/append/write/put/delete/search；\`kind\` world/exp/task/rule，rule 只读）；\`mc_kit_image\`（info/embed/render/grid/save）；\`mc_kit_express\`（把图/文件发给用户看）。
-- **自主 / 停 / 设置**：\`mc_auto\`（\`action\` status/on/off/stay/follow/wake/set；\`mode\` ai-led/balanced/legacy；\`off\` 只关反射层，\`set {idleWake:false}\` 才全静音）；\`mc_stop\` 强行停下；\`mc_ping\` 探服；\`mc_disconnect\` 下线；\`mc_watch\` 看门狗；\`mc_config\`（\`patch\` 支持点号键，如 \`{"wakeOn.itemPickup":true,"nearRadius":24}\`）；\`mc_admin_config\`（**MC 模式里调不动** —— 指令白名单、MC 模式工具范围、记忆目录、分享开关、每会话独立记忆这些，要请用户到**普通会话**改）。
+- **看**：\`mc_observe\`（看一眼；\`image:false\` 只给状态，**不算看过画面**）；\`mc_map\`（脚下 / 地表 / 竖列三种视角）；\`mc_scan\` 找方块；\`mc_inventory\`；\`mc_status\`；\`mc_diag\` 排查"动不了"；\`mc_events\` 攒着的聊天与系统事件；\`mc_sessions\`（是不是别的会话连着同一个 bot）。
+- **动**：\`mc_move\` 六个 mode —— \`walk\` / \`walk-nodig\` / \`fly\` / \`jump\` / \`swim\` / \`boat\`（先 \`use\` 上船，下船用 \`dismount\`）。**一次只走 10 秒**，没走到就照原目标再叫一次。
+- **手**：\`mc_dig\` / \`mc_build\` / \`mc_act\`（\`break\` \`place\` \`bridge\` \`use\` \`useitem\` \`equip\` \`toss\` \`look\` \`toward\` \`jump\` \`fish\` \`dismount\`）/ \`mc_give\`（**只有创造模式**）。\`mc_attack\` 打怪 / \`mc_shoot\` 射箭 / \`mc_station\` 附魔台·铁砧·锻造台 / \`mc_prep\` 出发前自查 / \`mc_fish\` 钓鱼 —— 这五个是**独立工具，不在 \`mc_act\` 里**，别硬套。
+- **做**：\`mc_craft\` 合成（自动补齐中间产物，缺工作台只报不替你放）；\`mc_furnace\` 烧炼（装好就返回；要看烧好没就再问一次）；\`mc_chest\` 存取箱子（受"看图"门禁）。
+- **任务与说**：\`mc_task\` 多条任务、记进度、续做；\`mc_say\` 说话（单行）；\`mc_command\` 服务器指令（**先确认有权限**）；\`mc_kit_memory\` 记 / 查笔记；\`mc_kit_image\` 画图；\`mc_kit_express\` 把图或文件发给用户看。
+- **自主 / 停 / 设置**：\`mc_auto\` 待机时自己安排；\`mc_stop\` 强行停下；\`mc_ping\` 探服；\`mc_disconnect\` 下线；\`mc_watch\` 看门狗与日志；\`mc_config\` 调唤醒与距离；\`mc_admin_config\`（指令白名单、MC 模式能用哪些工具、记忆目录、分享开关 —— **MC 模式里调不动，要请用户到普通会话改**）。
+
+- **收作物别用 \`mc_dig {name:"…"}\` 批量挖**：它自己挑坐标，你读数一偏就把旁边整片挖坏（实测把用户新种的麦田连带挖了）。收作物一株一株 \`mc_act {mode:"break", x,y,z}\`，看着挖；播种 / 锄地的成功判据是"数量变了没有"，返回值说"用了耕地"不代表种上了。
 
 **别把工具的"自动"当保证。** 自动换工具、自动垫脚、自动找工作台都可能失败 —— **看返回值里写了什么**。
 
 **判断结果看 \`outcome\` / \`outcomeText\`**：\`confirmed\` / \`failed\` / \`unknown\` / \`stale\`（这一步的结果属于上一代任务，已作废）。**\`unknown\` 不是失败** —— 超时或被新指令打断，但服务器可能已经做了：先 \`mc_observe\` / \`mc_inventory\` 看一眼再决定，**别直接重做**（可能把刚放好的方块又挖掉）。
 
 **长活被截断时，分清三件事**：结果里写"这一轮的 11 秒用完了"或带 \`remaining\` / \`hint\` → **同参数再叫一次**接着做（**不是失败**，别换目标、别重连）；确认失败了 → **换方法**再来，同一个方法最多两次；要接着干一整条任务 → \`mc_task {action:"resume"}\`。
-
 ## 干活习惯
 
 **每一步都是"检查 → 执行 → 核验"**，破坏性操作（挖、放、丢、存）尤其：**动手前**看目标方块是什么（\`mc_observe\` 的"射线打到的方块"或 \`mc_scan\`）、背包有没有位置、工具对不对；**动手后**看结果说成功没有、背包里的数变没有、那一格现在是什么。
