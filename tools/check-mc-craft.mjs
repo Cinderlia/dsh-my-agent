@@ -941,6 +941,113 @@ console.log('— ⑫ 背包满了 ⇒ 产物掉地上，必须点名 —')
     '补做抛错时先对账：真涨了就接着补，别把整步停在第一批（要 24 块只做 4 块就不动了）')
 }
 
+/* ─────────────── ⑦ 依赖树（tree:true）：合成 + 烧 + 挖三层串起来 ───────────────
+ * 来源：2026-10-23 用户「1档和2档做一下」里的一档②（mindcraft 的 ItemNode 思路）。
+ * 这里用一套**带掉落表和工具要求**的假注册表，专门测"铁锭到底哪来的"这种跨层问题。
+ */
+console.log('— ⑦ 依赖树 tree —')
+{
+  const { goalTree, describeGoalTree, sourceOf } = mod
+  const N2 = ['air', 'oak_log', 'oak_planks', 'stick', 'crafting_table',
+    'wooden_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'raw_iron', 'iron_ingot', 'iron_ore',
+    'cobblestone', 'stone', 'diamond', 'unobtainium']
+  const items2 = {}
+  const itemsByName2 = {}
+  N2.forEach((n, i) => { const it = { id: i, name: n }; items2[i] = it; itemsByName2[n] = it })
+  const iid = (n) => itemsByName2[n].id
+  /* 掉落表：铁矿石掉 raw_iron（名字和方块不一样）、石头掉圆石、原木掉自己 */
+  const blocksByName2 = {
+    oak_log: { id: 2000, name: 'oak_log', drops: [iid('oak_log')] },
+    iron_ore: { id: 2001, name: 'iron_ore', drops: [iid('raw_iron')], harvestTools: { [iid('stone_pickaxe')]: true, [iid('iron_pickaxe')]: true } },
+    stone: { id: 2002, name: 'stone', drops: [iid('cobblestone')], harvestTools: { [iid('wooden_pickaxe')]: true } },
+  }
+  const r2 = (out, outCount, requiresTable, ing) => ({
+    result: { id: iid(out), count: outCount },
+    requiresTable,
+    delta: [...ing.map(([n, c]) => ({ id: iid(n), metadata: null, count: -c })), { id: iid(out), metadata: null, count: outCount }],
+    ingredients: ing.map(([n]) => iid(n)),
+  })
+  const R2 = [
+    r2('oak_planks', 4, false, [['oak_log', 1]]),
+    r2('stick', 4, false, [['oak_planks', 2]]),
+    r2('crafting_table', 1, false, [['oak_planks', 4]]),
+    r2('wooden_pickaxe', 1, true, [['oak_planks', 3], ['stick', 2]]),
+    r2('stone_pickaxe', 1, true, [['cobblestone', 3], ['stick', 2]]),
+    r2('iron_pickaxe', 1, true, [['iron_ingot', 3], ['stick', 2]]),
+  ]
+  const mk2 = (inv = {}) => mkBot(inv, {
+    registry: { items: items2, itemsByName: itemsByName2, blocksByName: blocksByName2 },
+    recipes: (id, md, table) => R2.filter((r) => r.result.id === id && (!r.requiresTable || table)),
+  })
+
+  /* sourceOf：三种来源各认一遍 */
+  ok(sourceOf(mk2().bot, 'iron_ingot').kind === 'smelt', 'sourceOf：铁锭 → 烧出来')
+  ok(sourceOf(mk2().bot, 'iron_ingot').input === 'raw_iron', 'sourceOf：优先挑 raw_iron（不是矿石方块）')
+  ok(sourceOf(mk2().bot, 'raw_iron').kind === 'mine' && sourceOf(mk2().bot, 'raw_iron').block === 'iron_ore',
+    'sourceOf：raw_iron 反查掉落表 ⇒ 挖 iron_ore（不靠名字猜）')
+  ok(sourceOf(mk2().bot, 'unobtainium').kind === 'other', 'sourceOf：查不到就如实说 other，不编来源')
+
+  /* 整棵树：铁镐 ← 铁锭 ← 烧 raw_iron ← 挖 iron_ore ← 石镐 */
+  const t1 = goalTree(mk2().bot, 'iron_pickaxe', 1, { table: true })
+  const findNode = (n, nm) => {
+    if (!n) return null
+    if (n.name === nm) return n
+    for (const c of n.children ?? []) { const r = findNode(c, nm); if (r) return r }
+    return null
+  }
+  ok(t1.target === 'iron_pickaxe' && t1.ok === false, 'goalTree：铁镐没材料 ⇒ ok=false')
+  ok(t1.tree.kind === 'craft' && t1.tree.times === 1, '根节点是"合成 1 次"')
+  const ing = findNode(t1.tree, 'iron_ingot')
+  ok(!!ing && ing.kind === 'smelt', '树上铁锭这一枝是"烧"', JSON.stringify(t1.leaves.map((l) => [l.name, l.kind])))
+  const raw = ing?.children?.[0]
+  ok(raw?.name === 'raw_iron' && raw.kind === 'mine' && raw.block === 'iron_ore', '再往下一层：raw_iron ⇒ 挖 iron_ore')
+  ok(raw?.canMine === false, '身上没有石镐 ⇒ 标"挖不动"')
+  ok(raw?.children?.[0]?.name === 'stone_pickaxe' && raw?.children?.[0]?.kind === 'craft',
+    '挖不动 ⇒ 把"先做一把石镐"排进来（不是一句"查不到来源"）')
+  ok(raw?.children?.[0]?.children?.length > 0, '石镐自己也拆到"圆石 + 木棍"这一层')
+  const logLeaf = findNode(t1.tree, 'oak_log')
+  ok(logLeaf?.kind === 'mine' && logLeaf.canMine === true && !logLeaf.children,
+    '原木：能徒手挖 ⇒ 不再往下拆')
+
+  const txt = describeGoalTree(t1)
+  ok(/挖 \*\*iron_ore\*\*/.test(txt), '文字版点了名：挖 iron_ore', txt)
+  ok(/烧 \*\*raw_iron\*\*/.test(txt) && /mc_furnace/.test(txt), '文字版说清"烧 raw_iron + 用 mc_furnace"')
+  ok(/挖得动得先有 .*pickaxe/.test(txt), '文字版标出"挖得动得先有镐子"')
+  ok(/合成 \d+ 次/.test(txt), '文字版把"合成几次 ← 什么料"写出来')
+  ok(/动手顺序/.test(txt), '文字版给动手顺序（挖 → 烧 → 合成）')
+
+  /* 有石镐 ⇒ 不再往下拆工具 */
+  const t2 = goalTree(mk2({ stone_pickaxe: 1 }).bot, 'iron_pickaxe', 1, { table: true })
+  const raw2 = findNode(t2.tree, 'raw_iron')
+  ok(raw2?.kind === 'mine' && raw2.canMine === true && !raw2.children, '有石镐 ⇒ "挖不动"和"先做镐"都消失')
+
+  /* 材料齐了 ⇒ 直说"直接 mc_craft" */
+  const rich = mk2({ iron_ingot: 3, stick: 2, crafting_table: 1 })
+  ok(goalTree(rich.bot, 'iron_pickaxe', 1, { table: true }).ok === true, '材料齐 ⇒ ok=true（只剩合成）')
+  ok(/材料齐了/.test(describeGoalTree(goalTree(rich.bot, 'iron_pickaxe', 1, { table: true }))), '材料齐 ⇒ 文字版直接给下一步')
+
+  /* 深度上限：不许无限往下钻 */
+  const shallow = goalTree(mk2().bot, 'iron_pickaxe', 1, { table: true, maxDepth: 1 })
+  ok(shallow.tree.children.length === 2 && shallow.tree.children.every((c) => c.cut === true),
+    'maxDepth:1 ⇒ 根下面就只有一层，且都标 cut')
+  ok(!findNode(shallow.tree, 'oak_log'), 'maxDepth:1 ⇒ 不往下钻到原木')
+
+  /* execute 里接上了 + 一个合成都不点 */
+  const f = mk2()
+  const mc = mkMc(f)
+  const rt = await run({ tree: true, name: 'iron_pickaxe', count: 2 }, { mc })
+  ok(/要拿到 \*\*iron_pickaxe ×2\*\*/.test(rt.text) && /iron_ore/.test(rt.text), 'tree:true 走通、直接给树', rt.text.slice(0, 120))
+  ok(Array.isArray(rt.value.leaves) && rt.value.leaves.length > 0, '结果里带结构化 leaves')
+  ok(f.calls.length === 0, 'tree:true 一个合成都没点（只出计划）')
+  const rtNo = await run({ tree: true }, { mc })
+  ok(/得给 `name`/.test(rtNo.text), 'tree:true 缺 name ⇒ 说清楚要什么')
+
+  const src = readFileSync(new URL('../extensions/mc_craft.mjs', import.meta.url), 'utf8')
+  ok(/tree: \{ type: 'boolean'/.test(src), '参数表里有 tree')
+  ok(/goalTree\(bot, args\.name, args\.count, \{ table: allowTable \}\)/.test(src), 'execute 里接上了 goalTree')
+  ok(/from '\.\/mc_furnace\.mjs'/.test(src), '烧炼表复用 mc_furnace（没抄第二份）')
+}
+
 console.log('')
 console.log(`check-mc-craft：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

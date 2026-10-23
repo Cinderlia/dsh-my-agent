@@ -25,6 +25,12 @@ import { pickPlaceItem, isFullBlockItem } from './place-items.mjs'
 import { heldText } from './inventory.mjs'
 import { standableY } from './movement.mjs'
 
+/* 🔴 2026-10-23 实机（同一段时间里一条 `mc_move` 挂了 208 秒）：`b.placeBlock` 要等服务端
+ *    把方块放进去才 settle，服务端不理（拒绝/失步/延迟）就**永不 settle** ——
+ *    “跳起来再放”这条原地搭高的路上一样能挂死，而它不在任何预算闸门里。
+ *    这里给每次放置一个上限：到点算这次没放上，由外层 `tries` 再试。 */
+export const PLACE_TIMEOUT_MS = 2_500
+
 /**
  * 在目标周围找一块**能站的地面**当落脚点（"走过去放"用）。找不到返回 `null`。
  *
@@ -91,7 +97,10 @@ export async function placeWhileJumping (b, refBlock, face, { tries = 3 } = {}) 
         await sleep(20)
       }
       try {
-        await b.placeBlock(refBlock, new Vec3(face.x, face.y, face.z))
+        await Promise.race([
+          Promise.resolve(b.placeBlock(refBlock, new Vec3(face.x, face.y, face.z))),
+          sleep(PLACE_TIMEOUT_MS).then(() => { throw new Error(`放方块 ${PLACE_TIMEOUT_MS}ms 没回包（服务端没理）`) }),
+        ])
         return true
       } catch (e) { lastErr = e }
       await sleep(120)   // 落地了再跳一次

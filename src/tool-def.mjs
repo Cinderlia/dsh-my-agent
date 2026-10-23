@@ -247,6 +247,46 @@ export function validateJsonSchemaValue (schema, value, path = '') {
   }
 }
 
+/* ───────── 数字参数的容错（2026-10-23 实机：模型把坐标写成字符串）─────────
+ * 现象：`mc_act {mode:"place", x:-531, y:72, z:"-32"}` → 宿主按参数表里的 `type:"number"`
+ *   当场拒掉（`invalid arguments: "z" must be a number`），一次完全合法的调用白费。
+ * 做法分两步，**严格表一个字不改**（`numOf` 之类照旧要拿到数字）：
+ *   ① `loosenNumberParams`：注册给宿主的那份表里，number/integer 参数换成 `type:"json"`
+ *      （宿主里"任意 JSON 值"的标准写法，`mc_admin_config` 的 `value` 早就这么用），
+ *      宿主就不再因为字符串而拒；
+ *   ② `coerceNumberArgs`：`execute` 前照**严格表**把"看上去是数字的字符串"转成真数字，
+ *      下游（`numOf`／直接读 `args.count` 的地方）永远拿到 number；`"abc"` 之类留在原地，
+ *      由 `numOf` 报出原文。只动严格表里声明为 number/integer 的键 —— `name:"64"`、
+ *      `text:"123"` 这类文本参数一个都不碰。
+ */
+export const NUMERIC_PARAM_TYPES = new Set(['number', 'integer'])
+
+/** 这个属性节点是不是数字参数（声明在严格表里的 number/integer） */
+export function isNumericParam (spec) {
+  return Boolean(spec) && typeof spec === 'object' && NUMERIC_PARAM_TYPES.has(spec.type)
+}
+
+/** 注册给宿主用：数字参数 → `type:"json"`（其余原样透传，不改入参对象） */
+export function loosenNumberParams (params) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return params
+  const out = {}
+  for (const [k, v] of Object.entries(params)) out[k] = isNumericParam(v) ? { ...v, type: 'json' } : v
+  return out
+}
+
+/** 执行前：数字参数上的"数字字符串"转成 number（别的键一个都不碰；没改就返回原对象） */
+export function coerceNumberArgs (params, args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return args
+  let touched = false
+  const out = { ...args }
+  for (const [k, v] of Object.entries(params ?? {})) {
+    if (!isNumericParam(v)) continue
+    const val = out[k]
+    if (typeof val === 'string' && val.trim() !== '' && Number.isFinite(Number(val))) { out[k] = Number(val); touched = true }
+  }
+  return touched ? out : args
+}
+
 /** 内置的入参错误（宿主版是 HarnessError 子类；这里形状对齐但继承不到——见文件头"已知退化"） */
 export class BuiltinToolArgsError extends Error {
   constructor (violations) {

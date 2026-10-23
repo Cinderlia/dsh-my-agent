@@ -237,6 +237,7 @@ export async function connect (self, opts = {}, ctx = {}) {
        * 不清的话，重连后 `mc_diag` 会显示一堆早就结束的动作还占着 movement / interaction，
        * 等 P1 真的开始拦人时就会变成"重连之后什么都动不了"。 */
       try { self.actionScheduler?.().releaseAll?.('断线了') } catch { /* 清不掉不影响断线处理 */ }
+      clearSilenceWatch(self)
       self.emit('offline', { sub, reason: why, willReconnect, at: Date.now() })
       if (willReconnect) scheduleReconnect(self, sub, ctx)
     })
@@ -269,6 +270,12 @@ export async function connect (self, opts = {}, ctx = {}) {
     if (previous && previous !== b) { try { previous.quit() } catch {} }
     self.bot = b
     self.sub = sub
+    /* 包静默监控（见 PACKET_STALE_MS 的注释）：记"最后一个包什么时候到的"，
+     * 并由看门狗在假死时主动断开重连。 */
+    b._lastPacketAt = Date.now()
+    try { b._client?.on?.('packet', () => { b._lastPacketAt = Date.now() }) } catch {}
+    startSilenceWatch(self, b)
+
     self._lastHost = host          // ⚠️ 必须记：否则上面的"已连着就直接返回"永不生效，
                                    //    重复 mc_connect 会真去重连（先把自己踢下线再登回来）
     self.connectedAt = Date.now()
@@ -293,6 +300,59 @@ export async function connect (self, opts = {}, ctx = {}) {
   //    那样它的 rejection 就成了"未处理拒绝"→ 宿主 fail-loud 直接 exit(1)。
   self.connecting.catch(() => {})
   try { return await self.connecting } finally { self.connecting = null }
+}
+
+/* 🔴 2026-10-23 实机（用户："也是完全卡住，我tp也不行，最后重开才好" / "是它重进游戏"）：
+ *    这就是**连接假死** —— socket 看着还在，服务端其实已经不回包了：
+ *      · `b.dig()` 等 `blockUpdate` 永远等不到（vendor 只在包回来时才 settle）⇒ 动作永挂；
+ *      · 位置不再更新 ⇒ 每个动作都"在跑"，实际什么也没发生；
+ *      · 连 `tp` 都发不出去 ⇒ 用户看着像插件整个死了，只能重进游戏。
+ *    唯一可靠的信号是"多久没收到任何一个包"。正常游戏里服务端每秒都在发包（keep_alive /
+ *    time_update / entity…），40 秒全静默必然是死了。 */
+export const PACKET_STALE_MS = 40_000
+export const SILENCE_CHECK_MS = 5_000
+
+/** 距离"最后一个进来的包"过去多少毫秒；没开始记（旧连接/离线）返回 null。 */
+export function packetSilenceMs (b) {
+  const t = Number(b?._lastPacketAt)
+  if (!Number.isFinite(t) || t <= 0) return null
+  return Math.max(0, Date.now() - t)
+}
+
+/**
+ * 连接是不是已经假死。返回 `null` = 正常（或无从判断）；否则给出"静默多久 + 该怎么办"。
+ * 工具调用据此**立刻认输**，不陪着一起卡到预算上限。
+ */
+export function connectionStale (b, { staleMs = PACKET_STALE_MS } = {}) {
+  const silent = packetSilenceMs(b)
+  if (silent == null || silent < staleMs) return null
+  const sec = Math.round(silent / 1000)
+  return {
+    silenceSec: sec,
+    reason: 'connection-stale',
+    hint: '服务端已经 ' + sec + ' 秒没回任何包 —— 连接假死，不是我走不动。先 mc_connect {force:true} 重连，再重试这个动作；别再原样重试（不会成功）。',
+  }
+}
+
+/** 假死看门狗：静默到点就主动断开重连（假死没有 `end` 事件，autoReconnect 永远不会触发）。 */
+export function startSilenceWatch (self, b, { everyMs = SILENCE_CHECK_MS } = {}) {
+  clearSilenceWatch(self)
+  if (typeof setInterval !== 'function') return
+  self._silenceTimer = setInterval(() => {
+    if (self.bot !== b || self.stopped) { clearSilenceWatch(self); return }
+    const stale = connectionStale(b)
+    if (!stale) return
+    clearSilenceWatch(self)
+    self.log(`🔌 连接假死：${stale.silenceSec} 秒没收到任何包 —— 主动断开，让自动重连接手`)
+    self.lastError = `连接假死（${stale.silenceSec} 秒没收到包）`
+    self.emit('silence', { silenceSec: stale.silenceSec, at: Date.now() })
+    try { b.end?.() } catch { try { b.quit?.() } catch {} }
+  }, Math.max(10, Number(everyMs) || SILENCE_CHECK_MS))
+  try { self._silenceTimer?.unref?.() } catch {}
+}
+
+export function clearSilenceWatch (self) {
+  if (self?._silenceTimer) { try { clearInterval(self._silenceTimer) } catch {} self._silenceTimer = null }
 }
 
 export function scheduleReconnect (self, sub, ctx = {}) {
@@ -381,6 +441,7 @@ export async function disconnect (self, reason = '主动下线', { graceMs = 300
   self.reconnecting = false
   self._reconnectTries = 0
   self.stopObserver()
+  clearSilenceWatch(self)
 
   const b = self.bot
   let graceful = false

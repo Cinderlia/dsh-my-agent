@@ -620,6 +620,39 @@ export function patchHarmfulFloorMoves (mv, { penalty = 60 } = {}) {
   return mv
 }
 
+/** 能像梯子一样往上爬的藤蔓族（原版 `isClimbable` 认的就是这几个）。 */
+const CLIMBABLE_NAMES = [
+  'vine', 'weeping_vines', 'weeping_vines_plant', 'twisting_vines', 'twisting_vines_plant',
+  'cave_vines', 'cave_vines_plant',
+]
+
+/**
+ * 把藤蔓族补进 `mv.climbables`（和梯子一样能往上爬）。
+ *
+ * 为什么值得补：vendor 只加了 `ladder`（`movements.js:64`，`vine` 那行被注释掉了），
+ * 而 `getMoveUp`（`movements.js:555`）只有在 `block1.climbable` 时才走"顺着爬上去、
+ * 不用垫方块"那条分支 ⇒ 藤蔓在原版里能爬，在 A* 眼里却只能当"empty 的空格"，
+ * 于是爬树取苹果、洞穴藤蔓上地面、下界缠怨藤下山全都要靠 1×1 垫柱子。
+ *
+ * 只动 `climbables`，不动 `blocksToAvoid` 也不动 `carpets`：藤蔓 boundingBox 本来就是
+ * `empty`（`minecraft-data` 里 7 个全是），safe 早就成立，缺的只是"能顺着爬"。
+ */
+export function patchClimbables (mv, b) {
+  if (!mv || !(mv.climbables instanceof Set)) return 0
+  const reg = b?.registry?.blocksByName
+  if (!reg) return 0
+  let added = 0
+  for (const nm of CLIMBABLE_NAMES) {
+    const id = reg[nm]?.id
+    if (typeof id !== 'number') continue
+    if (mv.climbables.has(id)) continue
+    mv.climbables.add(id)
+    added++
+  }
+  if (added) mv.__dshClimbables = added
+  return added
+}
+
 /**
  * 把"能直接走进去"的作物/贴地植物补进 `mv.carpets`。
  *
@@ -692,6 +725,22 @@ export function movements (self, { terrain = null } = {}) {
    * （`movements.js:233` 的 `b.safe`），上游只放了 fire/cobweb/web/lava ——
    * 把仙人掌 / 细雪 / 甜浆果丛 / 岩浆块 / 营火补上，A* 会主动绕开。 */
   for (const id of avoidBlockIds(b)) mv.blocksToAvoid.add(id)
+  /* 🔴 2026-10-23（二档，移植自 mindcraft / baritone 的同一个坑）：
+   *    `avoidBlockIds()` 里含 `lava` ⇒ 一旦人**真掉进岩浆**，A* 眼里四面八方全是
+   *    "不能站"，就再也规划不出"游出去"的路（只剩原地跳的 Escape）。
+   *    规则改成**看当下状态**：脚下是岩浆时把 lava 从黑名单里放出来（能规划穿岩浆脱困），
+   *    不在岩浆里时才把它当禁区。`src/movement.mjs` 每轮走路前都会重建一份 Movements，
+   *    所以掉进去之后下一轮就生效。
+   *    ⚠️ 只放 `blocksToAvoid`，不往 `mv.liquids` 里加 lava —— 那等于告诉 A*
+   *    "岩浆湖是水下通道"，平时就会规划着往里钻。 */
+  const lavaId = b?.registry?.blocksByName?.lava?.id
+  if (typeof lavaId === 'number') {
+    let inLava = false
+    try { inLava = b?.entity?.isInLava === true } catch { /* 假 bot 没有 entity */ }
+    if (inLava) mv.blocksToAvoid.delete(lavaId)
+    else mv.blocksToAvoid.add(lavaId)
+    mv.__dshInLava = inLava
+  }
   /* 2026-10-23 用户实机（「收小麦为什么挖土」「你一直在挖耕地，实际是拆了」）：
    *   下面是**田被毁掉的两条路**，都从"能不能站"这里堵：
    *     ① 站在耕地上时 pathfinder 会跳，跳起再落下（fallDistance > 0.5）就把耕地踩成泥土
@@ -740,6 +789,8 @@ export function movements (self, { terrain = null } = {}) {
   /* 作物/花草：「这一格能站进去」（`carpets`）—— 见 `patchPlantPassable` 的注释
    * （用户 2026-10-22：「家里非实体方块走不了」，整片麦田被 A* 当成墙）。 */
   patchPlantPassable(mv, b)
+  /* 藤蔓族能爬（2026-10-23 二档）：vendor 只认梯子，`vine` 那行是注释掉的。 */
+  patchClimbables(mv, b)
   return mv
 }
 

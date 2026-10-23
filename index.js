@@ -29,12 +29,15 @@ import { createRequire } from 'node:module'
 import { resolve, sep, join, isAbsolute, dirname, basename } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
-import { defineTool, toolDefKind } from './src/tool-def.mjs'
+import { defineTool, toolDefKind, loosenNumberParams, coerceNumberArgs } from './src/tool-def.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
 import { runText } from './src/task-exec.mjs'
 import { prepCheck } from './src/prep.mjs'
 import { fishOnce } from './src/fish.mjs'
+import { tradeVillager } from './src/trade.mjs'
+import { buildBlueprint } from './src/blueprint.mjs'
+import { sleepInBed, wakeUp, farmArea } from './src/farm.mjs'
 import { PRIORITY, DEFAULT_WAIT_MS } from './src/action-scheduler.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -2746,10 +2749,13 @@ export function apply(ctx, rawConfig) {
     const timeoutMs = LONG_TOOLS.has(spec?.name)
       ? spec?.timeoutMs
       : Math.min(Number(spec?.timeoutMs) || CALL_MS + 1_000, CALL_MS + 1_000)
+    const strictParams = spec?.parameters
     return defineTool({
       ...spec,
+      ...(strictParams && typeof strictParams === 'object' ? { parameters: loosenNumberParams(strictParams) } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-      async execute(args, exec) {
+      async execute(rawArgs, exec) {
+        const args = coerceNumberArgs(strictParams, rawArgs)
         const sess = getSession(exec)
         sess.bot.setAbortSignal(exec?.signal)
         // 本轮截止时刻：长动作到点就带着进度返回，而不是把这次调用挂住
@@ -3725,22 +3731,19 @@ export function apply(ctx, rawConfig) {
       + 'mode="jump" 原地跳一下（爬台阶/脱困，不需要坐标）；'
       + 'mode="swim" 在水里游到 x/y/z（不给坐标就只上浮换气）。\n'
       + 'mode="boat" 开船（先 use 上船；下船用 mode="dismount"）。\n'
-      + '🔴 **一次只走 10 秒**（用户要求：单次调用别超过 11 秒）。没走到会返回 '
-      + '`arrived:false` + `remaining`（还差几格）+ `hint`——**直接再叫一次往同一目标走**，'
-      + '从当前位置接着走；走远路连着叫几次，比一次挂 90 秒好。\n'
-      + '🔴 **在水里**（`mc_status` 里 `在水里`）寻路基本不动（A* 不把水当节点，实机"4 秒只挪 1 格"）：'
-      + '会自动直接游（实测 2 格/秒），上岸再交回寻路。'
-      + '**快淹死了就 `mode:"swim"` 不给坐标**（只上浮换气）：水挖不掉，别去 `mc_dig` 水。\n'
+      + '🔴 **一次只走 10 秒**。没走到返回 `arrived:false`+`remaining`+`hint`——**再叫一次往同一目标走**（比挂 90 秒好）。\n'
+      + '🔴 **在水里**寻路基本不动（A* 不把水当节点）：会自动直接游，上岸再交回寻路。'
+      + '**快淹死就 `mode:"swim"` 不给坐标**（只上浮换气）；水挖不掉，别 `mc_dig` 水。\n'
       + '🔴 **默认不挖方块**（用户 2026-10-20 定）：走路一格都不挖，只绕路/跳/下蹲过缝；'
       + '要挖穿挡路的方块必须显式 `noDig:false`（`mode:"walk-nodig"` 恒不挖）。\n'
-      + '🔴 **默认不垫 1×1 柱**（`allowTower:true` 才允许）—— 会被服务端拒、摔死；上高处走斜台阶。'
-      + '垫台阶会报 `pillaredWith`/`held`。'
-      + '🧭 `intent` 决定"到"的标准：near（默认）/ stand（站那格上）/ interact（够得着，2.2 格）/ same-level（同一层）。\n'
-      + '🔴 **长程赶路只给 x/z 就行**（`xz:true`）：不必猜高度，寻路按"到那一列"算'
-      + '（只锁水平两维，哪一层由寻路器自己定）—— 去几十上百格外的村子/矿口/传送点用这个，'
-      + '别再随便编一个 y 把自己挂在半空里。**给了 y 就按 y 走（y 优先），xz 只在没给 y 时才算数。**\n'
-      + '🔴 没走到时会报 `pathLen`（规划出来的剩余路径还有几格）和 `estCalls`（大约还要几次调用，'
-      + '一次 10 秒 ≈ 43 格）—— 用它判断"这趟走不完"还是"这条路不通"，别走两趟没到就换目标。',
+      + '🔴 **默认不垫 1×1 柱**（`allowTower:true` 才允许）；上高处走斜台阶，会报 `pillaredWith`。\n'
+      + '🧭 `intent` 决定"到"的标准：near（默认）/ stand / interact（2.2 格）/ same-level。\n'
+      + '🔴 **长程赶路只给 x/z 就够**（`xz:true`）：不必猜高度，按"到那一列"算（哪一层由寻路器定）—— 去几十格外的村子/矿口用这个，别编个 y 把自己挂半空。**给了 y 就按 y 走，xz 被忽略。**\n'
+      + '🔴 没走到时报 `pathLen`（剩余路径几格）+ `estCalls`（还要几次调用，一次 10 秒 ≈ 43 格）—— 用它分清"这趟走不完"和"路不通"。\n'
+      + '🔴 **每次结果都带 `above`**（脚底上方第 2 格 / 头顶净空 `headroom` / `canJump`）：要往上爬先看它，`canJump:false` 就是**跳不起来**（`note` 说清哪一格堵着），先挖开或换落点，**别反复 `mode:"jump"`**。\n'
+      + '🔴 掐断时报 `reason:"walk-hung"`+`hardLimitMs`（服务端不回包，**不是路不通**）；`digStalled`=路上挖方块卡在回包上。别原样第三次重叫：先 `noDig:true` 或换落点。\n'
+      + '🔴 **卡住时按执行顺序升**（`planStep`=最后试的那级）：开门→重算→跳→后退→**侧向绕行**→挖→垫柱；'
+      + '`planTried` 列出真试过哪几级（有 `breakAhead`=挖也没用）。同目标 90 秒内再叫会**从上次那级接着升**。',
     parameters: {
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       mode: { type: 'string', description: 'walk / walk-nodig / fly / jump / swim / boat（创造缺省 fly；jump 不需坐标；swim 不给坐标=只上浮换气；boat 要先上船）' },
@@ -3818,6 +3821,9 @@ export function apply(ctx, rawConfig) {
       + '· equip 装备(name)：护甲自动穿、盾进副手\n'
       + '· toss 丢弃(name,count)\n'
       + '· jump 原地跳一下（爬台阶/脱困，不需要坐标）\n'
+      + '· sleep 睡最近的床（夜里或雷雨才行；白天会直接告诉你别白跑）\n'
+      + '· wake 起床（躺着时才有用）\n'
+      + '· farm 耕地+播种（给 x/y/z 就那一格，不给就在周围找土；上面熟了的先收）\n'
       + '· dismount 从船/矿车/坐骑上下来（开船用 mc_move boat）',
     parameters: {
       mode: { type: 'string', description: '见上面各 mode（默认 look）' },
@@ -3826,10 +3832,15 @@ export function apply(ctx, rawConfig) {
       allowDangerous: { type: 'boolean', description: 'break：允许挖自己脚下的支撑（默认拦）' },
       name: { type: 'string', description: '方块或物品名（place/equip/toss 用）' },
       to: { type: 'string', description: 'equip 装哪格：head/torso/legs/feet/off-hand；只给=脱掉' },
-      count: { type: 'number', description: 'toss 丢几个（默认 1）' },
+      count: { type: 'number', description: 'toss 丢几个（默认 1）/ farm 最多处理几格（默认 6，上限 16）' },
       hold: { type: 'number', description: 'useitem 按住毫秒（拉弓 1000）' },
       approach: { type: 'boolean', description: 'toward 走近吗（默认 true）' },
-      budgetMs: { type: 'number', description: 'toward 走近毫秒（默认 10000）' },
+      budgetMs: { type: 'number', description: 'toward/sleep/farm 的走动毫秒（默认 10000）' },
+      seed: { type: 'string', description: 'farm：种什么（默认背包里第一种种子；wheat_seeds / carrot / potato / beetroot_seeds）' },
+      harvest: { type: 'boolean', description: 'farm：上面熟了的先收（默认 true）' },
+      clear: { type: 'boolean', description: 'farm：上面有杂物先挖掉（默认 false，只跳过并报出来）' },
+      radius: { type: 'number', description: 'sleep 找床 / farm 找地的范围（sleep 默认 32 上限 64；farm 默认 4 上限 8）' },
+      waitMs: { type: 'number', description: 'sleep：躺上后最多等多久醒（默认 8000，上限 20000）' },
     },
     output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
     timeoutMs: CALL_MS + 1_000,
@@ -3862,8 +3873,13 @@ export function apply(ctx, rawConfig) {
         case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
         /* 用户 2026-10-20：「还有下船」—— 上船一直有（`use`→`activateEntity`），下来没有：
          * `bot.dismount()` 只发包不确认，实现在 `src/boat.mjs`（发完轮询 `bot.vehicle`）。 */
+        /* 2026-10-23 一档第 4 条（用户「1档和2档做一下」）：睡觉 / 起床 / 耕地播种。
+         * 睡和种都是"夜里 / 远处才用得上的长活"，塞进 mc_act 是因为脱困过夜时手最顺的就是这个工具。 */
+        case 'sleep':   return { mode, ...(await sleepInBed(bot, { x: args.x, y: args.y, z: args.z, radius: args.radius, waitMs: args.waitMs, budgetMs: args.budgetMs })) }
+        case 'wake':    return { mode, ...(await wakeUp(bot)) }
+        case 'farm':    return { mode, ...(await farmArea(bot, { x: args.x, y: args.y, z: args.z, seed: args.seed, harvest: args.harvest, clear: args.clear, radius: args.radius, count: args.count })) }
         case 'dismount': return { mode, ...(await bot.dismountVehicle()) }
-        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/fish/equip/toss/jump/dismount；走路/飞/游泳用 mc_move，射箭/打怪/自查/方块台另见 mc_shoot / mc_attack / mc_prep / mc_station）`)
+        default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/fish/equip/toss/jump/sleep/wake/farm/dismount；走路/飞/游泳用 mc_move，射箭/打怪/自查/方块台另见 mc_shoot / mc_attack / mc_prep / mc_station）`)
       }
     },
   }))
@@ -4015,6 +4031,38 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
+  /* 村民交易（用户 2026-10-23：「1档和2档做一下」—— 一档第一条）。
+   * 抄 mindcraft 的 tradeWithVillager / showVillagerTrades（src/agent/library/skills.js:1748-1904），
+   * 但把"找谁/买第几条/买几次/买不买得起"做成两个 action：list 先看，buy 再买。
+   * 实现在 src/trade.mjs（openVillager 只认村民、count 必须显式给、realPrice 含涨价，都写在那个文件头上）。 */
+  ctx.tools.register(asTool({
+    name: 'mc_trade',
+    description: '**村民交易**（附魔书、钻石工具、食物这些中期最划算的来源）：走同一个工具、两个 action。\n'
+      + '· `action:"list"`（默认）：走到村民旁边、开界面、把它卖什么全列出来（序号 / 要什么 / 给什么 / 已换几次 / 材料够换几次）。\n'
+      + '· `action:"buy"`：`index` 是上面那个**序号（从 1 开始）**，`count` 换几次（默认 1）。\n'
+      + '· `who` 指定哪个村民（最近/图书管理员/盔甲匠…中英文都认），不给就找最近的。\n'
+      + '🔴 开不起界面多半是：它睡着了（晚上/下雨）、是宝宝、没职业（傻子），或者你离它超过 4 格。\n'
+      + '🔴 附魔书要挑附魔：不对就换一个村民，或者拆了它的工作台重放（刷新交易）。\n'
+      + '🔴 换到的次数以它自己报的"已换 N/M"为准（材料可能被别的手顺走，但次数骗不了人）。',
+    parameters: {
+      action: { type: 'string', description: 'list（默认，看它卖什么）/ buy（买第几条）' },
+      who: { type: 'string', description: '哪个村民（职业名中英文都认；默认最近的那个）' },
+      index: { type: 'number', description: 'buy：第几条（从 1 开始，就是 list 里的序号）' },
+      count: { type: 'number', description: 'buy：换几次（默认 1；材料/剩余次数不够会自己收窄并说明）' },
+      radius: { type: 'number', description: '找村民的范围（默认 32，最大 64）' },
+      budgetMs: { type: 'number', description: '走过去的时间（默认整轮 10 秒）' },
+    },
+    output: text(undefined, (a, v) => String(v?.text ?? compactJson(v))),
+    timeoutMs: CALL_MS + 1_000,
+    async execute(args, exec) {
+      const sess = getSession(exec)
+      return tradeVillager(sess.bot, {
+        action: args.action, who: args.who, index: args.index, count: args.count,
+        radius: args.radius, budgetMs: args.budgetMs,
+      })
+    },
+  }))
+
   ctx.tools.register(asTool({
     name: 'mc_sequence',
     description: '**按顺序执行一串世界交互**（替代"写脚本"）：适合"走到这里放几个方块，再走到那里放几个"这类连串动作。\n'
@@ -4052,17 +4100,41 @@ export function apply(ctx, rawConfig) {
     description: '批量搭方块：把 (x1,y1,z1)–(x2,y2,z2) 这个实心长方体用 name 方块搭出来（会自己走近/垫脚，上限 max 个）。'
       + '适合"搭一面墙/一根柱子/一个平台"，比一个个 mc_act{place} 省事。结果带 used/held。\n'
       + '🔴 **一次只放 10 秒的量**（用户要求：单次调用别超过 11 秒）。没放完会返回 `remaining` + `hint`——'
-      + '**再叫一次 mc_build、范围原样重发就行**，已经放对的格子会自动跳过（不会报"这格已经有方块"）。',
+      + '**再叫一次 mc_build、范围原样重发就行**，已经放对的格子会自动跳过（不会报"这格已经有方块"）。\n'
+      + '🔴 也能**按图施工**：给 layers（从最底层往上，一层一个字符串，层内用 / 分行）+ legend（字符→方块名，. = 空着不管），'
+      + '例如 layers:["BBB/B.B/BBB","BBB/BBB/BBB"] + legend:{"B":"planks"}。会先拆掉挡路的、再自下而上放；'
+      + '缺什么料直接报 missing（planks 这类泛名会按你手上那种木材落实成 oak_planks）；dryRun:true 只算不干。',
     parameters: {
-      x1: { type: 'number', required: true }, y1: { type: 'number', required: true }, z1: { type: 'number', required: true },
-      x2: { type: 'number', required: true }, y2: { type: 'number', required: true }, z2: { type: 'number', required: true },
+      x1: { type: 'number' }, y1: { type: 'number' }, z1: { type: 'number' },
+      x2: { type: 'number' }, y2: { type: 'number' }, z2: { type: 'number' },
       name: { type: 'string', description: '用哪种方块（缺省背包第一种；**建议显式给**，重发时才认得出哪些已经放对了）' },
       max: { type: 'number', description: '最多放几个（默认 64，防手滑）' },
+      layers: {
+        type: 'array', items: { type: 'string' },
+        description: '按图施工：从最底层往上，一层一个字符串，层内用 / 分行（给了这个就不用给 x1..z2）',
+      },
+      legend: { type: 'object', additionalProperties: true, description: '蓝图图例：字符→方块名（"."/空格=空着不管）；可以写泛名 planks/log/bed' },
+      orientation: { type: 'number', description: '蓝图绕竖轴转几个 90°（0..3，默认 0）' },
+      dryRun: { type: 'boolean', description: 'true = 只算"要动几格、缺什么料"，一格都不动' },
     },
     output: text(),
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
+      if (args.layers != null) {
+        return buildBlueprint(sess.bot, {
+          layers: args.layers,
+          legend: args.legend ?? {},
+          x: args.x1 ?? args.x ?? null,
+          y: args.y1 ?? args.y ?? null,
+          z: args.z1 ?? args.z ?? null,
+          orientation: args.orientation == null ? 0 : numOf(args.orientation, 'orientation'),
+          dryRun: args.dryRun === true,
+        })
+      }
+      if (args.x1 === undefined) {
+        throw new Error('mc_build 要给范围 (x1,y1,z1)–(x2,y2,z2)；想按图纸搭就给 layers + legend（见工具说明）')
+      }
       return sess.bot.build({
         ...boxOf(args),
         name: args.name ? String(args.name) : null,

@@ -19,6 +19,7 @@ import vec3pkg from 'vec3'
 const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 import { callBudget, callSecText, budgetSecText, CALL_BUDGET_MS } from './budget.mjs'
 import { inWaterNow } from './world-observer.mjs'
+import { connectionStale } from './connection.mjs'
 import { heldText, invSnap, invUsed } from './inventory.mjs'
 import { isAir, isLiquid, isPassable, isSolidBlock } from './block-names.mjs'
 import { BRIDGE_FATAL, heldSnapshotOf, restoreHeldOf } from './bridge.mjs'
@@ -189,13 +190,18 @@ export async function jump (self, ctx = {}) {
   const rest = Math.max(0, Math.min(200, self.msLeft() - 60))
   if (rest > 0) await raceAbort(sleep(rest), self.abortSignal, '跳跃')
   const jumped = rose == null ? null : rose > 0.05
+  /* 用户 2026-10-23：「跳不起来」时 AI 只能瞎猜 —— 直接抬头量一下，把堵在头顶的那格名字给出去。 */
+  const above = aboveOf(b)
   return {
     position: self.position,
     ...(rose == null ? {} : { rose }),
     ...(jumped === false ? {
       jumped: false,
-      note: '按了跳但**没离地**（rose≈0）—— 头顶净高不够 / 卡在半砖上 / 服务端没认。别当"跳上去了"用',
+      note: above && !above.canJump
+        ? "按了跳但**没离地**（rose≈0）—— " + above.note
+        : '按了跳但**没离地**（rose≈0）—— 卡在半砖上 / 服务端没认。别当「跳上去了」用',
     } : { jumped }),
+    ...(above ? { above } : {}),
   }
 }
 
@@ -621,11 +627,72 @@ export function routeTrack (self, target, info) {
  */
 export async function walkTo (self, target, opts = {}, ctx = {}) {
   const b = self.requireBot()
+  /* 🔴 2026-10-23 实机（"也是完全卡住，我tp也不行，最后重开才好"）：连接假死时**立刻认输**。
+   *    静默 40 秒没有包比任何预算都硬 —— 硬要走到 11 秒上限只会让 AI 以为"路难走"，
+   *    然后一遍遍重试（每次都在等一个永远不会回来的回包）。 */
+  const stale = connectionStale(b)
+  if (stale) {
+    const p = b?.entity?.position
+    const hx = Number(p?.x ?? 0), hz = Number(p?.z ?? 0)
+    return {
+      arrived: false,
+      position: { x: Math.floor(hx), y: Math.floor(Number(p?.y ?? 0)), z: Math.floor(hz) },
+      ms: 0,
+      remaining: Number(Math.hypot(Number(target?.x ?? hx) - hx, Number(target?.z ?? hz) - hz).toFixed(2)),
+      stuck: true,
+      via: 'pathfinder',
+      ...stale,
+    }
+  }
   const keep = heldSnapshotOf(b)
   let out = null
+  const t0 = Date.now()
+  /* 硬上限：预算 + `MOVE_HARD_SLACK_MS`（留给脱困阶梯/挖一格这些"预算外"动作）。
+   * `ctx.walkGuardMs` 是给离线套件注入的（不然一条断言要真等 3 秒）。 */
+  const budgetMs = Number(opts?.budget ?? self?.cfg?.moveBudgetMs) || 0
+  const guardMs = Number(ctx?.walkGuardMs) > 0
+    ? Math.max(30, Number(ctx.walkGuardMs))
+    : Math.max(1_500, budgetMs + MOVE_HARD_SLACK_MS)
+  const HUNG = Symbol('walk-hung')
+  let guardTimer = null
   try {
-    out = await walkToUnguarded(self, target, opts, ctx)
-    return out
+    const walk = walkToUnguarded(self, target, opts, ctx)
+    /* 硬上限先到时它还在后台跑 —— 挂个空 catch，别让它变成"未处理的拒绝"（会炸宿主）。 */
+    walk.catch(() => {})
+    out = await Promise.race([
+      walk,
+      new Promise((resolve) => { guardTimer = setTimeout(() => resolve(HUNG), guardMs) }),
+    ])
+    if (out === HUNG) {
+      /* 走到这里 = 里面有 await 永不 settle。先"作废"这次移动（号往前推，免得它稍后收尾时
+       * 把下一次走路停掉），再松开控制位、把正在挖的那一格停掉，最后如实告诉模型。 */
+      out = null
+      try { ctx.beginMove?.() } catch {}
+      try { ctx.stopPathing?.(b) } catch {}
+      try { ctx.releaseControls?.() } catch {}
+      try { b.stopDigging?.() } catch {}
+      let at = null
+      try {
+        const p = b.entity.position
+        at = { x: Number(p.x.toFixed(2)), y: Number(p.y.toFixed(2)), z: Number(p.z.toFixed(2)) }
+      } catch { /* 断线时读不到位置 */ }
+      let a = null
+      try { a = aboveOf(b) } catch { /* 同上 */ }
+      out = {
+        arrived: false,
+        position: at,
+        ms: Date.now() - t0,
+        stuck: true,
+        reason: 'walk-hung',
+        hardLimitMs: guardMs,
+        via: 'pathfinder',
+        ...(a ? { above: a } : {}),
+        hint: `这趟走路卡住了：超过硬上限 ${(guardMs / 1000).toFixed(1)} 秒还没回来，我已经强行掐断。`
+          + '最常见的原因是"挖那一格 / 换工具 / 开门"在等服务端回包而服务端没回（客户端看着就是不动）。'
+          + '别原样重叫同一个点：先看一眼坐标有没有变，再关掉挖（`noDig:true`）、换个近一点的目标，'
+          + '或者用 `mc_act {mode:"bridge"}` 绕过去。',
+      }
+    }
   } finally {
     /* 2026-10-23 审计（移动层报告第 4 条）：原来是 `keep && out` —— 抛错时 `out` 是 null，
      * 于是**失败那次不还原**，手里一直攥着垫脚用的圆石/泥土（vendor 垫方块时会 equip 且不换回）。
@@ -649,6 +716,8 @@ export async function walkTo (self, target, opts = {}, ctx = {}) {
       }
     }
   }
+  if (guardTimer) clearTimeout(guardTimer)
+  return out
 }
 
 async function walkToUnguarded (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false, xz = false } = {}, ctx = {}) {
@@ -1045,13 +1114,25 @@ export const MOVE_STUCK_MS = 2400       // 连续这么久"既没挪动也没靠
 export const MOVE_PROGRESS_EPS = 0.35   // 靠近这么多格才算"有进展"
 export const MOVE_BUSY_MAX_MS = 6000    // 一直挖/一直悬空超过这么久，就不再当"正常等待"
 export const MOVE_JUMP_MS = 320         // 跳跃脱困按住 jump 多久
+/* 🔴 2026-10-23 实机（用户：「刚刚一直卡在这里」，日志里这条动作 208747ms 才被抢占）：
+ *    `withTimeout` 只罩住 `pathfinder.goto`，走路这条路上还有**裸 await** 能无限挂住 ——
+ *    典型是"挖开挡路那一格"：vendor 的 `diggingTask` 只在收到 air 方块更新时才 settle，
+ *    服务端不回包就永远挂着（同一个病见 `src/dig-guard.mjs` 的注释）；`b.equip` 同理。
+ *    所以两层兜底：
+ *      · `MOVE_HARD_SLACK_MS` —— 整次 `walkTo` 的硬上限（预算 + 这点余量），到点就掐断并如实返回；
+ *      · `MOVE_CARVE_DIG_MS` —— 单格挖掘/换工具的上限，到点松手，别把整趟走路一起拖死。
+ *    ⚠️ 硬上限只是**兜底**：正常路径永远先在预算内自己结束，不许拿它当主超时。 */
+export const MOVE_HARD_SLACK_MS = 3_000
+export const MOVE_CARVE_DIG_MS = 3_000
 export const MOVE_BACK_MS = 420         // 后退脱困按住 back 多久
 /* P1：一次 `goto` 里路径被**失效**这么多次 ⇒ 别再等"没进展"了，直接进脱困阶梯。
  * 依据：vendor 自己会在 3.5s 无节点进展时 `resetPath('stuck')`，但它只会**重算同一条**；
  * 一个 goto 里失效这么多次，说明"光重算没用"（世界在变 / 一直被人挡），换策略才有意义。 */
 export const MOVE_RESET_LIMIT = 4
 /** 脱困阶梯（第 1 级 = `MOVE_ESCAPES[0]`）。走完还没进展 ⇒ 报 `unreachable`。 */
-export const MOVE_ESCAPES = ['repath', 'jump', 'backoff', 'breakAhead']
+/* 2026-10-23：`detour`（侧向绕行）插在 `breakAhead`（挖）之前 —— 能绕就别拆人家的房子。
+ * 前三级顺序是用户 2026-10-15 定的，没动。见 `MOVE_PLAN`。 */
+export const MOVE_ESCAPES = ['repath', 'jump', 'backoff', 'detour', 'breakAhead']
 /* 🔴 2026-10-18（实机，AI 原话：「窄隧道和 1 格台阶上它基本走不动，10 秒原地蹭 0.8 格」）：
  *    在 1×2 高的**窄隧道**里遇到 1 格台阶时，A* 上不去 —— 站上台阶要 3 格净高，而这里只有 2 格；
  *    vendor 的 `JumpUp` 只查"头顶有没有空"，**不会计划去挖那个天花板**。于是 `goto` 找不出路：
@@ -1443,9 +1524,100 @@ export function shaftInfoOf (b, target) {
   } catch { return null }
 }
 
+/**
+ * 头顶上方是什么（用户 2026-10-23 实机：「move 后输出再加上方的方块……现在 ai 不知道移动后是什么状态。跳不起来。」）
+ *
+ * 为什么单独一个探针：`arrived`/`remaining` 只说"走到没走到"，不说"现在能不能往上"。
+ * 跳上一格看的是**脚底上方第 2 格**（`feetY+2`）：头上只有 1 格净空时，人跳起来顶住天花板，
+ * 一格都上不去 —— 可 AI 看到"到了"就以为能上，于是反复 `mc_move {mode:"jump"}`（用户实机就是这么卡的）。
+ *
+ * 返回字段尽量短（每次移动都跟着结果走）：
+ *   `above`    脚底上方第 2 格（跳起来要占的那格）的方块名
+ *   `headroom` 从第 2 格往上连续空的格数（最多数 6 格）
+ *   `ceiling`  头顶第一块实心（有才给）
+ *   `canJump`  能不能跳上一格（第 2 格空 **且** 头那格没被堵）
+ *   `headBlocked` 头那格被什么堵着（有才给）
+ *   `note`     不能跳时的一句话（能跳就不给，省 token）
+ * 读不到世界就返回 `null`（不编）。
+ */
+export function aboveOf (b) {
+  try {
+    const p = b?.entity?.position
+    if (!p) return null
+    const fx = Math.floor(p.x)
+    const fy = Math.floor(p.y)
+    const fz = Math.floor(p.z)
+    const nameAt = (y) => {
+      try { return b.blockAt(new Vec3(fx, y, fz))?.name ?? null } catch { return null }
+    }
+    const head = nameAt(fy + 1)
+    const above = nameAt(fy + 2)
+    let headroom = 0
+    let ceiling = null
+    for (let y = fy + 2; y <= fy + 7; y++) {
+      const n = nameAt(y)
+      if (n != null && isSolidBlock(n)) { ceiling = n; break }
+      headroom++
+    }
+    const headBlocked = head != null && isSolidBlock(head) && !isPassable(head) ? head : null
+    const canJump = headroom >= 1 && !headBlocked
+    return {
+      above: above ?? '未加载',
+      headroom,
+      ...(ceiling ? { ceiling } : {}),
+      canJump,
+      ...(headBlocked ? { headBlocked } : {}),
+      ...(canJump
+        ? {}
+        : {
+            note: headBlocked
+              ? "头那格（y=" + (fy + 1) + "）被 **" + headBlocked + "** 堵着 —— 现在**跳不起来**（连站直都费劲）：先挖开或者挪开一格。"
+              : "脚底上方第 2 格（y=" + (fy + 2) + "）是 **" + (above ?? ceiling ?? "实心") + "** —— 现在**跳不起来**（只能原地蹦、上不了一格）；要往上就先挖开那一格。",
+          }),
+    }
+  } catch { return null }
+}
+
 export const MOVE_CARVE_CELLS = 2       // 一次最多往前看几格
 export const MOVE_CARVE_TRIES = 2       // 一次 walkPathfinder 里最多补挖几次
 export const MOVE_CARVE_RESETS = 4      // 挖开挡路方块之后"阶梯清零重走"最多几次（防挖了又挖不认输）
+export const MOVE_CARVE_TOTAL = 6       // 一次 mc_move 里总共最多补挖几格（挖几十格还走不动 = 方向搞错了，该交给 AI 决定）
+/* ══ 执行顺序（2026-10-23 用户：「动不了，太容易卡了，你要加对应的执行顺序」）════════
+ * 卡住之后**先试便宜的、能绕就不拆**，一级一级往下走；每级都写进日志和结果
+ * （`planStep` / `planTried`），AI 和人都看得出"现在试到第几步、下一步该换什么"：
+ *
+ *   door        开门 / 穿门        几毫秒 —— 门是最高频的"假卡住"（关着的门在 A* 眼里是墙）
+ *   repath      重算路径          零成本 —— 每轮本来就要重新 `goto`
+ *   jump        跳跃脱困          320ms —— 头顶没净空就跳过（白蹦一次还会把自己顶住）
+ *   backoff     后退半步再算       420ms —— 贴墙 / 贴角时换个起点
+ *   detour      侧向绕行 3 格再规划 1.6 秒 —— **能绕就别挖**：A* 是确定性的，同起点同终点
+ *                                 同一套 Movements 只会给同一条路，原地重算等于没算
+ *   breakAhead  挖开挡路那一格     每格 ≤3 秒（整趟最多 6 格）—— 真绕不过去才动镐子
+ *   tower       垫一格往上         只在目标确实在上方、头顶有空时（`towerFallback`）
+ *
+ * 🔴 2026-10-23：`detour` 插在 `breakAhead` **之前**。用户抱怨"它往 z5 挖而不是 x 方向"
+ *    —— 那正是"能绕却先拆"的后果；前三级（repath / jump / backoff）沿用 2026-10-15 用户定的
+ *    顺序，一个字没动。
+ * ⚠️ 跨调用也要接着升：同一个目标 90 秒内再叫，从上次卡住的那一级继续（`b._movePlan`），
+ *    否则每次 `mc_move` 都从第 1 级重来 —— AI 连叫五次就白试五遍同一套。
+ */
+export const MOVE_PLAN = ['door', 'repath', 'jump', 'backoff', 'detour', 'breakAhead', 'tower']
+export const MOVE_PLAN_TEXT = {
+  door: '开门/穿门',
+  repath: '重算路径',
+  jump: '跳跃脱困',
+  backoff: '后退再寻路',
+  detour: '侧向绕行',
+  breakAhead: '挖开挡路那格再走',
+  tower: '垫一格往上',
+}
+/** 执行顺序里某一级的中文名（日志 / 返回值文案用）。 */
+export function planStepTextOf (name) { return MOVE_PLAN_TEXT[name] ?? String(name ?? '') }
+
+export const MOVE_DETOUR_R = 3          // 侧向绕行偏离直线几格
+export const MOVE_DETOUR_MS = 1_600     // 单次绕行最多走多久
+export const MOVE_PLAN_TTL_MS = 90_000  // "同一目标上次卡在第几步"记多久
+export const MOVE_PLAN_SAME_R = 3       // 目标挪动小于这个距离才算"同一个目标"
 
 /** 第 `n` 级脱困动作（0 起）；超出阶梯返回 `null`（= 该认输了）。 */
 export function escapeStepOf (n) { return MOVE_ESCAPES[n] ?? null }
@@ -1455,7 +1627,8 @@ export function escapeTextOf (step) {
   return step === 'repath' ? '重算路径'
     : step === 'jump' ? '跳跃脱困'
       : step === 'backoff' ? '后退再寻路'
-        : step === 'breakAhead' ? '挖开挡路那格再走'
+        : step === 'detour' ? '侧向绕行再算'
+          : step === 'breakAhead' ? '挖开挡路那格再走'
           : '放弃'
 }
 
@@ -1481,12 +1654,25 @@ export function obstacleAheadOf (b, target, { cells = MOVE_CARVE_CELLS } = {}) {
     return !/^(bedrock|barrier|command_block|chain_command_block|repeating_command_block|obsidian|end_portal_frame)$/.test(n)
   }
   const sx = Math.sign(dx), sz = Math.sign(dz)
+  /* 🔴 2026-10-23 实机（用户："它往 z5 挖而不是 x方向"）：方向**只认主轴**（离得远的那个轴），
+   *    不再看"另一条轴"。副轴正侧方永远不是通往目标的方向 —— 那是隧道的侧墙，挖它只会
+   *    把 1 格宽的洞越挖越宽、越挖越乱（实机连挖几十格还是没过去，人却还在原地）。
+   *    斜拐时真挡路的在**对角**（2026-10-19 实机），对角保留，但只在"主轴前方 cells 格全通
+   *    （前方没堵，只是斜着拐）"时才看它 —— 主轴自己堵着就别绕到斜的上去。 */
+  const main = Math.abs(dx) >= Math.abs(dz) ? [sx, 0] : [0, sz]
   const dirs = []
-  if (Math.abs(dx) >= Math.abs(dz)) { if (sx) dirs.push([sx, 0]); if (sz) dirs.push([0, sz]) }
-  else { if (sz) dirs.push([0, sz]); if (sx) dirs.push([sx, 0]) }
+  if (main[0] || main[1]) dirs.push(main)
+  let mainClear = true
+  if (main[0] || main[1]) {
+    for (let d = 1; d <= cells; d++) {
+      const mx = fx + main[0] * d, mz = fz + main[1] * d
+      const fn = nameOf(at(mx, fy, mz)), hn = nameOf(at(mx, fy + 1, mz))
+      if (!fn || !hn || isSolidBlock(fn) || isSolidBlock(hn)) { mainClear = false; break }
+    }
+  }
   /* 2026-10-19 实机（"1 格宽巷道会卡，break 前面那格就过去"）：斜着拐弯时挡路的
    * 既不在正前也不在正侧，而在对角那一格 —— 两条轴都走不通时再看一眼对角线。 */
-  if (sx && sz) dirs.push([sx, sz])
+  if (sx && sz && mainClear) dirs.push([sx, sz])
   for (const [ddx, ddz] of dirs) {
     for (let d = 1; d <= cells; d++) {
       const x = fx + ddx * d, z = fz + ddz * d
@@ -1515,7 +1701,7 @@ export function obstacleAheadOf (b, target, { cells = MOVE_CARVE_CELLS } = {}) {
  *
  * 返回挖了几格（0 = 没得挖 / 不该挖）。**只挖不改走路** —— 挖完由调用方重跑同一个 `goto`。
  */
-export async function carveStepAhead (b, target, { cells = MOVE_CARVE_CELLS, radius = MOVE_CARVE_RADIUS, ignoreRange = false } = {}) {
+export async function carveStepAhead (b, target, { cells = MOVE_CARVE_CELLS, radius = MOVE_CARVE_RADIUS, ignoreRange = false, digMs = MOVE_CARVE_DIG_MS } = {}) {
   const me = b?.entity?.position
   if (!me || !target) return 0
   const fx = Math.floor(me.x), fy = Math.floor(me.y), fz = Math.floor(me.z)
@@ -1537,18 +1723,46 @@ export async function carveStepAhead (b, target, { cells = MOVE_CARVE_CELLS, rad
   }
   /* 方向：先主轴（离得远的那个轴），再另一条轴 —— 斜着走楼梯时两条都要看。 */
   const sx = Math.sign(dx), sz = Math.sign(dz)
+  /* 🔴 2026-10-23 实机（用户："它往 z5 挖而不是 x方向"）：方向**只认主轴**（离得远的那个轴），
+   *    不再看"另一条轴"。副轴正侧方永远不是通往目标的方向 —— 那是隧道的侧墙，挖它只会
+   *    把 1 格宽的洞越挖越宽、越挖越乱（实机连挖几十格还是没过去，人却还在原地）。
+   *    斜拐时真挡路的在**对角**（2026-10-19 实机），对角保留，但只在"主轴前方 cells 格全通
+   *    （前方没堵，只是斜着拐）"时才看它 —— 主轴自己堵着就别绕到斜的上去。 */
+  const main = Math.abs(dx) >= Math.abs(dz) ? [sx, 0] : [0, sz]
   const dirs = []
-  if (Math.abs(dx) >= Math.abs(dz)) { if (sx) dirs.push([sx, 0]); if (sz) dirs.push([0, sz]) }
-  else { if (sz) dirs.push([0, sz]); if (sx) dirs.push([sx, 0]) }
+  if (main[0] || main[1]) dirs.push(main)
+  let mainClear = true
+  if (main[0] || main[1]) {
+    for (let d = 1; d <= cells; d++) {
+      const mx = fx + main[0] * d, mz = fz + main[1] * d
+      const fn = nameOf(at(mx, fy, mz)), hn = nameOf(at(mx, fy + 1, mz))
+      if (!fn || !hn || isSolidBlock(fn) || isSolidBlock(hn)) { mainClear = false; break }
+    }
+  }
   /* 2026-10-19 实机（"1 格宽巷道会卡，break 前面那格就过去"）：斜着拐弯时挡路的
    * 既不在正前也不在正侧，而在对角那一格 —— 两条轴都走不通时再看一眼对角线。 */
-  if (sx && sz) dirs.push([sx, sz])
+  if (sx && sz && mainClear) dirs.push([sx, sz])
+  /* 🔴 2026-10-23 实机（208 秒挂死）：这里原来是两处**裸 await** ——
+   *    `b.equip()` 与 `b.dig()`。vendor 的 `dig()` 只在 `blockUpdate` 变成空气时才 settle，
+   *    服务端不回包（拒绝挖/失步/延迟）就永远挂着 ⇒ 整次 `mc_move` 卡死，
+   *    预算也罩不住它（预算只包着 `pathfinder.goto`）。现在每个动作都有上限：
+   *    到点就 `stopDigging()` 松手，这一格算"没挖开"，把结论交给上层。 */
+  const guarded = async (p) => {
+    const TO = Symbol('timeout')
+    const r = await Promise.race([
+      Promise.resolve(p).then(() => true, () => false),
+      sleep(digMs).then(() => TO),
+    ])
+    if (r !== TO) return r
+    try { b.stopDigging?.() } catch {}
+    try { b.__carveDigStalled = (Number(b.__carveDigStalled) || 0) + 1 } catch {}
+    return false
+  }
   const digOne = async (blk) => {
     try {
       const tool = typeof b.pathfinder?.bestHarvestTool === 'function' ? b.pathfinder.bestHarvestTool(blk) : null
-      if (tool && typeof b.equip === 'function') await b.equip(tool, 'hand')
-      await b.dig(blk, true)
-      return true
+      if (tool && typeof b.equip === 'function') await guarded(b.equip(tool, 'hand'))
+      return await guarded(b.dig(blk, true)) === true
     } catch { return false }
   }
   let dug = 0
@@ -1688,6 +1902,62 @@ export function moveProgressWatcher (b, target, {
  * ⚠️ 三级动作**都不换 goal 对象** —— vendor 的 `goto` 监听 `goal_updated`，换了对象
  *    就直接以 `GoalChanged` 拒绝（`lib/goto.js:35`），等于把这次走路判死。
  */
+/**
+ * 侧向绕行（执行顺序第 5 级，2026-10-23）：往目标方向的**左边或右边**走开几格，
+ * 换个起点再规划。
+ *
+ * 为什么这一级必须存在：A* 是确定性的 —— 同一个起点、同一个终点、同一套 `Movements`
+ * 只会给出**同一条路**。路被一个人 / 一格台阶 / 一道关着的门堵死时，"原地重算"答案永远是
+ * 那条死路（实机表现：连续几轮 `remaining` 一点不变，日志里全是"重算路径"）。
+ * 走开三格 = 换一个起点，规划结果就真的会变。
+ *
+ * 只试**两个**候选（左、右；先试离目标更近的那个），必须站得住（`standPointFor` 的三级兜底），
+ * 且不能把自己绕得更远。走不动就如实返回 `moved:0`，交给下一级（挖）。**这一级不挖、不放方块。**
+ */
+export async function detourStep (b, target, { goals = null, ctx = {}, budgetMs = MOVE_DETOUR_MS, r = MOVE_DETOUR_R } = {}) {
+  const p = b?.entity?.position
+  const G = goals ?? null
+  if (!p || target == null || !G?.GoalNear) return { moved: 0, why: 'no-goal-api' }
+  const dx = Number(target.x) - p.x
+  const dz = Number(target.z) - p.z
+  const L = Math.hypot(dx, dz)
+  if (!(L > 0.5)) return { moved: 0, why: 'too-close' }     // 已经在这一格上了，绕什么绕
+  const ux = dx / L, uz = dz / L
+  const cands = []
+  for (const s of [{ x: -uz, z: ux }, { x: uz, z: -ux }]) {
+    for (const stepR of [r, Math.max(2, r - 1)]) {
+      const cx = Math.floor(p.x + s.x * stepR)
+      const cz = Math.floor(p.z + s.z * stepR)
+      const sp = standPointFor(b, cx, Math.floor(p.y), cz)
+      if (!sp) continue
+      const dTo = Math.hypot(sp.x - Number(target.x), sp.z - Number(target.z))
+      if (dTo > L + 0.5) continue                             // 别绕到反方向去
+      cands.push({ x: sp.x, y: sp.y, z: sp.z, dTo })
+    }
+  }
+  if (cands.length === 0) return { moved: 0, why: 'no-side-spot' }
+  cands.sort((a, c) => a.dTo - c.dTo)
+  const pick = cands[0]
+  const bx = p.x, bz = p.z
+  /* ⚠️ 必须在"pathfinder 已经停掉"的窗口里跑：vendor 每个 physicsTick 都会把控制位按回去，
+   *    所以先 `stopPathing`（同时让上一轮的 `goto` 以 GoalChanged 收场，上面已经 catch 过）。 */
+  try { ctx.stopPathing?.(b) } catch { /* 假 bot */ }
+  await sleep(60)
+  let reached = false
+  try {
+    const work = b.pathfinder.goto(new G.GoalNear(pick.x, pick.y, pick.z, 0))
+    work.catch?.(() => {})                                   // race 先结束时不留下未处理拒绝
+    reached = await Promise.race([
+      withTimeout(work, Math.max(200, Number(budgetMs) || MOVE_DETOUR_MS), '绕行').then(() => true).catch(() => false),
+      sleep(Math.max(200, Number(budgetMs) || MOVE_DETOUR_MS)).then(() => false),
+    ])
+  } catch { /* 走不动就算了，下一级 */ }
+  try { ctx.stopPathing?.(b) } catch { /* 同上 */ }
+  const now = b?.entity?.position ?? { x: bx, z: bz }
+  const moved = Math.hypot(Number(now.x) - bx, Number(now.z) - bz)
+  return { moved: Math.round(moved * 100) / 100, to: { x: pick.x, y: pick.y, z: pick.z }, reached }
+}
+
 export async function escapeMove (b, goal, step, ctx = {}, extra = {}) {
   try { ctx.stopPathing?.(b) } catch {}
   await sleep(60)                       // 让 pathfinder 的 physicsTick 把控制位松开
@@ -1705,6 +1975,11 @@ export async function escapeMove (b, goal, step, ctx = {}, extra = {}) {
     try { b.setControlState('back', true) } catch {}
     await sleep(MOVE_BACK_MS)
     if (mine()) { try { b.setControlState('back', false) } catch {} }
+  }
+  else if (step === 'detour') {
+    /* 执行顺序第 5 级（见 `MOVE_PLAN`）：走开三格换个起点再规划 —— 能绕就别挖。 */
+    const d = await detourStep(b, extra.target, { goals: extra.goals ?? null, ctx, budgetMs: extra.detourMs })
+    return { detour: d, moved: d?.moved ?? 0, dug: 0 }
   }
   else if (step === 'breakAhead') {
     /* 2026-10-22 用户「还是能卡住」：前三级（重算 / 跳 / 后退）都不改地形 ——
@@ -2042,6 +2317,23 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   /* P0-1：一次 `goto` 到底不够 —— 卡住时按阶梯换策略再试（见上面的常量注释）。
    * 每一轮都是**全新的 `goto(同一个 goal 对象)`**：重发前先由 `escapeMove` 把上一轮真停掉，
    * 所以不会攒下重复的 `goal_reached` 监听器。 */
+  /* 跨调用接着升级（2026-10-23，见 `MOVE_PLAN` 的注释）：同一个目标 90 秒内又叫一次，
+   * 就从上次卡住的那一级继续，而不是从第 1 级重来 —— 否则 AI 连叫五次等于白试五遍同一套。
+   * 状态挂在 bot 上（`b._movePlan`）：重连换了 bot 实例就自动清零，不用额外清理。 */
+  let planFrom = 0
+  try {
+    const prevPlan = b?._movePlan
+    if (prevPlan && Date.now() - Number(prevPlan.at ?? 0) < MOVE_PLAN_TTL_MS
+      && Math.hypot(Number(prevPlan.target?.x) - Number(target.x), Number(prevPlan.target?.z) - Number(target.z)) <= MOVE_PLAN_SAME_R) {
+      /*  记的是「下次该从第几级起」（见 `markPlan`）：试过第 2 级就记 3，别重复同一套。 */
+      planFrom = Math.max(0, Math.min(MOVE_ESCAPES.length + 1, Number(prevPlan.step) || 0))
+    }
+  } catch { /* 假 bot 没有这个字段 */ }
+  const planTried = []
+  const markPlan = (i, name) => {
+    planTried.push(name)
+    try { b._movePlan = { target: { x: Number(target.x), y: Number(target.y), z: Number(target.z) }, at: Date.now(), step: i } } catch { /* 同上 */ }
+  }
   let repathCount = 0
   /* P1：其中有多少次是**因为路径被反复失效**而进阶梯的（不是"没进展"）—— 分开报，
    * 因为给模型的下一步不同：一个该换目标点，一个该先看看世界在变什么。 */
@@ -2112,6 +2404,14 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     ...(carved ? { carved } : {}),
     ...(pathThrash ? { pathThrash } : {}),
     ...(pathResetsTotal >= 1 ? { pathResets: pathResetsTotal, pathResetReasons: { ...resetReasons } } : {}),
+    /* 挖/换工具在等回包时被守卫掐断过（见 `MOVE_CARVE_DIG_MS`）：这条路"挖过去"没挖动。 */
+    ...(Number(b.__carveDigStalled) > 0 ? { digStalled: Number(b.__carveDigStalled) } : {}),
+    /* 执行顺序试到哪一步（2026-10-23）：`planStep` = 最后试的那一级，`planTried` = 这一趟试过的全部。
+     *  AI 看到 `planTried` 里有 breakAhead 就该明白"挖也没用"，别再叫同一个点。 */
+    ...(planTried.length ? { planStep: planTried[planTried.length - 1], planTried: [...planTried] } : {}),
+    /* 用户 2026-10-23：走完一步要能看见"头顶是什么"（不然它以为能往上、结果跳不起来）。
+     * 走不到、到了、中途放弃都走这条 moveInfo，所以三处结果口径一致。 */
+    ...(() => { const a = aboveOf(b); return a ? { above: a } : {} })(),
   })
   /** 到达时**重算落点地形**：`classifyTerrainCached` 的缓存键含脚下坐标，走到新位置会自动重算，
    *  不用手动清缓存。平地/未知照旧不报（默认值）。 */
@@ -2147,7 +2447,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       } catch {}
     }
     let carveResets = 0   // 挖开挡路方块后"阶梯清零重走"的次数（上限 MOVE_CARVE_RESETS）
-    let attempt = 0
+    let attempt = planFrom
     for (;;) {
       if (attempt > 0) {
         const step = escapeStepOf(attempt - 1)
@@ -2161,6 +2461,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
             const hardAt = (y) => { if (!p0) return true; const n = nameAt(Math.floor(p0.x), y, Math.floor(p0.z)); return Boolean(n) && isSolidBlock(n) }
             if (p0 && upGap >= 1.5 && !hardAt(Math.floor(p0.y) + 2) && !hardAt(Math.floor(p0.y) + 3)) {
               towerTried = 1
+              markPlan(MOVE_ESCAPES.length + 1, 'tower')
               const mv3 = ctx.movements(terrain)
               if (!mv3) throw new Error('pathfinder 的 Movements 造不出来（插件没挂上？）')
               mv3.allow1by1towers = true
@@ -2192,8 +2493,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           }
         }
         repathCount++
-        self.log(`🔁 走不动了 → 第 ${attempt} 级脱困：${escapeTextOf(step)}（累计重算 ${repathCount} 次）`)
-        const em = await escapeMove(b, goal, step, ctx, { target, noDig })
+        markPlan(attempt + 1, step)
+        self.log(`🔁 走不动了 → 第 ${attempt} 步：${escapeTextOf(step)}（执行顺序 ${MOVE_PLAN.indexOf(step) + 1}/${MOVE_PLAN.length}，累计重算 ${repathCount} 次）`)
+        const em = await escapeMove(b, goal, step, ctx, { target, noDig, goals })
         if (step === 'breakAhead' && Number(em?.dug) > 0) {
           carved += Number(em.dug)
           carveResets++
@@ -2280,7 +2582,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
             attempt++
             continue
           }
-          if (carveAllowed && carveTries < MOVE_CARVE_TRIES) {
+          if (carveAllowed && carveTries < MOVE_CARVE_TRIES && carved < MOVE_CARVE_TOTAL) {
             const end = b.entity.position
             const dNow = Math.hypot(end.x - target.x, end.z - target.z)
             const obstacle = obstacleAheadOf(b, target)
@@ -2298,6 +2600,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
                 continue
               }
             }
+          }
+          if (carveAllowed && carved >= MOVE_CARVE_TOTAL) {
+            self.log(`⛏ 已经补挖了 ${carved} 格还是走不动 —— 方向多半不对，停止挖，交给脱困阶梯`)
           }
           attempt++                                // 卡住 ⇒ 下一轮走脱困阶梯
           continue
@@ -2448,6 +2753,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
      *    起步时人已经落在到达圈里（`remaining <= arrive`）时，寻路一步都不用挪，照样回 `arrived:true`。
      *    模型看到“到了”以为走到位了，下次再叫同一个点还是“到了 + moved 0” —— 于是**反复**。
      *    口径不变（到了就是到了），但必须把“本来就站在圈里”说明白，否则它永远不知道该换 `intent:"stand"`。 */
+    try { b._movePlan = null } catch { /* 到了就不用再记"卡在第几步" */ }
     const moved3dTotal = Number(deltaOf(end).moved3d) || 0
     const alreadyThere = moved3dTotal < 0.6 && Number.isFinite(Number(startRemaining))
       && Number(startRemaining) <= arriveUsed + 0.05

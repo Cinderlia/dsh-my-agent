@@ -73,6 +73,14 @@ export function statusOf (b, ctx = {}) {
     health: b.health, food: b.food, players: Object.keys(b.players ?? {}),
     held: b.heldItem ? `${b.heldItem.name}x${b.heldItem.count}` : null,
     uptimeSec: Math.round((Date.now() - ctx.connectedAt) / 1000),
+    /* 连接假死（2026-10-23 实机：用户"完全卡住，tp 也不行，只能重进"）：多久没收到任何包。
+     * 正常游戏里服务端每秒都在发包，这里到 40 秒 = 连接已经死了（阈值见 connection.mjs）。
+     * 直接读 `b._lastPacketAt` 而不是 import connection.mjs —— 少一条状态层和连接层的依赖。 */
+    silenceSec: (() => {
+      const t = Number(b?._lastPacketAt)
+      if (!Number.isFinite(t) || t <= 0) return null
+      return Math.round((Date.now() - t) / 1000)
+    })(),
     inWater: inWaterNow(b),
     // 氧气（0–20，20 = 满）。在水里憋气会一路掉到 0，然后开始掉血 —— 淹死就是这么来的。
     // 🔴 实机教训（2026-10-07）：**头在水面上的时候这项是 null** —— mineflayer 只在服务端

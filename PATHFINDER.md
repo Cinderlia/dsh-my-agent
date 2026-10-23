@@ -422,6 +422,50 @@ const outOfWater = !st.inWater                              // 真的出水了
 - **注意**：这仍然不是"会自己挖路"——只在**已经贴着目标、且脚下那格有支撑**时才动**前方脚的上面那格**。
   沟/水/悬崖/远处卡住一律不挖（照旧报 `unreachable` 并劝拆段走）。
 
+## 2026-10-23：四条「寻路器不懂这个世界」的补丁
+
+前三条抄自 mindcraft 的 vendor 补丁（`备份/mindcraft-参考/patches_mineflayer-pathfinder+2.4.5.patch`），
+每一条都对应一次真机上的难看死法。**两处改 vendor 源码、两处在 `src/plugins.mjs` 运行时改对象** ——
+分界线是「能不能在拿到 `Movements` 实例后改」：能改的一律不改 vendor（升级依赖时不丢）。
+
+### 1. 门：路径点瞄到门顶上（改 vendor `mineflayer-pathfinder/lib/index.js`）
+
+门在方块数据里是**整格碰撞箱**，`getBlockInfo` 给的 `point` 是「站在这一格上面」=
+`{x: 格子x, y: 格子y + 1, z: 格子z}`。结果人走到门口一直往门框上顶。
+`postProcessPath` 里对 `openable` 的门改成瞄**格子中心、脚在那格**，即
+`{x: floor(x) + 0.5, y: floor(y), z: floor(z) + 0.5}`。铁门不在 `openable` 里，照旧当实心。
+备份：`备份/pathfinder-补丁备份/index.js.已打补丁`。
+
+### 2. 岩浆：人在岩浆里时 A* 一条路都规划不出（改 `src/plugins.mjs`）
+
+vendor 构造器无条件 `blocksToAvoid.add(lava)`。设计上是对的（别靠近岩浆），但**人已经在里面**时
+四面全是「不能站」，`goto()` 直接返回空 —— 于是掉进岩浆只能原地跳到烧死。
+现在 `movements()` 建完实例后看当下状态：脚下或眼高那一格是 `lava` 就把岩浆从禁区里删掉，
+否则照旧加进去。**只在「已经在里面」时放出来**，不会主动往岩浆湖里钻。
+
+### 3. 藤蔓：在寻路眼里只是「空着的格子」（改 `src/plugins.mjs`）
+
+vendor 的 `climbables` 只有 `ladder`（`vine` 那行是注释掉的）=> 藤蔓能站进去、不会顺着爬，
+爬树 / 竖井上来 / 下界藤蔓落地全靠垫柱子。`patchClimbables(mv)` 按原版规则补七种：
+`vine`、`weeping_vines`、`weeping_vines_plant`、`twisting_vines`、`twisting_vines_plant`、
+`cave_vines`、`cave_vines_plant`（顶部挂的向上爬、底部垂的向下爬、`cave_vines` 双向）。
+名字对不上就跳过，不抛错（换版本不会炸）。
+
+### 4. 顺带：放方块等回包 5 秒 = 一轮 10 秒被它吃光（改 vendor `mineflayer/lib/plugins/place_block.js`）
+
+`blockUpdate` 的等待超时上游是 `5000`，碰上幽灵方块放两个就整轮报废。改成 `1500`
+（局域网实测正常回包 <100ms），失败后交给我们自己的复核逻辑判（`localRestored` 那套）。
+备份：`备份/mineflayer-补丁备份/place_block.js.已打补丁`。
+
+### 钉住它们的回归
+
+- `node tools\check-mc-pathfinder.mjs`（36/0）—— 藤蔓七个名字各一条、「不认识的方块名不抛」、门点=格子中心；
+- `node tools\check-mc-deps.mjs`（9/0）第 5 节 —— `place_block` 的 `timeout` 必须是 1500；
+- `node tools\check-terrain.mjs`（146/0）—— 岩浆动态开关的接线断言。
+
+> 注意：vendor 不在本仓库里（在 `<profile>/vendor/mc-deps/node_modules/`）。**重装依赖树后**
+> `src/plugins.mjs` 那两条自动生效（代码在本仓库），**改 vendor 源码的两条要拷回备份文件**。
+
 ## 测试
 
 - **离线**：pathfinder 的加载、`via:"pathfinder"`、不许谎报到达、`NoPath` 如实上报、超时和未加载时安全停止，

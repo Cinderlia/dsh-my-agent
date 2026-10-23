@@ -445,6 +445,49 @@ section('⑦ 端到端：movements(self, { terrain }) 真的换了一套权重')
   ok(movements({ bot: null, cfg: {}, _pf: {} }) === null, '没有 Movements 构造器 ⇒ null（照旧）')
 }
 
+/* ═══════════════ ⑨ 二档：藤蔓能爬 / 掉进岩浆能脱困 ═══════════════ */
+section('⑨ 二档补丁：藤蔓能爬、掉进岩浆能规划着游出来')
+{
+  const { movements, patchClimbables } = await import(new URL('../src/plugins.mjs', import.meta.url))
+  /* 最小 Movements 假件：只要那几个 Set 在，movements() 里所有 add/delete 都不会炸 */
+  class Mv {
+    constructor (b) {
+      this.bot = b
+      this.blocksToAvoid = new Set([7])       // 7 = fire（上游默认那批的占位）
+      this.climbables = new Set([5])          // 5 = ladder（上游唯一那个）
+      this.carpets = new Set()
+      this.openable = new Set()
+    }
+  }
+  const reg = { blocksByName: { lava: { id: 9 }, ladder: { id: 5 }, vine: { id: 6 } }, blocksArray: [] }
+  const selfOf = (isInLava) => {
+    const b = mkBot(flatScene().w, { x: 0, y: 64, z: 0 })
+    b.registry = reg
+    b.entity.isInLava = isInLava
+    return { bot: b, cfg: {}, _pf: { Movements: Mv } }
+  }
+
+  const dry = movements(selfOf(false))
+  ok(dry.blocksToAvoid.has(9) === true, '🔴 不在岩浆里 ⇒ 岩浆留在寻路黑名单（照旧绕开）')
+  ok(dry.__dshInLava === false, '记了"当前不在岩浆里"')
+
+  const wet = movements(selfOf(true))
+  ok(wet.blocksToAvoid.has(9) === false, '🔴 掉进岩浆 ⇒ 岩浆从黑名单里放出来（A* 才能规划着游出去）')
+  ok(wet.__dshInLava === true, '记了"当前在岩浆里"')
+  ok(wet.liquids?.has?.(9) !== true, '🔴 但**不**把岩浆算成水路（不然平时就往岩浆湖里钻）')
+
+  const mv = new Mv({ registry: reg })
+  ok(patchClimbables(mv, { registry: reg }) === 1 && mv.climbables.has(6), '藤蔓进 climbables（vendor 那行是注释掉的）')
+  ok(patchClimbables(mv, { registry: reg }) === 0, '再叫一次不重复加（幂等）')
+  ok(patchClimbables(null, { registry: reg }) === 0 && patchClimbables(mv, null) === 0, '没有 mv / 没有 registry ⇒ 0，不炸')
+
+  const src = read('../src/plugins.mjs')
+  ok(/const CLIMBABLE_NAMES = \[[\s\S]*?'vine'[\s\S]*?'weeping_vines'[\s\S]*?'cave_vines_plant'[\s\S]*?\]/.test(src),
+    '藤蔓族名单齐全（vine / 缠怨藤 / 垂泪藤 / 洞穴藤蔓 各两个形态）')
+  ok(/patchClimbables\(mv, b\)/.test(src), 'movements() 结尾真的调了 patchClimbables')
+  ok(/inLava = b\?\.entity\?\.isInLava === true/.test(src), '岩浆避让按"当下是否在岩浆里"判')
+}
+
 console.log('\n' + '─'.repeat(50))
 console.log(`check-terrain：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

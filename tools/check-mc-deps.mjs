@@ -180,5 +180,25 @@ for (const [dir, label] of [[VN, 'vendor 树'], [PROFILE_NM, 'profile']]) {
     '没有的话：手上没有能挖的工具时挖方块会让 JS 堆十几秒涨到几 GB 直接 OOM')
 }
 
+// ── 5. mineflayer 的放置等待超时（2026-10-23 缩短，重装后必须重打）───────────
+section('5. mineflayer 放置等待超时（上游 5000ms 太长，幽灵方块白等）')
+/* 上游 `place_block.js` 放完方块后等 `blockUpdate:dest` 最多 5000ms；
+ * 幽灵方块（服务端没收到 / 客户端以为那一格空着）时这 5 秒**纯粹白等**，
+ * 而一次工具调用总共 10 秒 ⇒ 盖房子放十几个方块，撞上两个就整轮报废。
+ * 我们改成 1500ms（不抄 mindcraft 的 500：慢服会误报"没放上"）。
+ * 实机用不上"等 5 秒"这种场景时，越短越好 —— 复核由 `src/place.mjs` 自己做。 */
+{
+  const pb = join(VN, 'mineflayer', 'lib', 'plugins', 'place_block.js')
+  if (!existsSync(pb)) {
+    console.log('  · 没有 mineflayer/lib/plugins/place_block.js（跳过）')
+  } else {
+    const src = readFileSync(pb, 'utf8')
+    const m = src.match(/blockUpdate:\$\{dest\}[\s\S]{0,900}?timeout:\s*(\d+)/)
+    const t = m ? Number(m[1]) : NaN
+    ok(t === 1500, 'mineflayer place_block 的等回包超时是 1500ms（DSH 补丁）',
+      Number.isFinite(t) ? `现在是 ${t}ms —— 重装 vendor 后要重打：cp 备份/mineflayer-补丁备份/place_block.js.已打补丁 回去` : '读不到 timeout')
+  }
+}
+
 console.log(`\n${fail === 0 ? '✓ 全部通过' : '✗ 有失败项'}：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

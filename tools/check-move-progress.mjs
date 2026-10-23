@@ -30,7 +30,9 @@ const Vec3 = vec3pkg.Vec3 ?? vec3pkg
 const mod = await import(new URL('../src/movement.mjs', import.meta.url))
 const {
   MOVE_SAMPLE_MS, MOVE_STUCK_MS, MOVE_BUSY_MAX_MS, MOVE_ESCAPES,
-  escapeStepOf, escapeTextOf, moveBusyNow, moveProgressWatcher, escapeMove, walkPathfinder, routeTrack,
+  escapeStepOf, escapeTextOf, moveBusyNow, moveProgressWatcher, escapeMove, walkPathfinder, routeTrack, aboveOf,
+  walkTo, carveStepAhead, MOVE_HARD_SLACK_MS, MOVE_CARVE_DIG_MS,
+  MOVE_PLAN, MOVE_PLAN_TEXT, planStepTextOf, detourStep, MOVE_DETOUR_R, MOVE_DETOUR_MS, MOVE_PLAN_TTL_MS, MOVE_PLAN_SAME_R,
 } = mod
 
 let pass = 0
@@ -97,12 +99,13 @@ const watchOpts = (clock) => ({ arrive: 1.6, ty: 64, now: clock.now, setTimer: c
 /* ═══════════════ ① 阶梯：纯函数 ═══════════════ */
 section('① 脱困阶梯的顺序与命名（纯函数）')
 {
-  ok(Array.isArray(MOVE_ESCAPES) && MOVE_ESCAPES.length === 4 && MOVE_ESCAPES[3] === 'breakAhead', '阶梯四级，最后一级是真挖开挡路那格', JSON.stringify(MOVE_ESCAPES))
+  ok(Array.isArray(MOVE_ESCAPES) && MOVE_ESCAPES.length === 5 && MOVE_ESCAPES[4] === 'breakAhead', '阶梯五级，最后一级是真挖开挡路那格', JSON.stringify(MOVE_ESCAPES))
+  ok(MOVE_ESCAPES[3] === 'detour', '🔴 侧向绕行排在挖之前（能绕就别拆：用户 2026-10-23「太容易卡」）', MOVE_ESCAPES.join(' → '))
   ok(MOVE_ESCAPES[0] === 'repath' && MOVE_ESCAPES[1] === 'jump' && MOVE_ESCAPES[2] === 'backoff',
     '🔴 顺序 = 用户要求的「重算路径 → 跳跃脱困 → 后退再寻路」', MOVE_ESCAPES.join(' → '))
   ok(escapeStepOf(0) === 'repath' && escapeStepOf(1) === 'jump' && escapeStepOf(2) === 'backoff',
     'escapeStepOf(n) 按序给动作')
-  ok(escapeStepOf(4) === null && escapeStepOf(99) === null, '🔴 走完阶梯返回 null（= 该认输了，不无限重试）')
+  ok(escapeStepOf(5) === null && escapeStepOf(99) === null, '🔴 走完阶梯返回 null（= 该认输了，不无限重试）')
   ok(escapeTextOf('repath') === '重算路径' && escapeTextOf('jump') === '跳跃脱困' && escapeTextOf('backoff') === '后退再寻路',
     'escapeTextOf 的中文名（日志与返回值文案用）')
   ok(escapeTextOf('随便什么') === '放弃', '不认识的级别 → 放弃')
@@ -404,14 +407,15 @@ function mkCtx (self, clock) {
   ok(r.arrived === false && r.stuck === true, '走不动 ⇒ arrived:false / stuck:true', JSON.stringify({ a: r.arrived, s: r.stuck }))
   ok(r.reason === 'unreachable', '🔴 阶梯用完 ⇒ reason = unreachable（**不是** timeout / 不是"再叫一次"）', String(r.reason))
   ok(r.repathCount === MOVE_ESCAPES.length, `repathCount = ${MOVE_ESCAPES.length}（三级都试过了）`, String(r.repathCount))
-  ok(bot.calls.goto === MOVE_ESCAPES.length + 1, `重新 goto 了 ${MOVE_ESCAPES.length + 1} 次（首次 + 每级脱困各一次）`, String(bot.calls.goto))
+  ok(bot.calls.goto >= MOVE_ESCAPES.length + 1 && bot.calls.goto <= MOVE_ESCAPES.length + 2,
+    `重新 goto 了 ${bot.calls.goto} 次（首次 + 每级脱困各一次；绕行那一级自己再走一次）`, String(bot.calls.goto))
   ok(/真的走不动了/.test(r.hint ?? ''), 'hint 如实说"真的走不动了"', String(r.hint).slice(0, 60))
   ok(/别原地重试/.test(r.hint ?? ''), '🔴 hint 明确劝"别原地重试"（把长路拆成几段）', String(r.hint).slice(0, 90))
   ok(!/再叫一次 mc_move 往同一个目标走/.test(r.hint ?? ''), '不误报成"再叫一次就好"')
-  const escLogs = self.logs.filter((m) => /脱困/.test(m))
+  const escLogs = self.logs.filter((m) => /第 \d+ 步|脱困/.test(m))
   ok(escLogs.length === MOVE_ESCAPES.length, '每级脱困各记一行日志', String(escLogs.length))
   ok(/重算路径/.test(escLogs[0] ?? '') && /跳跃脱困/.test(escLogs[1] ?? '') && /后退再寻路/.test(escLogs[2] ?? ''),
-    '日志按阶梯顺序（重算路径 → 跳跃脱困 → 后退再寻路）', JSON.stringify(escLogs.map((s) => s.slice(0, 30))))
+    '日志按阶梯顺序（重算路径 → 跳跃脱困 → 后退再寻路 → 侧向绕行 → 挖开）', JSON.stringify(escLogs.map((s) => s.slice(0, 30))))
   ok(bot.controls.some(([k, v]) => k === 'jump' && v === true), '真的按过 jump（跳跃脱困不是空话）')
   ok(bot.controls.some(([k, v]) => k === 'back' && v === true), '真的按过 back（后退再寻路不是空话）')
   ok(clock.live === 0, '🔴 收尾时采样器定时器全清掉（不然把进程钉住）')
@@ -497,7 +501,7 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
     '🔴 walkPathfinder 把采样器的 promise 和 goto 一起竞速')
   ok(!/await raceAbort\(withTimeout\(work, budget, '寻路'\), self\.abortSignal, '寻路'\)/.test(src),
     '🔴 不再是"一次 goto 到底"的老写法')
-  ok(/let attempt = 0\s*\n\s*for \(;;\)/.test(src), '有重试循环（attempt 手动推进：挖台阶补救不算一级脱困）')
+  ok(/let attempt = planFrom\s*\n\s*for \(;;\)/.test(src), '有重试循环（attempt 手动推进：挖台阶补救不算一级脱困）')
   ok(/const step = escapeStepOf\(attempt - 1\)/.test(src), '每轮按阶梯取脱困动作')
   ok(/err\.mcStuck = true[\s\S]{0,120}?err\.mcExhausted = true/.test(src), '阶梯用完抛的是带 mcStuck 的错误')
   ok(/if \(e\?\.mcStuck\)[\s\S]{0,1400}?attempt\+\+[\s\S]{0,200}?continue/.test(src), '采样器判卡 ⇒ 补救没戏就进下一轮脱困')
@@ -1747,7 +1751,7 @@ section('⑱ 门失败兜底 / 斜向障碍 / 上方目标垫柱兜底')
   const d = obstacleAheadOf(diag, { x: 10, y: 64, z: 10 })
   ok(d && d.x === 1 && d.z === 1 && d.name === 'stone', '对角线那格的石头也算"眼前挡路"', JSON.stringify(d))
   /* 门没开透 ⇒ 补按一次再走（不再直接交给脱困阶梯） */
-  ok(/if \(sx && sz\) dirs\.push\(\[sx, sz\]\)/.test(src), 'carve/obstacle 都会看对角线方向')
+  ok(/if \(sx && sz && mainClear\) dirs\.push\(\[sx, sz\]\)/.test(src), 'carve/obstacle 都会看对角线方向（但只在主轴全通时）')
   ok(/if \(doorWalk && doorWalk\.passed !== true\)/.test(src), '门没过去时走兜底分支')
   ok(/opened: Number\(opened\) \|\| 0/.test(src) && /retry: true/.test(src), '兜底里补按门并把结果记进 doorWalk.retry')
   /* 上方目标、头顶为空 ⇒ 允许一次垫柱（否则 noTower 默认之下这类目标永远无解） */
@@ -1913,5 +1917,275 @@ section('⑨ P0-a xz 目标 / P0-b pathLen·estCalls')
   ok(/MOVE_BLOCKS_PER_CALL = 43/.test(read('../src/movement.mjs')), '一起算"还有几次调用"的换算常量在 movement.mjs 里')
 }
 
+{
+  /* ⑩ 头顶上方（用户 2026-10-23：「move 后输出再加上方的方块……现在 ai 不知道移动后是什么状态。跳不起来。」）
+   *   钉死三件事：① 能跳时不啰嗦（不给 note/ceiling）② 跳不起来时**说清是哪一格、y 多少**
+   *   ③ 走到了也照样报（不是只有卡住才报 —— 用户要的是"移动后是什么状态"）。 */
+  const mkCeilBot = (ceilY) => ({
+    entity: { position: new Vec3(1, 64, 1) },
+    blockAt (v) {
+      const y = Math.floor(v.y)
+      if (y <= 63) return { name: 'stone' }
+      if (ceilY != null && y >= ceilY) return { name: 'stone' }
+      return { name: 'air' }
+    },
+  })
+  const openAir = aboveOf(mkCeilBot(null))
+  ok(openAir && openAir.canJump === true, '头顶敞着 ⇒ canJump:true', JSON.stringify(openAir))
+  ok(openAir.above === 'air' && openAir.headroom === 6, '报脚底上方第 2 格 + 往上连续净空格数', JSON.stringify(openAir))
+  ok(openAir.note === undefined && openAir.ceiling === undefined, '能跳就不啰嗦（note / ceiling 只在有时才给，省 token）')
+  const lowCeil = aboveOf(mkCeilBot(66))
+  ok(lowCeil && lowCeil.canJump === false, '第 2 格就是实心 ⇒ canJump:false', JSON.stringify(lowCeil))
+  ok(/跳不起来/.test(lowCeil.note ?? '') && /y=66/.test(lowCeil.note ?? ''), 'note 明说跳不起来 + 是哪一格（y=66）', lowCeil.note)
+  ok(lowCeil.ceiling === 'stone' && lowCeil.headroom === 0, 'ceiling / headroom 一起给', JSON.stringify(lowCeil))
+  const headFull = aboveOf({
+    entity: { position: new Vec3(1, 64, 1) },
+    blockAt (v) { const y = Math.floor(v.y); return { name: y <= 63 || y === 65 ? 'stone' : 'air' } },
+  })
+  ok(headFull && headFull.canJump === false && headFull.headBlocked === 'stone', '头那格被堵 ⇒ 单独报 headBlocked（不是只说第 2 格）', JSON.stringify(headFull))
+  ok(aboveOf({}) === null && aboveOf(null) === null, '读不到世界就返回 null（不编）')
+  /* 走完一步要带着走：真跑一趟 walk，结果里得有 above */
+  const clock2 = autoClock()
+  const bot2 = mkLoopBot()
+  bot2.blockAt = (p) => (Math.floor(p.y) >= 68 ? { name: 'stone' } : { name: 'air' })
+  const self2 = mkSelf(bot2)
+  const ctx2 = mkCtx(self2, clock2)
+  const tgt2 = { x: 3, y: 64, z: 0 }
+  clock2.onTick = () => {
+    const p = bot2.entity.position
+    if (p.distanceTo(new Vec3(tgt2.x, 64, tgt2.z)) <= 1.6) { bot2.settleGoto((q) => q.resolve()); return }
+    bot2.entity.position = new Vec3(p.x + 0.8, 64, p.z)
+  }
+  const rAbove = await walkPathfinder(self2, tgt2, { arrive: 1.6, budget: 20000 }, ctx2)
+  clock2.stopPump()
+  ok(rAbove.arrived === true && rAbove.above && rAbove.above.canJump === true,
+    '走到了也有 above（不是只有卡住才报）', JSON.stringify(rAbove.above))
+  ok(rAbove.above.headroom === 2 && rAbove.above.ceiling === 'stone',
+    'above 说的是"到这儿之后"的头顶（y=68 起是石头）', JSON.stringify(rAbove.above))
+}
+
+/* ═══════════════ ㉑ 不许"无限等服务器回包"（2026-10-23 实机：一条 mc_move 挂 208 秒） ═══════════════ */
+section('㉑ 硬上限 + 单格挖掘守卫（用户：刚刚一直卡在这里）')
+{
+  /* 背景：`withTimeout` 只罩着 `pathfinder.goto`。走路这条路上还有裸 await 能永不 settle
+   * （挖一格要等服务端把方块改成空气；换工具等 heldItemChanged）。实机表现就是
+   * 工具一直不返回、模型那头"卡在这里"。这一节钉住两层兜底都真的在。 */
+  ok(MOVE_HARD_SLACK_MS > 0 && MOVE_CARVE_DIG_MS > 0,
+    '两个兜底常量都在（硬上限余量 / 单格挖掘上限）', JSON.stringify({ MOVE_HARD_SLACK_MS, MOVE_CARVE_DIG_MS }))
+
+  /* ②-1 硬上限：让 `ctx.walkPathfinder` 永不 settle，`walkTo` 也必须按时返回 */
+  {
+    const clock = autoClock()
+    const bot = mkLoopBot()
+    const self = mkSelf(bot)
+    self.requireBot = () => bot
+    self.pfReady = true          // 假 self 默认没这个标记，缺了会直接走 PathfinderUnavailable 分支
+    let stopped = 0
+    let released = 0
+    const ctx = {
+      ...mkCtx(self, clock),
+      walkGuardMs: 80,                       // 测试注入：80ms 而不是真等 10+3 秒
+      walkPathfinder: () => new Promise(() => {}),   // 永不 settle —— 模拟"服务端不回包"
+      stopPathing: () => { stopped++ },
+      releaseControls: () => { released++ },
+    }
+    const t0 = Date.now()
+    const r = await walkTo(self, { x: 20, y: 64, z: 0 }, { budget: 200 }, ctx)
+    const ms = Date.now() - t0
+    clock.stopPump()
+    ok(r.arrived === false && r.stuck === true, '永不返回的走路 ⇒ arrived:false / stuck:true', JSON.stringify({ a: r.arrived, s: r.stuck }))
+    ok(r.reason === 'walk-hung', '🔴 reason = walk-hung（跟 timeout / unreachable 分开：这是"被硬上限掐断"）', String(r.reason))
+    ok(r.hardLimitMs === 80, '结果里报出这次用的硬上限（模型能看出"是被掐断的"）', String(r.hardLimitMs))
+    ok(ms >= 60 && ms < 1_000, '🔴 硬上限真的生效（按时返回，不是挂死）', String(ms) + 'ms')
+    ok(stopped >= 1 && released >= 1, '掐断时松开了寻路与控制位（不留后台在跑）', JSON.stringify({ stopped, released }))
+    ok(Boolean(r.position), '报出掐断时的坐标（模型据此判断"到底挪没挪"）')
+    ok(r.above && typeof r.above.canJump === 'boolean', '硬上限的结果也带 above（和别的失败口子口径一致）', JSON.stringify(r.above))
+    ok(/掐断/.test(r.hint ?? '') && /noDig:true/.test(r.hint ?? ''),
+      'hint 如实说被掐断 + 给出下一步（关掉挖/换目标/搭桥）', String(r.hint).slice(0, 60))
+    ok(r.held !== undefined || r.heldRestored !== undefined || true, '（手上有东西时才报 held，不强制）')
+  }
+
+  /* ②-2 单格挖掘守卫：`b.dig` 永不 settle 时，`carveStepAhead` 必须按时放弃 */
+  {
+    const b = mkLoopBot({ x: 0, y: 64, z: 0 })
+    b.entity = { position: new Vec3(0, 64, 0), onGround: true }
+    b.blockAt = (p) => {
+      const x = Math.floor(p.x), y = Math.floor(p.y)
+      if (y <= 63) return { name: 'stone' }          // 底下有支撑（能挖）
+      if ((x === 1 || x === 2) && y === 64) return { name: 'dirt' }   // 挡路的脚那一格
+      return { name: 'air' }
+    }
+    let equips = 0
+    let stops = 0
+    b.equip = async () => { equips++; return {} }
+    b.dig = () => new Promise(() => {})               // 永不回包（服务端不判 air）
+    b.stopDigging = () => { stops++ }
+    b.pathfinder.bestHarvestTool = () => ({ name: 'iron_shovel' })
+    const t0 = Date.now()
+    const n = await carveStepAhead(b, { x: 30, y: 64, z: 0 }, { ignoreRange: true, digMs: 60 })
+    const ms = Date.now() - t0
+    ok(n === 0, '🔴 挖不动就不许谎报"挖开了"（返回 0，不返回真）', String(n))
+    ok(ms < 800, '🔴 单格挖掘有上限（不是无限等）', String(ms) + 'ms')
+    ok(equips >= 1, '该换工具还是先换（守卫罩的是"等回包"，不是"干脆不挖"）', String(equips))
+    ok(stops >= 1, '掐断时调了 stopDigging 松手（不留半截挖掘状态）', String(stops))
+    ok(Number(b.__carveDigStalled) >= 1, '记了一笔"被守卫掐断"（供 moveInfo 报 digStalled）', String(b.__carveDigStalled))
+  }
+
+  /* ②-3 正常情况不受影响：`dig` 很快 resolve 时照样算"挖开了" */
+  {
+    const b = mkLoopBot({ x: 0, y: 64, z: 0 })
+    b.entity = { position: new Vec3(0, 64, 0), onGround: true }
+    b.blockAt = (p) => {
+      const x = Math.floor(p.x), y = Math.floor(p.y)
+      if (y <= 63) return { name: 'stone' }
+      if (x === 1 && y === 64) return { name: 'dirt' }
+      return { name: 'air' }
+    }
+    b.dig = async () => {}
+    b.equip = async () => ({})
+    b.stopDigging = () => {}
+    b.pathfinder.bestHarvestTool = () => null
+    const n = await carveStepAhead(b, { x: 30, y: 64, z: 0 }, { ignoreRange: true, digMs: 500 })
+    ok(n === 1, '正常的挖掘一眼没变（挖开了就报 1）', String(n))
+    ok(!b.__carveDigStalled, '没超时就不留"被掐断"的账', String(b.__carveDigStalled))
+  }
+
+  /* ②-4 静态：硬上限必须**包住整段 walkToUnguarded**，而不是只在 goto 上 */
+  {
+    const src = strip(read('../src/movement.mjs'))
+    ok(/Promise\.race\(\s*\[\s*walk,/.test(src) || /walk\.catch\(\(\) => \{\}\)/.test(src),
+      'walkTo 里对 walkToUnguarded 做了 race（整段被罩住，不只是 goto）')
+    ok(/ctx\.walkGuardMs/.test(src), '硬上限可被测试注入（ctx.walkGuardMs）')
+    ok(/b\.stopDigging\?\.\(\)/.test(src), '掐断 / 守卫超时都会 stopDigging')
+    ok(/__carveDigStalled/.test(src) && /digStalled/.test(src), '掐断记账并报进 moveInfo（digStalled）')
+    ok(/const guarded = async/.test(src), '挖一格走 guarded()（equip 与 dig 都在罩内）')
+  }
+}
+
+
+/* ═══════════════ ㉒ 挖的方向只认主轴（2026-10-23 实机：它往 z5 挖而不是 x方向）═══════════════ */
+section('㉒ 补挖的方向只认主轴 / 对角受限 / 有总预算')
+{
+  const src = read('../src/movement.mjs')
+  /* 目标在 +x 远、+z 只差一点点 ⇒ 主轴是 x；z 方向那堵墙不该被挖（旧代码会挖，越挖越乱） */
+  const b1 = mkCarveBot({ '0,64,1': 'stone', '0,63,1': 'stone' })
+  const n1 = await carve(b1, { x: 10, y: 64, z: 2 }, { ignoreRange: true })
+  ok(n1 === 0 && !b1.dug.includes('0,64,1'), '🔴 主轴是 x ⇒ 绝不挖 z 方向的侧墙', JSON.stringify(b1.dug))
+  /* 主轴那格真堵着 ⇒ 挖主轴那格（这才是往目标去的方向） */
+  const b2 = mkCarveBot({ '1,64,0': 'stone', '1,63,0': 'stone', '0,64,1': 'stone', '0,63,1': 'stone' })
+  const n2 = await carve(b2, { x: 10, y: 64, z: 2 }, { ignoreRange: true })
+  ok(n2 === 1 && b2.dug.includes('1,64,0'), '主轴那格堵着 ⇒ 挖主轴那格', JSON.stringify(b2.dug))
+  ok(!b2.dug.includes('0,64,1'), '有主轴可挖时一下都不碰侧墙', JSON.stringify(b2.dug))
+  /* 主轴堵着但挖不动（基岩）⇒ 也别绕到斜的/侧的去乱挖，交给脱困阶梯 */
+  const b3 = mkCarveBot({ '1,64,0': 'bedrock', '1,63,0': 'stone', '0,64,1': 'stone', '0,63,1': 'stone' })
+  const n3 = await carve(b3, { x: 10, y: 64, z: 2 }, { ignoreRange: true })
+  ok(n3 === 0 && b3.dug.length === 0, '主轴挖不动 ⇒ 一格都不挖（不乱挖侧墙）', JSON.stringify(b3.dug))
+  /* 主轴是 z 时同理（方向按目标算，不是写死 x） */
+  const b4 = mkCarveBot({ '0,64,1': 'stone', '0,63,1': 'stone', '1,64,0': 'stone', '1,63,0': 'stone' })
+  const n4 = await carve(b4, { x: 2, y: 64, z: 10 }, { ignoreRange: true })
+  ok(n4 === 1 && b4.dug.includes('0,64,1'), '主轴是 z ⇒ 挖 z 方向那格', JSON.stringify(b4.dug))
+  ok(!b4.dug.includes('1,64,0'), '主轴是 z 时 x 墙不碰', JSON.stringify(b4.dug))
+  /* 斜拐（2026-10-19 实机）仍然要管：主轴全通、只有对角堵 ⇒ 挖对角 */
+  const b5 = mkCarveBot({ '1,64,1': 'stone', '1,63,1': 'stone' })
+  const n5 = await carve(b5, { x: 10, y: 64, z: 10 }, { ignoreRange: true })
+  ok(n5 === 1 && b5.dug.includes('1,64,1'), '主轴全通、只有对角堵 ⇒ 还是挖对角（斜拐不退化）', JSON.stringify(b5.dug))
+  /* 静态：方向只从主轴算，副轴那两个 push 已删 */
+  ok(/const main = Math\.abs\(dx\) >= Math\.abs\(dz\) \? \[sx, 0\] : \[0, sz\]/.test(src), '方向只从主轴算')
+  const sidePushes = (src.match(/dirs\.push\(\[0, sz\]\)/g) || []).length
+  ok(sidePushes === 2, '副轴方向只剩 doorOnRoute 那两行（carve/obstacle 不再看侧墙）', 'count=' + sidePushes)
+  ok(/export function doorOnRoute/.test(src) && /cells \+ 1/.test(src), 'doorOnRoute 仍然往前进走廊里多看一格（保护门，不退化）')
+  ok(/export const MOVE_CARVE_TOTAL = 6/.test(src), '一次 mc_move 有挖掘总预算')
+  ok(/carved < MOVE_CARVE_TOTAL/.test(src), '🔴 预算真的用在补挖条件上（不是摆设）')
+}
+
+
+/* ═══════════════ ㉓ 执行顺序（2026-10-23 用户：「动不了，太容易卡了，你要加对应的执行顺序」）═══════════════
+ * 要钉死的三件事：
+ *   ① 顺序表本身：开门 → 重算 → 跳 → 后退 → **侧向绕行** → 挖 → 垫柱（能绕就别拆）；
+ *   ② `detourStep` 真的挑侧向点、真的走过去（不是"原地重算"换个名字）；
+ *   ③ **跨调用接着升级** —— 同一个目标 90 秒内再叫，从上次卡住的那一级继续，
+ *      到了就把账清掉（否则 AI 连叫五次等于白试五遍同一套）。
+ */
+section('㉓ 执行顺序：先便宜的、能绕就别挖；跨调用接着升级')
+{
+  ok(JSON.stringify(MOVE_PLAN) === JSON.stringify(['door', 'repath', 'jump', 'backoff', 'detour', 'breakAhead', 'tower']),
+    '执行顺序表 = 开门 → 重算 → 跳 → 后退 → 绕行 → 挖 → 垫柱', JSON.stringify(MOVE_PLAN))
+  ok(MOVE_ESCAPES.indexOf('detour') >= 0 && MOVE_ESCAPES.indexOf('detour') < MOVE_ESCAPES.indexOf('breakAhead'),
+    '🔴 绕行排在挖之前（用户 2026-10-23：能绕就别拆）', MOVE_ESCAPES.join(' → '))
+  ok(planStepTextOf('detour') === '侧向绕行' && planStepTextOf('tower') === '垫一格往上',
+    'planStepTextOf 给中文名（日志/结果用）')
+  ok(MOVE_DETOUR_R >= 2 && MOVE_DETOUR_MS > 0, '绕行半径/时长有默认值', `${MOVE_DETOUR_R} 格 / ${MOVE_DETOUR_MS}ms`)
+  ok(MOVE_PLAN_TTL_MS === 90000 && MOVE_PLAN_SAME_R === 3, '跨调用记账的有效期 = 90 秒 / 同目标 3 格内')
+}
+{
+  /* detourStep：挑侧向点 → 真走一步 */
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  const clock = autoClock()
+  let lastGoal = null
+  bot.pathfinder.goto = (g) => {
+    bot.calls.goto++
+    lastGoal = g
+    return new Promise((resolve) => { bot._detourResolve = resolve })
+  }
+  const p = detourStep(bot, { x: 20, y: 64, z: 0 }, { goals: self._pf.goals, ctx: mkCtx(self, clock), budgetMs: 300 })
+  await sleep(120)
+  ok(Boolean(lastGoal) && Math.abs(Number(lastGoal.z)) >= 2 && Math.abs(Number(lastGoal.x)) === 0,
+    '绕行点是**侧向**的（不是往前/往后，也不是反方向）', JSON.stringify({ x: lastGoal?.x, z: lastGoal?.z }))
+  if (lastGoal) bot.entity.position = new Vec3(lastGoal.x, 64, lastGoal.z)
+  bot._detourResolve?.()
+  const d = await p
+  clock.stopPump()
+  ok(Number(d.moved) >= 2, '侧向绕行真的挪了格数（换了个起点再规划）', String(d.moved))
+  ok(d.to && Number.isFinite(Number(d.to.x)), '结果报走到哪一格（to）', JSON.stringify(d.to))
+}
+{
+  /* 没有侧向落脚点 ⇒ 如实 moved:0，交给下一级（不许假装绕过） */
+  const bot = mkLoopBot()
+  // 目标就在脚下：没必要绕（先判「太近」，别白走一趟）
+  const self = mkSelf(bot)
+  const clock = autoClock()
+  const d = await detourStep(bot, { x: 0, y: 64, z: 0 }, { goals: self._pf.goals, ctx: mkCtx(self, clock), budgetMs: 200 })
+  clock.stopPump()
+  ok(Number(d.moved) === 0 && d.why === 'too-close', '已经在这一格上 ⇒ moved:0 / why:too-close（不白绕）', JSON.stringify(d))
+}
+{
+  /* 跨调用接着升级：上次卡在第 3 级，这次直接从第 3 级开始，而不是重来 */
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  bot._movePlan = { target: { x: 20, y: 64, z: 0 }, at: Date.now(), step: 3 }   // 上次试完第 2 级
+  const r = await walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 20000 }, mkCtx(self, clock))
+  clock.stopPump()
+  const first = self.logs.find((m) => /第 \d+ 步/.test(m)) ?? ''
+  ok(/第 3 步/.test(first), '同一目标再叫：从上次卡住的第 3 级接着升（不从第 1 级重来）', first.slice(0, 46))
+  ok(Array.isArray(r.planTried) && r.planTried.length >= 1, '结果里报 planTried（这一趟试过哪几级）', JSON.stringify(r.planTried))
+  ok(r.planStep === 'breakAhead', 'planStep = 最后试的那一级', String(r.planStep))
+  ok(bot._movePlan && Number(bot._movePlan.step) === MOVE_ESCAPES.length + 1,
+    '还是卡 ⇒ 记下"卡到顶了"，下次直接换做法', JSON.stringify(bot._movePlan))
+}
+{
+  /* 到了就把账清掉（用**不推进**的假时钟：采样器永不判卡，免得跟到达抢时序） */
+  const clock = fakeClock()
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  bot._movePlan = { target: { x: 20, y: 64, z: 0 }, at: Date.now(), step: 0 }   // 还没试过任何一级
+  const p = walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 4000 }, mkCtx(self, clock))
+  await sleep(30)
+  bot.entity.position = new Vec3(20, 64, 0)
+  bot.settleGoto((x) => x.resolve())
+  const r = await p
+  clock.stopPump?.()
+  ok(r.arrived === true, '走到了', JSON.stringify({ a: r.arrived, rem: r.remaining }))
+  ok(bot._movePlan === null, '到了就把「卡在第几步」清掉（下个目标重新从第 1 级开始）', JSON.stringify(bot._movePlan))
+}
+{
+  /* 静态：detour 那一级绝不能挖（绕过不去才轮到挖） */
+  const src = strip(read('../src/movement.mjs'))
+  ok(/else if \(step === 'detour'\)[\s\S]{0,240}?detourStep\(/.test(src), 'escapeMove 里有 detour 分支（真调 detourStep）')
+  ok(!/else if \(step === 'detour'\)[\s\S]{0,240}?carveStepAhead\(/.test(src), '🔴 detour 分支里没有挖（能绕就别拆）')
+  ok(/markPlan\(attempt \+ 1, step\)/.test(src), '每一级都记账，且记的是「下次从第几级起」（跨调用升级靠它）')
+  ok(/b\._movePlan = \{ target:/.test(src) && /b\._movePlan = null/.test(src), '计划状态写在 bot 上、到达时清空')
+}
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

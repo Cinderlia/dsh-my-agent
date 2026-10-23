@@ -77,6 +77,12 @@ ok(/allowSprinting\s*&&\s*physics\.canSprintJump\(path\)/.test(indexSrc), 'index
 ok(/profileFor\(terrain\?\.kind/.test(plugSrc), 'movements() 按地形取权重（导航 P2）')
 ok(/allowParkour: 'walkAllowParkour'/.test(terrainSrc), 'walkAllowParkour 配置键登记在 terrain.mjs 的 TERRAIN_CFG_KEYS 里（默认关）')
 ok(/from '\.\/plugins\.mjs'/.test(coreSrc), 'core.mjs 确实从 plugins.mjs 取装配（搬走 + 忘接 = 这条会红）')
+/* 🔴 2026-10-23（二档，来源 mindcraft 的 pathfinder 补丁）：脚那一格是木门/栅栏门/活板门时，
+ * vendor 的 `postProcessPath` 会走进 `getPositionOnTopOf` —— minecraft-data 里门的 boundingBox
+ * 一律是 `block`（开没开都一样），它于是算出"门顶上方"那个点，把路径点抬高一格 ⇒
+ * 机器人对着门往上撞。补丁 = 门那一格直接瞄格心（y 不变）。 */
+ok(/const doorHere = Boolean\(b && typeof b\.name === 'string'/.test(indexSrc) && /const doorHere[\s\S]{0,400}?curPoint\.y = Math\.floor\(curPoint\.y\)/.test(indexSrc),
+  'index.js 的 postProcessPath 认门（门格瞄格心，不抬到门顶上）')
 
 // ── 假世界：一小片地板 + 那个 1 格台阶 + 一块半砖 + 一条 1 格宽走廊 ────────────────
 const FULL = [[0, 0, 0, 1, 1, 1]]

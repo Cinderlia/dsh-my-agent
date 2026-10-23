@@ -170,12 +170,12 @@ export async function apply (api) {
     name: 'mc_observe',
     description: '👁 **第一人称视角**：从我眼睛（眼高 1.62）朝正在看的方向渲染截图，直接内联给你看，并附**三段式感知**：'
       + '① **我看到**（图里数出来的：像素占比、谁在哪一侧、准星压着什么、手里拿什么）；'
-      + '② **程序检测到**（坐标/朝向/独立射线打到的方块/半径内实体带坐标·距离·血量/脚下）；'
+      + '② **程序检测到**（坐标/朝向/独立射线打到的方块/半径内实体带坐标·距离·血量/脚下/头顶第 2 格与**能不能跳**）；'
       + '③ **不确定**（客户端预测的方块世界、没加载的区块、读不到的血量 —— **别把推测当事实**）。'
       + '两套眼睛对不上时点名（以程序射线为准）。\n'
       + '图里：玩家（真皮肤）· 怪物（红=敌对/黄=被动）· 掉落物（黑描边）· 暗紫=区块没加载；右下角是手上的东西。\n'
       + (gateEnabled
-        ? '🔴 **动手之前必须先看一眼**。动作类工具（' + [...gated].join(' / ')
+        ? '🔴 **硬规则：动手之前必须先看一眼**。动作类工具（' + [...gated].join(' / ')
           + '）手上没有够新的图会被**直接拒绝**'
           + `（让你先调 mc_observe）。看一眼后最多连着做 ${maxActions} 个动作${spanText}，超了再看一次。\n`
           + '嫌紧可以改（立即生效）：写 `.dsh-mc-agent/view.json`，如 {"maxActions":8} 或 {"gate":false}。\n'
@@ -347,6 +347,23 @@ export async function apply (api) {
       try { tools = toolDurability(bot) } catch { tools = [] }
       try { durText = durabilityText(bot) } catch { durText = null }
 
+      /* 用户 2026-10-23：「现在 ai 不知道移动后是什么状态，跳不起来」⇒ 头顶也量一份。
+       * `headBlock` 只是"头那格"，跳上一格看的是它的**上一格**（`fy+2`）—— 两个分开报，
+       * 再给一个能/不能跳的结论（`mc_move` 的 `above` 用同一套口径）。 */
+      const headName = blockAt(bot.world, fx, fy + 1, fz)
+      const jumpName = blockAt(bot.world, fx, fy + 2, fz)
+      const headroomAbove = (() => {
+        let n = 0
+        for (let y = fy + 2; y <= fy + 7; y++) {
+          const nm = blockAt(bot.world, fx, y, fz)
+          if (nm === null) break // 未加载：不猜
+          if (!isAirName(nm)) break // 第一块实心
+          n++
+        }
+        return n
+      })()
+      const headBlocked = headName !== null && !isAirName(headName)
+      const canJumpNow = headroomAbove >= 1 && !headBlocked
       const out = {
         capturedAt: nowMs,
         position: s.position ?? { x: fx, y: fy, z: fz },
@@ -376,6 +393,17 @@ export async function apply (api) {
           underFeet: showBlock(blockAt(bot.world, fx, fy - 1, fz)),
           feetBlock: showBlock(blockAt(bot.world, fx, fy, fz)),
           headBlock: showBlock(blockAt(bot.world, fx, fy + 1, fz)),
+          /* 跳上一格要占的那格 + 头顶净空：AI 老在"以为能跳"上卡（用户 2026-10-23）。 */
+          jumpBlock: showBlock(jumpName),
+          headroom: headroomAbove,
+          canJump: canJumpNow,
+          ...(canJumpNow
+            ? {}
+            : {
+                aboveNote: headBlocked
+                  ? "头那格（y=" + (fy + 1) + "）被 " + headName + " 堵着 —— 跳不起来，先挖开或挪开一格"
+                  : "脚底上方第 2 格（y=" + (fy + 2) + "）是 " + (jumpName ?? "未加载") + " —— 跳不起来（上不了一格）",
+              }),
           ahead: showBlock(blockAt(bot.world, fx + stepX, fy, fz + stepZ)),
           /* 🔴 只看 `e.isInWater` 会漏：泡在水柱里它读出来是 undefined（实机 (-31,59,261) 脚/头
            *    两格都是 water 却报"没在水里"）⇒ 再看脚/头那两格的方块名。
@@ -625,7 +653,10 @@ export async function apply (api) {
           `   · 🎒 背包：${invText}`,
           `   · 🛡 装备栏：${eqText ?? '读不到'}`,
           ...(out.durability ? [`   · ${out.durability}`] : []),
-          `   · 脚下 ${out.surroundings.underFeet} · 脚内 ${out.surroundings.feetBlock} · 头上一格 ${out.surroundings.headBlock} · 正前方一格 ${out.surroundings.ahead}`
+          `   · 脚下 ${out.surroundings.underFeet} · 脚内 ${out.surroundings.feetBlock} · 头上一格 ${out.surroundings.headBlock} · 头顶第 2 格 ${out.surroundings.jumpBlock ?? `?`}`
+            + ` · 正前方一格 ${out.surroundings.ahead}`
+            + (out.surroundings.canJump === false ? ` · ⛔ **跳不起来**（${out.surroundings.aboveNote ?? '头顶堵着'}）`
+              : out.surroundings.canJump === true ? ` · 能跳（头顶净空 ${out.surroundings.headroom} 格）` : '')
             + (out.surroundings.inWater ? ' · 泡在水里' : ''),
           '⚠️ **不确定**（别当成事实）：' + shown.map((t, i) => `${'①②③④⑤⑥⑦⑧⑨'[i] ?? '·'}${t}`).join('　'),
         )
@@ -678,7 +709,9 @@ export async function apply (api) {
           `🎯 准星：${cross === null ? '天空（' + distance + ' 格内没方块）' : cross.unknown ? '未加载区块' : `${cross.name} · ${r1(cross.dist)} 格`}`
             + (out.crosshairEntity ? ` · **准星正对着 ${out.crosshairEntity.name}（${out.crosshairEntity.distance} 格）**` : '')
             + ` · 脚下 ${out.surroundings.underFeet} · 脚内 ${out.surroundings.feetBlock} · 头上一格 ${out.surroundings.headBlock}`
-            + ` · 正前方一格 ${out.surroundings.ahead}`,
+            + ` · 正前方一格 ${out.surroundings.ahead}`
+            + (out.surroundings.canJump === false ? ` · ⛔ **跳不起来**（${out.surroundings.aboveNote ?? '头顶堵着'}）`
+              : out.surroundings.canJump === true ? ` · 能跳（头顶净空 ${out.surroundings.headroom} 格）` : ''),
           `🧱 画面：命中 ${out.image.hitPct}% · 天空 ${out.image.skyPct}% · 未加载 ${out.image.unloadedPct}%`
             + (out.image.topBlocks.length ? ` · 视野里：${out.image.topBlocks.slice(0, 5).join(' · ')}` : '')
             + (out.image.softBlocks?.length ? ` · 非实体方块：${out.image.softBlocks.slice(0, 4).join(' · ')}` : ''),

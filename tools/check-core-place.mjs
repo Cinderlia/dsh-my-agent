@@ -415,5 +415,33 @@ section('⑧ 目标格 = 自己站的那一格 —— 必须跳起来放（pilla
     const useSrc = readFileSync(new URL('../src/world-use.mjs', import.meta.url), 'utf8')
     ok(/isEntityItem\(item\.name\)/.test(useSrc), 'useitem 对船/蛋会提示改用 place（别让人以为再按一次就好）')
   }
+
+/* ── ⑨ 跳起放置不许挂死（2026-10-23 实机：一条 mc_move 挂了 208 秒，同一个毛病） ── */
+section('⑨ 跳起放置有上限（placeBlock 不回包也要按时放弃）')
+{
+  const placeSrc9 = readFileSync(new URL('../src/place.mjs', import.meta.url), 'utf8')
+  const { placeWhileJumping } = await import('../src/place.mjs')
+  const { PLACE_TIMEOUT_MS } = await import('../src/place.mjs')
+  ok(/export const PLACE_TIMEOUT_MS = \d/.test(placeSrc9), '有明确的上限常量 PLACE_TIMEOUT_MS')
+  ok(/Promise\.race\(\s*\[\s*\s*Promise\.resolve\(b\.placeBlock/.test(placeSrc9),
+    '跳起放置走 Promise.race（placeBlock 要等服务端回包，不回就永不 settle）')
+  ok(PLACE_TIMEOUT_MS > 0 && PLACE_TIMEOUT_MS <= 5000, '上限是个合理的短数字（不是几十秒）', String(PLACE_TIMEOUT_MS))
+  /* 行为：placeBlock 永不 settle 时，placeWhileJumping 必须按时抛出而不是挂着 */
+  {
+    const hangBot = {
+      entity: { position: { x: 0.5, y: 20.3, z: 0.5 } },   // 已经在空中 ⇒ 不等"离地"
+      setControlState: () => {},
+      placeBlock: () => new Promise(() => {}),
+      lookAt: async () => {},
+    }
+    const ref = { name: 'cobblestone', boundingBox: 'block', position: { x: 0, y: 19, z: 0 } }
+    const t0 = Date.now()
+    let threw = null
+    try { await placeWhileJumping(hangBot, ref, { x: 0, y: 1, z: 0 }, { tries: 1 }) } catch (e) { threw = e }
+    const ms = Date.now() - t0
+    ok(ms < PLACE_TIMEOUT_MS + 2000, '🔴 不回包也有上限（按时放弃，不是挂死）', String(ms) + 'ms')
+    ok(threw != null && /没回包/.test(String(threw?.message ?? '')), '抛的是人话（说清是服务端没回包）', String(threw?.message).slice(0, 40))
+  }
+}
 console.log(`\n${fail === 0 ? '✓ 全部通过' : '✗ 有失败'}：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

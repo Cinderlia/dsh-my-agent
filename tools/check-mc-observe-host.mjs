@@ -359,6 +359,12 @@ console.log('— ④ execute 输出（含真实渲染 + 附件 + 落盘）—')
   ok(out.crosshair && out.crosshair.block === 'stone', '准星命中北边石墙', JSON.stringify(out.crosshair))
   ok(out.crosshair.distance === 3.5, '命中距离 3.5 格（眼在 z=0.5，墙面 z=-3）', String(out.crosshair.distance))
   ok(out.surroundings.underFeet === 'grass_block' && out.surroundings.feetBlock === 'air', '脚下草地 / 脚内空气', JSON.stringify(out.surroundings))
+  /* 用户 2026-10-23：「现在 ai 不知道移动后是什么状态，跳不起来」⇒ 头顶第 2 格 + 净空 + 结论都要给 */
+  ok(out.surroundings.jumpBlock === 'air' && out.surroundings.canJump === true && out.surroundings.headroom >= 1,
+    '头顶第 2 格 / 净空格数 / 能不能跳都给', JSON.stringify(out.surroundings))
+  ok(out.surroundings.aboveNote === undefined, '能跳就不塞 aboveNote（省 token）')
+  ok(/头顶第 2 格/.test(out.text) && /能跳（头顶净空/.test(out.text), 'text 里也写了头顶第 2 格与能不能跳',
+    out.text.split('\n').find((l) => l.includes('头顶第 2 格')))
   ok(out.image.hitPct + out.image.skyPct + out.image.unloadedPct >= 98 && out.image.hitPct + out.image.skyPct + out.image.unloadedPct <= 102, '三类像素占比合计 ≈100%', `${out.image.hitPct}/${out.image.skyPct}/${out.image.unloadedPct}`)
   ok(out.image.unloadedPct > 0, '未加载区域被算出来', String(out.image.unloadedPct))
   ok(out.image.topBlocks.length > 0, '有 topBlocks', JSON.stringify(out.image.topBlocks))

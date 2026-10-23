@@ -26,6 +26,8 @@ import {
 } from './mc_util.mjs'
 import { withTimeout, CALL_MS } from '../src/core.mjs'
 import { dropsNear } from '../src/world-observer.mjs'
+/* 烧炼反查表在 mc_furnace 里（同一份表，别抄第二遍）。它不 import 本文件，所以不成环。 */
+import { smeltInputsFor } from './mc_furnace.mjs'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -391,6 +393,189 @@ export function describeMissing (plan, bot = null) {
   }
   for (const h of hints) lines.push(`  → ${h}`)
   return lines.join('\n')
+}
+
+/* ─────────────── 递归物品目标树：「我要 N 个 X，整套活儿怎么排」 ───────────────
+ * 灵感来自 mindcraft 的 `ItemNode`（setRecipe / setCollectable / setSmeltable + prereq）：
+ * `planCraft` 只管**合成**那一层，碰到底下的"要挖的矿、要烧的锭"只报告、不展开。
+ * 这里把三层串成一棵树 —— 合成 → 烧炼 → 挖掘（连"挖它要什么镐"一起），
+ * 回答的是"这台活儿到底该怎么排"。
+ *
+ * 🔴 只出计划、绝不动手：真干活还是 `mc_dig` / `mc_furnace` / `mc_craft` 各干各的
+ *    （mindcraft 那套是自己写执行器，我们已经有工具了，不需要）。
+ */
+
+/**
+ * 方块 → 掉落物品（含"要什么工具才挖得下来"）。同一个 registry 只建一次。
+ * 🔴 minecraft-data 里 `block.drops` 装的是**物品 id**、`block.harvestTools` 是"能挖下它的工具物品 id"
+ *    （iron_ore = 石/铁/金/钻石/下界合金镐）；铁矿石掉的是 `raw_iron`，名字和方块不一样，
+ *    所以必须靠掉落表反查，不能拿物品名去猜方块名。
+ */
+let _dropCache = null
+function dropIndexOf (bot) {
+  const reg = bot?.registry
+  if (_dropCache && _dropCache.reg === reg) return _dropCache.map
+  const map = new Map()
+  for (const [bname, blk] of Object.entries(reg?.blocksByName ?? {})) {
+    for (const d of Array.isArray(blk.drops) ? blk.drops : []) {
+      const id = d && typeof d === 'object' ? (d.drop?.id ?? d.id) : d
+      const it = reg.items?.[id]
+      if (!it) continue
+      const tools = blk.harvestTools ? Object.keys(blk.harvestTools).map((k) => reg.items?.[k]?.name).filter(Boolean) : []
+      const list = map.get(it.name) ?? []
+      if (!list.some((x) => x.block === bname)) list.push({ block: bname, tools })
+      map.set(it.name, list)
+    }
+  }
+  _dropCache = { reg, map }
+  return map
+}
+
+/** 一个物品的所有"合成配方"（含要用工作台的），整理成树能用的形状 */
+function recipeChoicesOf (bot, name) {
+  const id = itemIdOf(bot, name)
+  if (id == null) return []
+  let rs = []
+  try { rs = recipesAllOf(bot, id, true) } catch { rs = [] }
+  return rs.map((r) => ({
+    out: r.result?.count || 1,
+    requiresTable: !!r.requiresTable,
+    from: ingredientsOf(r).map((i) => ({ name: itemNameOf(bot, i.id), count: i.count })),
+  })).filter((c) => c.from.length)
+}
+
+/**
+ * 一个物品"从哪来"。优先级按"哪条路最省事"排：
+ *   ① 有一个**同名方块**掉落它（砍 oak_log 得 oak_log）—— 最直接
+ *   ② 有 `X_ore` 方块掉落它（挖 diamond_ore 得 diamond）—— 比烧划算
+ *   ③ 能烧出来（raw_iron → iron_ingot）
+ *   ④ 有合成配方（oak_planks ← oak_log）
+ *   ⑤ 别的方块掉落它
+ *   ⑥ 都没有：打怪 / 开箱 / 交易，或名字写错
+ */
+export function sourceOf (bot, name) {
+  const have = countOf(bot, itemIdOf(bot, name))
+  const drops = dropIndexOf(bot).get(name) ?? []
+  const pickDrop = (pred) => drops.find((d) => pred(d.block)) ?? null
+  const mineNode = (d) => {
+    const tools = d.tools
+    const canMine = tools.length === 0 || tools.some((t) => countOf(bot, itemIdOf(bot, t)) > 0)
+    return { kind: 'mine', name, have, block: d.block, blocks: drops.slice(0, 4).map((x) => x.block), tools, canMine }
+  }
+  const same = pickDrop((b) => b === name)
+  if (same) return mineNode(same)
+  const ore = pickDrop((b) => /_ore$/.test(b))
+  if (ore) return mineNode(ore)
+  const smeltIn = smeltInputsFor(bot, name)
+  if (smeltIn.length) {
+    const owned = smeltIn.filter((n) => countOf(bot, itemIdOf(bot, n)) > 0)
+    /* 优先挑 `raw_*`：1.21 挖矿掉的是粗矿，矿石方块一般不在背包里 */
+    const prefer = smeltIn.find((n) => /^raw_/.test(n)) ?? smeltIn[0]
+    return { kind: 'smelt', name, have, inputs: smeltIn.slice(0, 6), input: owned[0] ?? prefer }
+  }
+  const choices = recipeChoicesOf(bot, name)
+  if (choices.length) {
+    /* 挑原料种类最少的那条（木板 = 1 种原木，不会被"9 个粒"那种分支带偏） */
+    const best = choices.slice().sort((a, b) => a.from.length - b.from.length
+      || a.from.reduce((s, f) => s + f.count, 0) - b.from.reduce((s, f) => s + f.count, 0))[0]
+    return { kind: 'craft', name, have, out: best.out, requiresTable: best.requiresTable, from: best.from, choices: choices.length }
+  }
+  if (drops.length) return mineNode(drops[0])
+  return { kind: 'other', name, have }
+}
+
+/**
+ * 把"拿到 want 个 query"拆成一棵树（挖 → 烧 → 合成，三层串起来）。
+ * 🔴 自己递归、不借 `planCraft`：`planCraft` 遇到**第一个**缺料就停（它给的是"下一步该干啥"），
+ *    而树要的是"**整套活儿**一共缺什么"，所以得把每条分支都走一遍。
+ * @returns {{target, want, have, ok, tree, leaves, blockers, missing, note, maxDepth}}
+ */
+export function goalTree (bot, query, want, opts = {}) {
+  const table = opts.table !== false
+  const wantN = clamp(Math.round(Number(want) || 1), 1, 1024)
+  const maxDepth = clamp(Math.round(Number(opts.maxDepth) || 5), 1, 8)
+  const target = resolveItem(bot, query, table, wantN)
+  const targetName = itemNameOf(bot, target.item.id)
+  const missing = []
+  const expand = (name, need, depth, path) => {
+    const have = countOf(bot, itemIdOf(bot, name))
+    if (have >= need) return { name, need, have, kind: 'have' }
+    const src = sourceOf(bot, name)
+    const node = { ...src, need }
+    if (path.has(name)) return { ...node, dup: true }
+    if (depth <= 0) { missing.push(name); return { ...node, cut: true } }
+    const next = new Set(path).add(name)
+    if (src.kind === 'craft') {
+      const times = Math.max(1, Math.ceil((need - have) / (src.out || 1)))
+      node.times = times
+      node.children = src.from.map((f) => expand(f.name, f.count * times, depth - 1, next))
+    } else if (src.kind === 'smelt' && src.input) {
+      node.children = [expand(src.input, need, depth - 1, next)]
+    } else if (src.kind === 'mine' && !src.canMine) {
+      /* 挖不动 = 缺工具：工具自己也是一棵树（石镐 ← 圆石 + 木棍 ← 原木）。
+       * 🔴 挑**最弱的那把**（harvestTools 的 key 是按物品 id 升序的，木→石→铁→钻→合金）：
+       *    能挖钻石的镐子有一堆，先做木/石镐最省事。 */
+      const tool = src.tools[0] ?? null
+      if (tool) node.children = [expand(tool, 1, depth - 1, next)]
+    }
+    return node
+  }
+  const tree = expand(targetName, wantN, maxDepth, new Set())
+  const collect = (n, out = []) => {
+    if (n && ['mine', 'smelt', 'craft', 'other'].includes(n.kind)) {
+      out.push({ name: n.name, kind: n.kind, need: n.need, have: n.have })
+    }
+    for (const c of n?.children ?? []) collect(c, out)
+    return out
+  }
+  const leaves = collect(tree)
+  /* "能直接按顺序干" = 全是合成/已有的，没有哪一样还得去挖、去烧、去想办法 */
+  const gather = leaves.filter((x) => x.kind === 'mine' || x.kind === 'smelt' || x.kind === 'other')
+  return {
+    target: targetName, want: wantN, have: countOf(bot, target.item.id, null), ok: gather.length === 0,
+    tree, leaves, gather, missing, note: target.note ?? null, maxDepth,
+    blockers: [...new Set(leaves.filter((x) => x.kind === 'other').map((x) => x.name))],
+  }
+}
+
+/** 树的文字版：一层层念下来（挖 → 烧 → 合成），每行都是"要几个 + 从哪来" */
+export function describeGoalTree (tree) {
+  const L = []
+  L.push(`🧠 要拿到 **${tree.target} ×${tree.want}**（现在有 ${tree.have}）：`)
+  if (tree.note) L.push(`　${tree.note}`)
+  const linesOf = (n, ind) => {
+    const pad = '　'.repeat(ind)
+    const out = []
+    const need = n.need > 1 ? ` ×${n.need}` : ''
+    const haveNote = n.have > 0 ? `（身上有 ${n.have}` : ''
+    if (n.kind === 'have') {
+      out.push(`${pad}· **${n.name}**${need}：背包里有 ${n.have}，够了 ✅`)
+    } else if (n.kind === 'mine') {
+      const tool = n.canMine ? '' : `｜⚠️ 挖得动得先有 ${(n.tools ?? []).join(' / ')}`
+      out.push(`${pad}· **${n.name}**${need}：挖 **${n.block}**${haveNote ? haveNote + '）' : ''}${tool}`)
+    } else if (n.kind === 'craft') {
+      const from = n.from.map((f) => `${f.name} ×${f.count}`).join(' + ')
+      out.push(`${pad}· **${n.name}**${need}：合成 ${n.times} 次 ← ${from}`
+        + `${n.requiresTable ? '（要工作台）' : ''}${haveNote ? haveNote + '）' : ''}`
+        + `${n.choices > 1 ? `（另有 ${n.choices - 1} 条别的配方）` : ''}`)
+    } else if (n.kind === 'smelt') {
+      out.push(`${pad}· **${n.name}**${need}：烧 **${n.input}**（要熔炉 → \`mc_furnace {name:"${n.input}",count:${Math.max(1, n.need - n.have)}}\`）${haveNote ? haveNote + '）' : ''}`)
+    } else {
+      out.push(`${pad}· **${n.name}**${need}：没有配方、也查不到掉落 —— 只能打怪/开箱/交易搞到（或名字写错了）`)
+    }
+    if (n.cut) out.push(`${pad}　（再往下拆太深了，先弄这一层）`)
+    if (n.dup) out.push(`${pad}　（这一样上面已经排过，别重复弄）`)
+    for (const c of n.children ?? []) out.push(...linesOf(c, ind + 1))
+    return out
+  }
+  L.push(...linesOf(tree.tree, 1))
+  if (tree.ok) {
+    L.push(`　→ 材料齐了：\`mc_craft {name:"${tree.target}",count:${tree.want}}\` 就行`)
+  } else {
+    L.push('　→ 动手顺序：**挖的最先、烧的其次、合成的最后**（下面的没到手，上面的做不了）')
+    if (tree.blockers.length) L.push(`　→ 没来源的：${tree.blockers.join(' / ')}（这几样我没有数据，得靠打怪/开箱/交易，或者换个目标）`)
+  }
+  return L.join('\n')
 }
 
 /* ───────────────────────── list：看配方 / 看能做什么 ───────────────────────── */
@@ -905,6 +1090,9 @@ export async function apply (api) {
       + '· `list:true` 看配方/看当前能做什么；`dryRun:true` 只出计划不动手（拿不准就先 dryRun）。\n'
       + '· `count` 是"背包里**一共**要到几个"（默认 1）：已经够了就**一个都不做**，结果会如实说"一个都没做"。要"再做 4 个"就写 `{count:4, more:true}`。\n'
       + '· 🔴 连着两三次都"超时"就先 `mc_scan` 复核现场（我每次动手前都会先把合成格里的材料点回背包）。\n'
+      + '· `tree:true` 出**整套活儿**的依赖树（合成 + 要烧的 + 要挖的，连"挖它要什么镐"一起）——'
+      + '比如 `{tree:true,name:"iron_pickaxe"}` ⇒ 铁镐 ← 铁锭 ← 烧 raw_iron ← 挖 iron_ore ← 石镐 ← 圆石… 全排出来。'
+      + '**只出计划、不动手**；不知道该从哪一步开始时先看它。\n'
       + '🔴 合成只动背包、不动世界，所以**不受 mc_observe 门禁限制**。',
     parameters: {
       name: { type: 'string', description: '要合成的物品（英文 id 或简称，如 planks / stick / wooden_pickaxe）' },
@@ -917,6 +1105,7 @@ export async function apply (api) {
       radius: { type: 'number', description: '附近找工作台的半径（默认 4，最大 8）' },
       list: { type: 'boolean', description: '只看配方，不合成' },
       dryRun: { type: 'boolean', description: '只出合成计划，不动手（默认 false）' },
+      tree: { type: 'boolean', description: '只出「整套活儿」的依赖树：合成 + 要烧的 + 要挖的（连"挖它要什么镐"一起），不动手。拿不准"这东西到底怎么搞到"就先 tree:true' },
     },
     output: {
       schema: { type: 'object', properties: {}, additionalProperties: true },
@@ -958,6 +1147,17 @@ export async function apply (api) {
         }
         if (t.note) lines.push(`　${t.note}`)
         return { text: lines.join('\n') }
+      }
+
+      /* ①b tree：整套活儿的依赖树（合成 + 烧 + 挖），只出计划不动手 */
+      if (args.tree === true) {
+        if (args.name == null || args.name === '') return { text: '❌ 要 `tree:true` 得给 `name`（比如 `{tree:true,name:"iron_pickaxe",count:3}`）' }
+        try {
+          const t = goalTree(bot, args.name, args.count, { table: allowTable })
+          return { text: describeGoalTree(t), ...t }
+        } catch (e) {
+          return { text: `❌ ${e.message}` }
+        }
       }
 
       /* ② 解析目标 + 找/放工作台 */
