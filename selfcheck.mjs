@@ -1382,7 +1382,9 @@ console.log('\n--- 记忆能力（.dsh-mc-agent / README 索引 / 任意格式�
 
   // 工具层（用插件的真实记忆库）
   const ovTool = await tools.get('mc_kit_memory').execute({ action: 'index' }, A)
-  console.log(`  ${ovTool.root && 'totalFiles' in ovTool && 'readme' in ovTool ? '✅' : '❌'} mc_kit_memory{index} 可用（真实库 ${ovTool.totalFiles} 个文件）`)
+  const ovFull = await tools.get('mc_kit_memory').execute({ action: 'index', verbose: true }, A)
+  console.log(`  ${ovTool.root && 'totalFiles' in ovTool && 'groups' in ovTool ? '✅' : '❌'} mc_kit_memory{index} 默认只给分组摘要（真实库 ${ovTool.totalFiles} 个文件）`)
+  console.log(`  ${'readme' in ovFull && 'tree' in ovFull ? '✅' : '❌'} index{verbose:true} 才给 README 全文 + 目录树`)
   const badAct = await tools.get('mc_kit_memory').execute({ action: '不存在' }, A).catch((e) => e.message)
   console.log(`  ${/未知 action/.test(String(badAct)) ? '✅' : '❌'} 未知 action 报错并列出可用值`)
 }
