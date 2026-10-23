@@ -108,6 +108,29 @@ node %USERPROFILE%\Desktop\agent\dsh-mc-agent\tools\check-mc-deps.mjs   # 装完
 判断"是不是被预算截断的"用 `#walkPathfinder` 的 `budgetAsked` 入参 —— 以前只看 `msLeft() <= 400`，
 DSH 把截止时刻设成一整轮时，预算到点还剩约 1 秒 ⇒ 被误判成"真走不通"。
 
+## 长程赶路：只给 x/z + 报出"还要几次调用"（2026-10-23，用户点名要的）
+
+用户点破的真问题不是"少一个移动项目"，而是**现成的 pathfinder 长程能力没暴露给 AI**。四处漏：
+
+| 漏在哪 | 以前 | 现在 |
+| --- | --- | --- |
+| 目标必须猜 y | `mc_move` 强制 x/y/z，goal 恒为 `GoalNear(x, ty, z, ~1)`，`standPointFor` 只兜 ±1 格（y 猜错 2 格就救不回来） | `mc_move {x, z}`（或 `xz:true`）⇒ `goals.GoalXZ`，**按"到那一列"算，y 不用猜**；**给了 y 就按 y 走（y 优先）**，`xz` 被忽略 |
+| 走了多远没数 | 只报 `moved` / `remaining` | 多报 `pathLenPlanned`（首次规划多少节点）、`pathLen`（最后一次还剩多少）、`estCalls`（按一次 10 秒 ≈ 43 格算**大约还要几次调用**）；hint 直接说"同参数接着叫，别换目标点" |
+| 路径每轮都被扔掉 | `finally` 里 `stopPathing(b)` ⇒ `setGoal(null)` ⇒ `resetPath`，**整条 A\* 路径丢**（这轮走 10 秒，下轮从头重算） | 仍然每轮重算（P0 没动这条，见下面"还没做"），但现在**报得出"还剩多少节点"**，模型能估还要不要接着叫 |
+| 旋钮全锁死 | `allowSprinting` / `dontMineUnderFallingBlock` / `blocksToAvoid` / `profileFor` 全在内部 | 仍未暴露（P2 待做），AI 目前只能间接碰 `noDig` / `allowTower` |
+
+- `xz` 下**到达判定与"卡住"判定一律用水平距离**（`Math.hypot(dx, dz)`）：`GoalXZ` 只有两维，
+  用三维距离判"靠近"会把"在上层来回乱爬"也当成进展，长路永远不判卡。
+- `xz` 目标**不过 `standPointFor`**：那函数会替目标挪列（找附近能站的格），等于替 AI 改目的地。
+- `xz` 下到达复核也放宽到"水平距离 ≤ arrive + 1"（`GoalXZ.isEnd` 要求真踏进那一列，太严）。
+- `fly` / `boat` 是三维移动，**必须给 y**（`xz` 只对 walk 有效）。
+- **还没做（P1 / P2）**：`resume:true` 保留路径续走（省掉每轮重算 A* 的开销）、
+  `allowParkour` / `maxDrop` / `sprint` 旋钮。真要做得先确认"保留路径"不会和 `#walkPathfinder`
+  的抢占号（`_moveGen`）打架。
+
+回归：`check-move-progress.mjs` 第 ⑨ 节（`xz` 采样器对比、`GoalXZ` 接线、
+`pathLenPlanned === 200` / `estCalls === 5`、不给 xz 时不多出字段、静态接线 9 条）。
+
 ## 移动抢占：两份移动共用一个 `bot.pathfinder` 会互相停掉
 
 自主层原来那份自保（被怪贴上时先跑）和 AI 那一轮的 `mc_move`/`mc_dig` 用的是**同一个** `bot.pathfinder`，

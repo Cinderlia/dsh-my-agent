@@ -651,8 +651,8 @@ export async function walkTo (self, target, opts = {}, ctx = {}) {
   }
 }
 
-async function walkToUnguarded (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false } = {}, ctx = {}) {
-  let info = await walkToOnce(self, target, { arrive, budget, noTower, towerFallback, intent, waterRecover, noDig }, ctx)
+async function walkToUnguarded (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false, xz = false } = {}, ctx = {}) {
+  let info = await walkToOnce(self, target, { arrive, budget, noTower, towerFallback, intent, waterRecover, noDig, xz }, ctx)
   /* 🔴 2026-10-20（实机连撞两次）：vendor 的 `goal_reached` 是**全局**事件（`lib/goto.js:60` 不看 goal），
    *    别的寻路（自主层逃跑/跟随、或者上一次走路的残留 promise）到点时会顺手把**我这次** goto 一起
    *    resolve ⇒ 本次调用 45~85ms 就返回 goal-reached-elsewhere，人一步没动。以前只能让 AI 再手动叫
@@ -660,15 +660,26 @@ async function walkToUnguarded (self, target, { arrive = 1.6, budget = self.cfg.
    *    NoPath / stuck / call-over 重试是同参数撞墙，没意义。 */
   if (!info.arrived && info.reason === 'goal-reached-elsewhere' && self.msLeft() > 1_200) {
     try { ctx.stopPathing?.(self.requireBot()) } catch {}
-    const retried = await walkToOnce(self, target, { arrive, budget, noTower, towerFallback, intent, waterRecover, noDig }, ctx)
+    const retried = await walkToOnce(self, target, { arrive, budget, noTower, towerFallback, intent, waterRecover, noDig, xz }, ctx)
     info = { ...retried, retriedElsewhere: true }
+  }
+  /* 🔴 2026-10-23（P0-b，用户 m00634）：以前 `arrived:false` 只说"还差 N 格"（直线）——
+   *    AI 看不出"这条路还有 180 格、要叫四次"，于是每次都当最后一趟在等，走两趟没到就换目标。
+   *    够长（≥2 次调用）才补这一句，免得一两格的路多一句废话。 */
+  const estCalls = Number(info?.estCalls) || 0
+  if (!info.arrived && estCalls >= 2) {
+    const blocks = Math.max(0, Math.round(Number(info?.pathLen) || Number(info?.remaining) || 0))
+    info = {
+      ...info,
+      hint: `${info.hint ? info.hint + ' ' : ''}这条路还剩约 ${blocks} 格，按一次 10 秒（约 43 格）算**大约还要 ${estCalls} 次调用** —— 同参数接着叫就行，别换目标点。`,
+    }
   }
   const route = routeTrack(self, target, info)
   if (!route?.stalled) return { ...info, route }
   return { ...info, route, hint: `${info.hint ? info.hint + '\n' : ''}${route.hint}` }
 }
 
-async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false } = {}, ctx = {}) {
+async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false, xz = false } = {}, ctx = {}) {
   const b = self.requireBot()
   endHoverFlight(b)   // 悬停着就别想蹦/走：先恢复重力（否则走路全废，见 endHoverFlight）
   /* 🔴 2026-10-19 用户：「水下自救要让 ai 能开关」+「要默认开」——
@@ -794,6 +805,7 @@ async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveB
     towerFallback,
     noDig,
     intent,
+    xz,
     // 🔴 单次调用 ≤11 秒：预算收进 CALL_BUDGET_MS，且不超过本轮剩余时间。
     //    走不到不是失败，是"这一轮用完了"—— 再叫一次接着走。
     //    `msLeft()` 没设截止时刻时返回 CALL_MS（11000），用完时返回 0（别再 `||` 补 10 秒）。
@@ -1588,7 +1600,7 @@ export function moveBusyNow (b) {
  * @returns {{ promise: Promise<void>, stop: () => void, info: () => object }}
  */
 export function moveProgressWatcher (b, target, {
-  arrive = 1.6, ty = null,
+  arrive = 1.6, ty = null, xz = false,
   sampleMs = MOVE_SAMPLE_MS, stuckMs = MOVE_STUCK_MS,
   busyMaxMs = MOVE_BUSY_MAX_MS, progressEps = MOVE_PROGRESS_EPS,
   resetsOf = null, resetLimit = MOVE_RESET_LIMIT,
@@ -1597,9 +1609,19 @@ export function moveProgressWatcher (b, target, {
   clearTimer = (h) => clearInterval(h),
 } = {}) {
   const goalVec = new Vec3(target.x, ty ?? target.y, target.z)
-  const distOf = () => {
-    try { return b.entity.position.distanceTo(goalVec) } catch { return Infinity }
-  }
+  /* 🔴 2026-10-23（P0-a 配套）：`xz` 目标（`GoalXZ`）**只有水平两维** —— 那个 y 是猜的。
+   *    拿三维距离判"有没有靠近"时，人沿着同一条水平线在上下层乱爬也照样"在靠近"，
+   *    进度时钟一直被重置 ⇒ 长路上永远不判卡。xz 一律只量水平。 */
+  const distOf = xz
+    ? () => {
+        try {
+          const p = b.entity.position
+          return Math.hypot(p.x - target.x, p.z - target.z)
+        } catch { return Infinity }
+      }
+    : () => {
+        try { return b.entity.position.distanceTo(goalVec) } catch { return Infinity }
+      }
   let stopped = false
   let reject = null
   let best = distOf()
@@ -1811,7 +1833,7 @@ export function goalPointFor ({ target, ty, arriveUsed, portal = null } = {}) {
   }
 }
 
-export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null, noTower = true, towerFallback = true, intent = 'near', noDig = false } = {}, ctx = {}) {
+export async function walkPathfinder (self, target, { arrive = 1.6, budget = self.cfg.moveBudgetMs, budgetAsked = null, noTower = true, towerFallback = true, intent = 'near', noDig = false, xz = false } = {}, ctx = {}) {
   const b = self.bot
   endHoverFlight(b)   // 悬停着就别想蹦/走：先恢复重力（否则走路全废，见 endHoverFlight）
   /* 2026-10-18 审计 P1-2：意图决定"到"的标准（arrive / 允许高差） */
@@ -1880,18 +1902,32 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
   /* 🔴 2026-10-22 用户第三条反馈：目标格站不住（门框内侧、只有 1 格净空）时，
    *    `standableY` 只在本柱上下找，找不到就把不可站的 y 原样丢给 A* ⇒ 终点永不成立。
    *    `standPointFor` 会往水平邻域找最近的可站格，并把"改去哪"如实报回去。 */
-  const sp = standPointFor(b, target.x, target.y, target.z)
+  /* 🔴 2026-10-23（P0-a，用户 m00634「现有 mc_move 没有把 Pathfinder 的长程能力完整暴露给 AI」）：
+   *    `xz` = 只知道"去西边 200 格的那个村子"、**不知道高度**的长程目标。
+   *    这种目标不许过 `standPointFor`：它是按"这一格站不住"往水平邻域找邻居的 ——
+   *    长程目标的 y 本来就是猜的，让它挪一格等于**替 AI 改了目的地**（而且它只兜 ±1 格，
+   *    救不了 y 猜错 10 格的情况）。整列原样交给 A*（`GoalXZ`），到了哪一层由 pathfinder 自己定。 */
+  const sp = xz
+    ? {
+        x: Math.floor(Number(target.x)),
+        y: Math.floor(Number(target.y)),
+        z: Math.floor(Number(target.z)),
+        adjusted: false,
+        xz: true,
+      }
+    : standPointFor(b, target.x, target.y, target.z)
   const ty = sp.y
   /* 🔴 2026-10-19 用户：「还有把末影传送门视为危险方块」—— 真正的原因是**目标半径**：
    *    `GoalNear(…, max(0, round(arrive-0.6)))` 默认半径 1，人在门外 1 格就满足 ⇒
    *    "到了但没进去"。目标（或它旁边）是传送门时把半径收到 **0**（必须站在那一格上），
    *    并在到了之后补一步"迈进去"（`stepIntoPortal`）。 */
-  const portal = portalAt(b, Math.floor(target.x), ty, Math.floor(target.z))
+  /* xz 目标不判传送门：门是"站到某一格上"，那是三维精确目标（给 x/y/z 时才有意义）。 */
+  const portal = xz ? null : portalAt(b, Math.floor(target.x), ty, Math.floor(target.z))
   let gp = goalPointFor({ target: { x: sp.x, z: sp.z }, ty, arriveUsed, portal })
   /* 🔴 2026-10-22 用户第二条的另一半：`GoalNear` 半径默认 1 格是**三维球**，
    *    人站在半格里（起点被算作 y 下层）时起点本身就在球内 ⇒ A* 一步不走就报"到了"
    *    （`moved: 0` + `arrived: true` 的假成功）。离得还远就把半径收到 0，逼它真走。 */
-  if (!gp.portal && gp.radius > 0) {
+  if (!xz && !gp.portal && gp.radius > 0) {
     const horiz0 = Math.hypot(start.x - gp.x, start.z - gp.z)
     if (horiz0 > arriveUsed + 0.5) {
       try {
@@ -1902,7 +1938,14 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       } catch { /* 假 bot 没有真 goals：忽略 */ }
     }
   }
-  const goal = new goals.GoalNear(gp.x, gp.y, gp.z, gp.radius)
+  /* 🔴 2026-10-23（P0-a）：`xz` 用 **`goals.GoalXZ`（只锁水平两维）**替代 `GoalNear`。
+   *    原来全仓只有 `GoalNear` 一种 goal ⇒ AI 想"去那一带"必须编一个 y，
+   *    编高了 A* 就老老实实垫方块往上爬（"搭路搭到空气里"），编低了就 `NoPath`。
+   *    `GoalXZ` 让"到那一列"本身就是目标，y 由 pathfinder 自己决定怎么下去/怎么上去。 */
+  const GoalXZ = xz ? goals?.GoalXZ : null
+  const goal = GoalXZ
+    ? new GoalXZ(gp.x, gp.z)
+    : new goals.GoalNear(gp.x, gp.y, gp.z, xz ? 0 : gp.radius)
   // 地形分类（导航 P2，用户 m02868 的"地形分类 + 路径评分"）：
   // **只换权重，不换算法** —— 台阶上把挖穿调便宜一点、沟边把垫方块调便宜一点、
   // 岩浆边一格都不许往下跳。看错了顶多走回原来的路，不会让机器人做危险动作。
@@ -1965,10 +2008,21 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
      *    "成功"却离目标很远。旧代码据此报 `preempted`（"不是走不通"），模型于是一遍遍重发同一个
      *    到不了的点。这里把"空路径的 noPath"单独记下来。 */
     if (r?.status === 'noPath' && Array.isArray(r?.path) && r.path.length === 0) emptyNoPath = true
+    /* P0-b：只有非空路径才记 —— 空路径 = "一格邻居都生不出来"，那是没路，不是"还剩 0 格"。 */
+    if (Array.isArray(r?.path) && r.path.length > 0) {
+      pathLen = r.path.length
+      if (pathLenFirst == null) pathLenFirst = r.path.length
+    }
   }
   /* P1：**路径失效计数** —— vendor 会在 3.5s 无节点进展时 `resetPath('stuck')`，另外还有
    * `block_updated` / `path_stopped` / `goal_updated` 等理由。同一个 `goto` 里反复失效
    * = 这条路一直在被世界变化（别人放的方块、实体、岩浆流）打断，**光重算没用**。 */
+  /* 🔴 2026-10-23（P0-b，用户 m00634）：**路径量级** —— AI 以前只知道"直线还差几格"，
+   *    不知道"这条路还有多少格、大概要叫几次"，于是长路只能一次次试、两趟没到就换目标。
+   *    `path_update` 里的 `r.path` 就是**当前规划出来的剩余路径**（节点数≈还要走的格数），
+   *    这里只在内存里记账（首次规划长度 + 最后一次规划长度），**不改路线、不改目标**。 */
+  let pathLen = null                 // 最后一次规划出的剩余路径长度（节点数）
+  let pathLenFirst = null            // 这一次调用里第一次规划出的路径长度（用于判断"这趟本来就走不完"）
   let pathResets = 0                 // 本轮 goto（每一轮都归零）
   let pathResetsTotal = 0            // 整次调用
   const resetReasons = {}
@@ -2027,7 +2081,24 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
       goalAskedAt: sp.from ?? { x: Math.floor(Number(target.x)), y: Math.floor(Number(target.y)), z: Math.floor(Number(target.z)) },
     }
     : {}
+  /* 一次 `mc_move` 实际能走多少格：疾跑约 4.3 格/秒 × 10 秒预算 ≈ 43 格（已经把开门、
+   * 爬台阶、等方块更新这些停顿算进去了，偏保守）。只用来给 AI 一个**量级**（"这趟走不完、
+   * 还要三四次"），不是承诺 —— 所以措辞一律写"大约"。 */
+  const MOVE_BLOCKS_PER_CALL = 43
+  /** 还要几次调用：取"直线距离"和"规划出来的路径长度"里大的那个（长路上直线严重low估）。 */
+  const estCallsOf = () => {
+    try {
+      const p = b.entity.position
+      const d = Math.hypot(p.x - sp.x, p.z - sp.z)
+      const n = Math.max(d, Number(pathLen) || 0, Number(pathLenFirst) || 0)
+      return n >= 3 ? Math.max(1, Math.ceil(n / MOVE_BLOCKS_PER_CALL)) : 0
+    } catch { return 0 }
+  }
   const moveInfo = (opts = {}) => ({
+    ...(xz ? { xz: true } : {}),
+    ...(pathLenFirst ? { pathLenPlanned: pathLenFirst } : {}),
+    ...(pathLen ? { pathLen } : {}),
+    ...(() => { const n = estCallsOf(); return n ? { estCalls: n } : {} })(),
     ...(doorWalk ? { doorWalk } : {}),
     ...goalFix,
     ...(terrain.kind === 'flat' || terrain.kind === 'unknown' ? {}
@@ -2240,13 +2311,17 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     }
     const end = b.entity.position
     // 复核距离要用**收过的 ty**（不然目标 y 在半空时，明明站到它脚下了也会被判成"还差 9 格"）
-    const left = end.distanceTo(new Vec3(sp.x, ty, sp.z))
+    const left = xz
+      ? Math.hypot(end.x - sp.x, end.z - sp.z)      // xz：那个 y 是猜的，量三维等于量了个寂寞
+      : end.distanceTo(new Vec3(sp.x, ty, sp.z))
     /* P1：**到达判定分两轴看** —— 只看三维距离会漏掉一种假成功：水平已经到位、垂直却差着一两格
      * （站在目标正上方/正下方，比如目标格旁边有个坑），三维距离照样小于阈值 ⇒ 被报成"到了"。
      * 水平仍用 `arrive + 1.0`（宽松，允许"到附近"）；垂直卡在 ±1.5 格（一步台阶以内）。 */
     const horiz = Math.hypot(end.x - sp.x, end.z - sp.z)
     const vert = end.y - ty
-    const vertBad = vert < -vertTol || vert > vertTol
+    /* xz 目标不比高度：GoalXZ 本来就允许"到了那一列、站在哪一层都算"，
+     * 拿垂直差判"没到"会把 AI 逼着去猜 y（正好是 P0-a 要治的毛病）。 */
+    const vertBad = xz ? false : (vert < -vertTol || vert > vertTol)
     /* 🔴 2026-10-18 审计（用户转来的报告 Bug 1）：判"到没到"**不能先看距离、后看"是不是我的目标"**。
      *    vendor 的 `goal_reached` 是全局事件，别人的移动到点会把我这次 goto 一起 resolve；
      *    只要人恰好落在宽松距离（`arrive + 1.0`）以内，旧代码就直接报 arrived，绕过了 mine 诊断。
@@ -2254,8 +2329,11 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
      *    距离只用来区分"插件早报但确实是我的目标"。`mine === null` = 判不了（假 bot 没有真 Vec3）。 */
     const fp = typeof end?.floored === 'function' ? end.floored() : null
     const up1 = fp && typeof fp.offset === 'function' ? fp.offset(0, 1, 0) : null
-    const mine = !fp || typeof goal?.isEnd !== 'function' ? null
-      : Boolean(goal.isEnd(fp) || (up1 && goal.isEnd(up1)))
+    /* `GoalXZ` 的 `isEnd` 要求**真的踏进那一列**，比"到这一带"严得多：监工在圈外 1 格就报到达，
+     * 这里再拿 `isEnd` 一卡就又变成"插件说到了但还差 2 格"。xz 改用水平距离认账。 */
+    const mine = xz
+      ? horiz <= arriveUsed + 1.0
+      : (!fp || typeof goal?.isEnd !== 'function' ? null : Boolean(goal.isEnd(fp) || (up1 && goal.isEnd(up1))))
     // ⚠️ 现成的插件报"到了"，也**自己核一遍距离**：`goal_reached` 个别情况会早一点
     //    （目标格被占住 / 站在半砖上 / 只到附近），盲信就又变成"谎报 arrived"。
     /* 站在目标点上（≤0.5 格）就不必再问 `isEnd`：GoalNear 的半径本来就允许这一圈。
@@ -2410,7 +2488,9 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
     const end = b.entity.position
     const d = deltaOf(end)
     const moved = d.moved
-    const remaining = Number(end.distanceTo(new Vec3(target.x, ty, target.z)).toFixed(2))
+    const remaining = Number((xz
+      ? Math.hypot(end.x - sp.x, end.z - sp.z)
+      : end.distanceTo(new Vec3(target.x, ty, target.z))).toFixed(2))
     /* P0-1：`mcStuck` = 采样器判卡住（脱困阶梯走完还没进展）—— 这跟"时间用完了"、
      * "被抢占"、"没路可走"都是**不同结局**，必须分开报，否则模型会继续原地重发。 */
     const exhausted = Boolean(e?.mcStuck)

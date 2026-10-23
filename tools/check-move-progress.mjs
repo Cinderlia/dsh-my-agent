@@ -365,6 +365,15 @@ function mkSelf (bot, budgetMs = 20000) {
             return Math.hypot(dx, dz) <= this.range + 3.0 && Math.abs(dy) <= 1.5
           }
         },
+        /* 🔴 2026-10-23（P0-a）：vendor 的 `GoalXZ` —— **只有水平两维**，没有 y、没有半径。
+         *    这里照它的真实形状做桩：`isEnd` 只看 x/z，用来钉住"walkPathfinder 认的是哪一类 goal"。 */
+        GoalXZ: class {
+          constructor (x, z) { this.x = x; this.z = z }
+          isEnd (p) {
+            const q = p?.position ?? p
+            return Math.floor(q.x) === this.x && Math.floor(q.z) === this.z
+          }
+        },
       },
       Movements: class {},
     },
@@ -526,7 +535,7 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(/const onReset = \(reason\) => \{[\s\S]{0,120}?pathResets\+\+/.test(src), 'onReset 里真的在数')
   ok(/REASON_TEXT\[k\] \?\? k/.test(src), '报出去的理由也翻成人话（不漏内部字符串）')
   // ── P1：到达判定分两轴 ──
-  ok(/const vertBad = vert < -vertTol \|\| vert > vertTol/.test(src), '🔴 垂直窗口按意图给（near ±1.5 / stand ±0.6）')
+  ok(/const vertBad = xz \? false : \(vert < -vertTol \|\| vert > vertTol\)/.test(src), '🔴 垂直窗口按意图给（near ±1.5 / stand ±0.6）；xz 目标没有 y，不讲垂直')
   ok(/if \(!onSpot && \(mine === false \|\| left > arriveUsed \+ 1\.0 \|\| vertBad\)\)/.test(src), '🔴 高度不对也算"没到"（水平到了、人却在目标上下）')
   /* 2026-10-23 审计 A[10]：`sp` 是方块**角**坐标，站在那一格正中间水平就已 0.707 ⇒ `left <= 0.5` 是死条件。
    * 现在 onSpot 按**格心**单独量（`cHoriz`），`left`/`horiz` 口径不动。 */
@@ -575,7 +584,7 @@ section('⑨ noTower（逃跑时关掉"原地垫高"）')
   ok(/if \(noTower\) mv\.allow1by1towers = false/.test(src), '🔴 关的是 allow1by1towers 这一个开关')
   ok(!/mv\.scafoldingBlocks = \[\]/.test(src), '🔴 绝不清空 scafoldingBlocks（那会把 1×1 柱子的 move 一起剪掉，掉坑里出不来）')
   /* 2026-10-22：walkTo 已拆成「包装层 + walkToUnguarded」，断言改查后者（同样带 towerFallback）。 */
-  ok(src.includes(`noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false } = {}, ctx = {})`), 'walkTo 也接 noTower，且**默认 true**（不垫柱 —— 2026-10-18 实机：垫柱放错就摔死）')
+  ok(src.includes(`noTower = true, towerFallback = true, intent = 'near', waterRecover, noDig = false, xz = false } = {}, ctx = {})`), 'walkTo 也接 noTower，且**默认 true**（不垫柱 —— 2026-10-18 实机：垫柱放错就摔死）')
   /* 🔴 2026-10-17（用户："自动战斗的优先级不应该比 AI 高"）：战斗层**不再自己撤退**，
    *    所以"撤退要关掉垫脚"这条已经没有对象了 —— 反过来要守住"不许再出现撤退执行"。 */
   const atk = read('../src/attack.mjs')
@@ -1783,8 +1792,11 @@ section('⑲ 目标落点修正 / 起点半格修正')
     '站 farmland/箱子顶这类半格上 ⇒ 起点取上一格（不再嵌在方块里）')
   ok(standFeetY(b4, { x: 0.5, y: 64.0, z: 0.5 }) === 64, '正常站在空气格里 ⇒ 起点不变')
   /* ⑤ 接线：walkPathfinder 真的用上了 */
-  ok(/const sp = standPointFor\(b, target\.x, target\.y, target\.z\)/.test(src),
-    'walkPathfinder 真的用了 standPointFor')
+  /* 2026-10-23（P0-a）之后`standPointFor` 成了 `xz ? … : standPointFor(…)` 的 else 分支 ——
+   * 断言跟着改形状，**语义没变**（不给 xz 时仍走它）。 */
+  ok(/: standPointFor\(b, target\.x, target\.y, target\.z\)/.test(src),
+    'walkPathfinder 真的用了 standPointFor（xz 目标是唯一例外）')
+  ok(/const sp = xz\n?\s*\?/.test(src) || /const sp = xz/.test(src), 'xz 目标不过 standPointFor（不替 AI 改目的地）')
   ok(/const startY = standFeetY\(b, start\)/.test(src), 'walkPathfinder 真的修正了起点 y')
   ok(/goalAdjusted/.test(src) && /goalAskedAt/.test(src), '目标被挪过会如实报回去')
   ok(/tightened: true/.test(src) && /radius: 0/.test(src),
@@ -1794,6 +1806,111 @@ section('⑲ 目标落点修正 / 起点半格修正')
   ok(/mv\.canOpenDoors = true/.test(plug), 'A* 规划里门不是墙（canOpenDoors 已开）')
   ok(/mv\.openable\.add\(blk\.id\)/.test(plug), '木门/活板门/栅栏门进了 openable')
   ok(/openNearbyDoor\(b\)/.test(src), '执行层每 400ms 找身边关着的门按一下')
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * ⑨ P0-a / P0-b（用户 m00634 原话：「你的首要问题很可能不是缺少新的移动项目，
+ *    而是现有 mc_move 没有把 Pathfinder 的长程能力完整暴露给 AI」）
+ *
+ * ① **长程目标只给 x/z**（`GoalXZ`）：以前全仓只有 `GoalNear`，AI 必须编一个 y ——
+ *    编高了 A* 老老实实垫方块上天，编低了直接 NoPath；
+ * ② **报路径量级**（`pathLen` / `estCalls`）：以前只说"直线还差几格"，
+ *    AI 看不出"这趟本来就走不完"，走两趟没到就换目标。
+ * ═══════════════════════════════════════════════════════════════════════ */
+section('⑨ P0-a xz 目标 / P0-b pathLen·estCalls')
+{
+  /* ① 采样器：xz 只看水平 —— 人沿着目标那一列上下乱爬，不是"在靠近" */
+  const clock = fakeClock()
+  const b = mkProbe({ x: 0, y: 64, z: 0 })
+  const tgt = { x: 10, y: 70, z: 0 }
+  /* ⚠️ 不能用 `watchOpts()`：它把 `ty` 钉成 64，会把"目标 y=70"盖掉，三维口径就测不出来了。 */
+  const base = { arrive: 1.6, ty: 70, now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer }
+  const w3 = moveProgressWatcher(b, tgt, base)                      // 三维口径
+  const wX = moveProgressWatcher(b, tgt, { ...base, xz: true })
+  let err3 = null, errX = null
+  w3.promise.catch((e) => { err3 = e })
+  wX.promise.catch((e) => { errX = e })
+  clock.onTick = () => {
+    /* 水平一动不动、只有 y 一路靠近目标 y=70（3D 距离确实在变小） */
+    const step = Math.min(70, b.entity.position.y + 1)
+    b.entity.position = new Vec3(0, step, 0)
+  }
+  await clock.advance(MOVE_STUCK_MS + MOVE_SAMPLE_MS * 2)
+  w3.stop(); wX.stop()
+  ok(err3 === null, '三维口径：只有高度在靠近也算"有进展"（老行为，不动）')
+  ok(errX?.mcStuck === true, '🔴 xz 口径：只有高度在靠近 ⇒ 照样判卡（不然长路上永远不认输）')
+  ok(errX && Math.abs(Number(errX.remaining) - 10) < 0.01,
+    '🔴 xz 的"还剩几格"是水平距离（10 格），不是三维 11.66', String(errX?.remaining))
+  ok(clock.live === 0, '两个采样器的定时器都清干净')
+}
+{
+  /* ② walkPathfinder：goal 必须是 GoalXZ（没有 y）、结果带 xz / pathLen / estCalls */
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  const handlers = new Map()
+  bot.on = (ev, fn) => { handlers.set(ev, fn) }
+  bot.removeListener = (ev) => { handlers.delete(ev) }
+  const goalsSeen = []
+  const goto0 = bot.pathfinder.goto.bind(bot.pathfinder)
+  bot.pathfinder.goto = (g) => { goalsSeen.push(g); return goto0(g) }
+  const self = mkSelf(bot)
+  const ctx = mkCtx(self, clock)
+  const target = { x: 200, y: 64, z: 0 }        // AI 只知道"去东边 200 格"，y 是随手给的
+  let sentPath = false
+  clock.onTick = () => {
+    if (!sentPath && handlers.get('path_update')) {
+      sentPath = true
+      /* 一次 `path_update` 就带整条剩余路径 —— 200 个节点 */
+      handlers.get('path_update')({ status: 'success', path: Array.from({ length: 200 }, () => ({ x: 0, y: 64, z: 0 })) })
+    }
+    const p = bot.entity.position
+    const d = Math.hypot(p.x - target.x, p.z - target.z)
+    if (d <= 1.6) { bot.settleGoto((q) => q.resolve()); return }
+    bot.entity.position = new Vec3(p.x + 0.8, 64, p.z)
+  }
+  const r = await walkPathfinder(self, target, { arrive: 1.6, budget: 20000, xz: true }, ctx)
+  clock.stopPump()
+  ok(goalsSeen.length >= 1, '真的下发了 goal', String(goalsSeen.length))
+  const g0 = goalsSeen[0]
+  ok(g0 && g0.constructor?.name === 'GoalXZ', '🔴 xz 目标是 GoalXZ（不是 GoalNear）', String(g0?.constructor?.name))
+  ok(g0 && g0.x === 200 && g0.z === 0, 'GoalXZ 收到的是原样的 x/z（没被 standPointFor 挪一格）', JSON.stringify({ x: g0?.x, z: g0?.z }))
+  ok(g0 && g0.y === undefined && g0.range === undefined, '🔴 GoalXZ 上**没有 y、没有半径**（高度交给寻路器自己定）', JSON.stringify(Object.keys(g0 ?? {})))
+  ok(r.xz === true, '结果里带 xz:true（模型知道自己这次是"到那一列"）')
+  ok(r.pathLenPlanned === 200, '🔴 pathLenPlanned = 首次规划出来的路径长度（200 节点）', String(r.pathLenPlanned))
+  ok(r.estCalls === 5, '🔴 estCalls = ceil(200 / 43) = 5（一次 10 秒约 43 格）', String(r.estCalls))
+  ok(r.arrived === true && r.remaining < 2.2, '到达判定按水平距离（GoalXZ 没半径，不能拿 isEnd 卡）', JSON.stringify({ a: r.arrived, rem: r.remaining }))
+}
+{
+  /* ③ 不给 xz 时一切照旧：还是 GoalNear（别把老路改了） */
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  const self = mkSelf(bot)
+  const ctx = mkCtx(self, clock)
+  const target = { x: 20, y: 64, z: 0 }
+  clock.onTick = () => {
+    const p = bot.entity.position
+    if (p.distanceTo(new Vec3(target.x, 64, target.z)) <= 1.6) { bot.settleGoto((q) => q.resolve()); return }
+    bot.entity.position = new Vec3(p.x + 0.8, 64, p.z)
+  }
+  const r = await walkPathfinder(self, target, { arrive: 1.6, budget: 20000 }, ctx)
+  clock.stopPump()
+  ok(r.xz === undefined, '不给 xz 就不报 xz（不无中生有）')
+  ok(r.estCalls === undefined, '没规划出长路就不报 estCalls（短程不塞废话）')
+  ok(r.arrived === true, '老路照旧到达')
+}
+{
+  /* ④ 工具面：参数、描述、firewall（fly/boat 是三维的） */
+  const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  ok(/xz: \{ type: 'boolean'/.test(idx), 'mc_move 有 xz 参数')
+  ok(/只给 x\/z 就够/.test(idx) && /GoalXZ/.test(idx), '描述里点名"长程只给 x/z"与 GoalXZ')
+  ok(/estCalls/.test(idx) && /pathLen/.test(idx), '描述里点名会报 pathLen / estCalls')
+  ok(/xz: wantsXZ/.test(idx), 'xz 真的传给了 walkTo（不是只在参数表里挂个名）')
+  ok(/fly 是三维直飞，必须给 y/.test(idx) && /boat 要有终点高度/.test(idx),
+    'fly / boat 不收 xz（说清楚，而不是静默按 walk 走）')
+  ok(/const wantsXZ = !yGiven/.test(idx), '🔴 只给 x/z 就自动按列算（不逼模型加参数）')
+  ok(/const yGiven = args\.y !== undefined && args\.y !== null/.test(idx), '🔴 给了 y 就以 y 为准（2026-10-23 修：xz:true 曾把同时给的 y 静默吃掉）')
+  ok(/给了 y 就按 y 走/.test(idx), '描述里写明 y 优先，免得模型以为 y 不能用了')
+  ok(/MOVE_BLOCKS_PER_CALL = 43/.test(read('../src/movement.mjs')), '一起算"还有几次调用"的换算常量在 movement.mjs 里')
 }
 
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)

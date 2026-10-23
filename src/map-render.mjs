@@ -563,7 +563,41 @@ export function parseXZ (t) {
  *            solidRun:number,firstGap:object|null,gaps:Array,unloaded:number,complete:boolean,
  *            here:object,above:object}}
  */
-export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX, up = null } = {}) {
+/* 🔴 2026-10-23（用户 m00855「不是有 map 的竖轴吗」）：竖列图的纵向窗口一直是以**我脚下**为基准的
+ *    （`from = 脚 y - 1`、头顶从 `脚 y + 2` 往上）。所以它能回答"我这一层上下那一列是什么"，
+ *    却回答不了"**远处那一列的地表在多高**"。要回答后者，得先把那一列的地表扫出来 —— 就是下面这个。 */
+export const COLUMN_SCAN_TOP = 320
+export const COLUMN_SCAN_BOTTOM = -64
+
+/**
+ * 某一列的**地表**在第几格（自上而下第一个不是空气的方块）。
+ * @returns {{x:number,z:number,y:number|null,name:string|null,kind:string,loaded:boolean}}
+ *   `loaded:false` = 那一列的区块**没加载**（`blockAt` 返回 null）—— 这时 y 是"不知道"，不是"没有"。
+ */
+export function surfaceYOf (b, { x = null, z = null, yTop = COLUMN_SCAN_TOP, yBottom = COLUMN_SCAN_BOTTOM } = {}) {
+  const ok = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v))
+  const fx = ok(x) ? Math.floor(Number(x)) : Math.floor(b?.entity?.position?.x ?? 0)
+  const fz = ok(z) ? Math.floor(Number(z)) : Math.floor(b?.entity?.position?.z ?? 0)
+  /* 🔴 2026-10-23 踩过的坑：y=320 在 1.18+ 已经是世界外（-64..319），而 `blockAt` 对**世界外**也返回 null ——
+   *    照 COLUMN_SCAN_TOP=320 起扫，第一格就是 null，会被当成"区块没加载"直接报"读不到"。
+   *    所以起点先按当前维度的高度夹回来（mineflayer 的 `bot.game` 里有 minY / height）。 */
+  const dimTop = (Number.isFinite(b?.game?.minY) && Number.isFinite(b?.game?.height))
+    ? Number(b.game.minY) + Number(b.game.height) - 1
+    : COLUMN_SCAN_TOP
+  const top = Math.floor(ok(yTop) ? Math.min(Number(yTop), dimTop) : dimTop)
+  const bot = Math.floor(ok(yBottom) ? Number(yBottom) : COLUMN_SCAN_BOTTOM)
+  for (let y = top; y >= bot; y--) {
+    const blk = b?.blockAt?.(new Vec3(fx, y, fz))
+    if (blk == null) return { x: fx, z: fz, y: null, name: null, kind: 'unloaded', loaded: false }
+    const kind = columnKindOf(blk.name)
+    if (kind === 'air') continue
+    return { x: fx, z: fz, y, name: blk.name, kind, loaded: true }
+  }
+  /* 整根扫完全是空气：世界高度范围内没有地面（虚空）—— 仍然是"读到了"，只是没有地表 */
+  return { x: fx, z: fz, y: null, name: null, kind: 'air', loaded: true }
+}
+
+export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX, up = null, anchorY = null } = {}) {
   const feet = b?.entity?.position
   /* 🔴 2026-10-15（踩过的坑）：**`Number(null)` 是 `0`，而 `Number.isFinite(0)` 为真** ——
    *    直接写 `Number.isFinite(Number(x))` 会让"没传"变成"传了 0"：不传 x/z 时永远看 (0,0)、
@@ -571,7 +605,9 @@ export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, m
   const given = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v))
   const fx = given(x) ? Math.floor(Number(x)) : Math.floor(feet?.x ?? 0)
   const fz = given(z) ? Math.floor(Number(z)) : Math.floor(feet?.z ?? 0)
-  const fy = Math.floor(feet?.y ?? 0)
+  /* 🔴 2026-10-23：`anchorY` 给了就把它当"脚"（查**别的列**时 = 那一列地表上面那一格），
+   *    这样往下扫的起点就是"那一列的地表"，而不是我脚下 —— 否则远程查列只会看到我自己这一层。 */
+  const fy = given(anchorY) ? Math.floor(Number(anchorY)) : Math.floor(feet?.y ?? 0)
   /* 默认从**脚底那一格**（`fy - 1`，也就是托着你的那块）开始往下 —— 从 `fy` 开始的话
    * 第一格永远是你自己站的空气，看着像"脚底下就是空的"。 */
   const from = given(yTop) ? Math.floor(Number(yTop)) : fy - 1
@@ -673,6 +709,7 @@ export function columnOf (b, { x = null, z = null, yTop = null, yBottom = -24, m
     unloaded,
     complete: unloaded === 0,
     mode: 'column',
+    ...(given(anchorY) ? { anchorY: fy } : {}),
   }
 }
 
@@ -739,9 +776,17 @@ function aboveLines (col) {
 export function columnText (col) {
   if (!col || !col.layers?.length) return '🕳 竖列图：这一列一格都没读到（区块没加载？）'
   const where = (col.x === undefined) ? '' : `(${col.x}, ${col.z})`
+  /* 🔴 2026-10-23：查**别的列**时，"脚底"这个词会骗人 —— 那不是你的脚，是那一列的地表。 */
+  const mine = col.mine !== false
+  const footWord = mine ? '脚底那一格' : '那一列地表那一格'
   /* 抬头里把"往上也看了"写出来 —— 只报脚下的时候，AI 会以为这就是全部信息 */
   const upSpan = col.above?.layers?.length ? `，头顶看 y=${col.above.from}..${col.above.to}` : ''
-  const out = [`🕳 竖列 ${where}：脚底 y=${col.feetY}，从 y=${col.from} 往下扫到 y=${col.to}${upSpan}`]
+  const out = [mine
+    ? `🕳 竖列 ${where}：脚底 y=${col.feetY}，从 y=${col.from} 往下扫到 y=${col.to}${upSpan}`
+    : `🕳 竖列 ${where}：**那一列的地表在 y=${col.surfaceY}**（不是你的脚下），从 y=${col.from} 往下扫到 y=${col.to}${upSpan}`]
+  if (!mine && col.surfaceY != null) {
+    out.push(`  📍 要落上去就 ` + '`' + `mc_move {x: ${col.x}, y: ${col.surfaceY + 1}, z: ${col.z}}` + '`' + `（站到地表上面那一格）—— 这就是"该给哪个 y"的答案。`)
+  }
   /* 先说你**自己**那一格是什么 —— 它不在下面那串 runs 里（扫的是脚底往下），
    * 但"泡在水里/岩浆里"和"站在空气里"完全是两回事，不说清就会得出"可以放心往下挖"。 */
   const hk = col.here?.kind
@@ -759,7 +804,7 @@ export function columnText (col) {
   /* `unloaded` 与"空"是两回事：没加载 = **不知道**，不能说成"托不住你"（那是断言世界的样子） */
   const top = col.runs?.[0]
   if (top?.kind === 'unloaded') {
-    out.push('  ⚠️ 脚底那一格**没加载**（不是"空的"）—— 先等一下区块 / 挪一步再看，别凭这个下判断。')
+    out.push(`  ⚠️ ${footWord}**没加载**（不是"空的"）—— 先等一下区块 / 挪一步再看，别凭这个下判断。`)
   } else if (col.solidRun === 0) {
     /* 脚底那格本身就托不住：也要点名是空的 / 水 / 岩浆 —— "掉下去"和"掉进岩浆"不是一回事 */
     const k = top?.kind ?? 'air'
@@ -768,7 +813,7 @@ export function columnText (col) {
     const tail = k === 'lava' ? '**先挪一步，别在这上面挖**。'
       : k === 'water' ? (col.here?.kind === 'water' ? '**你自己就在水里** —— 先游出去，别在这往下挖。' : '别往下挖，水会灌下来。')
         : '别往下挖，先挪一步。'
-    out.push(`  ${GAP_WARN[k] ?? '⚠️'} 脚底那一格是 ${what}，托不住你 —— ${tail}`)
+    out.push(`  ${GAP_WARN[k] ?? '⚠️'} ${footWord}是 ${what}，托不住你 —— ${tail}`)
   } else if (!col.firstGap) {
     /* 🔴 判"可以放心往下挖"之前先看你自己站在哪 —— 泡在水里 / 岩浆里时这句话会把人坑死。 */
     const inLava = col.here?.kind === 'lava'

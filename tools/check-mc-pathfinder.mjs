@@ -262,8 +262,9 @@ const seqSrc = readFileSync(join(HERE, '..', 'src', 'sequence.mjs'), 'utf8')
 ok(/noDig: s\.noDig !== false/.test(seqSrc), 'mc_sequence 的 move 步骤默认也不挖（和 mc_move 一致）')
 ok(countOf(mcIndexSrc, 'noDig, intent: intentArgOf(args.intent)') === 2,
   'noDig 传进了两条 walkTo（walk 与「swim 给坐标」那条）', String(countOf(mcIndexSrc, 'noDig, intent: intentArgOf(args.intent)')))
-ok(countOf(mvSrc, 'noDig = false } = {}, ctx = {})') === 3,
-  'walkTo / walkToOnce / walkPathfinder 三个函数都收 noDig', String(countOf(mvSrc, 'noDig = false } = {}, ctx = {})')))
+ok(countOf(mvSrc, 'noDig = false, xz = false } = {}, ctx = {})') === 3,
+  'walkToUnguarded / walkToOnce / walkPathfinder 三个函数都收 noDig（连 xz 一起逐层转发）',
+  String(countOf(mvSrc, 'noDig = false, xz = false } = {}, ctx = {})')))
 ok(countOf(mvSrc, 'if (noDig) mv') === 3,
   '三处新建 Movements 都关掉 canDig（出厂 / 垫柱 / 地形重估）', String(countOf(mvSrc, 'if (noDig) mv')))
 ok(/const carveAllowed = !noDig &&/.test(mvSrc), '卡住时"挖开台阶"的补救也因 noDig 关掉')

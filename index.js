@@ -44,7 +44,7 @@ import { EXPRESS_DIR, OUT_DIR, expressRootOf, outRootOf, parseExpressPath, safeE
 import { Watchdog, WATCH_DEFAULTS } from './src/watchdog.mjs'
 /* 2026-10-15：`mc_map` 默认改成"脚下方块那一层"（地板层视图）—— 直接调 `src/map-render.mjs`
  * 的新函数，**不往 `core.mjs` 加薄包装**（那个文件已经贴着 `check-module-load` 的 1000 行上限）。 */
-import { floorMapOf, navSummaryOf, hazardCellsOf, columnOf, columnText, parseXZ } from './src/map-render.mjs'
+import { floorMapOf, navSummaryOf, hazardCellsOf, columnOf, columnText, parseXZ, surfaceYOf } from './src/map-render.mjs'
 /* 2026-10-15：事件循环延迟 / CPU 占用监测（用户「异步与多线程优化」方案第 1 步）——
  * **用数据决定要不要上 Worker 线程**，`mc_diag` 的 `perf` 段直接给结论。 */
 import { perfWrap, perfSnapshot, perfText, perfReset } from './src/perf-monitor.mjs'
@@ -3481,7 +3481,9 @@ export function apply(ctx, rawConfig) {
     description: '看周围地形。**默认给"脚下方块那一层"**（地板层图：这一层哪里是实心地面、哪里是坑/岩浆/未加载）：'
       + '· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载。'
       + 'mode="floor"（默认）/ "surface"（地表：@ 我 · . 沙 · " 草木 · T 木构 · : 石/建筑 · _ 土/农田）'
-      + '/ "column"（竖列：只看你脚下这一格，往下几格实心、哪里开始是空的、头顶什么封着、跳不跳得起来）。'
+      + '/ "column"（竖列：往下几格实心、哪里开始是空的、头顶什么封着、跳不跳得起来）。'
+      + '🔴 竖列可以查**任意一列**：给 `target:"x,z"` 就看那一列，并报出**那一列的地表 y**'
+      + '（跑远路前先探一眼，比猜 y 靠谱）；读不到 = 区块没加载，别猜。'
       + 'format="image" 出**俯视图像**（有视觉的模型能直接看，并落盘）。'
       + '🔴 想让 用户 看到图：见 out 参数。'
       + '字符图省 token 且坐标精确；形状/外观问题用图像。',
@@ -3530,10 +3532,27 @@ export function apply(ctx, rawConfig) {
        *    不参与 radius / legend / 导航摘要那一套。`target` 用 `parseXZ` 定 x/z（`"12,-4"` 或 `"12,63,-4"`），
        *    不给就用机器人自己站的那一格；`yBottom`（默认 -24）就是往下看多深；`format` 忽略，恒出字符。 */
       if (mode === 'column') {
-        const p = parseXZ(args.target)
+        const tgt = parseXZ(args.target)
+        /* 🔴 2026-10-23（用户 m00855）：给了**别的列**的 x/z ⇒ 纵向窗口改以"那一列的地表"为基准，
+         *    并顺手报出地表 y —— 这就是"跑远路该给哪个 y"的答案。读不到 = 区块没加载，那就别猜。 */
+        const feetPos = sess.bot.requireBot()?.entity?.position
+        const mineXZ = !tgt || (Math.floor(tgt.x) === Math.floor(feetPos?.x ?? 0) && Math.floor(tgt.z) === Math.floor(feetPos?.z ?? 0))
+        let sf = null
+        if (!mineXZ) {
+          sf = surfaceYOf(sess.bot.requireBot(), { x: tgt.x, z: tgt.z })
+          if (!sf.loaded) {
+            return {
+              mode: 'column', x: Math.floor(tgt.x), z: Math.floor(tgt.z), surfaceY: null, loaded: false,
+              text: `🕳 竖列 (${Math.floor(tgt.x)}, ${Math.floor(tgt.z)})：那一列**还没加载**（区块没到）—— 读不到地表高度。`
+                + '别猜 y：按 xz 走过去（`mc_move {x, z}`），到了那一带再看。',
+            }
+          }
+        }
         const col = columnOf(sess.bot.requireBot(), {
-          x: p?.x ?? null, z: p?.z ?? null, yBottom: args.yBottom, up: args.up,
+          x: tgt?.x ?? null, z: tgt?.z ?? null, yBottom: args.yBottom, up: args.up,
+          anchorY: sf ? sf.y + 1 : null,
         })
+        const view = { ...col, mine: mineXZ, surfaceY: sf ? sf.y : null }
         return {
           mode: 'column', x: col.x, z: col.z, feetY: col.feetY, from: col.from, to: col.to,
           solidRun: col.solidRun, firstGap: col.firstGap, gaps: col.gaps, hazards: col.hazards,
@@ -3541,7 +3560,8 @@ export function apply(ctx, rawConfig) {
           /* 头顶：跳不跳得起来 / 封着什么 / 上面是不是水或岩浆（2026-10-18 用户需求） */
           above: col.above,
           unloaded: col.unloaded, complete: col.complete, runs: col.runs, layers: col.layers,
-          text: columnText(col),
+          ...(mineXZ ? {} : { mine: false, surfaceY: sf.y, surfaceBlock: sf.name }),
+          text: columnText(view),
         }
       }
       /* `floor` 走新函数（直接 import `src/map-render.mjs`，不经过 `core.mjs` 的薄包装 —— 那文件贴着 1000 行上限）；
@@ -3715,11 +3735,17 @@ export function apply(ctx, rawConfig) {
       + '要挖穿挡路的方块必须显式 `noDig:false`（`mode:"walk-nodig"` 恒不挖）。\n'
       + '🔴 **默认不垫 1×1 柱**（`allowTower:true` 才允许）—— 会被服务端拒、摔死；上高处走斜台阶。'
       + '垫台阶会报 `pillaredWith`/`held`。'
-      + '🧭 `intent` 决定"到"的标准：near（默认）/ stand（站那格上）/ interact（够得着，2.2 格）/ same-level（同一层）。',
+      + '🧭 `intent` 决定"到"的标准：near（默认）/ stand（站那格上）/ interact（够得着，2.2 格）/ same-level（同一层）。\n'
+      + '🔴 **长程赶路只给 x/z 就行**（`xz:true`）：不必猜高度，寻路按"到那一列"算'
+      + '（只锁水平两维，哪一层由寻路器自己定）—— 去几十上百格外的村子/矿口/传送点用这个，'
+      + '别再随便编一个 y 把自己挂在半空里。**给了 y 就按 y 走（y 优先），xz 只在没给 y 时才算数。**\n'
+      + '🔴 没走到时会报 `pathLen`（规划出来的剩余路径还有几格）和 `estCalls`（大约还要几次调用，'
+      + '一次 10 秒 ≈ 43 格）—— 用它判断"这趟走不完"还是"这条路不通"，别走两趟没到就换目标。',
     parameters: {
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       mode: { type: 'string', description: 'walk / walk-nodig / fly / jump / swim / boat（创造缺省 fly；jump 不需坐标；swim 不给坐标=只上浮换气；boat 要先上船）' },
       noDig: { type: 'boolean', description: '走路时挖不挖方块（**默认不挖**）；要挖穿挡路的写 false' },
+      xz: { type: 'boolean', description: '长程赶路用：只给 x/z 就够（目标 y 不用猜，按"到那一列"算 GoalXZ）；**给了 y 就按 y 走，这个开关被忽略**；fly/boat 仍必须给 y' },
       budgetMs: { type: 'number', description: 'walk/swim 最长时间（≤10000）；swim 上浮默认 9000' },
       waterRecover: { type: 'boolean', description: '游不动时自动找出口（默认 true）' },
       allowTower: { type: 'boolean', description: '允许垫 1×1 柱往上爬（默认不许，容易摔死）' },
@@ -3744,17 +3770,34 @@ export function apply(ctx, rawConfig) {
         }
         return { ...withOutcome(await sess.bot.swimUp({ hold: callBudget(args.budgetMs ?? 9_000) }), { expect: 'moved' }), ...aroundOf(sess) }
       }
-      if (args.x === undefined || args.y === undefined || args.z === undefined) {
-        throw new Error('walk/fly 需要 x/y/z；只想跳一下请给 mode:"jump"，在水里上浮请给 mode:"swim"')
+      /* 🔴 2026-10-23（P0-a，用户 m00634）：允许**只给 x/z** —— 长程目标的 y 是猜的，
+       *    以前强制三维点等于逼 AI 编一个高度（编高就垫方块上天、编低就 NoPath）。
+       *    `xz:true` 或"给了 x/z 没给 y"都按"到那一列"算；替换成的 y 只是**当天的脚下高度**，
+       *    留给 watcher / 兜底逻辑参考，不参与 goal。 */
+      /* 🔴 2026-10-23 修（用户 m00786「为什么现在用不了 y」）：**给了 y 就以 y 为准**。
+       *    以前 `xz:true` 会把同时给的 y 静默吃掉（换成脚下高度），等于 y 白写；
+       *    现在只有"没给 y"才按 xz 走，给了 y 就按三维（GoalNear），写没写 xz 都一样。 */
+      const yGiven = args.y !== undefined && args.y !== null
+      const wantsXZ = !yGiven
+      if (args.x === undefined || args.z === undefined) {
+        throw new Error('walk/fly 需要 x/z；只想跳一下请给 mode:"jump"，在水里上浮请给 mode:"swim"')
       }
-      const target = coordOf(args)
+      const target = wantsXZ
+        ? { x: numOf(args.x, 'x'), y: Math.floor(Number(sess.bot.bot?.entity?.position?.y ?? 64)), z: numOf(args.z, 'z') }
+        : coordOf(args)
       const creative = sess.bot.bot?.game?.gameMode === 'creative'
       const use = (mode === 'walk-nodig' ? 'walk' : mode) || (creative ? 'fly' : 'walk')
       // 🔴 2026-10-08 审计⑤：fly 以前不传 budgetMs —— 写 budgetMs:2000 也照样跑满 10 秒
-      if (use === 'fly') return { ...withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
-      if (use === 'boat') return { ...withOutcome(await sess.bot.driveBoat(target, { arrive: args.intent === 'stand' ? 1.2 : 2, budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
+      if (use === 'fly') {
+        if (wantsXZ) throw new Error('fly 是三维直飞，必须给 y（xz:true 只对 walk 有效）')
+        return { ...withOutcome(await sess.bot.flyTo(target.x, target.y, target.z, { budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
+      }
+      if (use === 'boat') {
+        if (wantsXZ) throw new Error('boat 要有终点高度，必须给 y（xz:true 只对 walk 有效）')
+        return { ...withOutcome(await sess.bot.driveBoat(target, { arrive: args.intent === 'stand' ? 1.2 : 2, budget: callBudget(args.budgetMs) }), { expect: 'moved' }), ...aroundOf(sess) }
+      }
       if (use !== 'walk') throw new Error(`未知 mode："${use}"（可用 walk / walk-nodig / fly / jump / swim / boat）`)
-      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: intentArgOf(args.intent), waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined }), { expect: 'moved' }), ...aroundOf(sess) }
+      return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: intentArgOf(args.intent), waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined, xz: wantsXZ }), { expect: 'moved' }), ...aroundOf(sess) }
     },
   }))
 

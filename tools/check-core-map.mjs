@@ -59,7 +59,7 @@ const { McBot, glyphOf } = await import(new URL('../src/core.mjs', import.meta.u
 /* 2026-10-15：`mc_map` 默认改成"脚下方块那一层" —— 新函数直接从 map-render.mjs 取
  *（工具层就是这么 import 的，没经过 core.mjs 的薄包装）。 */
 const { floorMapOf, floorCell, floorKeyOf, gridToWorld, hazardCellsOf, navSummaryOf,
-  columnOf, columnText, columnKindOf, parseXZ } =
+  columnOf, columnText, columnKindOf, parseXZ, surfaceYOf } =
   await import(new URL('../src/map-render.mjs', import.meta.url))
 
 const TMP_DIRS = []
@@ -518,10 +518,10 @@ try {
   ok(!/modeArg === 'cave'|modeArg === 'auto'/.test(strip(idx)), 'index：mode 解析里已经没有 cave / auto 了')
   /* ⑩ 竖列图的接线（2026-10-15） */
   ok(/if \(mode === 'column'\) \{/.test(strip(idx)), 'index：mc_map 有 mode:"column" 分支')
-  ok(/columnOf\(sess\.bot\.requireBot\(\), \{\s*x: p\?\.x \?\? null, z: p\?\.z \?\? null, yBottom: args\.yBottom, up: args\.up,/.test(strip(idx)),
+  ok(/columnOf\(sess\.bot\.requireBot\(\), \{\s*x: tgt\?\.x \?\? null, z: tgt\?\.z \?\? null, yBottom: args\.yBottom, up: args\.up,/.test(strip(idx)),
     'index：column 分支直接调 map-render 的 columnOf（不经过 core 薄包装），并透传 `up`')
   ok(/parseXZ\(args\.target\)/.test(strip(idx)), 'index：column 用 target 定 x/z')
-  ok(/text: columnText\(col\)/.test(strip(idx)), 'index：column 的 text 走 columnText()')
+  ok(/text: columnText\(view\)/.test(strip(idx)), 'index：column 的 text 走 columnText()（view 带上 mine/surfaceY）')
   ok(/here: col\.here/.test(strip(idx)), 'index：column 分支把 here（你自己站的那一格）透传出去')
   ok(/const hereName = b\?\.blockAt\?\.\(new Vec3\(fx, fy, fz\)\)\?\.name \?\? null/.test(strip(mapSrc)),
     'map-render：columnOf 真的去读机器人自己那一格（here 不是编的）')
@@ -531,13 +531,77 @@ try {
   ok(/above: col\.above/.test(strip(idx)), 'index：column 分支把 above（头顶扫描）透传出去')
   ok(/头顶什么封着/.test(idx), 'index：mc_map 描述里写了"头顶什么封着/跳不跳得起来"')
   ok(/export const COLUMN_UP_DEFAULT = 40/.test(mapSrc), 'map-render：COLUMN_UP_DEFAULT = 40（头顶一次最多看 40 格）')
-  ok(/export function columnOf \(b, \{ x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX, up = null \} = \{\}\) \{/.test(mapSrc),
-    'map-render：columnOf(b, {x,z,yTop,yBottom,maxDepth,up})')
+  ok(/export function columnOf \(b, \{ x = null, z = null, yTop = null, yBottom = -24, maxDepth = COLUMN_MAX, up = null, anchorY = null \} = \{\}\) \{/.test(mapSrc),
+    'map-render：columnOf(b, {x,z,yTop,yBottom,maxDepth,up,anchorY})')
   ok(/const headFrom = fy \+ 2/.test(strip(mapSrc)),
     '🔴 map-render：头顶从 `fy + 2` 起算 —— `fy` 是脚、`fy + 1` 是脑袋，从 fy+1 起算就自己的头算成方块了')
   ok(/export function columnText \(col\) \{/.test(mapSrc), 'map-render：columnText(col)')
   ok(/const given = \(v\) => v !== null && v !== undefined && v !== '' && Number\.isFinite\(Number\(v\)\)/.test(mapSrc),
     '🔴 map-render：columnOf 里判"传没传"必须用 `given()` 先挡 null —— `Number(null) === 0` 会让"没传"变成"传了 0"')
+  {
+  /* ═══════════════════════════════════════════════════════════════════════════
+   * ⑳ 查**别的列**：那一列的地表在 y 几（2026-10-23 用户 m00855
+   *    「现在为什么不知道 y 轴，不是有 map 的竖轴吗」）
+   *
+   * 竖列图原来只回答"我这一层上下那一列是什么"（窗口钉死在我的脚上），
+   * 远处目的地那一列的地表在几米，它说不了 —— 而"该给哪个 y"正是跑远路时最缺的那一个数。
+   * ═══════════════════════════════════════════════════════════════════════════ */
+  section('⑳ 查别的列：那一列的地表 y（2026-10-23 用户 m00855）')
+
+  const w = mkWorld({ fill: 'air', cells: { '5,63,7': 'stone', '5,64,7': 'grass_block' } })
+  const b = mkBot({ pos: [0, 64, 0], world: w })
+
+  const sf = surfaceYOf(b, { x: 5, z: 7 })
+  ok(sf.loaded === true, '加载了的列 ⇒ loaded:true', JSON.stringify(sf))
+  ok(sf.y === 64 && sf.name === 'grass_block', '地表 = 自上而下第一个非空气方块（y=64 草方块）', JSON.stringify(sf))
+  ok(surfaceYOf(b, { x: 0, z: 0 }).y === null && surfaceYOf(b, { x: 0, z: 0 }).loaded === true,
+    '整根都是空气 ⇒ 没有地表但"读到了"（是虚空，不是没加载）')
+
+  const col = columnOf(b, { x: 5, z: 7, anchorY: sf.y + 1, yBottom: -4 })
+  ok(col.feetY === 65, 'anchorY 决定"脚"在哪（= 地表上面那一格）', String(col.feetY))
+  ok(col.from === 64, '🔴 往下扫**从那一列的地表那一格开始**（不是我脚底下）', String(col.from))
+  ok(col.solidRun >= 2, '那一列地表下面连续实心', String(col.solidRun))
+  ok(col.anchorY === 65, '结果里带着 anchorY（上层能分清"这是谁的列"）')
+
+  const view = { ...col, mine: false, surfaceY: sf.y }
+  const t = columnText(view)
+  ok(/地表在 y=64/.test(t), '别的列直接报"地表在 y=64"')
+  ok(!/脚底 y=/.test(t), '🔴 别的列不许说"脚底"——那不是你的脚')
+  ok(/mc_move \{x: 5, y: 65, z: 7\}/.test(t), '顺手给出"该给哪个 y"：地表上面那一格')
+
+  /* 我自己的列：一个字都不能变（还是"脚底"那套） */
+  const mineCol = columnOf(b, { x: 0, z: 0, yBottom: -8 })
+  const tm = columnText({ ...mineCol, mine: true, surfaceY: null })
+  ok(/脚底 y=64/.test(tm), '自己的列照旧说"脚底 y=…"（老行为不动）')
+
+  /* 未加载：地表**不知道**，不能说成 y=0 或"没有地面" */
+  const wUn = mkWorld({ fill: null })
+  const sfUn = surfaceYOf(mkBot({ pos: [0, 64, 0], world: wUn }), { x: 40, z: 40 })
+  ok(sfUn.loaded === false && sfUn.y === null, '🔴 区块没加载 ⇒ loaded:false、y 是 null（不知道，不是没有）', JSON.stringify(sfUn))
+
+  /* 🔴 世界外 ≠ 没加载：1.18+ 的世界是 -64..319，y=320 起 `blockAt` 也返回 null。
+   *    照 320 起扫就会被误判成"区块没加载"，把明明查得到的列报成"读不到"。 */
+  const inner = mkBot({ pos: [0, 64, 0], world: mkWorld({ fill: 'air', cells: { '0,63,0': 'stone' } }) })
+  const bEdge = {
+    entity: inner.entity,
+    game: { minY: -64, height: 384 },
+    blockAt (v) { return v.y > 319 ? null : inner.blockAt(v) },
+  }
+  const sfEdge = surfaceYOf(bEdge, { x: 0, z: 0 })
+  ok(sfEdge.loaded === true && sfEdge.y === 63, '🔴 世界外的高度（y>319）不算"没加载"：照样读到 y=63 的石头', JSON.stringify(sfEdge))
+
+  /* 工具面 + 线上接线 */
+  const idxRaw = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  /* 只去掉注释（和上面 `strip` 同一套规则，但这里作用域不同，得自己来一份） */
+  const idx2 = idxRaw
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+  ok(/surfaceYOf/.test(idx2), 'index：真的用了 surfaceYOf（不是只在 import 里挂着）')
+  ok(/anchorY: sf \? sf\.y \+ 1 : null/.test(idx2), 'index：查到地表就把窗口锚到那一列')
+  ok(/还没加载/.test(idx2) && /别猜 y/.test(idx2), 'index：没加载时明说"别猜 y"')
+  ok(/surfaceY: sf\.y/.test(idx2), 'index：结果里报 surfaceY')
+  ok(/竖列可以查\*\*任意一列\*\*/.test(idxRaw), 'index：mc_map 描述里写了"竖列能查任意一列/报地表 y"')
+  }
 } finally {
   for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 }

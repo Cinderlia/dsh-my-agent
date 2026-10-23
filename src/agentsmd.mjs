@@ -32,7 +32,11 @@ const FILE = 'RULES.md'
 const LEGACY_FILE = 'AGENTS.md'
 const MAX_BYTES = 128 * 1024
 
-/** 默认「行事准则」（2026-10-23 第十三版：工具速查补两条**会把 AI 带偏的返回语义** ——
+/** 默认「行事准则」（2026-10-23 第十五版：工具速查「看」补**竖列查任意一列** —— `mc_map` 的 `mode:"column"` 给 `target:"x,z"` 就报那一列的地表 y，
+ *  解决了"跑远路该给哪个 y"（以前纵向窗口钉在自己脚下，远处地表多高根本查不到）。
+ *  2026-10-23 第十四版：工具速查「动」补**长程赶路** —— 几十上百格外只给 x/z（GoalXZ），
+ *  给了 y 就按 y 走（不能把 y 静默吃掉）；没走到报 `pathLen`/`estCalls`，用来分"这趟走不完"和"这条路不通"。
+ *  2026-10-23 第十三版：工具速查补两条**会把 AI 带偏的返回语义** ——
  *   `mc_move` 的 `alreadyThere`（本来就站在圈里 ≠ 走到了）与 `goal-not-standable`；
  *   `mc_dig` 的 `localRestored`（服务端静默拒绝时本地已回滚，别在空气上盖房）。
  *   2026-10-23 第十二版：工具速查**瘦身** —— 只留"有什么、什么时候用、权限边界、会毁东西的坑"，
@@ -226,8 +230,8 @@ export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 
 > **参数名 / 默认值 / 上限都在工具自己的描述里**，这里只给"有什么、什么时候用" —— 要确切参数就去看那个工具的描述，别猜。
 
-- **看**：\`mc_observe\`（看一眼；\`image:false\` 只给状态，**不算看过画面**）；\`mc_map\`（脚下 / 地表 / 竖列三种视角）；\`mc_scan\` 找方块；\`mc_inventory\`；\`mc_status\`；\`mc_diag\` 排查"动不了"；\`mc_events\` 攒着的聊天与系统事件；\`mc_sessions\`（是不是别的会话连着同一个 bot）。
-- **动**：\`mc_move\` 六个 mode —— \`walk\` / \`walk-nodig\` / \`fly\` / \`jump\` / \`swim\` / \`boat\`（先 \`use\` 上船，下船用 \`dismount\`）。**一次只走 10 秒**，没走到就照原目标再叫一次 返回里有 \`alreadyThere:true\` = **你本来就站在到达圈里、这一趟一步没挪**（不是"走到了"）——要精确站到那一格上用 \`intent:"stand"\`，只是想"到附近"就别再重叫同一个点；目标格站不住时落点会被挪，挪完一步没走会报 \`reason:"goal-not-standable"\`（别当成到了）。
+- **看**：\`mc_observe\`（看一眼；\`image:false\` 只给状态，**不算看过画面**）；\`mc_map\`（脚下 / 地表 / 竖列三种视角；**竖列可以查任意一列** —— 给 \`target:"x,z"\` 就报那一列的**地表 y**，跑远路前先探一眼比猜 y 靠谱，读不到=区块没加载别猜）；\`mc_scan\` 找方块；\`mc_inventory\`；\`mc_status\`；\`mc_diag\` 排查"动不了"；\`mc_events\` 攒着的聊天与系统事件；\`mc_sessions\`（是不是别的会话连着同一个 bot）。
+- **动**：\`mc_move\` 六个 mode —— \`walk\` / \`walk-nodig\` / \`fly\` / \`jump\` / \`swim\` / \`boat\`（先 \`use\` 上船，下船用 \`dismount\`）。**一次只走 10 秒**，没走到就照原目标再叫一次 返回里有 \`alreadyThere:true\` = **你本来就站在到达圈里、这一趟一步没挪**（不是"走到了"）——要精确站到那一格上用 \`intent:"stand"\`，只是想"到附近"就别再重叫同一个点；目标格站不住时落点会被挪，挪完一步没走会报 \`reason:"goal-not-standable"\`（别当成到了）。**长程赶路只给 x/z**（几十上百格外的村子/矿口 —— 不必猜 y，\`xz\` 也不用写）——**给了 y 就按 y 走**；没走到会报 \`pathLen\`（规划出几格路）和 \`estCalls\`（约还要几次调用，一次 ≈43 格）：\`estCalls\` 大就同参数接着叫，**没有 \`pathLen\` 才是这条路不通**。
 - **手**：\`mc_dig\`（默认**不挖穿挡路的方块**，矿在墙后要加 \`digThrough:true\`；「本地清了但**没收到服务端回包**」= 服务端八成拒了，这时我**已经把本地那一格改回原样**并报 \`localRestored\` —— 别在空气上盖房、别走进你以为挖穿的墙，用 \`mc_scan\` 复核）/ \`mc_build\` / \`mc_act\`（\`break\` \`place\` \`bridge\` \`use\` \`useitem\` \`equip\` \`toss\` \`look\` \`toward\` \`jump\` \`fish\` \`dismount\`）/ \`mc_give\`（**只有创造模式**）。\`mc_attack\` 打怪 / \`mc_shoot\` 射箭 / \`mc_station\` 附魔台·铁砧·锻造台 / \`mc_prep\` 出发前自查 / \`mc_fish\` 钓鱼 —— 这五个是**独立工具，不在 \`mc_act\` 里**，别硬套。
 - **做**：\`mc_craft\` 合成（自动补齐中间产物，缺工作台只报不替你放）；\`mc_furnace\` 烧炼（装好就返回；要看烧好没就再问一次）；\`mc_chest\` 存取箱子（受"看图"门禁）。
 - **任务与说**：\`mc_task\` 多条任务、记进度、续做；\`mc_say\` 说话（单行）；\`mc_command\` 服务器指令（**先确认有权限**）；\`mc_kit_memory\` 记 / 查笔记；\`mc_kit_image\` 画图；\`mc_kit_express\` 把图或文件发给用户看。
