@@ -32,7 +32,9 @@ const FILE = 'RULES.md'
 const LEGACY_FILE = 'AGENTS.md'
 const MAX_BYTES = 128 * 1024
 
-/** 默认「行事准则」（2026-10-23 第二十版：数字参数容错 —— 坐标写成字符串（`z:"-32"`）也认，会自动转成数字；文本参数（`name:"64"`）不受影响。
+/** 默认「行事准则」（2026-10-23 第二十一版：加一句"结果字段怎么读" —— 结果都是单行 JSON，
+ *  `distance` 是"还有几格"、`around` 只报活物、掉落物只给 `junk:{count,nearest}`。
+ *  2026-10-23 第二十版：数字参数容错 —— 坐标写成字符串（`z:"-32"`）也认，会自动转成数字；文本参数（`name:"64"`）不受影响。
  *  2026-10-23 第十九版：卡住时按**执行顺序**升级（开门 → 重算 → 跳 → 后退 → 侧向绕行 → 挖 → 垫柱）、结果带 planStep / planTried、同一个目标 90 秒内再叫会从上次卡住的那一级接着升。
  *  2026-10-23 第十八版：补挖只朝目标那条轴（一次 ≤6 格）+ `reason:"connection-stale"` 说明连接假死要先重连；`mc_status` 报 `silenceSec`。
  *  2026-10-23 第十七版：工具速查「动」补**走完一步就知道头顶** —— `mc_move` 每次结果都带 `above`（脚底上方第 2 格 / `headroom` / `canJump`），跳不起来时 `note` 说清是哪一格；`mc_observe` 的感知也报 `jumpBlock`/`headroom`/`canJump`。
@@ -252,6 +254,8 @@ export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 **别把工具的"自动"当保证。** 自动换工具、自动垫脚、自动找工作台都可能失败 —— **看返回值里写了什么**。
 
 **判断结果看 \`outcome\` / \`outcomeText\`**：\`confirmed\` / \`failed\` / \`unknown\` / \`stale\`（这一步的结果属于上一代任务，已作废）。**\`unknown\` 不是失败** —— 超时或被新指令打断，但服务器可能已经做了：先 \`mc_observe\` / \`mc_inventory\` 看一眼再决定，**别直接重做**（可能把刚放好的方块又挖掉）。
+
+**结果是单行 JSON，字段名固定**：\`distance\` 一律是"还有几格"；\`around\` 只报身边的**活物**（同种合并带 \`count\`），掉落物不逐个列，只给 \`junk:{count,nearest}\` —— 想捡东西别看 around，用 \`mc_scan {name:"item"}\`。**
 
 **长活被截断时，分清三件事**：结果里写"这一轮的 11 秒用完了"或带 \`remaining\` / \`hint\` → **同参数再叫一次**接着做（**不是失败**，别换目标、别重连）；确认失败了 → **换方法**再来，同一个方法最多两次；要接着干一整条任务 → \`mc_task {action:"resume"}\`。
 ## 干活习惯

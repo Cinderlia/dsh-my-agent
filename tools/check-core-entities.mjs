@@ -243,7 +243,25 @@ section('⑧ limit 截断 + 还没位置信息时不炸 + 掉落物也能列出�
     entities: { 1: { type: 'object', name: 'item', position: new Vec3(1, 63, 0), metadata: {} } },
   }
   const rd = mkMc(dropBot).entities()
-  ok(rd.list.length === 1 && rd.list[0].name === 'item' && rd.list[0].kind === 'other', '掉落物（type=object）也列出来，归到"其它"')
+  ok(rd.list.length === 1 && rd.list[0].name === 'item' && rd.list[0].kind === 'junk' && rd.list[0].junk === true,
+    '掉落物（type=object）也列出来，但单列 junk 一档（2026-10-23 用户「怎么全是item」）')
+  /* 🔴 同一句话的现场：地上摊着一片掉落物，6 个 / 40 个名额被 item 占满，怪一只都列不出来。
+   *    现在活体优先、掉落物垫底 —— 距离近的 item 也压不过 6 格外的 zombie。 */
+  const mixedBot = {
+    entity: { position: new Vec3(0, 64, 0) },
+    entities: {
+      1: { type: 'object', name: 'item', position: new Vec3(0.5, 63, 0), metadata: {} },
+      2: { type: 'object', name: 'item', position: new Vec3(0.6, 63, 0.2), metadata: {} },
+      3: { type: 'hostile', name: 'zombie', position: new Vec3(0, 64, 6), metadata: {} },
+    },
+  }
+  const rm = mkMc(mixedBot).entities()
+  ok(rm.list[0].name === 'zombie' && rm.list.filter((x) => x.junk).length === 2 && rm.counts.junk === 2,
+    '活体排在掉落物前面（贴近的 item 也挤不掉 6 格外的僵尸），counts.junk 单算', JSON.stringify(rm.list.map((x) => x.name)))
+  const rj = mkMc(mixedBot).entities(24, { kind: 'junk' })
+  ok(rj.list.length === 2 && rj.list.every((x) => x.junk), 'kind:"junk" 只看掉落物', String(rj.list.length))
+  const rh = mkMc(mixedBot).entities(24, { kind: 'hostile' })
+  ok(rh.list.length === 1 && rh.list[0].name === 'zombie', 'kind:"hostile" 不掺掉落物（以前 item 会被算进 hostile 的候选外面）', String(rh.list.length))
 }
 
 /* ─────────── ⑨ 静态检查：工具注册 + 门禁 + 名单一致性 + 实现位置 ─────────── */
@@ -338,7 +356,7 @@ section('⑨ 静态检查（实体工具已并进 mc_observe 感知块、不看�
   const scanNo = readFileSync(new URL('../src/world-scan.mjs', import.meta.url), 'utf8')
   ok(scanNo.includes('hostilityOf(nm, e.kind)'), 'world-scan 用 hostilityOf 判立场（不是自己写正则）')
   ok(scanNo.includes('const neutral = stance === \'neutral\''), 'world-scan 输出里有 neutral 标记')
-  ok(scanNo.includes('counts = { hostile: 0, neutral: 0, player: 0, other: 0 }'),
+  ok(scanNo.includes('counts = { hostile: 0, neutral: 0, player: 0, other: 0, junk: 0 }'),
     'world-scan 的计数里有 neutral 一档')
   ok(scanNo.includes("if (want === 'neutral' && group !== 'neutral') continue"),
     'world-scan 支持 kind:"neutral" 过滤')

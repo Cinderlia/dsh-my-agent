@@ -553,7 +553,7 @@ export async function apply (api) {
         if (prog?.error) {
           entLines.push(`（读不到实体列表：${prog.error}）`)
         } else if (prog) {
-          const label = { hostile: '敌对', neutral: '中立', player: '玩家', other: '生物' }
+          const label = { hostile: '敌对', neutral: '中立', player: '玩家', other: '生物', junk: '掉落物' }
           const one = (x) => {
             const bits = [`${label[x.kind] ?? x.kind} **${x.name}**`, `(${x.position.x}, ${x.position.y}, ${x.position.z})`, `${x.distance} 格`]
             if (x.dy) bits.push(`上下 ${x.dy > 0 ? '+' : ''}${x.dy}`)
@@ -571,14 +571,16 @@ export async function apply (api) {
           for (const x of prog.list) {
             if (/^item$/i.test(String(x.name))) drops++
             if (x.health == null) noHp++
-            if (x.kind !== 'other') { entLines.push(one(x)); continue }
+            /* 🔴 2026-10-23：掉落物单列 `junk` 档后必须**走聚合**，否则 174 个 item 会各占一行。
+             *    捡东西时要知道在哪，所以保留"最近 3 个坐标"，只是压成一行。 */
+            if (x.kind !== 'other' && x.kind !== 'junk') { entLines.push(one(x)); continue }
             const g = groups.get(x.name) ?? []
             g.push(x)
             groups.set(x.name, g)
           }
           for (const [nm, g] of groups) {
             if (g.length < 3) { for (const x of g) entLines.push(one(x)); continue }
-            entLines.push(`其它 **${nm}**×${g.length}（最近 3 个：${g.slice(0, 3).map((x) => `(${x.position.x}, ${x.position.y}, ${x.position.z}) ${x.distance} 格`).join('、')}）`)
+            entLines.push(`${label[g[0].kind] ?? '其它'} **${nm}**×${g.length}（最近 3 个：${g.slice(0, 3).map((x) => `(${x.position.x}, ${x.position.y}, ${x.position.z}) ${x.distance} 格`).join('、')}）`)
           }
         }
 
@@ -644,6 +646,7 @@ export async function apply (api) {
             : prog === null
               ? '   · 这次没收集实体（`entities:false`）'
               : `   · ${distance} 格内实体：敌对 ${prog?.counts?.hostile ?? 0} ｜ 中立 ${prog?.counts?.neutral ?? 0} ｜ 玩家 ${prog?.counts?.player ?? 0} ｜ 其它 ${prog?.counts?.other ?? 0}`
+                + (prog?.counts?.junk ? ` ｜ 掉落物 ${prog.counts.junk}` : '')
                 + (entLines.length ? ` —— ${entLines.join(' ｜ ')}` : '（一只都没有）')
                 + (prog && prog.total > prog.list.length ? `（还有 ${prog.total - prog.list.length} 个没列出来）` : ''),
           ...(bossText ? [`   · 🗡 **Boss 血条**：${bossText}（龙/凋灵的血只在血条里，\`实体\` 那行读不到它）`] : []),

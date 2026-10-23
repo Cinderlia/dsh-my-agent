@@ -3002,7 +3002,7 @@ console.log('\n--- 行事准则 RULES.md / 新开关 / 边界信息 ---')
   }
 
   // 边界信息工具
-  const caps = await tools.get('mc_capabilities').execute({}, A)
+  const caps = await tools.get('mc_capabilities').execute({ detail: true }, A)   // 2026-10-23 审计：默认精简，清单要 detail:true
   const vers = caps?.game?.testedVersions ?? []
   // ⚠️ **不许断言"清单里必须有 26.2"**（2026-09-16 第八轮踩到）：官方 npm 版没有 26.2，
   //    只有本机那份打过补丁的树有；CI 是在干净环境跑官方依赖的，写死就等于把 CI 判死。

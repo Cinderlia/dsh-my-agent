@@ -1000,6 +1000,21 @@ section('⑧ 战斗策略层接线 —— attack() 真的会撤 / 会换 / 会�
     ok(/我自己在 \(/.test(m), '🔴 同时说出我自己的坐标（用来判断是不是客户端没跟上）', m.slice(0, 80))
     ok(/没跟上服务端/.test(m), '实体数少得离谱时直说"客户端没跟上服务端"，别让它反复换名字试')
   }
+  {   /* 🔴 2026-10-23 用户实机：「怎么全是item」—— 地上摊着一片掉落物时，
+   *    "24 格内实际有"的 6 个名额被 `item` 占满，一只 creeper 就在 4 格却没列出来，
+   *    模型拿着这份清单改一百次名字也改不对。现在活体优先，掉落物只报个数。 */
+    const junk = Array.from({ length: 12 }, (_, i) => ent({ id: 'i' + i, name: 'item', type: 'object', kind: 'Objects', pos: { x: 0.4, y: 64, z: 1 + i * 0.1 } }))
+    const creeper = ent({ id: 'c1', name: 'creeper', type: 'hostile', kind: 'Hostile mobs', pos: { x: 0, y: 64, z: 4 } })
+    const f = mkFightBot([...junk, creeper])
+    const { ctx } = mkCtx()
+    let err = null
+    try { await attack(f.bot, { who: 'rabbit', budget: 300 }, ctx) } catch (e) { err = e }
+    const m = String(err?.message ?? '')
+    ok(/creeper 4\.0 格/.test(m), '🔴 满地掉落物时仍能列出活体（creeper 4.0 格）', m.slice(0, 140))
+    ok(!/item [\d.]+ 格/.test(m), '🔴 掉落物不再占那 6 个名额', m.slice(0, 140))
+    ok(/掉落物\/经验球 ×12/.test(m), '掉落物改成报个数（×12）', m.slice(0, 140))
+    ok(/真活体 1 个/.test(m), '🔴 实体总数里把掉落物单算：真活体 1 个才说明客户端没跟上', m.slice(0, 180))
+  }
   {   /* 🔴 2026-10-17 用户实机：副手一直挂着 shield 103/336，它却报「没有盾牌，只能拉开距离」。
    *    根因是 `hasShield` 只查 `bot.inventory.items()`（背包 9..44 格），副手是 45 格 ⇒ 看不见。 */
     const slots = []
@@ -1315,7 +1330,8 @@ section('⑩ 威胁优先 / 换目标 / 举盾 / 血掉太快早收手 / 远程�
     const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
     ok(/priority: \{ type: 'string'/.test(idx), 'mc_act 参数里有 priority')
     ok(/aroundOf/.test(idx), 'mc_move 走完带 around（周围实体）')
-    ok(/around: out\.slice\(0, 6\)/.test(idx), 'mc_move 结果里真有 around 字段')
+    /* 2026-10-23 审计：aroundOf 现在按名字合并、活体优先、掉落物单独计数（用户"怎么全是item"） */
+    ok(/const around = \[\.\.\.live\.values\(\)\]/.test(idx) && /junk: \{ count: junk, nearest/.test(idx), 'mc_move 结果里真有 around（活体）+ junk（掉落物只报数）')
   }
 }
 

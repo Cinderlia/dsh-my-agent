@@ -204,7 +204,7 @@ section('⑦ 实体目标（末影龙）：按实测速度算提前量')
   ok(sawTarget === dragon, 'grade 拿到的是那个实体（不是坐标壳）')
   ok(sawSpeed && Math.abs(sawSpeed.x) > 0, '速度非零（实测位置差，不是读 velocity）', JSON.stringify(sawSpeed))
   ok(r.ok === true && r.target?.name === 'ender_dragon', '结果报目标名', JSON.stringify(r.target))
-  ok(r.target.dist > 29.5 && r.target.dist < 32, '结果报距离（≈30 格）', String(r.target.dist))
+  ok(r.target.distance > 29.5 && r.target.distance < 32, '结果报距离（≈30 格）', String(r.target.distance))
   ok(b.__log.filter((e) => e[0] === 'look').length >= 2, '实体目标会"放箭前再瞄一次"（目标在动）')
 }
 {

@@ -518,7 +518,7 @@ async function shootInner (b, args = {}, ctx = {}) {
       grade: Number(Number(grade.grade ?? 0).toFixed(1)),
       /* 🔴 2026-10-20 审计：原来 `?? 0` 会把"算不出误差"写成 **0 = 完美命中**。 */
       aimError: grade.nearestDistance == null ? null : Number(Number(grade.nearestDistance).toFixed(2)),
-      dist: target.dist != null ? Number(target.dist.toFixed(1)) : null,
+      distance: target.dist != null ? Number(target.dist.toFixed(1)) : null,
       blocked: blockedPos ? (b.blockAt?.(blockedPos)?.name ?? '?') : null,
       ...(blockedPos ? { blockedAt: [blockedPos.x, blockedPos.y, blockedPos.z] } : {}),
       arrowsUsed: Math.max(0, used),
@@ -548,7 +548,7 @@ async function shootInner (b, args = {}, ctx = {}) {
           target: {
             name: lastTarget.label,
             at: [Math.floor(lastTarget.pos.x), Math.floor(lastTarget.pos.y), Math.floor(lastTarget.pos.z)],
-            ...(lastTarget.dist != null ? { dist: Number(lastTarget.dist.toFixed(1)) } : {}),
+            ...(lastTarget.dist != null ? { distance: Number(lastTarget.dist.toFixed(1)) } : {}),
           },
         }
       : {}),

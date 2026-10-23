@@ -18,7 +18,7 @@
 
 import { Vec3 } from 'vec3'
 import { isAir, cropStageOf } from './block-names.mjs'
-import { entityNameOf, HOSTILE_RE, RANGED_RE, hostilityOf } from './entity-names.mjs'
+import { entityNameOf, HOSTILE_RE, RANGED_RE, JUNK_RE, hostilityOf } from './entity-names.mjs'
 import { worldBoundsOf } from './world-observer.mjs'
 
 export function scanAround (b, { radius = 16, height = 4, name = null, limit = 10, y = null } = {}) {
@@ -166,9 +166,16 @@ export function entitiesNear (b, radius = 24, { kind = 'all', limit = 40 } = {})
      *    末影人、猪灵这类**中立**怪被算成 hostile ⇒ AI 以为它们要打自己；狼、蜜蜂、铁傀儡
      *    被塞进 `other` ⇒ 又完全看不出它们是"惹了才打你"。现在四档，且判定只有 `hostilityOf()` 一处。 */
     const stance = isPlayer ? 'player' : hostilityOf(nm, e.kind)
+    /* 🔴 2026-10-23（用户实机：「怎么全是item」）：掉落物也是实体，以前和怪一起按距离排，
+     *    地上摊着一片掉落物时（几十上百个 item 是常态），`list` 的前几十条全是 `item`，
+     *    活体一只都挤不进来。现在单列一档 `junk`、排在最后，`kind` 指名要怪/玩家/动物时
+     *    也把它排除 —— 想专门看掉落物就 `kind:'junk'`。 */
+    const isJunk = JUNK_RE.test(nm)
     const hostile = stance === 'hostile'
     const neutral = stance === 'neutral'
-    const group = stance === 'passive' ? 'other' : stance
+    const group = isJunk ? 'junk' : (stance === 'passive' ? 'other' : stance)
+    if (want === 'junk') { if (!isJunk) continue }
+    else if (want !== 'all' && isJunk) continue     // 指名要怪/玩家/动物时不掺掉落物；all 保留但垫底
     if (want === 'hostile' && group !== 'hostile') continue
     if (want === 'neutral' && group !== 'neutral') continue
     if (want === 'player' && group !== 'player') continue
@@ -178,6 +185,7 @@ export function entitiesNear (b, radius = 24, { kind = 'all', limit = 40 } = {})
     const hp = healthOf(e)
     list.push({
       name: nm, kind: group, hostile, neutral, ranged: RANGED_RE.test(nm),
+      ...(isJunk ? { junk: true } : {}),
       distance: Math.round(d * 100) / 100,
       position: { x: Math.floor(e.position.x), y: Math.floor(e.position.y), z: Math.floor(e.position.z) },
       dy: Math.round((e.position.y - me.y) * 10) / 10,
@@ -185,8 +193,9 @@ export function entitiesNear (b, radius = 24, { kind = 'all', limit = 40 } = {})
       ...(isPlayer ? { player: true } : {}),
     })
   }
-  list.sort((a, c) => a.distance - c.distance)
-  const counts = { hostile: 0, neutral: 0, player: 0, other: 0 }
+  // 活体优先，掉落物垫底（同一档里才比距离）
+  list.sort((a, c) => (Number(Boolean(a.junk)) - Number(Boolean(c.junk))) || (a.distance - c.distance))
+  const counts = { hostile: 0, neutral: 0, player: 0, other: 0, junk: 0 }
   for (const x of list) counts[x.kind]++
   return {
     me: { x: Math.floor(me.x), y: Math.floor(me.y), z: Math.floor(me.z) },

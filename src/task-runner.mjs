@@ -357,6 +357,12 @@ export function outcomeOf (res, { expect = null } = {}) {
   if (pos(r.dug) > 0 || pos(r.placed) > 0 || pos(r.got) > 0) return 'confirmed'
   if (r.broken === true || pos(r.broken) > 0) return 'confirmed'
   if (r.arrived === true || r.killed === true || r.done === true || r.ok === true) return 'confirmed'
+  /* 🔴 2026-10-23 审计（用户："你过一遍所有的工具输出，看看有没有问题"）：mc_act 的轻动作
+   *    （look / toward / equip / toss / jump）返回值里**本来就有"成没成"**，但这里一个都不认 ⇒
+   *    一次成功的转头、换装、丢东西全部被判成「❓ 结果未知，先看一眼再决定」，模型于是反复复核。
+   *    这几个字段各自只在动作真的发生时写入（失败时是 false，或干脆抛错不返回），所以能精确判。 */
+  if (r.jumped === true || r.equipped === true || r.tossed != null || r.lookingAt != null) return 'confirmed'
+  if (r.jumped === false || r.equipped === false) return 'failed'
 
   // ③ 时间到 / 被抢占 / 超时 → 结果未知（不是失败）
   if (/budget|timeout|preempted|时间不够|用完了|被打断|抢占/i.test(blob + ' ' + s(r.status))) return 'unknown'

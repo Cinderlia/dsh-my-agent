@@ -204,8 +204,18 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
   /* 🔴 中立怪（末影人 / 猪灵 / 狼 / 蜜蜂 / 铁傀儡…）**不带名字就绝不去打**。
    *    它们本不会主动打你，但惹了会 —— 末影人 40 血 + 能瞬移，是最不该"顺手打一只"的。
    *    动物仍然只在 4.5 格内才算（打猎），玩家也改成必须点名。 */
-  const nearOf = (snap) => snap.slice().sort((a, c) => a.d - c.d).slice(0, 6)
-    .map((x) => `${x.nm} ${x.d.toFixed(1)} 格`).join('、')
+  /* 🔴 2026-10-23（用户实机原话：「怎么全是item」）：这份"身边实际有什么"原来把掉落物和怪
+   *    混在一起按距离取前 6 —— 地上摊着一片掉落物时（几百个 item 是常态），
+   *    6 个名额全被 `item` 占满，一个怪名都不剩，模型改一百次名字也改不对。
+   *    现在：活体（怪/动物/玩家）按距离取前 6，掉落物只报个数，不占名额。 */
+  const nearOf = (snap) => {
+    const live = snap.filter((x) => rankOf(x) !== 4).sort((a, c) => a.d - c.d)
+    const junk = snap.filter((x) => rankOf(x) === 4)
+    const liveText = live.slice(0, 6).map((x) => `${x.nm} ${x.d.toFixed(1)} 格`).join('、')
+    if (!junk.length) return liveText
+    const junkText = `掉落物/经验球 ×${junk.length}（不打）`
+    return liveText ? `${liveText}，另有${junkText}` : junkText
+  }
   let near = nearOf(all)
   /* 打完这一只，**附近还有哪些怪** —— 顺手报一句（用户 2026-10-16："用完 mc_attack 后自动调用
    * 获取实体的功能，防止周围有其他怪物"）。
@@ -250,14 +260,23 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
        *    ① **名字写错了**（那好办，改个名）② **客户端根本没跟踪到那只怪**
        *    （重生 / 换维度 / 区块卸载之后 `bot.entities` 会被清空或过期 —— 这时改一百次名字都没用）。
        *    所以把"客户端共跟踪几个实体 + 我自己在哪"一并报出来：数字少得离谱本身就是证据。 */
-      const seen = Object.keys(b.entities ?? {}).length
+      /* 🔴 2026-10-23（用户：「怎么全是item」+174 个实体）：只报总数会被一堆掉落物骗了 ——
+       *    以前那句"这么少基本说明客户端没跟上服务端"在满地的 item 面前永远不触发，
+       *    反过来看着像"客户端跟得好好的"。这里把掉落物数单算，活体数才是判据。 */
+      const tracked = Object.values(b.entities ?? {}).filter((e) => e && e !== b.entity && e.position)
+      const seen = tracked.length
+      const junkSeen = tracked.filter((e) => JUNK_RE.test(entityNameOf(e))).length
+      const liveSeen = seen - junkSeen
+      const countText = junkSeen
+        ? `客户端现在共跟踪 ${seen} 个实体（其中 ${junkSeen} 个是掉落物/经验球，真活体 ${liveSeen} 个）`
+        : `客户端现在共跟踪 ${seen} 个实体`
       const me = b.entity?.position
       const meText = me && Number.isFinite(me.x)
         ? `(${me.x.toFixed(1)}, ${me.y.toFixed(1)}, ${me.z.toFixed(1)})`
         : '（坐标读不到）'
       throw new Error(`附近找不到 "${who}"（24 格内实际有：${near || '什么都没有'}）`
-        + ` —— 客户端现在共跟踪 ${seen} 个实体，我自己在 ${meText}。`
-        + (seen < 8
+        + ` —— ${countText}，我自己在 ${meText}。`
+        + (liveSeen < 8
           ? '**这么少基本说明客户端没跟上服务端**（刚重生 / 换了维度 / 区块还没加载）—— '
             + '先 `mc_observe` 看一眼身边到底有什么，别反复换名字试。'
           : '')

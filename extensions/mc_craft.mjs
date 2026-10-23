@@ -72,8 +72,8 @@ export function listTablesNearby (bot, radius = 32, limit = 5) {
     const from = bot.entity?.position
     const found = bot.findBlocks({ matching: ids, maxDistance: clamp(Number(radius) || 32, 1, 48), count: clamp(Number(limit) || 5, 1, 8) }) ?? []
     return found
-      .map((p) => ({ x: p.x, y: p.y, z: p.z, dist: from ? Math.round(from.distanceTo(p) * 10) / 10 : null }))
-      .sort((a, b) => (a.dist ?? 1e9) - (b.dist ?? 1e9))
+      .map((p) => ({ x: p.x, y: p.y, z: p.z, distance: from ? Math.round(from.distanceTo(p) * 10) / 10 : null }))
+      .sort((a, b) => (a.distance ?? 1e9) - (b.distance ?? 1e9))
   } catch { return [] }
 }
 
@@ -380,7 +380,7 @@ export function describeMissing (plan, bot = null) {
       const near = bot ? listTablesNearby(bot, 32, 4) : []
       hints.add('工作台：附近有就自动用；没有就报"缺桌子"并列出周围哪几张能用 —— **我不替你放**（要自己 `mc_act {mode:"place",…}` 放）'
         + (near.length
-          ? `｜周围 32 格内找到 ${near.length} 张：${near.map((t) => `(${t.x},${t.y},${t.z}) ${t.dist} 格`).join('、')}`
+          ? `｜周围 32 格内找到 ${near.length} 张：${near.map((t) => `(${t.x},${t.y},${t.z}) ${t.distance} 格`).join('、')}`
             + ` —— 走过去用，或者直接 \`mc_craft {…,x:${near[0].x},y:${near[0].y},z:${near[0].z}}\``
           : '｜周围 32 格内也没有别的工作台'))
     }

@@ -35,6 +35,7 @@ import { outcomeOf, verdictText } from './src/task-runner.mjs'
 import { runText } from './src/task-exec.mjs'
 import { prepCheck } from './src/prep.mjs'
 import { fishOnce } from './src/fish.mjs'
+import { isDropEntity, HOSTILE_RE } from './src/entity-names.mjs'
 import { tradeVillager } from './src/trade.mjs'
 import { buildBlueprint } from './src/blueprint.mjs'
 import { sleepInBed, wakeUp, farmArea } from './src/farm.mjs'
@@ -2533,10 +2534,6 @@ export function apply(ctx, rawConfig) {
     })
   } catch (e) { logLine(`装未捕获异常记录器失败（不影响使用）：${e?.message ?? e}`) }
 
-  const text = (value, render) => ({
-    schema: { type: 'object', properties: {}, additionalProperties: true },
-    render: (args, value2) => [{ type: 'text', text: render ? render(args, value2) : String(value2?.text ?? JSON.stringify(value2, null, 2)) }],
-  })
 
   /**
    * 紧凑 JSON（2026-10-18 审计）：把 `null` / `undefined` / 空对象 / 空数组先剔掉，
@@ -2565,6 +2562,20 @@ export function apply(ctx, rawConfig) {
     try { return JSON.stringify(strip(v)) } catch { return JSON.stringify(v) }
   }
 
+  /**
+   * 工具输出渲染：有 text 就用 text，否则走 compactJson（单行、去空字段）。
+   *
+   * 🔴 2026-10-23 审计：以前兜底是 `JSON.stringify(value2, null, 2)` —— 23 个没写 text 的工具
+   *    （mc_move / mc_act / mc_attack / mc_trade …）每次都以两空格缩进的多行 JSON 交给模型。
+   *    同一份数据实测多 38%（有嵌套对象 + around 数组时更多）。`compactJson` 本来就是为省 token 写的，
+   *    只是当时只接到了个别分支上。键名与形状不变，模型读起来只有"换行没了"这一处差别。
+   *
+   * ⚠️ 定义必须排在 `compactJson` 之后（它是 const 箭头函数，提前引用会踩 TDZ，插件直接加载失败）。
+   */
+  const text = (value, render) => ({
+    schema: { type: 'object', properties: {}, additionalProperties: true },
+    render: (args, value2) => [{ type: 'text', text: render ? render(args, value2) : String(value2?.text ?? compactJson(value2)) }],
+  })
   /** 保留两位小数（省 token：`-3.366740127096657` → `-3.37`；不是数字就原样返回） */
   const round2 = (n) => (Number.isFinite(Number(n)) ? Math.round(Number(n) * 100) / 100 : n)
 
@@ -2579,6 +2590,14 @@ export function apply(ctx, rawConfig) {
    * 只加字段、不改原有结构（`text()` 的渲染是 `JSON.stringify`，新字段自动出现在输出里）；
    * 数组/标量返回值原样透传（`dig()` 那种返回数组的走"往数组里 push 一行判决"那条路）。
    */
+  /* 🔴 2026-10-23 审计：mc_config 无论改没改都把 `config` 与 `defaults` 各回一遍 —— 用户多半只在默认值时读它，
+   *    那份重复等于把同一坨 JSON 说两遍。只有真的改过（值不同于默认）才附 `defaults` 供对照。 */
+  const configPair = (cfg) => {
+    const defaults = JSON.parse(JSON.stringify(WATCH_DEFAULTS))
+    const same = JSON.stringify(cfg) === JSON.stringify(defaults)
+    return same ? { config: cfg } : { config: cfg, defaults }
+  }
+
   const withOutcome = (res, opts = {}) => {
     if (!res || typeof res !== 'object' || Array.isArray(res)) return res
     if (res.outcome) return res
@@ -2976,8 +2995,16 @@ export function apply(ctx, rawConfig) {
        *    现在下限 1000ms（和 statusPing 内部一致），返回里的 timeoutMs 是**真正生效**的值。 */
       const timeoutMs = Math.min(Math.max(Number(args.timeoutMs) || 5000, 1_000), 10_000)
       const r = await statusPing({ host, port, timeoutMs, fakeHost: args.subserver ? String(args.subserver) : '' })
-      // 通了但版本表里没有对应话术的情况也用得上：把"能不能连"与"连上会怎样"分开说
-      return r
+      /* 🔴 2026-10-23 审计：以前整包透传（host/port/timeoutMs/elapsedMs/handshakeMs/statusMs/motdRaw…），
+       *    没一句结论，而且与 mc_lan（文本风格）两套。这里补一句人话，字段原样保留。 */
+      const where = `${r.host}:${r.port}`
+      const text = r.ok
+        ? `📡 ${where} 通（${r.elapsedMs}ms，延迟 ${r.latencyMs ?? '?'}ms）｜ 版本 ${r.version ?? '?'}（协议 ${r.protocol ?? '?'}）`
+          + `｜ 在线 ${r.players?.online ?? '?'}/${r.players?.max ?? '?'}`
+          + (r.motd ? `\nMOTD：${r.motd}` : '')
+        : `📡 ${where} 不通（${r.elapsedMs ?? '?'}ms）：${r.error ?? '未知原因'}`
+          + (r.hint ? `\n${r.hint}` : '')
+      return { ...r, text }
     },
   }))
 
@@ -3035,13 +3062,25 @@ export function apply(ctx, rawConfig) {
       if (wd.config.autoArm && !wd.armed) {
         try { wd.arm() } catch (e) { ctx.logger?.warn?.(`[dsh-mc-agent] 看门狗自动挂载失败：${e.message}`) }
       }
+      /* 🔴 2026-10-23 审计：以前回**整份** accounts.view()（innerID/id/login/name/uuid/uuidSource/type/
+       *    server/hasCredential）—— 刚连上只需要知道"用哪个号进来的"，完整信息 mc_accounts 随时可看。
+       *    而且整包没有一句结论：连上之后站哪、什么模式、看门狗挂没挂，全靠模型自己从字段里拼。 */
+      const accView = accounts.view(accounts.get(resolved.innerID))
+      const st = sess.bot.status()
+      const armed = wd.status().armed
       return {
         connected: true,
-        account: accounts.view(accounts.get(resolved.innerID)),
-        ...sess.bot.status(), chunksReady: ready,
+        account: accView ? { innerID: accView.innerID, name: accView.name, type: accView.type } : null,
+        ...st, chunksReady: ready,
         // 连接信息（host/port/子服）已在 status() 里；这里**不再**回带
         // `_connectionProfile`（那份含 authMode 与账号名，没必要发出去）。
-        watchdog: wd.status().armed ? '已自动挂载' : '未挂载（autoArm 关闭）',
+        watchdog: armed ? '已自动挂载' : '未挂载（autoArm 关闭）',
+        text: `✅ 已进服：${st.connection?.host ?? '?'}:${st.connection?.port ?? '?'}`
+          + (st.sub ? `（子服 ${st.sub}）` : '')
+          + `\n我：${st.position?.x ?? '?'}, ${st.position?.y ?? '?'}, ${st.position?.z ?? '?'}`
+          + `｜ ${st.gamemode ?? '?'} ｜ ${st.dimension ?? '?'}`
+          + `\n看门狗：${armed ? '已自动挂载（有人喊我会叫醒我）' : '未挂载'}`
+          + '\n先 mc_observe 看一眼周围再动手。',
       }
     },
   }))
@@ -3177,7 +3216,15 @@ export function apply(ctx, rawConfig) {
     output: text(),
     async execute(args, exec) {
       const sess = getSession(exec)
-      return { sent: sess.bot.chatSay(String(args.message)) }
+      const asked = String(args.message ?? '')
+      const sent = sess.bot.chatSay(asked)
+      /* 🔴 2026-10-23 审计：以前只回 { sent: '原话' } —— 没说明发没发出去、也没提醒被压成单行/截断。 */
+      const squashed = sent !== asked.trim()
+      return {
+        sent,
+        text: `💬 公屏已发出：「${sent}」`
+          + (squashed ? `\n（原话 ${asked.length} 字，发出前压成单行并截到 220 字 —— 太长就分几次说）` : ''),
+      }
     },
   }))
 
@@ -3227,15 +3274,15 @@ export function apply(ctx, rawConfig) {
       const wantsChange = Boolean(args.reset) || Object.keys(args.patch ?? {}).length > 0
       if (!sess.watchdog && !wantsChange) {
         return {
-          config: clone(WATCH_DEFAULTS), defaults: clone(WATCH_DEFAULTS),
-          note: '看门狗还没挂（进服后会自动挂上）—— 这里是默认配置；改配置会真的挂上看门狗',
+          config: clone(WATCH_DEFAULTS),
+          note: '看门狗还没挂（进服后会自动挂上）—— 上面就是默认配置；改配置会真的挂上看门狗',
         }
       }
       const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal, watchdogGate(sess))
       if (args.reset) {
         wd.config = clone(WATCH_DEFAULTS)
         // 🔴 F11：reset 以前少回 `defaults`（和 set 分支结构不一致，模型无从对照）
-        return { reset: true, config: wd.config, defaults: clone(WATCH_DEFAULTS) }
+        return { reset: true, ...configPair(wd.config) }
       }
       // 把 "wakeOn.itemPickup": true 这种点号键拆成嵌套补丁
       const patch = {}
@@ -3247,7 +3294,7 @@ export function apply(ctx, rawConfig) {
         } else patch[k] = v
       }
       if (Object.keys(patch).length) wd.updateConfig(patch)
-      return { config: wd.config, defaults: clone(WATCH_DEFAULTS) }
+      return { ...configPair(wd.config) }
     },
   }))
 
@@ -3256,9 +3303,12 @@ export function apply(ctx, rawConfig) {
     description: '【边界信息】这个插件能做什么、边界在哪：**支持的 MC 版本范围**（testedVersions）、底层 mineflayer 版本、'
       + '支持的登录方式、工具命名空间、各种上限（序列步数/记忆大小/事件队列）以及当前配置要点。\n'
       + '**进服前不确定版本能不能连时先看它**；确实不支持就如实跟他说一声，别硬试。',
-    parameters: {},
+    parameters: {
+      detail: { type: 'boolean', description: 'true = 连工具名清单、准则注入路径等细节一起给（默认精简）' },
+    },
     output: text(),
     async execute(args, exec) {
+      const detail = args.detail === true
       const lib = libraryInfo()
       return {
         plugin: { name: 'dsh-mc-agent', version: PLUGIN_VERSION, dir: redactPath(fileURLToPath(new URL('.', import.meta.url))) },
@@ -3286,7 +3336,7 @@ export function apply(ctx, rawConfig) {
             note: 'mc_* / mc_kit_* 只在 MC模式 / MC+模式 会话里暴露（其他模式隐藏 + guard 硬拒）。',
           },
           count: ourToolNames.length,
-          names: [...ourToolNames],
+          ...(detail ? { names: [...ourToolNames] } : { note: '要完整工具名清单加 detail:true' }),
         },
         limits: {
           perCallMs: CALL_MS,          // 🔴 单次工具调用的硬上限（用户要求 ≤11 秒，长动作分几次）
@@ -3306,11 +3356,13 @@ export function apply(ctx, rawConfig) {
           mcModePresets: pluginConfig.mcModePresets,
           mcPlusPresets: pluginConfig.mcPlusPresets,
         },
-        prompt: {
-          agentsMd: redactPath(agentsMdPath(memoryFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent)).root)),
-          injectDshMcAgentAgentsMd: wsCfgValues(workspaceOf(exec?.agent)).injectDshMcAgentAgentsMd,
-          injectWorkspaceAgentsMd: wsCfgValues(workspaceOf(exec?.agent)).injectWorkspaceAgentsMd,
-        },
+        ...(detail ? {
+          prompt: {
+            agentsMd: redactPath(agentsMdPath(memoryFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent)).root)),
+            injectDshMcAgentAgentsMd: wsCfgValues(workspaceOf(exec?.agent)).injectDshMcAgentAgentsMd,
+            injectWorkspaceAgentsMd: wsCfgValues(workspaceOf(exec?.agent)).injectWorkspaceAgentsMd,
+          },
+        } : {}),
       }
     },
   }))
@@ -3465,7 +3517,8 @@ export function apply(ctx, rawConfig) {
               + (r.unloaded ? `（但有 ${r.unloaded} 格未加载 —— **不算"没有"**，可以走近再看）` : ''),
           }
         }
-        const items = (r.blocks ?? []).map((blk) => `${blk.pos}`
+        /* 🔴 2026-10-23 审计：以前写成 `5,64,-3 距 2.1` —— 坐标和距离挤在一起看不出哪部分是坐标。 */
+        const items = (r.blocks ?? []).map((blk) => `(${blk.pos})`
           + `${blk.distance != null ? ` 距 ${blk.distance}` : ''}`
           + `${blk.ripe === true ? ' 熟' : (blk.ripe === false ? ' 没熟' : '')}`
           + `${blk.age != null && blk.maxAge != null ? ` ${blk.age}/${blk.maxAge}` : ''}`)
@@ -3706,23 +3759,49 @@ export function apply(ctx, rawConfig) {
 
   /* 周围实体快照（用户 m01114：走完一步要能看见"身边有谁"，不用再单独叫 mc_entities）。
    * 只列 12 格内、最多 6 个；附近没人就返回 {}（常态零额外 token）。 */
+  /* 🔴 2026-10-23 审计（用户："怎么全是item"）：掉落物统一叫 item，地上摊着几件就把真怪挤没了。
+   *    口径与 src/attack.mjs 的 nearOf 一致：活体优先（同类合并成 count），掉落物只报个数、不占名额。
+   *    距离字段统一叫 distance（以前这里叫 d，mc_observe 叫 distance，同一个意思两个名）。 */
   const aroundOf = (sess, radius = 12) => {
     const b = sess?.bot?.bot
     const me = b?.entity?.position
     if (!me) return {}
-    const out = []
+    const live = new Map()
+    let junk = 0
+    let junkNearest = Infinity
     for (const e of Object.values(b.entities ?? {})) {
       if (!e || !e.position || e.id === b.entity?.id) continue
-      const name = e.username || e.name || e.displayName
-      if (!name) continue
       let d = Infinity
       try { d = me.distanceTo(e.position) } catch { continue }
       if (!(d <= radius)) continue
-      out.push({ name, d: Number(d.toFixed(1)), ...(Number.isFinite(Number(e.health)) ? { hp: e.health } : {}) })
+      const name = e.username || e.name || e.displayName
+      if (!name) continue
+      if (isDropEntity(e) || /^experience_orb$/i.test(String(e.name ?? ""))) {
+        junk++
+        if (d < junkNearest) junkNearest = d
+        continue
+      }
+      const cur = live.get(name)
+      if (cur) {
+        cur.n += 1
+        if (Number(d.toFixed(1)) < cur.distance) cur.distance = Number(d.toFixed(1))
+      } else {
+        live.set(name, {
+          name, n: 1, distance: Number(d.toFixed(1)),
+          ...(HOSTILE_RE.test(name) ? { hostile: true } : {}),
+          ...(Number.isFinite(Number(e.health)) ? { hp: e.health } : {}),
+        })
+      }
     }
-    if (!out.length) return {}
-    out.sort((a, c) => a.d - c.d)
-    return { around: out.slice(0, 6) }
+    const around = [...live.values()]
+      .sort((a, c) => a.distance - c.distance)
+      .slice(0, 6)
+      .map(({ n, ...rest }) => (n > 1 ? { ...rest, count: n } : rest))
+    if (!around.length && !junk) return {}
+    return {
+      ...(around.length ? { around } : {}),
+      ...(junk ? { junk: { count: junk, nearest: Number(junkNearest.toFixed(1)) } } : {}),
+    }
   }
 
   ctx.tools.register(asTool({
@@ -3852,9 +3931,9 @@ export function apply(ctx, rawConfig) {
         /* 🔴 2026-10-23 实机（用户直接把『未知 mode："jump"』贴回来）：跳一下属于移动，
          *    但人在 mc_act 里找它（脱困 / 爬台阶时手最顺的就是这个工具）。与其报错让人换工具，
          *    直接把 jump 接过来 —— 和 mc_move {mode:"jump"} 走同一条路（同一个 bumpGen）。 */
-        case 'jump':    return { mode, ...(await bot.jump()), ...aroundOf(sess) }
-        case 'look':    return { mode, ...(await bot.lookAt(args)) }
-        case 'toward':  return { mode, ...(await bot.interact(args)) }
+        case 'jump':    return withOutcome({ mode, ...(await bot.jump()) }, { ...aroundOf(sess) })
+        case 'look':    return withOutcome({ mode, ...(await bot.lookAt(args)) })
+        case 'toward':  return withOutcome({ mode, ...(await bot.interact(args)) })
         case 'place':   return withOutcome({ mode, ...(await bot.placeBlock(args)) }, { expect: 'placed' })
         /* P0-2（用户 m02868）：搭路是**独立状态机** —— 每格"放一块 → 等服务端确认 → 才走"，任何一处
          * 对不上（脚下悬空 / 区块没加载 / 血量太低 / 回读没确认）立刻停，绝不继续往下铺；桥下有岩浆/火、或者下方是 >64 格深空 ⇒ **只警告不拦**（2026-10-22 用户要求），结果里带 warnings/risk。
@@ -3864,21 +3943,21 @@ export function apply(ctx, rawConfig) {
         case 'use': {
           // 没给坐标也没给 who ⇒ 不是"右键某个东西"，而是"用手上的东西"（对着空气用）
           const noTarget = args.who == null && args.x == null && args.y == null && args.z == null
-          if (noTarget) return { mode: 'useitem', ...(await bot.useItem(args)) }
+          if (noTarget) return withOutcome({ mode: 'useitem', ...(await bot.useItem(args)) })
           return withOutcome({ mode, ...(await bot.useBlock(args)) })
         }
-        case 'useitem': return { mode, ...(await bot.useItem(args)) }
-        case 'fish':    return { mode, ...(await fishOnce(bot.requireBot())) }
-        case 'equip':   return { mode, ...(await bot.equip({ name: args.name, to: args.to })) }
-        case 'toss':    return { mode, ...(await bot.tossItem({ name: args.name, count: args.count })) }
+        case 'useitem': return withOutcome({ mode, ...(await bot.useItem(args)) })
+        case 'fish':    return withOutcome({ mode, ...(await fishOnce(bot.requireBot())) })
+        case 'equip':   return withOutcome({ mode, ...(await bot.equip({ name: args.name, to: args.to })) })
+        case 'toss':    return withOutcome({ mode, ...(await bot.tossItem({ name: args.name, count: args.count })) })
         /* 用户 2026-10-20：「还有下船」—— 上船一直有（`use`→`activateEntity`），下来没有：
          * `bot.dismount()` 只发包不确认，实现在 `src/boat.mjs`（发完轮询 `bot.vehicle`）。 */
         /* 2026-10-23 一档第 4 条（用户「1档和2档做一下」）：睡觉 / 起床 / 耕地播种。
          * 睡和种都是"夜里 / 远处才用得上的长活"，塞进 mc_act 是因为脱困过夜时手最顺的就是这个工具。 */
-        case 'sleep':   return { mode, ...(await sleepInBed(bot, { x: args.x, y: args.y, z: args.z, radius: args.radius, waitMs: args.waitMs, budgetMs: args.budgetMs })) }
-        case 'wake':    return { mode, ...(await wakeUp(bot)) }
-        case 'farm':    return { mode, ...(await farmArea(bot, { x: args.x, y: args.y, z: args.z, seed: args.seed, harvest: args.harvest, clear: args.clear, radius: args.radius, count: args.count })) }
-        case 'dismount': return { mode, ...(await bot.dismountVehicle()) }
+        case 'sleep':   return withOutcome({ mode, ...(await sleepInBed(bot, { x: args.x, y: args.y, z: args.z, radius: args.radius, waitMs: args.waitMs, budgetMs: args.budgetMs })) })
+        case 'wake':    return withOutcome({ mode, ...(await wakeUp(bot)) })
+        case 'farm':    return withOutcome({ mode, ...(await farmArea(bot, { x: args.x, y: args.y, z: args.z, seed: args.seed, harvest: args.harvest, clear: args.clear, radius: args.radius, count: args.count })) })
+        case 'dismount': return withOutcome({ mode, ...(await bot.dismountVehicle()) })
         default: throw new Error(`未知 mode："${mode}"（可用 look/toward/place/bridge/break/use/useitem/fish/equip/toss/jump/sleep/wake/farm/dismount；走路/飞/游泳用 mc_move，射箭/打怪/自查/方块台另见 mc_shoot / mc_attack / mc_prep / mc_station）`)
       }
     },
@@ -3909,7 +3988,7 @@ export function apply(ctx, rawConfig) {
        *    报「tool "mc_fish" returned invalid output: "value" must be an object」——
        *    等于钓鱼整个不可用（连人都没开始钓就被拦）。其它工具返回的是对象，只有这里裸串。
        *    统一成 `{ text }`（`text()` 的 render 会优先取 `value.text`）。 */
-      return { text: `${head}：${r.message}${tail}`, ...r }
+      return withOutcome({ text: `${head}：${r.message}${tail}`, ...r })
     },
   }))
 
@@ -3929,8 +4008,26 @@ export function apply(ctx, rawConfig) {
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
-      if (args.clearAll) return sess.bot.clearInventory()
-      return sess.bot.giveItem({ name: args.name, count: args.count, slot: args.slot, force: args.force })
+      /* 🔴 2026-10-23 审计：清空走 `clearInventory`、给物走 `giveItem`，两个分支返回的键**完全不同**
+       *    （`{cleared,left,names}` vs `{gave,slot,now}`），而且都没有 text —— 模型只能靠猜键名判成败。 */
+      if (args.clearAll) {
+        const r = await sess.bot.clearInventory()
+        return withOutcome({
+          ...r,
+          text: r.cleared
+            ? '🧹 背包清空了（抽查过：一件不剩）'
+            : `🧹 **没清干净**：还剩 ${r.left} 叠（${(r.names ?? []).join('、')}）—— 别当成背包空了`,
+          ...(r.cleared ? { done: true } : { ok: false }),
+        })
+      }
+      const g = await sess.bot.giveItem({ name: args.name, count: args.count, slot: args.slot, force: args.force })
+      return withOutcome({
+        ...g,
+        text: g.now
+          ? `🎁 已给出 ${g.gave}（第 ${g.slot} 格${g.note ? '，' + g.note : ''}）`
+          : `🎁 **没放进去**：${g.gave} —— ${g.note ?? '服务端没认这次 setInventorySlot，别当成拿到了'}`,
+        ...(g.now ? { done: true } : { ok: false }),
+      })
     },
   }))
 

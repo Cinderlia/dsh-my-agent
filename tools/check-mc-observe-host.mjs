@@ -469,6 +469,36 @@ console.log('— ⑥ 皮肤阶段共享 11 秒预算（静态）—')
   ok(!/上界压到 CALL_BUDGET_MS（10 秒）/.test(src), '那句"压到 10 秒就不会顶穿 11 秒"的错误注释已经删掉')
 }
 
+/* ─────────── ㊹ 掉落物：垫底 + 聚成一行（用户 2026-10-23「怎么全是item」） ─────────── */
+console.log('㊹ 掉落物单列 junk 档：不抢怪的名额，也不逐行刷屏')
+{
+  const spec = registered.get('mc_observe')
+  const junkRows = Array.from({ length: 12 }, (_, i) => ({
+    name: 'item', kind: 'junk', junk: true, hostile: false, neutral: false, ranged: false,
+    distance: 1 + i * 0.3, position: { x: 0, y: 1, z: 1 }, dy: 0,
+  }))
+  const zombieRow = {
+    name: 'zombie', kind: 'hostile', hostile: true, neutral: false, ranged: false,
+    distance: 5, position: { x: 2, y: 1, z: -2 }, dy: 0, health: 20,
+  }
+  const botJunk = {
+    ...mkBot(true),
+    entities: (radius = 24, opts = {}) => ({
+      me: { x: 0, y: 1, z: 0 }, radius, kind: opts.kind ?? 'all',
+      counts: { hostile: 1, neutral: 0, player: 0, other: 0, junk: 12 },
+      total: 13,
+      list: [zombieRow, ...junkRows],
+    }),
+  }
+  sessions.set('JUNK', { bot: botJunk })
+  const out = await spec.execute({}, { agent: { id: 'JUNK', session: { header: { cwd: wsRoot } } } })
+  const t = String(out.text ?? '')
+  ok(/掉落物 \*\*item\*\*×12/.test(t), '掉落物要聚成一行（掉落物 **item**×12），不是 12 行各占一条', t.slice(t.indexOf('实体'), t.indexOf('实体') + 200))
+  ok((t.match(/\*\*item\*\*/g) ?? []).length === 1, '渲染里 item 只出现一次（聚合后）', String((t.match(/\*\*item\*\*/g) ?? []).length))
+  ok(/掉落物 12/.test(t), '计数行单独报掉落物个数', t.slice(t.indexOf('格内实体'), t.indexOf('格内实体') + 120))
+  ok(t.indexOf('**zombie**') >= 0 && t.indexOf('**zombie**') < t.indexOf('掉落物 **item**'), '怪排在掉落物前面', '')
+  sessions.delete('JUNK')
+}
 console.log(`\n${fail === 0 ? '全部通过' : '有失败'}：pass=${pass} fail=${fail}`)
 if (!process.argv.includes('--keep')) {
   try { rmSync(wsRoot, { recursive: true, force: true }) } catch { /* 清不掉就算了 */ }

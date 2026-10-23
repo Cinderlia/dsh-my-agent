@@ -224,11 +224,11 @@ section('⑦ 工具层接线 —— mc_act{useitem} 与"use 不给目标"都要�
     && /async runSequence \(steps, opts = \{\}\) \{ return await runSequence\(this, steps, opts\) \}/.test(core),
     'core 的 runSequence 是薄包装（步骤分发在 sequence.mjs）')
 
-  ok(/case 'useitem': return \{ mode, \.\.\.\(await bot\.useItem\(args\)\) \}/.test(idx),
+  ok(/case 'useitem': return withOutcome\(\{ mode, \.\.\.\(await bot\.useItem\(args\)\) \}\)/.test(idx),
     'mc_act 的 switch 里有 `case \'useitem\'`')
   ok(/const noTarget = args\.who == null && args\.x == null && args\.y == null && args\.z == null/.test(idx),
     '`use` 会判断"有没有给目标"')
-  ok(/if \(noTarget\) return \{ mode: 'useitem', \.\.\.\(await bot\.useItem\(args\)\) \}/.test(idx),
+  ok(/if \(noTarget\) return withOutcome\(\{ mode: 'useitem', \.\.\.\(await bot\.useItem\(args\)\) \}\)/.test(idx),
     '没给目标时 `use` 退回 useItem（对着空气用手上的东西）')
   ok(/· useitem 用手上的东西/.test(idx), '工具描述里有 useitem 一行')
   ok(/hold: \{ type: 'number'/.test(idx), 'schema 里有 hold 参数')
