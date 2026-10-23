@@ -797,7 +797,7 @@ console.log('— ⑧ 合成窗口失步（实机 2026-10-07：10 根橡木没了
   {
     const f = mkBot({ oak_log: 2 }, { world: mkWorld({ '4,1,0': 'crafting_table' }) })
     const r = await run({ name: 'wooden_pickaxe' }, { mc: mkMc(f), id: 'S4' })
-    ok(/够不着或看不见/.test(r.text), '够不着的工作台不用它，并说清为什么', r.text.split('\n').slice(0, 2).join(' ').slice(0, 170))
+    ok(/工作台用不了：离我/.test(r.text), '够不着的工作台不用它，并说清"离我几格"', r.text.split('\n').slice(0, 2).join(' ').slice(0, 170))
     ok(/工作台/.test(r.text) && !/完成/.test(r.text), '如实报"需要工作台"，不去挂那一整轮', r.text.split('\n').slice(0, 3).join(' ').slice(0, 210))
   }
   // ⑤ 反过来：3 格内的工作台照旧用（别误伤正常路径）
@@ -811,7 +811,14 @@ console.log('— ⑧ 合成窗口失步（实机 2026-10-07：10 根橡木没了
   {
     const f = mkBot({ oak_log: 2 }, { world: mkWorld({ '1,1,0': 'crafting_table' }), canSeeBlock: false })
     const r = await run({ name: 'wooden_pickaxe' }, { mc: mkMc(f), id: 'S6' })
-    ok(/够不着或看不见/.test(r.text), '看不见的工作台也不用它', r.text.split('\n').slice(0, 2).join(' ').slice(0, 170))
+    ok(/工作台用不了：视线被挡/.test(r.text), '看不见的工作台也不用它，并说清"视线被挡"', r.text.split('\n').slice(0, 2).join(' ').slice(0, 170))
+  }
+  // ⑥b 工作台正上方被实心方块挡着 ⇒ 人站不到它旁边，右键永远没回包（用户 2026-10-24）
+  {
+    const f = mkBot({ oak_log: 2 }, { world: mkWorld({ '1,1,0': 'crafting_table', '1,2,0': 'stone' }) })
+    const r = await run({ name: 'wooden_pickaxe' }, { mc: mkMc(f), id: 'S6b' })
+    ok(/正上方被 stone 挡着/.test(r.text), '正上方被挡时点名说是哪块方块', r.text.split('\n').slice(0, 2).join(' ').slice(0, 170))
+    ok(/工作台/.test(r.text) && !/完成/.test(r.text), '如实报"需要工作台"，不当成能用', r.text.split('\n').slice(0, 3).join(' ').slice(0, 200))
   }
   // ⑦ 一次 craft 只做出一批（实机：要 8 块木板只出了 4 块）⇒ 自己把剩下的补上
   {

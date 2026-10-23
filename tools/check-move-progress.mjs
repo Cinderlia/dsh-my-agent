@@ -33,6 +33,8 @@ const {
   escapeStepOf, escapeTextOf, moveBusyNow, moveProgressWatcher, escapeMove, walkPathfinder, routeTrack, aboveOf,
   walkTo, carveStepAhead, MOVE_HARD_SLACK_MS, MOVE_CARVE_DIG_MS,
   MOVE_PLAN, MOVE_PLAN_TEXT, planStepTextOf, detourStep, MOVE_DETOUR_R, MOVE_DETOUR_MS, MOVE_PLAN_TTL_MS, MOVE_PLAN_SAME_R,
+  MOVE_ESCAPES_DIG, MOVE_ESCAPES_NODIG, escapeStepsFor, movePlanFor, MOVE_PLAN_NODIG,
+  MOVE_VENDOR_STUCK_MS, MOVE_RESET_LIMIT,
 } = mod
 
 let pass = 0
@@ -99,13 +101,18 @@ const watchOpts = (clock) => ({ arrive: 1.6, ty: 64, now: clock.now, setTimer: c
 /* ═══════════════ ① 阶梯：纯函数 ═══════════════ */
 section('① 脱困阶梯的顺序与命名（纯函数）')
 {
-  ok(Array.isArray(MOVE_ESCAPES) && MOVE_ESCAPES.length === 5 && MOVE_ESCAPES[4] === 'breakAhead', '阶梯五级，最后一级是真挖开挡路那格', JSON.stringify(MOVE_ESCAPES))
-  ok(MOVE_ESCAPES[3] === 'detour', '🔴 侧向绕行排在挖之前（能绕就别拆：用户 2026-10-23「太容易卡」）', MOVE_ESCAPES.join(' → '))
-  ok(MOVE_ESCAPES[0] === 'repath' && MOVE_ESCAPES[1] === 'jump' && MOVE_ESCAPES[2] === 'backoff',
-    '🔴 顺序 = 用户要求的「重算路径 → 跳跃脱困 → 后退再寻路」', MOVE_ESCAPES.join(' → '))
-  ok(escapeStepOf(0) === 'repath' && escapeStepOf(1) === 'jump' && escapeStepOf(2) === 'backoff',
-    'escapeStepOf(n) 按序给动作')
-  ok(escapeStepOf(5) === null && escapeStepOf(99) === null, '🔴 走完阶梯返回 null（= 该认输了，不无限重试）')
+  ok(Array.isArray(MOVE_ESCAPES_DIG) && MOVE_ESCAPES_DIG.length === 5 && MOVE_ESCAPES_DIG.includes('breakAhead'),
+    '允许挖时阶梯五级，含"挖开挡路那格"', JSON.stringify(MOVE_ESCAPES_DIG))
+  ok(JSON.stringify(MOVE_ESCAPES_NODIG) === JSON.stringify(['repath', 'jump', 'backoff', 'detour']),
+    '🔴 不挖时阶梯里**没有** breakAhead（以前空转一轮 2.4 秒，还写进 planTried 误导模型）', JSON.stringify(MOVE_ESCAPES_NODIG))
+  ok(escapeStepsFor(true) === MOVE_ESCAPES_NODIG && escapeStepsFor(false) === MOVE_ESCAPES_DIG && escapeStepsFor() === MOVE_ESCAPES_DIG,
+    'escapeStepsFor(noDig) 按开关选阶梯')
+  ok(MOVE_ESCAPES_DIG[0] === 'repath' && MOVE_ESCAPES_DIG[1] === 'jump' && MOVE_ESCAPES_DIG[2] === 'breakAhead',
+    '🔴 允许挖时 breakAhead 提到 jump 之后（能挖就别绕远路）', MOVE_ESCAPES_DIG.join(' → '))
+  ok(MOVE_ESCAPES_NODIG[0] === 'repath' && MOVE_ESCAPES_NODIG[1] === 'jump' && MOVE_ESCAPES_NODIG[2] === 'backoff',
+    '🔴 不挖时顺序 = 用户要求的「重算路径 → 跳跃脱困 → 后退再寻路」', MOVE_ESCAPES_NODIG.join(' → '))
+  ok(escapeStepOf(0, MOVE_ESCAPES_DIG) === 'repath' && escapeStepOf(1, MOVE_ESCAPES_DIG) === 'jump' && escapeStepOf(2, MOVE_ESCAPES_DIG) === 'breakAhead',
+    'escapeStepOf(n, steps) 按序给动作')
   ok(escapeTextOf('repath') === '重算路径' && escapeTextOf('jump') === '跳跃脱困' && escapeTextOf('backoff') === '后退再寻路',
     'escapeTextOf 的中文名（日志与返回值文案用）')
   ok(escapeTextOf('随便什么') === '放弃', '不认识的级别 → 放弃')
@@ -172,13 +179,29 @@ section('③ moveProgressWatcher —— "既没挪动、也没靠近"才判卡�
   w.stop()
 }
 {
+  /* 🔴 2026-10-23 审计（A[1]）改口：以前这条断言钉的是**旧行为**（在到达圈里不动也不算卡），
+   *    而那正是"走到目标附近被门框/台阶挡住、永远不进脱困阶梯、干等预算耗尽"的根因。
+   *    现在：在圈里**一动不动**照样判卡；**还在靠近**才不判。 */
   const clock = fakeClock()
   const b = mkProbe({ x: 9, y: 64, z: 0 })          // 离目标 1 格 ⇒ 已经在到达半径里
   const w = moveProgressWatcher(b, { x: 10, y: 64, z: 0 }, watchOpts(clock))
   let err = null
   w.promise.catch((e) => { err = e })
   await clock.advance(MOVE_STUCK_MS * 3)
-  ok(err === null, '已经在到达半径里 ⇒ 不动也不算卡住')
+  ok(err?.mcStuck === true, '🔴 已经在到达半径里**但一动不动** ⇒ 照样判卡（以前这里永远不判）')
+  w.stop()
+}
+{
+  const clock = fakeClock()
+  const b = mkProbe({ x: 9, y: 64, z: 0 })
+  const w = moveProgressWatcher(b, { x: 10, y: 64, z: 0 }, watchOpts(clock))
+  let err = null
+  w.promise.catch((e) => { err = e })
+  for (let i = 1; i <= 3; i++) {
+    b.entity.position = new Vec3(9 + i * 0.3, 64, 0)   // 9.3 → 9.6 → 9.9，一直在靠近
+    await clock.advance(MOVE_SAMPLE_MS)
+  }
+  ok(err === null, '在到达圈里但**还在靠近** ⇒ 不判卡')
   w.stop()
 }
 
@@ -407,15 +430,16 @@ function mkCtx (self, clock) {
   ok(r.arrived === false && r.stuck === true, '走不动 ⇒ arrived:false / stuck:true', JSON.stringify({ a: r.arrived, s: r.stuck }))
   ok(r.reason === 'unreachable', '🔴 阶梯用完 ⇒ reason = unreachable（**不是** timeout / 不是"再叫一次"）', String(r.reason))
   ok(r.repathCount === MOVE_ESCAPES.length, `repathCount = ${MOVE_ESCAPES.length}（三级都试过了）`, String(r.repathCount))
-  ok(bot.calls.goto >= MOVE_ESCAPES.length + 1 && bot.calls.goto <= MOVE_ESCAPES.length + 2,
-    `重新 goto 了 ${bot.calls.goto} 次（首次 + 每级脱困各一次；绕行那一级自己再走一次）`, String(bot.calls.goto))
+  /* 2026-10-23 审计（A[4]）：绕行那一级现在**最多试两个候选**（每个一次 goto），所以上界 +3。 */
+  ok(bot.calls.goto >= MOVE_ESCAPES.length + 1 && bot.calls.goto <= MOVE_ESCAPES.length + 3,
+    `重新 goto 了 ${bot.calls.goto} 次（首次 + 每级脱困各一次；绕行那一级最多试两个候选）`, String(bot.calls.goto))
   ok(/真的走不动了/.test(r.hint ?? ''), 'hint 如实说"真的走不动了"', String(r.hint).slice(0, 60))
   ok(/别原地重试/.test(r.hint ?? ''), '🔴 hint 明确劝"别原地重试"（把长路拆成几段）', String(r.hint).slice(0, 90))
   ok(!/再叫一次 mc_move 往同一个目标走/.test(r.hint ?? ''), '不误报成"再叫一次就好"')
   const escLogs = self.logs.filter((m) => /第 \d+ 步|脱困/.test(m))
   ok(escLogs.length === MOVE_ESCAPES.length, '每级脱困各记一行日志', String(escLogs.length))
-  ok(/重算路径/.test(escLogs[0] ?? '') && /跳跃脱困/.test(escLogs[1] ?? '') && /后退再寻路/.test(escLogs[2] ?? ''),
-    '日志按阶梯顺序（重算路径 → 跳跃脱困 → 后退再寻路 → 侧向绕行 → 挖开）', JSON.stringify(escLogs.map((s) => s.slice(0, 30))))
+  ok(/重算路径/.test(escLogs[0] ?? '') && /跳跃脱困/.test(escLogs[1] ?? '') && /挖开挡路那格再走/.test(escLogs[2] ?? ''),
+    '日志按阶梯顺序（允许挖：重算路径 → 跳跃脱困 → 挖开 → 后退 → 侧向绕行）', JSON.stringify(escLogs.map((s) => s.slice(0, 30))))
   ok(bot.controls.some(([k, v]) => k === 'jump' && v === true), '真的按过 jump（跳跃脱困不是空话）')
   ok(bot.controls.some(([k, v]) => k === 'back' && v === true), '真的按过 back（后退再寻路不是空话）')
   ok(clock.live === 0, '🔴 收尾时采样器定时器全清掉（不然把进程钉住）')
@@ -502,11 +526,15 @@ section('⑧ 静态接线（谁把这几条改回去谁红）')
   ok(!/await raceAbort\(withTimeout\(work, budget, '寻路'\), self\.abortSignal, '寻路'\)/.test(src),
     '🔴 不再是"一次 goto 到底"的老写法')
   ok(/let attempt = planFrom\s*\n\s*for \(;;\)/.test(src), '有重试循环（attempt 手动推进：挖台阶补救不算一级脱困）')
-  ok(/const step = escapeStepOf\(attempt - 1\)/.test(src), '每轮按阶梯取脱困动作')
+  ok(/const step = escapeStepOf\(attempt - 1, steps\)/.test(src), '每轮按**这一趟的**阶梯取脱困动作（noDig 时不含 breakAhead）')
   ok(/err\.mcStuck = true[\s\S]{0,120}?err\.mcExhausted = true/.test(src), '阶梯用完抛的是带 mcStuck 的错误')
   ok(/if \(e\?\.mcStuck\)[\s\S]{0,1400}?attempt\+\+[\s\S]{0,200}?continue/.test(src), '采样器判卡 ⇒ 补救没戏就进下一轮脱困')
-  ok(/await carveStepAhead\(b, target, \{ ignoreRange: true \}\)/.test(src) && /carveTries < MOVE_CARVE_TRIES/.test(src),
+  ok(/await carveStepAhead\(b, target, \{ ignoreRange: true, only: obstacle \}\)/.test(src) && /carveTries < MOVE_CARVE_TRIES/.test(src),
     '🔴 阶梯之前先试"挖开挡路的台阶"（2026-10-18 实机；审计后改成看眼前障碍）')
+  ok(/if \(obstacle\) \{/.test(src) && !/carveTries === 0/.test(src),
+    '🔴 2026-10-24 审计：没有明确障碍证据就不许挖（旧的 carveTries===0 无条件补挖已删）')
+  ok(/only: obstacle/.test(src) && /if \(only\) \{/.test(src),
+    '🔴 2026-10-24 审计：补挖直接挖 obstacle 指出的那一格，不再自己重扫')
   ok(/const carveAllowed = !noDig && ctx\.cfg\?\.walkCanDig !== false && ctx\.cfg\?\.walkCarveStep !== false/.test(src),
     '🔴 自动挖台阶服从 walkCanDig / walkCarveStep（不许绕过配置）')
   ok(/export const CARVE_PROTECTED = new RegExp/.test(src), '容器/矿石/装置有保护名单（不替 AI 挖掉）')
@@ -1303,6 +1331,22 @@ section('⑭ 门：不挖、不重复按、按开的别被 vendor 关回去（20
     const out = []
     mv.getMoveForward({ x: 0, y: 64, z: 0 }, { x: 1, z: 0 }, out)
     ok(out[0].toPlace.length === 0, '🔴 门已经开着 ⇒ 没有"再按一下"那步', JSON.stringify(out[0].toPlace))
+  }
+  {
+    // 🔴 2026-10-24 审计（用户第三份）：所有候选都"得挖门框"时，宁可没路
+    //（⇒ NoPath ⇒ 脱困阶梯 / 等开门），也不要把未过滤的候选还给 A*
+    //（那是"挖穿门框过去"的假路：规划上通、执行时被拦，机器人就在门口蹭）
+    const world2 = { '1,64,0': blk('stone', false), '1,64,1': blk('oak_door', false) }
+    const mv = {
+      getBlock (node, dx, dy, dz) { return world2[`${node.x + dx},${node.y + dy},${node.z + dz}`] ?? blk('air', false) },
+      getNeighbors (node) {
+        return [{ cost: 12, toBreak: [{ x: 1, y: 64, z: 0 }], toPlace: [] }]
+      },
+    }
+    patchDoorMoves(mv)
+    const out = mv.getNeighbors({ x: 0, y: 64, z: 0 })
+    ok(Array.isArray(out) && out.length === 0,
+      '🔴 门保护把候选全作废时返回空（不再退回未过滤的候选）', JSON.stringify(out))
   }
   {
     // 铁门按不开：保留原行为（别把唯一的路堵死）
@@ -2108,10 +2152,14 @@ section('㉒ 补挖的方向只认主轴 / 对角受限 / 有总预算')
  */
 section('㉓ 执行顺序：先便宜的、能绕就别挖；跨调用接着升级')
 {
-  ok(JSON.stringify(MOVE_PLAN) === JSON.stringify(['door', 'repath', 'jump', 'backoff', 'detour', 'breakAhead', 'tower']),
-    '执行顺序表 = 开门 → 重算 → 跳 → 后退 → 绕行 → 挖 → 垫柱', JSON.stringify(MOVE_PLAN))
-  ok(MOVE_ESCAPES.indexOf('detour') >= 0 && MOVE_ESCAPES.indexOf('detour') < MOVE_ESCAPES.indexOf('breakAhead'),
-    '🔴 绕行排在挖之前（用户 2026-10-23：能绕就别拆）', MOVE_ESCAPES.join(' → '))
+  ok(JSON.stringify(MOVE_PLAN) === JSON.stringify(['door', 'repath', 'jump', 'breakAhead', 'backoff', 'detour', 'tower']),
+    '允许挖时的执行顺序 = 开门 → 重算 → 跳 → 挖 → 后退 → 绕行 → 垫柱', JSON.stringify(MOVE_PLAN))
+  ok(JSON.stringify(MOVE_PLAN_NODIG) === JSON.stringify(['door', 'repath', 'jump', 'backoff', 'detour', 'tower']),
+    '不挖时的执行顺序 = 开门 → 重算 → 跳 → 后退 → 绕行 → 垫柱（没有"挖"这一级）', JSON.stringify(MOVE_PLAN_NODIG))
+  ok(movePlanFor(true) === MOVE_PLAN_NODIG && movePlanFor(false) === MOVE_PLAN,
+    'movePlanFor(noDig) 与 escapeStepsFor 同源')
+  ok(MOVE_ESCAPES_DIG.indexOf('breakAhead') < MOVE_ESCAPES_DIG.indexOf('detour'),
+    '🔴 允许挖时"挖"排在绕行之前（能挖就别绕远路）', MOVE_ESCAPES_DIG.join(' → '))
   ok(planStepTextOf('detour') === '侧向绕行' && planStepTextOf('tower') === '垫一格往上',
     'planStepTextOf 给中文名（日志/结果用）')
   ok(MOVE_DETOUR_R >= 2 && MOVE_DETOUR_MS > 0, '绕行半径/时长有默认值', `${MOVE_DETOUR_R} 格 / ${MOVE_DETOUR_MS}ms`)
@@ -2160,7 +2208,7 @@ section('㉓ 执行顺序：先便宜的、能绕就别挖；跨调用接着升�
   const first = self.logs.find((m) => /第 \d+ 步/.test(m)) ?? ''
   ok(/第 3 步/.test(first), '同一目标再叫：从上次卡住的第 3 级接着升（不从第 1 级重来）', first.slice(0, 46))
   ok(Array.isArray(r.planTried) && r.planTried.length >= 1, '结果里报 planTried（这一趟试过哪几级）', JSON.stringify(r.planTried))
-  ok(r.planStep === 'breakAhead', 'planStep = 最后试的那一级', String(r.planStep))
+  ok(r.planStep === 'detour', 'planStep = 最后试的那一级（允许挖那套的最后一级是绕行）', String(r.planStep))
   ok(bot._movePlan && Number(bot._movePlan.step) === MOVE_ESCAPES.length + 1,
     '还是卡 ⇒ 记下"卡到顶了"，下次直接换做法', JSON.stringify(bot._movePlan))
 }
@@ -2186,6 +2234,170 @@ section('㉓ 执行顺序：先便宜的、能绕就别挖；跨调用接着升�
   ok(!/else if \(step === 'detour'\)[\s\S]{0,240}?carveStepAhead\(/.test(src), '🔴 detour 分支里没有挖（能绕就别拆）')
   ok(/markPlan\(attempt \+ 1, step\)/.test(src), '每一级都记账，且记的是「下次从第几级起」（跨调用升级靠它）')
   ok(/b\._movePlan = \{ target:/.test(src) && /b\._movePlan = null/.test(src), '计划状态写在 bot 上、到达时清空')
+}
+/* ═══════════════ ㉔ 预算自适应门槛 + 挖不到立刻换招（2026-10-23 晚，用户实机 mc_sequence 卡死）═══════════════
+ * 实机症状：10 秒一次调用里 vendor 只判了 **2 次** stuck（3.5 秒一次），而脱困阶梯要等"重算 4 次"
+ * 才启动 ⇒ 永远轮不上，结果里连 planTried 都没有，10 秒全耗在 stuck→重算→超时。
+ * 两条修法：① 门槛按预算算（够几轮就几轮，最少 2）；② 挖 0 格就封顶，别空转一个 stuck 周期。
+ */
+section('㉔ 预算只够判 2 次 stuck 时，脱困阶梯必须当轮就启动')
+{
+  const src2 = strip(read('../src/movement.mjs'))
+  ok(MOVE_VENDOR_STUCK_MS === 3500, 'vendor 判一次 stuck 约 3.5 秒（常量写死，门槛靠它算）', String(MOVE_VENDOR_STUCK_MS))
+  ok(/resetLimit: resetLimitEff/.test(src2), 'watcher 收自适应门槛（resetLimitEff）')
+  ok(/Math\.floor\(budget \/ MOVE_VENDOR_STUCK_MS\)/.test(src2), '门槛 = 预算 ÷ 3.5 秒')
+  ok(/Math\.max\(2,/.test(src2) && /Math\.min\(MOVE_RESET_LIMIT/.test(src2), '门槛夹在 2 与 MOVE_RESET_LIMIT 之间')
+  ok(/carveTries = MOVE_CARVE_TRIES/.test(src2), '挖不到就封顶，不再重复试')
+  ok(/不重复试，直接换下一招/.test(src2), '日志说清楚"不重复试"')
+}
+{
+  /* 行为：10 秒预算 + 2 次 path_reset ⇒ 直接进阶梯（以前要等 4 次，永远等不到） */
+  const clock = autoClock()
+  const bot = mkLoopBot()
+  const handlers = new Map()
+  bot.on = (ev, fn) => { const a = handlers.get(ev) ?? []; a.push(fn); handlers.set(ev, a) }
+  bot.removeListener = () => {}
+  const self = mkSelf(bot)
+  bot.pathfinder.goto = () => new Promise(() => {})   // 永不返回：只能靠 watcher 判卡
+  const run = walkPathfinder(self, { x: 20, y: 64, z: 0 }, { arrive: 1.6, budget: 10000 }, mkCtx(self, clock))
+  await sleep(80)
+  const emit = (ev, arg) => { for (const fn of handlers.get(ev) ?? []) fn(arg) }
+  emit('path_reset', 'stuck')
+  emit('path_reset', 'stuck')
+  await sleep(400)
+  const stepped = self.logs.filter((m) => /第 \d+ 步/.test(m))
+  ok(stepped.length > 0, '2 次重算就进脱困阶梯（10 秒预算下不再等 4 次）', stepped.join(' | '))
+  clock.stopPump()
+  await Promise.race([run, sleep(60)]).catch(() => {})
+}
+
+section('㉔ 2026-10-23 审计 A 组：卡住检测 / 游泳代次 / 绕行候选 / 穿门信号 / 补挖记账')
+{
+  const src = readFileSync(new URL('../src/movement.mjs', import.meta.url), 'utf8')
+
+  /* A[1] 近距离不等于有进展：在到达圈里一动不动，也要判卡 */
+  ok(!src.includes('d <= arrive + 0.6 || d < best - progressEps'), '🔴 "在到达圈里"不再当成进展（旧条件已删）')
+  ok(/if \(d < best - progressEps\)/.test(src), '只有距离真的变小才算进展')
+
+  /* A[2] 游泳：等完立刻验代次；收尾松反压键也要验代次 */
+  ok(/await raceAbort\(sleep\(250\), self\.abortSignal, '游泳'\)[\s\S]{0,400}if \(self\._moveGen !== gen\) return preemptResult/.test(src),
+    '游泳每轮等完立刻验代次（被接管就不再动控制位）')
+  ok(/if \(lastStrafe && self\._moveGen === gen\)/.test(src), '收尾松反压键也只在还是自己的代次时松')
+
+  /* A[4] 绕行：按评分依次试两个候选，不是一个 */
+  ok(/const tries = candsU\.slice\(0, 2\)/.test(src), '绕行真的试两个候选（不是只试最近的）')
+  ok(/for \(const c of cands\) uniq\.set/.test(src), '绕行候选先去重（左右两侧可能落到同一格）')
+  ok(/MOVE_ESCALATE_MIN_MS/.test(src) && /err\.mcBudgetOut = true/.test(src), '脱困阶梯吃预算（见底当阶梯用完，走同一条收尾路径）')
+  ok(/if \(reached \|\| got >= 0\.5\)/.test(src), '走到 / 挪开一段就收手，不再试另一侧')
+
+  /* A[5] 穿门：信号从调用方传进来（以前写 b.abortSignal = undefined，等于不可中断） */
+  ok(/radius = 3\.2, signal = null/.test(src), 'walkThroughDoor 接了 signal 参数')
+  ok(/raceAbort\(sleep\(80\), signal, '穿门'\)/.test(src), '穿门等待用传进来的 signal（可中断）')
+  ok(!/raceAbort\(sleep\(80\), b\.abortSignal/.test(src), '不再拿 bot 上不存在的 abortSignal')
+  ok(/walkThroughDoor\(b, target, \{ budgetMs: leftMs, signal: self\.abortSignal, moveGenOf: \(\) => self\._moveGen \}\)/.test(src), '调用处把 self.abortSignal 与 self._moveGen 的读法都传进去')
+  /* 2026-10-24 通审：`b._moveGen` 根本不存在（字段在 core 实例上），代次判断改成 ctx 递进来的读法。 */
+  ok(/if \(moveGenOf && moveGenOf\(\) !== gen0\) break/.test(src), '穿门循环里被接管就停手')
+  ok(/const gen0 = moveGenOf \? moveGenOf\(\) : null/.test(src), '穿门的代次从调用方拿（bot 上没有 _moveGen）')
+  ok(!/b\?\._moveGen/.test(src), '全仓不再从 bot 上读 _moveGen')
+
+  /* A[3] 阶梯前那次补挖要记账，注释与常量也要一致 */
+  ok(/planTried\.push\('carveAhead'\)/.test(src), '阶梯前的补挖也记进 planTried（AI 才看得到"其实先挖过"）')
+  ok(MOVE_PLAN.indexOf('breakAhead') < MOVE_PLAN.indexOf('detour'), '允许挖那套：挖在绕行之前（用户 2026-10-24 定的）')
+  ok(MOVE_PLAN_NODIG.indexOf('detour') > MOVE_PLAN_NODIG.indexOf('jump'), '不挖那套：绕行在跳之后，且没有挖这一级')
+  ok(!MOVE_PLAN_NODIG.includes('breakAhead'), '不挖那套确实没有 breakAhead')
+}
+
+section('㉕ 2026-10-24 局部运动层：一格台阶先踩上去，别把台阶挖了')
+{
+  const src = strip(read('../src/movement.mjs'))
+  /* 前方脚层实心、头顶空 ⇒ 这是一格台阶，站上去能站住 */
+  const g0 = mod.stepGeometryOf(mkCarveBot({ '1,64,0': 'stone' }), { x: 1, y: 64, z: 0 })
+  ok(g0?.kind === 'step', '前方一格高、顶上空 ⇒ 认成一格台阶', JSON.stringify(g0))
+  ok(g0?.canStandOnTop === true, '站上去能站住 ⇒ 可以直接跳上去')
+
+  /* 台阶顶部上方被堵 ⇒ 跳不上去（这是 1×2 窄道里最常见的样子） */
+  const g1 = mod.stepGeometryOf(mkCarveBot({ '1,64,0': 'stone', '1,66,0': 'stone' }), { x: 1, y: 64, z: 0 })
+  ok(g1?.kind === 'step' && g1?.canStandOnTop === false, '台阶顶部上方被堵 ⇒ 净空不足', JSON.stringify(g1))
+  ok(g1?.ceiling?.name === 'stone', '并且指出是哪一块堵着（好决定挖哪格）')
+
+  /* 两格高 ⇒ 是墙，不是台阶 */
+  const g2 = mod.stepGeometryOf(mkCarveBot({ '1,64,0': 'stone', '1,65,0': 'stone' }), { x: 1, y: 64, z: 0 })
+  ok(g2?.kind === 'wall', '前方两格高 ⇒ 是墙不是台阶（别当台阶处理）', JSON.stringify(g2))
+
+  /* 不挖 + 净空不足 ⇒ 如实报 blocked，一格都不动 */
+  const bNo = mkCarveBot({ '1,64,0': 'stone', '1,66,0': 'stone' })
+  const r1 = await mod.stepUp(bNo, { x: 1, y: 64, z: 0 }, { allowDig: false, ms: 40 })
+  ok(r1?.tried === true && r1?.ok === false, '不挖的模式下跳不上去 ⇒ 如实报失败', JSON.stringify(r1))
+  ok(r1?.why === 'no-headroom', '原因说清是「净空不足」，不是「没路」')
+  ok(bNo.dug.length === 0, '🔴 不挖就一格都不挖')
+
+  /* 允许挖 + 净空不足 ⇒ 只清天花板那一格，绝不挖台阶块本身 */
+  const bDig = mkCarveBot({ '1,64,0': 'stone', '1,66,0': 'stone' })
+  const r2 = await mod.stepUp(bDig, { x: 1, y: 64, z: 0 }, { allowDig: true, ms: 40 })
+  ok(r2?.dug === 1 && bDig.dug.includes('1,66,0'), '允许挖时只清挡在头顶的那一格', JSON.stringify(bDig.dug))
+  ok(!bDig.dug.includes('1,64,0'), '🔴 台阶块本身不许挖（那等于把楼梯削平）')
+
+  /* 静态接线：局部运动层必须排在通用挖掘之前，且 NoPath 时也有机会 */
+  ok(/export const STEP_UP_TRIES = 1/.test(src), '一次移动里只试一次局部台阶处理（试不通就交给脱困阶梯换招）')
+  ok(/if \(stepUpTries < STEP_UP_TRIES\)/.test(src), '卡住分支里先走局部运动层')
+  ok(/if \(emptyNoPath && stepUpTries < STEP_UP_TRIES\)/.test(src), 'A* 直接 NoPath 时也给一次机会（等不到 2.4 秒监控器）')
+  ok(/emptyNoPath = false/.test(src), '试完之后重置 NoPath 结论，别拿旧结论继续走')
+  ok(/planTried\.push\('stepUp'\)/.test(src), '台阶处理记进 planTried（AI 看得到试过什么）')
+  ok(/\.\.\.\(stepUpLast \? \{ stepUp: stepUpLast \}/.test(src), '结果里带 stepUp 证据')
+}
+
+section('㉖ 2026-10-24 导航世界模型：实体 / 未加载 / 岩浆 都不是「方块挡路」')
+{
+  const src = strip(read('../src/movement.mjs'))
+  const plug = strip(read('../src/plugins.mjs'))
+
+  /* 实体挡路：怪站在前方通道里 */
+  const botEnt = (list) => ({
+    entity: { position: new Vec3(0, 64, 0) },
+    entities: list,
+    blockAt: () => ({ name: 'air', position: new Vec3(0, 0, 0) }),
+  })
+  const e1 = mod.entityObstacleAhead(botEnt([{ name: 'zombie', position: new Vec3(1, 64, 0) }]), { x: 5, y: 64, z: 0 })
+  ok(e1?.name === 'zombie' && e1?.dist === 1, '正前方 1 格的怪 ⇒ 认成挡路', JSON.stringify(e1))
+  const e2 = mod.entityObstacleAhead(botEnt([{ name: 'zombie', position: new Vec3(1, 64, 2) }]), { x: 5, y: 64, z: 0 })
+  ok(e2 === null, '偏到侧边 2 格的怪 ⇒ 不算挡路（不误报）')
+  const e3 = mod.entityObstacleAhead(botEnt([{ name: 'item', position: new Vec3(1, 64, 0) }]), { x: 5, y: 64, z: 0 })
+  ok(e3 === null, '掉落物不算挡路（跟 vendor 的 passableEntities 一致）')
+  const e4 = mod.entityObstacleAhead(botEnt([{ name: 'zombie', position: new Vec3(-3, 64, 0) }]), { x: 5, y: 64, z: 0 })
+  ok(e4 === null, '身后的怪不算挡路')
+
+  /* 未加载：blockAt 返回 null */
+  const botNull = { entity: { position: new Vec3(0, 64, 0) }, blockAt: () => null }
+  ok(mod.blockKnownAt(botNull, 5, 64, 0) === false, '读不到方块 ⇒ 视为未加载（不是空气）')
+  ok(mod.blockKnownAt(botEnt([]), 5, 64, 0) === true, '读得到 ⇒ 已知')
+
+  /* 岩浆 */
+  const botLava = {
+    entity: { position: new Vec3(0, 64, 0) },
+    blockAt: (v) => ({ name: v.x === 2 ? 'lava' : 'air', position: v }),
+  }
+  const l1 = mod.lavaAheadOf(botLava, { x: 5, y: 64, z: 0 }, { cells: 3 })
+  ok(l1?.name === 'lava' && l1?.dist === 2, '前方 2 格是岩浆 ⇒ 认出来', JSON.stringify(l1))
+  const botWater = {
+    entity: { position: new Vec3(0, 64, 0) },
+    blockAt: (v) => ({ name: v.x === 2 ? 'water' : 'air', position: v }),
+  }
+  ok(mod.lavaAheadOf(botWater, { x: 5, y: 64, z: 0 }, { cells: 3 }) === null, '水不算岩浆（水有游泳控制器）')
+
+  /* 静态接线 */
+  ok(/mv\.entityCost = 8/.test(plug), '实体成本调到 8（默认 1 太弱，A* 绕一步就抵掉了）')
+  ok(/mv\.allowEntityDetection = true/.test(plug), '显式打开实体检测（别被别处关掉）')
+  ok(/reason: 'waiting_chunks'/.test(src), '区块没加载 ⇒ 报 waiting_chunks，不再说「被墙挡住」')
+  ok(/entityObstacleAhead\(b, target, \{ cells: 2 \}\)/.test(src), '卡住时先查是不是实体挡着')
+  ok(/planTried\.push\('entity'\)/.test(src), '实体挡路记进 planTried')
+  ok(/planTried\.push\('lava'\)/.test(src), '岩浆挡路记进 planTried')
+  ok(/why: 'iron'/.test(src) && /铁门/.test(src), '铁门按不开时给一句人话')
+  ok(/why: 'closed'/.test(src) && /别挖门框/.test(src), '门按不开时明确「别挖门框」')
+  /* 2026-10-24 用户：「每级时间缩短，按你之前的建议」—— 阶梯等待按动作分档 */
+  ok(/export const MOVE_STEP_WAIT_MS = \{/.test(src), '脱困阶梯的等待时间按动作分档（不再一律 2.4 秒）')
+  ok(/stuckMs: stuckMsNow/.test(src) && /const stepNow = attempt > 0 \? escapeStepOf/.test(src), '判卡用的是当前那一级的等待时间')
+  ok(/repath: 900/.test(src) && /detour: 1500/.test(src) && /breakAhead: 2400/.test(src), '便宜招远短于 2.4 秒，只有挖方块保持 2.4 秒')
+  ok(/STEP_UP_TRIES = 1/.test(src), '局部台阶一次移动只试一次')
 }
 console.log(`check-move-progress：pass=${pass} fail=${fail}`)
 process.exit(fail ? 1 : 0)

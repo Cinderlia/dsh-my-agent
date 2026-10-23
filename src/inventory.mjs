@@ -222,6 +222,21 @@ export function canHarvestNow (b, blk) {
   return Boolean(b?.heldItem && blk.harvestTools[b.heldItem.type])
 }
 
+/** 工具档位：木/金=1、石=2、铁=3、钻石=4、下界合金=5；不是工具回 0。
+ *
+ * 用途只有一件事：**手上这把已经能挖，就别为了快几成换成更高级的**（2026-10-24 用户：
+ * 「挖深板岩石镐 1.1 秒、铁镐 0.75 秒，慢三成；碰见钻石矿还得换回铁镐」）——
+ * 铁镐该留给挖不动的矿，不该被拿去挖石头。 */
+export function toolTierOf (name) {
+  const n = String(name ?? '')
+  if (!/_?(pickaxe|axe|shovel|hoe|sword)$/.test(n)) return 0
+  if (/^netherite_/.test(n)) return 5
+  if (/^diamond_/.test(n)) return 4
+  if (/^iron_/.test(n)) return 3
+  if (/^stone_/.test(n)) return 2
+  if (/^(wooden|golden)_/.test(n)) return 1
+  return 0
+}
 /** 挖它需要什么工具（人话：镐／斧／锹；minecraft-data 里是 pickaxe/axe/shovel 这种英文） */
 export function toolKinds (b, blk) {
   const CN = { pickaxe: '镐', axe: '斧', shovel: '锹', hoe: '锄', shears: '剪刀', sword: '剑' }
@@ -484,8 +499,14 @@ export async function equipFor (self, b, blk, label = '换工具', ctx = {}) {
   const canNow = canHarvestNow(b, blk)
   const nowMs = digMsFor(b, blk, b?.heldItem?.type ?? null)
   const best = bestToolFor(b, blk)
+  /* 2026-10-24 用户：「能挖就不升档」—— 手上这把已经挖得动（能掉落）、且本身就是工具时，
+   * 不许为了快几成换成更高级的（铁镐挖深板岩快 47%，但那是拿耐久换速度）。
+   * 空手（tier 0）例外：该换还得换，否则会徒手挖土。 */
+  const heldTier = toolTierOf(b?.heldItem?.name)
+  const bestTier = toolTierOf(best?.item?.name)
+  const wouldUpgrade = Boolean(canNow && heldTier > 0 && bestTier > heldTier)
   const faster = Boolean(best && nowMs != null && best.ms < nowMs * 0.72
-    && best.item?.name !== b?.heldItem?.name)
+    && best.item?.name !== b?.heldItem?.name && !wouldUpgrade)
   if (canNow && !faster) return { heldBefore, held: heldBefore, changed: false }
   try {
     if (faster) {

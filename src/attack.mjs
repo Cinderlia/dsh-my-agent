@@ -628,7 +628,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     }
 
     const snap = assessCombat({
-      health: b.health, food: b.food, air: b.oxygenLevel, submerged: b.entity?.isInWater === true,
+      health: b.health, food: b.food, air: Number.isFinite(b.oxygenLevel) ? Math.max(0, Math.round(Number(b.oxygenLevel))) : null, submerged: b.entity?.isInWater === true,
       target: {
         name: label,
         distance: stillThere ? distOf(target) : null,

@@ -396,9 +396,11 @@ section('⑧ 静态接线：core / index 都在')
     && /from '\.\/mining\.mjs'/.test(core), 'dig() 先拒流体（实现已搬到 src\\mining.mjs）')
   /* 路线图第 ④ 条第十三刀：`status()` 已搬进 `src/status.mjs` —— 下面五条改查那个文件。 */
   const stSrc = strip(readFileSync(new URL('../src/status.mjs', import.meta.url), 'utf8'))
-  ok(/air: Number\.isFinite\(b\.oxygenLevel\) \? b\.oxygenLevel : null/.test(stSrc), 'status() 报氧气 air（实现已搬到 src\\status.mjs）')
+  /* 2026-10-24 实机：陆地/矿洞里报出「氧气 -1」—— 残留值 + 负数。现在只在头真的在水下时报、夹到 0 以上。 */
+  ok(/air: airNow/.test(stSrc) && /const airNow = submergedNow && Number\.isFinite\(b\.oxygenLevel\)/.test(stSrc)
+    && /Math\.max\(0, Math\.round\(Number\(b\.oxygenLevel\)\)\)/.test(stSrc), 'status() 报氧气 air（只在头在水下时报，夹到 0 以上）')
   // 🔴 实机（2026-10-07）：`bot.oxygenLevel` 只在头入水后才有读数（水面上是 null）⇒ 判据要有"头在水下"
-  ok(/submerged: \(\(\) => \{/.test(stSrc), 'status() 报"头在水下"submerged（氧气读不到时的可靠判据）')
+  ok(/const submergedNow = \(\(\) => \{/.test(stSrc) && /submerged: submergedNow/.test(stSrc), 'status() 报"头在水下"submerged（氧气读不到时的可靠判据）')
   ok(/b\.entity\.position\.offset\(0, b\.entity\.eyeHeight \?\? 1\.62, 0\)/.test(stSrc), 'submerged 用眼睛那一格算')
   ok(/return isLiquid\(b\.blockAt\(eye\)\?\.name\)/.test(stSrc), 'submerged = 眼睛那格是液体')
   ok(!/if \(!b\.entity\.isInWater\) return false/.test(stSrc), 'status().submerged 不再先要求 entity.isInWater（泡水柱时它会漏报）')

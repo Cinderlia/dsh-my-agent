@@ -130,6 +130,44 @@ const off = await boot({ perSession: false })
   ok(!existsSync(join(off.base, 'sessions')), '没有建 sessions/ 子目录')
 }
 
+/* ─────────────── ⑤ 返回瘦身：index 默认只给分组摘要 ─────────────── */
+section('⑤ 返回瘦身：mc_kit_memory index 默认只给分组摘要（用户 2026-10-23「返回瘦身」）')
+{
+  const { MemoryStore } = await import('../src/memory.mjs')
+  const root = mk('wc-slim-mem-')
+  mkdirSync(join(root, 'srv-a'), { recursive: true })
+  for (let i = 0; i < 5; i++) writeFileSync(join(root, 'srv-a', `f${i}.md`), `# f${i}\n\n- 一条事实 ${i}\n`, 'utf8')
+  writeFileSync(join(root, 'README.md'), '# 记忆库\n\n' + 'x'.repeat(500), 'utf8')
+  const m = new MemoryStore(root, { create: false })
+  const brief = m.overview()
+  const full = m.overview({ brief: false })
+  const one = m.overview({ group: 'srv-a' })
+  ok(!('tree' in brief) && !('readme' in brief), '默认不回 readme / tree（它们最占地方）')
+  ok(Array.isArray(brief.groups) && brief.groups.every((g) => typeof g.files === 'number'), '分组只给计数，不逐个列文件')
+  ok(brief.groups.some((g) => g.group === 'srv-a' && g.files === 5), '分组计数对得上（srv-a 5 个）')
+  ok(typeof brief.hint === 'string' && /group|verbose/.test(brief.hint), '默认带"怎么要明细"的一句话')
+  ok(JSON.stringify(brief).length * 2 < JSON.stringify(full).length, `默认比全量小得多（${JSON.stringify(brief).length} vs ${JSON.stringify(full).length} 字符）`)
+  ok(Array.isArray(one.files) && one.files.length === 5, 'group 只列这一组的文件')
+  ok(String(one.files[0]?.path ?? '').includes('srv-a'), '路径相对记忆根')
+  ok(Array.isArray(full.groups[0]?.files) && typeof full.readme === 'string' && typeof full.tree === 'string', 'verbose 仍给全量（老行为一字不变）')
+  const two = m.overview({ group: 'srv-a', limit: 2 })
+  ok(two.files.length === 2 && two.rest === 3 && /limit/.test(String(two.hint ?? '')), 'group+limit 截断，并报还剩几个')
+  ok(m.overview({ group: '不存在的组' }).files.length === 0, '组名写错 ⇒ 空列表，不炸')
+  /* 静态：工具面真的接了 brief/group/verbose，且默认是 brief */
+  const idx = readFileSync('index.js', 'utf8')
+  ok(/brief: args\?\.verbose !== true/.test(idx), 'index.js：verbose 才给全量（默认 brief）')
+  ok(/group: args\?\.group \?\? null/.test(idx), 'index.js：把 group 透传下去')
+  ok(/verbose: \{ type: 'boolean', description: 'index：true = 全量/.test(idx), '参数表里有 verbose')
+  /* search 也瘦了：默认 12 条 + 每条 160 字 */
+  for (let i = 0; i < 20; i++) writeFileSync(join(root, 'srv-a', `s${i}.md`), '# s\n\n- 村民交易 ' + 'x'.repeat(300) + '\n', 'utf8')
+  const ms = new MemoryStore(root, { create: false })
+  const hit = ms.search({ query: '村民交易' })
+  ok(hit.hits.length === 12, `search 默认回 12 条（实际 ${hit.hits.length}）`)
+  ok(hit.hits.every((h) => h.text.length <= 161), '每条命中截断到 160 字 + 省略号')
+  ok(ms.search({ query: '村民交易', limit: 20 }).hits.length === 20, 'limit 仍然管用（一共只有 20 条命中）')
+  ok(/search 最多几条（默认 12/.test(idx), '参数表里写的是新默认值')
+}
+
 /* ─────────────── 收尾 ─────────────── */
 for (const d of TMP) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
 console.log(`\n${fail === 0 ? '✅ 全部通过' : '❌ 有失败'}：pass=${pass} fail=${fail}`)

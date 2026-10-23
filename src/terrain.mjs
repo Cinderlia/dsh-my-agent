@@ -98,7 +98,7 @@ export const TERRAIN_CFG_KEYS = {
  *   - `unloaded` 读到 `null`（区块没加载）⇒ 这一根**不计入统计**
  *   - `hazard` / `wet` 这一根里第一个致命 / 水方块的名字
  */
-export function columnAt (b, x, z, feetY, { up = TERRAIN_UP, down = TERRAIN_DOWN } = {}) {
+export function columnAt (b, x, z, feetY, { up = TERRAIN_UP, down = TERRAIN_DOWN, anchorFirst = false } = {}) {
   const at = (yy) => { try { return b.blockAt(new Vec3(x, yy, z)) } catch { return null } }
   const nm = (blk) => { try { return blk?.name ?? null } catch { return null } }
   const names = []
@@ -111,7 +111,12 @@ export function columnAt (b, x, z, feetY, { up = TERRAIN_UP, down = TERRAIN_DOWN
     if (!hazard && BRIDGE_FATAL.test(n)) hazard = n
     if (!wet && BRIDGE_WET.test(n)) wet = true
   }
-  for (let dy = up; dy >= -down; dy--) {
+  /* 试哪几层：默认自上而下（"往上找优先"）；`anchorFirst` 先试**脚那一层** ——
+   * 调用方已经知道人就站在那儿（局部空间地图就是这种情况），能省掉最多 `up` 层 × 3 次读块。 */
+  const levels = []
+  if (anchorFirst) levels.push(0)
+  for (let dy = up; dy >= -down; dy--) if (!(anchorFirst && dy === 0)) levels.push(dy)
+  for (const dy of levels) {
     const yy = feetY + dy
     const u = nm(at(yy - 1)); const a = nm(at(yy)); const c = nm(at(yy + 1))
     if (u === null || a === null || c === null) return { y: null, gap: false, wall: false, unloaded: true, hazard, wet, names }

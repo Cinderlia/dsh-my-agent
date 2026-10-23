@@ -261,7 +261,16 @@ export async function runStep (self, s) {
       //    实际跑满 callBudget 的 10 秒，把整串步骤的预算全吃掉。
       if (mode === 'fly') return { ...(await self.flyTo(target.x, target.y, target.z, { budget: callBudget(s.budgetMs) })), mode }
       // 用户 2026-10-20：走路**默认不挖方块**（和 mc_move 一致）—— 要挖得在步骤里写 `noDig:false`
-      return { ...(await self.walkTo(target, { budget: callBudget(s.budgetMs), noDig: s.noDig !== false })), mode }
+      /* 🔴 2026-10-24 用户实机：这里以前只传 budget/noDig，**把 intent 丢了** ⇒
+       *    步骤里写 `intent:"stand"` 也永远按 near（半径 1.6）判到达，差 1.5 格就算"到了"。 */
+      return {
+        ...(await self.walkTo(target, {
+          budget: callBudget(s.budgetMs),
+          noDig: s.noDig !== false,
+          ...(s.intent ? { intent: s.intent } : {}),
+        })),
+        mode,
+      }
     }
     case 'look':    return self.lookAt(s)
     // 'toward' 要与 mc_act{mode:"toward"} 语义一致：**看向并走近**（只 lookAt 是错的）

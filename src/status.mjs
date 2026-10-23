@@ -65,6 +65,25 @@ export function statusOf (b, ctx = {}) {
   /* 🔴 2026-10-19：末影龙/凋灵的血**不进**实体元数据（`entitiesNear()` 读不到），
    *    只在 Boss Bar 包里。这里带上，`mc_status` 就能一眼看到打龙打到几成。 */
   const bossBars = readBossBars(b)
+  /* 🔴 2026-10-24 实机（用户贴的 AI 思考）：在**石头里**挖矿时，observe 一路报「氧气 18 → 10 → -1 → 8」，
+   *    把 AI 吓到了（它以为要淹死）。根因两条：
+   *    ① `bot.oxygenLevel` 是 mineflayer 把 air_supply 除以 15 得来的**气泡数（0–20）**，
+   *       而窒息时 air_supply 会掉到负值 ⇒ 读出 **-1** 这种没法解释的数；
+   *    ② 它只在服务端发 air_supply 元数据时才更新 —— **上岸/在陆地上时是残留值**，
+   *       人明明在石头里，读数还停在水里那一档。
+   *    现在：只在**头真的在水下**时报，并且夹到 0 以上（0 = 正在窒息掉血）。 */
+  const submergedNow = (() => {
+    try {
+      /* 🔴 2026-10-08 实机：这里以前先看 `entity.isInWater` —— 而它泡在水柱里会读出
+       *    undefined（实测机器人 (-31,59,261) 脚/头两格都是 water 却报"没在水里"）。
+       *    头在水下就是头在水下，直接看眼睛那一格。 */
+      const eye = b.entity.position.offset(0, b.entity.eyeHeight ?? 1.62, 0)
+      return isLiquid(b.blockAt(eye)?.name)
+    } catch { return false }
+  })()
+  const airNow = submergedNow && Number.isFinite(b.oxygenLevel)
+    ? Math.max(0, Math.round(Number(b.oxygenLevel)))
+    : null
   return {
     online: true, sub: ctx.sub, connection,
     position: { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) },
@@ -82,21 +101,11 @@ export function statusOf (b, ctx = {}) {
       return Math.round((Date.now() - t) / 1000)
     })(),
     inWater: inWaterNow(b),
-    // 氧气（0–20，20 = 满）。在水里憋气会一路掉到 0，然后开始掉血 —— 淹死就是这么来的。
-    // 🔴 实机教训（2026-10-07）：**头在水面上的时候这项是 null** —— mineflayer 只在服务端
-    // 发 `air_supply` 元数据时才设 `bot.oxygenLevel`，而那条元数据是头入水、气开始掉之后才来的。
-    // 所以判据不能只看它：下面的 `submerged`（眼睛那一格是不是液体 = 头在水下）才是直接信号，
-    // 氧气读数有就一起报、没有就照实说。
-    air: Number.isFinite(b.oxygenLevel) ? b.oxygenLevel : null,
-    submerged: (() => {
-      try {
-        /* 🔴 2026-10-08 实机：这里以前先看 `entity.isInWater` —— 而它泡在水柱里会读出
-         *    undefined（实测机器人 (-31,59,261) 脚/头两格都是 water 却报"没在水里"）。
-         *    头在水下就是头在水下，直接看眼睛那一格。 */
-        const eye = b.entity.position.offset(0, b.entity.eyeHeight ?? 1.62, 0)
-        return isLiquid(b.blockAt(eye)?.name)
-      } catch { return false }
-    })(),
+    // 氧气（0–20 气泡，20 = 满）。在水里憋气会一路掉到 0，然后开始掉血 —— 淹死就是这么来的。
+    // 🔴 只有**头真的在水下**（`submergedNow`）才报：陆地/石头上这项是残留值，报出来只会误导。
+    // 0 = 已经在窒息掉血（mineflayer 读到的原始值可能是负数，已夹到 0）。
+    air: airNow,
+    submerged: submergedNow,
     ...(bossBars.length ? { bossBars } : {}),
   }
 }

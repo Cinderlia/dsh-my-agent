@@ -59,7 +59,7 @@ const { McBot, glyphOf } = await import(new URL('../src/core.mjs', import.meta.u
 /* 2026-10-15：`mc_map` 默认改成"脚下方块那一层" —— 新函数直接从 map-render.mjs 取
  *（工具层就是这么 import 的，没经过 core.mjs 的薄包装）。 */
 const { floorMapOf, floorCell, floorKeyOf, gridToWorld, hazardCellsOf, navSummaryOf,
-  columnOf, columnText, columnKindOf, parseXZ, surfaceYOf } =
+  columnOf, columnText, columnKindOf, parseXZ, surfaceYOf, glyphMapText } =
   await import(new URL('../src/map-render.mjs', import.meta.url))
 
 const TMP_DIRS = []
@@ -489,11 +489,16 @@ try {
     [core, /from '\.\/block-names\.mjs'/, 'core：这些纯方块名判据改成从 block-names.mjs 导入（路线图第 ④ 条第二刀）'],
     [core, /from '\.\/map-render\.mjs'/, 'core：地图那一层改成从 map-render.mjs 导入（路线图第 ④ 条第十一刀）'],
     [core, /heightmap \(opts = \{\}\) \{ return heightmapOf\(this\.requireBot\(\), opts\) \}/, 'core：heightmap() 留成薄包装'],
-    [core, /static glyphMap \(names, step = 2, selfIndex = null\) \{ return glyphMapText\(names, step, selfIndex\) \}/, 'core：static glyphMap() 留成薄包装'],
+    [core, /static glyphMap \(names, step = 2, selfIndex = null, opts = \{\}\) \{ return glyphMapText\(names, step, selfIndex, opts\) \}/, 'core：static glyphMap() 留成薄包装（opts 透传）'],
     [core, /mapImage \(opts = \{\}\) \{ return mapImageOf\(this\.requireBot\(\), opts\) \}/, 'core：mapImage() 留成薄包装'],
     [strip(idx), /mode: \{ type: 'string'/, 'index：mc_map 有 mode 参数'],
     [strip(idx), /const legendText = hm\.legend\.slice\(0, 8\)/, 'index：图例渲染抽成 legendText（只留前 8 种）'],
     [strip(idx), /e\?\.glyph \? `\$\{e\.glyph\}\$\{e\.name\}×\$\{e\.count\}`/, 'index：图例渲染认 glyph（地板层的图例带字形）'],
+    /* ── 2026-10-23 晚（用户 m05002「map · surface 的输出怎么这么奇怪」）：字符图默认不压缩 ── */
+    [mapSrc, /glyphMapText \(names, step = 2, selfIndex = null, \{ compress = false \} = \{\}\)/, 'map-render：glyphMapText 收 compress 开关，默认 false'],
+    [mapSrc, /out\.push\(compress \? rleGlyphs\(line\) : line\)/, 'map-render：只有 compress 才走 RLE'],
+    [strip(idx), /compress: \{ type: 'boolean'/, 'index：mc_map 有 compress 参数'],
+    [strip(idx), /McBot\.glyphMap\(hm\.names, step, \{ x: hm\.radius, y: hm\.radius \}, \{ compress: args\.compress === true \}\)/, 'index：compress 真的传到 glyphMap'],
     /* ── 2026-10-15：地板层视图（用户需求）── */
     [names, /export const FLOOR_GLYPH = \{/, 'block-names：地板层字形表'],
     [names, /export const isSolidBlock = /, 'block-names：isSolidBlock（实心判据，与 isPassable 互补但不等价）'],
@@ -601,6 +606,22 @@ try {
   ok(/还没加载/.test(idx2) && /别猜 y/.test(idx2), 'index：没加载时明说"别猜 y"')
   ok(/surfaceY: sf\.y/.test(idx2), 'index：结果里报 surfaceY')
   ok(/竖列可以查\*\*任意一列\*\*/.test(idxRaw), 'index：mc_map 描述里写了"竖列能查任意一列/报地表 y"')
+  }
+  /* ── 2026-10-23 晚（用户 m05002「map · surface 的输出怎么这么奇怪」）──
+   * 整行同字符被压成 X*n ⇒ 一行看不出任何形状。默认不压了，只有 compress:true 才压。 */
+  section('㉑ 字符图默认不压缩（整行同字符不许变成压缩串）')
+  {
+    const names = [
+      ['grass_block', 'grass_block', 'grass_block', 'grass_block', 'grass_block', 'grass_block'],
+      ['grass_block', 'stone', 'grass_block', 'stone', 'grass_block', 'stone'],
+    ]
+    const plain = glyphMapText(names, 1, null).split('\n')
+    ok(!plain[0].includes('*'), `默认不给压缩串（第一行：${JSON.stringify(plain[0])}）`)
+    ok(plain[0].length === 6, `默认一行 6 格就是 6 个字符（实际 ${plain[0].length}）`)
+    ok(glyphMapText(names, 1, null, {}).split('\n')[0].length === 6, '传空对象也不压')
+    const zip = glyphMapText(names, 1, null, { compress: true }).split('\n')
+    ok(zip[0].includes('*6'), `compress:true 才压（第一行：${JSON.stringify(zip[0])}）`)
+    ok(zip[0].length < plain[0].length, '压缩确实变短了（6 格 → 3 字符）')
   }
 } finally {
   for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }

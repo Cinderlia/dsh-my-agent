@@ -224,6 +224,7 @@ section('④ walkTo() —— 到点带着进度返回，文案是"再叫一次"�
   const ms = Date.now() - t0
   ok(ms >= CALL_BUDGET_MS - 600 && ms < CALL_MS + 500, `默认预算 40 秒 → 墙钟 ${CALL_BUDGET_MS / 1000} 秒左右就返回（单次调用 ≤${CALL_MS / 1000} 秒）`, `${ms}ms`)
   ok(r.arrived === false && r.via === 'pathfinder', '如实报"没到"，via 还是 pathfinder', JSON.stringify({ arrived: r.arrived, via: r.via }))
+  console.log('DBG', JSON.stringify(r).slice(0,600));
   ok(/用完了/.test(r.hint ?? ''), '文案说"这一轮的时间用完了"', String(r.hint).slice(-60))
   ok(/不是走不通/.test(r.hint ?? ''), '并且明确"不是走不通"（预算到点是正常返回）', String(r.hint).slice(-60))
   ok(/再叫一次 mc_move/.test(r.hint ?? ''), '并告诉模型"再叫一次 mc_move 接着走"', String(r.hint).slice(-60))
@@ -670,6 +671,9 @@ section('⑩ interruptMove() —— 自保反射抢 AI 那一步的移动（"动
     {
       const fake = mkBot({ hang: false })
       fake.bot.entity.position = new Vec3(0, 64, 0)
+      /* 2026-10-24：目标那一列**读得到**（空气）—— 否则新逻辑会如实报 waiting_chunks（未加载），
+       * 那是另一条正确分支，这个用例要验的是「空路径 = 真没路」。 */
+      fake.bot.blockAt = () => ({ name: 'air' })
       fake.bot.pathfinder = {
         // 先送 `path_update{status:'noPath', path:[]}`（真 pathfinder 的空路径分支就是这样），**再** resolve
         goto: () => new Promise((resolve) => {
@@ -837,5 +841,12 @@ section('⑩ interruptMove() —— 自保反射抢 AI 那一步的移动（"动
 
 // ── 收尾：删掉临时目录 ────────────────────────────────────────────────────────
 for (const d of TMP_DIRS) { try { rmSync(d, { recursive: true, force: true }) } catch {} }
+/* 🔴 2026-10-24 用户实机（问题清单第 6 条）：`mc_sequence` 的 move 步骤以前只传 budget/noDig，
+ *    把 intent 丢了 ⇒ 步骤里写 `intent:"stand"` 也永远按 near（1.6 格）判到达。 */
+{
+  const seqSrc = readFileSync(new URL('../src/sequence.mjs', import.meta.url), 'utf8')
+  ok(/\.\.\.\(s\.intent \? \{ intent: s\.intent \} : \{\}\)/.test(seqSrc), 'move 步骤把 intent 传下去了')
+}
+
 console.log(`\n结果：${pass}/${pass + fail} 通过，${fail} 失败`)
 process.exit(fail ? 1 : 0)

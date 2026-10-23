@@ -236,5 +236,18 @@ section('⑩ 接线：mc_build 的蓝图参数 + core 行数')
   ok(!/name: 'mc_blueprint'/.test(idx), '没有新开一个工具（蓝图是 mc_build 的一种输入形状，省一份固定前缀）')
 }
 
+/* 🔴 2026-10-24 用户实机（问题清单第 1、3 条）：层数模式没有锚点 ⇒ 人一被垫高就原地重盖；
+ *    拆不动读 `r?.why` 而 breakBlock 回的是 `note` ⇒ 永远只有"拆不动"三个字。 */
+{
+  const idxSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  const bpSrc = readFileSync(new URL('../src/blueprint.mjs', import.meta.url), 'utf8')
+  ok(/x: \{ type: 'number', description: '蓝图原点 x/.test(idxSrc), 'mc_build 把蓝图原点 x 暴露出来了')
+  ok(/y: \{ type: 'number', description: '蓝图原点 y/.test(idxSrc), 'mc_build 把蓝图原点 y 暴露出来了')
+  ok(/z: \{ type: 'number', description: '蓝图原点 z/.test(idxSrc), 'mc_build 把蓝图原点 z 暴露出来了')
+  ok(/一定要给原点 x\/y\/z/.test(idxSrc), '描述里点名"层数模式一定要给原点"（人会走开、被垫高）')
+  ok(/r\?\.note \?\? r\?\.why/.test(bpSrc), '拆不动时读 breakBlock 的 note（不是不存在的 why）')
+  ok(/split\('\\n'\)\[0\]\.slice\(0, 80\)/.test(bpSrc), '拆不动的原因只留一行（不把整段堆进失败列表）')
+}
+
 console.log(`\n${fail === 0 ? '✅ 全部通过' : '❌ 有失败'}：pass=${pass} fail=${fail}`)
 process.exit(fail === 0 ? 0 : 1)

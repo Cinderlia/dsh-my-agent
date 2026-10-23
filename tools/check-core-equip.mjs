@@ -40,6 +40,8 @@ const stripComments = (s) => String(s).replace(/\/\*[\s\S]*?\*\//g, '').replace(
 // ── 借依赖：源码树里没有 node_modules，从包目录借 vec3 ────────────────────────────
 const DSH_HOME = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const PROFILE = join(DSH_HOME, 'profiles', 'desktop')
+import { equipFor, toolTierOf } from '../src/inventory.mjs'
+
 const req = (() => {
   const bases = [
     new URL('../index.js', import.meta.url).href,                  // 包内直接就有
@@ -346,6 +348,48 @@ const buildSrc = stripComments(await (await import('node:fs/promises')).readFile
   ok(/import \{ useBlock, useItem, interact, equip[^}]*\} from '\.\/world-use\.mjs'/.test(coreSrc)
     && /async equip \(opts = \{\}\) \{ return await equip\(this, opts, \{ t: \(p, k, l\) => this\.#t\(p, k, l\) \}\) \}/.test(coreSrc),
     'core 有 equip 薄包装、并且确实从 world-use.mjs 导入（ctx.t 塞的是本轮的 11 秒闸门）')
+}
+
+/* ─────────── ⑨ 工具档位：能挖就不升档（2026-10-24） ─────────── */
+section('⑨ 工具档位：手上这把已经能挖，就不为了快换更高级的')
+try {
+  ok(toolTierOf('stone_pickaxe') === 2 && toolTierOf('iron_pickaxe') === 3 && toolTierOf('diamond_axe') === 4,
+    '档位：木/金 1、石 2、铁 3、钻 4、合金 5')
+  ok(toolTierOf('dirt') === 0 && toolTierOf('iron_sword') === 3, '非工具回 0；剑也算工具（挖木头比空手快）')
+
+  /* 假 bot：只够 equipFor 用 —— 背包里含手上那格（真 mineflayer 语义） */
+  const mkT = (held, bag) => {
+    const bot = {
+      game: { gameMode: 'survival' },
+      entity: { position: new Vec3(0, 64, 0), onGround: true, effects: {} },
+      inventory: { items: () => [held, ...bag].filter(Boolean), slots: [] },
+      heldItem: held,
+      equip: async (it) => { bot.heldItem = it },
+      registry: { items: {}, itemsByName: {} },
+    }
+    return bot
+  }
+
+  // ① 石镐能挖深板岩（1.1s）而铁镐更快（0.75s）—— 不许换
+  const deepslate = { name: 'deepslate', harvestTools: { 1: true, 2: true, 3: true }, digTime: (t) => (t === 2 ? 750 : 1100) }
+  const b1 = mkT({ name: 'stone_pickaxe', type: 3, count: 1 }, [{ name: 'iron_pickaxe', type: 2, count: 1 }])
+  const r1 = await equipFor({}, b1, deepslate, '换工具', {})
+  ok(r1.changed === false && b1.heldItem?.name === 'stone_pickaxe',
+    '手上石镐能挖深板岩 ⇒ 不为快三成换铁镐（省耐久）', `held=${b1.heldItem?.name}`)
+
+  // ② 钻石矿石镐挖不动 —— 必须换铁镐
+  const dia = { name: 'diamond_ore', harvestTools: { 2: true }, digTime: (t) => (t === 2 ? 900 : null) }
+  const b2 = mkT({ name: 'stone_pickaxe', type: 3, count: 1 }, [{ name: 'iron_pickaxe', type: 2, count: 1 }])
+  await equipFor({}, b2, dia, '换工具', {})
+  ok(b2.heldItem?.name === 'iron_pickaxe', '石镐挖不动钻石矿 ⇒ 照样换铁镐', `held=${b2.heldItem?.name}`)
+
+  // ③ 空手挖土 —— tier 0 不拦，该换铲子还得换
+  const dirt = { name: 'dirt', harvestTools: {}, digTime: (t) => (t === 9 ? 150 : 750) }
+  const b3 = mkT(null, [{ name: 'iron_shovel', type: 9, count: 1 }])
+  await equipFor({}, b3, dirt, '换工具', {})
+  ok(b3.heldItem?.name === 'iron_shovel', '空手挖土 ⇒ 照旧换铲子（档位 0 不拦）', `held=${b3.heldItem?.name}`)
+} catch (err) {
+  ok(false, '⑨ 工具档位测试自己炸了', String(err?.message ?? err))
 }
 
 /* ─────────── 收尾 ─────────── */

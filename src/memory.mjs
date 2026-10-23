@@ -567,17 +567,27 @@ export class MemoryStore {
   }
 
   /** 查：跨文本文件搜索（二进制自动跳过） */
-  search ({ query, limit = 30 } = {}) {
+  /**
+   * 关键词检索。
+   *
+   * 🔴 2026-10-23 返回瘦身（用户：「返回瘦身」）：原来默认回 30 条、每条是**整行原文**
+   *    （记忆里的长段落一命中就是几百字），一次 search 几千字符，之后每步都要重读。
+   *    现在默认 12 条、每条最多 160 字 —— 够判断"要不要 read 这个文件"。
+   */
+  search ({ query, limit = 12 } = {}) {
     const q = String(query ?? '').trim().toLowerCase()
     if (!q) throw new Error('query 不能为空')
-    const n = Math.min(Math.max(Number(limit) || 30, 1), 100)
+    const n = Math.min(Math.max(Number(limit) || 12, 1), 100)
     const hits = []
     for (const f of this.list()) {
       if (f.kind !== 'text') continue
       let text = ''
       try { text = readFileSync(join(this.root, ...f.rel.split('/')), 'utf8') } catch { continue }
       for (const [i, line] of text.split('\n').entries()) {
-        if (line.toLowerCase().includes(q)) hits.push({ path: f.rel, line: i + 1, text: line.trim() })
+        if (line.toLowerCase().includes(q)) {
+          const raw = line.trim()
+          hits.push({ path: f.rel, line: i + 1, text: raw.length > 160 ? raw.slice(0, 160) + '…' : raw })
+        }
         if (hits.length >= n) break
       }
       if (hits.length >= n) break
@@ -586,22 +596,60 @@ export class MemoryStore {
   }
 
   /** 总览（工具 action:"index" 用） */
-  overview () {
+  /**
+   * 索引概览。
+   *
+   * 🔴 2026-10-23 返回瘦身（用户：「返回瘦身」）：原来默认把**每个文件一行**（还带 60 字摘要）
+   *    + README 全文 + 整棵树一起回。本机实测 **93,899 字符 ≈ 59K token** —— 一次 `index`
+   *    就能把上下文塞满，而且之后每一步都要重读它。现在分三档：
+   *      · 默认：只给分组摘要（每组几个文件、几条），够判断"东西在不在"；
+   *      · `group`：只列这一组的文件（带 limit，默认 40）；
+   *      · `verbose:true`：老行为（全量文件清单 + README + 树）。
+   */
+  overview ({ brief = true, group = null, limit = 40 } = {}) {
     const files = this.list()
     const groups = new Map()
     for (const f of files) {
       if (!groups.has(f.group)) groups.set(f.group, [])
       groups.get(f.group).push(f)
     }
-    let readme = ''
-    try { readme = existsSync(this.readmePath) ? readFileSync(this.readmePath, 'utf8') : '' } catch {}
-    return {
+    const label = (g) => (g === GLOBAL_DIR ? '(通用)' : g)
+    const sumOf = (list) => list.reduce((n, f) => n + (f.entries ?? 0), 0)
+    const base = {
       root: this.root,
       readmePath: this.readmePath,
       totalFiles: files.length,
-      totalEntries: files.reduce((n, f) => n + (f.entries ?? 0), 0),
-      groups: [...groups.entries()].map(([group, list]) => ({
-        group: group === GLOBAL_DIR ? '(通用)' : group,
+      totalEntries: sumOf(files),
+    }
+    /* ① 点名一组：只列这一组（带 limit） */
+    if (group) {
+      const key = String(group)
+      const list = groups.get(key) ?? groups.get(key === '(通用)' ? GLOBAL_DIR : key) ?? []
+      const cap = Math.max(1, Number(limit) || 40)
+      const shown = list.slice(0, cap)
+      return {
+        ...base,
+        group: label(key),
+        files: shown.map((f) => ({ path: f.rel, kind: f.kind, entries: f.entries, updatedAt: f.updatedAt, summary: f.summary })),
+        shown: shown.length,
+        ...(list.length > shown.length ? { rest: list.length - shown.length, hint: `还有 ${list.length - shown.length} 个没列，把 limit 调大` } : {}),
+      }
+    }
+    /* ② 默认：只给分组摘要 */
+    if (brief) {
+      return {
+        ...base,
+        groups: [...groups.entries()].map(([g, list]) => ({ group: label(g), files: list.length, entries: sumOf(list) })),
+        hint: '默认只给分组摘要。看某组有哪些文件：{action:"index", group:"<组名>"}；要看全量（README + 文件清单）：verbose:true',
+      }
+    }
+    /* ③ verbose：老行为 */
+    let readme = ''
+    try { readme = existsSync(this.readmePath) ? readFileSync(this.readmePath, 'utf8') : '' } catch {}
+    return {
+      ...base,
+      groups: [...groups.entries()].map(([g, list]) => ({
+        group: label(g),
         files: list.map((f) => ({ path: f.rel, kind: f.kind, entries: f.entries, updatedAt: f.updatedAt, summary: f.summary })),
       })),
       readme,

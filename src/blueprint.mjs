@@ -222,7 +222,13 @@ async function run (self, b, { layers, legend = {}, x = null, y = null, z = null
     if (deadline - Date.now() < 400) break
     try {
       const r = await self.breakBlock({ x: s.pos.x, y: s.pos.y, z: s.pos.z })
-      if (r?.broken === false) failed.push(`${at(s.pos)}:拆不动${r?.why ? '（' + r.why + '）' : ''}`)
+      /* 🔴 2026-10-24 用户实机：这里读的是 `r?.why`，而 `breakBlock` 回的是 `note`
+       *    （见 `src/mining.mjs` 的失败分支）⇒ 永远只报"拆不动"，够不着/没工具/时间不够长一样。 */
+      if (r?.broken === false) {
+        const why = r?.note ?? r?.why ?? ''
+        const oneLine = String(why).split('\n')[0].slice(0, 80)
+        failed.push(`${at(s.pos)}:拆不动${oneLine ? '（' + oneLine + '）' : ''}`)
+      }
       else broke.push(at(s.pos))
     } catch (e) { failed.push(`${at(s.pos)}:${String(e?.message ?? e).split('\n')[0]}`) }
   }

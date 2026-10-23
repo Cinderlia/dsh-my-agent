@@ -26,6 +26,7 @@ import {
 } from './mc_util.mjs'
 import { withTimeout, CALL_MS } from '../src/core.mjs'
 import { dropsNear } from '../src/world-observer.mjs'
+import { isPassable } from '../src/block-names.mjs'
 /* 烧炼反查表在 mc_furnace 里（同一份表，别抄第二遍）。它不 import 本文件，所以不成环。 */
 import { smeltInputsFor } from './mc_furnace.mjs'
 
@@ -700,6 +701,34 @@ const invDiffText = (bot, before, expectName) => {
 /* 这个工作台现在能不能用：够得着（≤4 格）且看得见。
  * 🔴 够不着/看不见 ⇒ 服务端不理这次右键 ⇒ craft.js 里 `once('windowOpen')` 永远不返回
  * （它没有超时）⇒ 整条 craft 挂到我们预算到点（实机日志里那些 4123~5000ms 的超时就是这个）。 */
+/* 🔴 2026-10-24 用户实机（问题清单第 5 条）：「工作台正上方被挡着，人就站不到它旁边」
+ *    以前只报"够不着或看不见"，一句话把三种原因（太远 / 视线被挡 / 头顶被堵）糊在一起，
+ *    AI 只能瞎猜。现在按原因说，能用返回 null。 */
+const tableWhyNot = (bot, tbl) => {
+  try {
+    const p = tbl?.position
+    if (!p) return '没有位置信息'
+    const center0 = typeof p.offset === 'function'
+      ? p.offset(0.5, 0.5, 0.5)
+      : { x: (p.x ?? 0) + 0.5, y: (p.y ?? 0) + 0.5, z: (p.z ?? 0) + 0.5 }
+    const me0 = bot?.entity?.position
+    if (!me0) return '读不到我的位置'
+    const d0 = typeof me0.distanceTo === 'function'
+      ? me0.distanceTo(center0)
+      : Math.hypot((me0.x ?? 0) - center0.x, (me0.y ?? 0) - center0.y, (me0.z ?? 0) - center0.z)
+    if (!(d0 <= 4.0)) return `离我 ${d0.toFixed(1)} 格（4 格内才开得起来）`
+    if (typeof bot.canSeeBlock === 'function' && !bot.canSeeBlock(tbl)) return '视线被挡（中间隔着方块）'
+    /* 工作台正上方那格：被实心方块占着时，人没法贴着它站，右键就永远没回包。 */
+    const above = blockAtXYZ(bot, p.x, p.y + 1, p.z)
+    if (above && above.name && !isPassable(above.name)) {
+      return `正上方被 ${above.name} 挡着（人站不到它旁边）`
+    }
+    return null
+  } catch (err) {
+    return '读不出来（' + String(err?.message ?? err).split('\n')[0].slice(0, 40) + '）'
+  }
+}
+
 const tableUsable = (bot, tbl) => {
   try {
     const p = tbl?.position
@@ -1186,10 +1215,13 @@ export async function apply (api) {
        * 判据用"计划里有没有哪一步要用工作台"（`s.table`），**不能**用 `plan.missing` ——
        * 有工作台的时候 missing 里当然没有 crafting_table，那条件永远不成立（第一版就是这么错的）。
        * 2×2 就能做的东西不为此多放一张桌子。 */
-      if (table && !tableUsable(bot, table) && plan.steps.some((s) => s.table)) {
-        placedNote = '（附近那个工作台够不着或看不见，先不用它）'
-        table = null
-        plan = planCraft(bot, target.item.id, want, null)
+      if (table && plan.steps.some((s) => s.table)) {
+        const whyTable = tableWhyNot(bot, table)
+        if (whyTable) {
+          placedNote = `（附近那个工作台用不了：${whyTable} —— 先不用它，能用手上 2×2 做的就先做）`
+          table = null
+          plan = planCraft(bot, target.item.id, want, null)
+        }
       }
       const head = []
       if (placedNote) head.push(placedNote)

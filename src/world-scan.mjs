@@ -49,7 +49,12 @@ export function scanAround (b, { radius = 16, height = 4, name = null, limit = 1
           else unloaded++
           continue
         }
-        if (isAir(blk.name)) continue
+        /* 🔴 2026-10-24 用户实机：以前这里无条件 `if (isAir(...)) continue` —— 而
+         *    `cave_air`/`void_air` 也算空气，所以点名找它们永远是"没找到"。
+         *    现在只有"查的正是这一种空气"才放行。 */
+        if (isAir(blk.name)) {
+          if (!name || blk.name !== name) continue
+        }
         if (name) {
           if (blk.name === name) {
             /* 🔴 2026-10-08 第五份审计报告 ③：以前只 `found.push` 再 `slice(0, limit)` ——

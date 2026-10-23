@@ -38,6 +38,7 @@ import { VIEW_DEFAULTS, compassOf, isAirName, makePos, renderView } from './mc_v
 import { ensureAtlas } from '../src/textures.mjs'
 import { createSkinStore } from './mc_skin.mjs'
 import { clamp } from './mc_util.mjs'
+import { spatialMapOf, spatialText } from '../src/spatial-map.mjs'
 
 /* ── 官方贴图库（src/textures.mjs）────────────────────────────────────────────
  * 第一次渲染时从本机客户端 jar 里建一次（之后走磁盘缓存，秒开）；拿不到就 null，
@@ -170,7 +171,7 @@ export async function apply (api) {
     name: 'mc_observe',
     description: '👁 **第一人称视角**：从我眼睛（眼高 1.62）朝正在看的方向渲染截图，直接内联给你看，并附**三段式感知**：'
       + '① **我看到**（图里数出来的：像素占比、谁在哪一侧、准星压着什么、手里拿什么）；'
-      + '② **程序检测到**（坐标/朝向/独立射线打到的方块/半径内实体带坐标·距离·血量/脚下/头顶第 2 格与**能不能跳**）；'
+      + '② **程序检测到**（坐标/朝向/独立射线打到的方块/半径内实体带坐标·距离·血量/脚下/头顶第 2 格与**能不能跳**/**局部空间地图**33×33（可站·墙·落差·未加载各多少，四向各能走几格与为什么停））；'
       + '③ **不确定**（客户端预测的方块世界、没加载的区块、读不到的血量 —— **别把推测当事实**）。'
       + '两套眼睛对不上时点名（以程序射线为准）。\n'
       + '图里：玩家（真皮肤）· 怪物（红=敌对/黄=被动）· 掉落物（黑描边）· 暗紫=区块没加载；右下角是手上的东西。\n'
@@ -364,6 +365,41 @@ export async function apply (api) {
       })()
       const headBlocked = headName !== null && !isAirName(headName)
       const canJumpNow = headroomAbove >= 1 && !headBlocked
+      /* 2026-10-23 局部空间地图（P0，用户「做p0」）：把"脚下三格"扩成"一两条通道"。
+       * 只交摘要（≤6 行），**不交 169 列** —— 地图对象留在 bot 上，下次调用直接复用。 */
+      const spatial = args.percept === false
+        ? null
+        : (() => {
+            try {
+              const sb = (() => {
+                if (!bot) return null
+                if (typeof bot.blockAt === 'function') return bot
+                const w = bot.world
+                if (w && typeof w.getBlock === 'function') {
+                  return {
+                    entity: bot.entity,
+                    on: (ev, fn) => { try { bot.on?.(ev, fn) } catch { /* 假 bot 没有 on */ } },
+                    blockAt: (pos) => { try { return w.getBlock(pos) } catch { return null } },
+                  }
+                }
+                return null
+              })()
+              if (!sb) return { note: '这个会话拿不到方块读取接口，空间地图跳过' }
+              const mp = spatialMapOf(sb)
+              const slines = spatialText(mp)
+              return {
+                r: mp.r,
+                reachable: mp.nav?.reachable ?? 0,
+                counts: mp.counts,
+                loaded: mp.loaded,
+                cached: mp.stats,
+                lines: slines,
+                ...(mp.ok ? {} : { note: mp.note || '这一圈区块都还没加载' }),
+              }
+            } catch (err) {
+              return { note: '空间地图算不出来：' + (err?.message ?? err) }
+            }
+          })()
       const out = {
         capturedAt: nowMs,
         position: s.position ?? { x: fx, y: fy, z: fz },
@@ -414,6 +450,7 @@ export async function apply (api) {
             || /water|lava/.test(String(blockAt(bot.world, fx, fy, fz) ?? ''))
             || /water|lava/.test(String(blockAt(bot.world, fx, fy + 1, fz) ?? '')),
         },
+        ...(spatial ? { spatial } : {}),
         entities: frame?.stats.entities ?? [],
         crosshairEntity: frame?.stats.crosshairEntity ?? null,
         image: frame
@@ -651,7 +688,7 @@ export async function apply (api) {
                 + (prog && prog.total > prog.list.length ? `（还有 ${prog.total - prog.list.length} 个没列出来）` : ''),
           ...(bossText ? [`   · 🗡 **Boss 血条**：${bossText}（龙/凋灵的血只在血条里，\`实体\` 那行读不到它）`] : []),
           `   · 生命 ${out.health ?? '?'} · 饥饿 ${out.food ?? '?'}`
-            + (out.air != null ? ` · 氧气 ${out.air}` : '') + (out.submerged ? '（头在水下）' : '')
+            + (out.air != null ? ` · 氧气 ${out.air}${out.air <= 0 ? '（见底，正在窒息掉血）' : ''}` : '') + (out.submerged ? '（头在水下）' : '')
             + ` · 模式 ${out.gamemode ?? '?'} · 手持 ${out.held ?? '空手'}`,
           `   · 🎒 背包：${invText}`,
           `   · 🛡 装备栏：${eqText ?? '读不到'}`,
@@ -699,6 +736,7 @@ export async function apply (api) {
             health: out.health, food: out.food, air: out.air, submerged: out.submerged,
             gamemode: out.gamemode, held: out.held, inventory: inv, equipment,
             surroundings: out.surroundings,
+            spatial: out.spatial ?? null,
           },
         }
         out.percept = percept
@@ -728,7 +766,7 @@ export async function apply (api) {
               : '👥 视野里没有实体（附近没人、没怪、没掉落物）'))
         if (out.health != null) {
           lines.push(`❤ 血量 ${out.health} · 饱食 ${out.food}`
-            + (out.air != null ? ` · 氧气 ${out.air}` : '') + (out.submerged ? '（头在水下）' : '')
+            + (out.air != null ? ` · 氧气 ${out.air}${out.air <= 0 ? '（见底，正在窒息掉血）' : ''}` : '') + (out.submerged ? '（头在水下）' : '')
             + ` · 模式 ${out.gamemode ?? '?'} · 手持 ${out.held ?? '空手'}`
             + (out.surroundings.inWater ? ' · 泡在水里' : ''))
         }
@@ -738,6 +776,7 @@ export async function apply (api) {
         if (out.image && out.image.unloadedPct > 25) {
           lines.push('⚠️ 未加载像素偏多：区块可能还没加载完，可以稍等再 mc_observe 一次。')
         }
+        if (out.spatial?.lines?.length) lines.push(...out.spatial.lines)
       }
       /* 2026-10-23：默认落盘路径（.out/）对决策没意义，只在用户点名 out 时才报。 */
       if (out.image?.file && !String(out.image.file).includes('/.out/')) lines.push(`💾 已落盘 ${out.image.file}（${renderMs}ms）`)

@@ -25,6 +25,7 @@ import { isAir, isLiquid, isSolidBlock, isPassable } from './block-names.mjs'
 import { heldText, canHarvestNow, toolKinds, countOf, durWarnText } from './inventory.mjs'
 import { digMsFor } from './dig-speed.mjs'
 import { blockReachOf, slowDigWhy, stateNameOf, dropHint, dropListOf } from './world-observer.mjs'
+import { waitForPickup } from './pickup.mjs'
 import { classifyRestore, restoreLocalBlock } from './server-break.mjs'
 import { callBudget, callSecText } from './budget.mjs'
 import { dangerNow, dangerText, dangerNotice, healthOf, noticeKey } from './danger.mjs'
@@ -644,10 +645,15 @@ export async function dig (self, {
                 + DESYNC_HINT)
             }
             /* 🔴 原地挖绕过了 collectBlock（它平时挖完还会把掉落物捡回来）⇒ 得自己去捡，
-             *    否则"挖到 3 根原木、背包里只有 1 根"（2026-10-08 实机）。 */
+             *    否则"挖到 3 根原木、背包里只有 1 根"（2026-10-08 实机）。
+             * 🔴 2026-10-24 用户（「可不可以不马上捡，过一段时间没吸到再去拿」）：**先等自动吸附** ——
+             *    掉在脚边的会自己飞进背包，等不到再走过去拿。以前每挖一格都立刻跑过去，
+             *    表现成"挖一个、动一下"，可那一步多半是白走。 */
+            const flew = await waitForPickup(self, b, { at: p }).catch(() => 0)
+            if (flew > 0) out.push(`　（等了一下，${flew} 个掉落物自己飞进背包）`)
             const got = await ctx.grabDrops(b)
             if (got > 0) out.push(`　（顺手捡回 ${got} 个掉落物）`)
-            else {
+            else if (flew <= 0) {
               /* 一个都没捡到（够不着 / 卡住 / 背包满）⇒ 点一句"东西还在地上"。
                * why：用户 2026-10-08 原话"挖完方块或者打完动物以后老是忘记走过去拾取" ——
                * 捡东西是**决策**，插件替不了，但结果里必须让它知道这活还没完。 */

@@ -386,7 +386,11 @@ export function heightmapOf (b, { radius = 32, yTop = 10, yBottom = -24 } = {}) 
 }
 
 /** 行内游程压缩：同一字符连续 ≥4 个写成 `X*n`（`*` 不是任何 glyph，所以不会歧义）。
- *  2026-10-23 审计：一次 mc_map 的 84% 字符量都在这张图上，实测 1055 → 613。 */
+ *  2026-10-23 审计：一次 mc_map 的 84% 字符量都在这张图上，实测 1055 → 613。
+ *  🔴 2026-10-23 晚（用户 m05002：「map · surface 的输出怎么这么奇怪」）：**默认不再压缩**。
+ *  开阔地整行同字符 ⇒ 一行变成 `"*16` 这种串，**看不出任何形状**（只报了数量），
+ *  模型拿它没法判断"哪边能走"。省下的 400 来字符（≈250 token）不值。
+ *  现在只有调用方显式要 `compress:true` 才走这里。 */
 export function rleGlyphs (line) {
   let out = ''
   let i = 0
@@ -401,7 +405,7 @@ export function rleGlyphs (line) {
 }
 
 /** 字符地形图（无视觉也能读） */
-export function glyphMapText (names, step = 2, selfIndex = null) {
+export function glyphMapText (names, step = 2, selfIndex = null, { compress = false } = {}) {
   const out = []
   for (let y = 0; y < names.length; y += step) {
     let line = ''
@@ -412,7 +416,7 @@ export function glyphMapText (names, step = 2, selfIndex = null) {
       const isSelf = selfIndex && Math.abs(y - selfIndex.y) < step && Math.abs(x - selfIndex.x) < step
       line += isSelf ? '@' : glyphOf(names[y][x])
     }
-    out.push(rleGlyphs(line))
+    out.push(compress ? rleGlyphs(line) : line)
   }
   return out.join('\n')
 }

@@ -535,9 +535,12 @@ export function patchDoorMoves (mv, { digPenalty = 0 } = {}) {
       const moves = origNeighbors.call(this, node)
       if (!Array.isArray(moves)) return moves
       const kept = moves.filter((m) => clean(node, m))
-      /* 🔴 兜底：门保护不该把整个世界变成"无路可走"。
-       * 万一某个节点上所有候选都因为"得挖门旁边的方块"被作废，就退回未过滤的候选 ——
-       * 执行层 `guardDoorDig` 仍然不会真去挖门/门框，宁可交给脱困阶梯也不要凭空 NoPath。 */
+      /* 🔴 2026-10-24 审计（用户第三份）：**不再退回未过滤的候选**。
+       * 旧写法 `return kept.length > 0 ? kept : moves`：某个节点上所有候选都因为
+       * "得挖门/门框"被作废时，把**原样的**候选还给 A* —— 那等于给了一条"挖穿门框过去"的
+       * 假路：规划上通，执行时被 `guardDoorDig` 拦下，机器人就在门口反复蹭，
+       * 既不报 NoPath 也不进脱困阶梯。宁可这里无路（⇒ NoPath ⇒ 脱困阶梯 / 等
+       * `openNearbyDoor` 把门按开），也不要给一条走不通的路。 */
       /* 🔴 `preferDoors`（2026-10-18 用户要求）：**所有"还得挖方块"的移动加一笔固定惩罚**。
        * 门/绕路本身不受影响，只是"挖墙"更不划算 ⇒ 有门的房子会优先走门、宁可多绕两步。
        * 放在 `clean()` 之后：门已经从 `toBreak` 里剔掉了，不会误伤"穿过门"。 */
@@ -546,7 +549,7 @@ export function patchDoorMoves (mv, { digPenalty = 0 } = {}) {
           if (Array.isArray(m.toBreak) && m.toBreak.length) m.cost = (Number(m.cost) || 0) + digPenalty
         }
       }
-      return kept.length > 0 ? kept : moves
+      return kept
     }
     mv.__dshDoorPatched = true
     return mv
@@ -696,6 +699,13 @@ export function movements (self, { terrain = null } = {}) {
    * 配上 canDig=true ⇒ "挖墙"永远比"绕路"便宜。规划允许穿门，执行由
    * `src/movement.mjs` 的 `openNearbyDoor` 走到门边按一下。 */
   mv.canOpenDoors = true
+  /* 🔴 2026-10-24 用户（导航世界模型）：**实体挡路要让 A* 看得见** ——
+   *    vendor 默认 `entityCost = 1`（`lib/movements.js:27`），A* 绕一步就抵掉了，
+   *    怪站在唯一通道里它照样硬穿。调到 8：明显倾向绕开，但真没别的路时还是走。
+   *    ⚠️ 成本只在**生成路径那一刻**按当时实体位置算（`lib/movements.js:298` 等 9 处）；
+   *    路径出来之后怪再走进通道，A* 不知道 —— 那一半靠 `entityObstacleAhead()` 在卡住时补。 */
+  mv.allowEntityDetection = true
+  mv.entityCost = 8
   /* 门进 `mv.openable`（2026-10-18 晚第二版，用户实机："你屋里我寻路进不去，
    * 我的寻路不会开门，只会硬挖，已经挖了你两块木板"）。
    *

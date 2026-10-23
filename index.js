@@ -3239,6 +3239,7 @@ export function apply(ctx, rawConfig) {
     parameters: {
       action: { type: 'string', description: 'status（默认）/ arm / disarm / log' },
       reason: { type: 'string', description: 'disarm 时的原因（会写进日志）' },
+      limit: { type: 'number', description: 'log：回最近几条（默认 12，最多 30；每条超过 200 字会截断）' },
     },
     output: text(),
     async execute(args, exec) {
@@ -3249,7 +3250,22 @@ export function apply(ctx, rawConfig) {
       const action = String(args.action ?? 'status')
       if (action === 'arm') return { ...wd.arm(), note: '看门狗已挂载，整局游戏期间有效（退服自动卸载并提醒你）。' }
       if (action === 'disarm') return wd.disarm(args.reason ? String(args.reason) : 'AI 主动关闭')
-      if (action === 'log') return { armed: wd.armed, stats: { ...wd.stats }, recent: wd.log.slice(-30) }
+      if (action === 'log') {
+        /* 返回瘦身（用户 2026-10-23）：原来固定回最近 30 条**全文**，聊天多的服一次就几千字符。
+         * 现在默认 12 条、每条最多 200 字（超了打点省略），要更多给 limit。 */
+        const cap = Math.max(1, Math.min(30, Number(args?.limit) || 12))
+        const recent = wd.log.slice(-cap).map((e) => {
+          const text = String(e?.text ?? '')
+          return text.length > 200 ? { ...e, text: text.slice(0, 200) + '…' } : e
+        })
+        return {
+          armed: wd.armed,
+          stats: { ...wd.stats },
+          total: wd.log.length,
+          recent,
+          ...(wd.log.length > cap ? { hint: `一共 ${wd.log.length} 条，这里只给最近 ${cap} 条；要看更多把 limit 调大（最多 30）` } : {}),
+        }
+      }
       return wd.status()
     },
   }))
@@ -3545,7 +3561,8 @@ export function apply(ctx, rawConfig) {
       + '（跑远路前先探一眼，比猜 y 靠谱）；读不到 = 区块没加载，别猜。'
       + 'format="image" 出**俯视图像**（有视觉的模型能直接看，并落盘）。'
       + '🔴 想让 用户 看到图：见 out 参数。'
-      + '字符图省 token 且坐标精确；形状/外观问题用图像。',
+      + '字符图省 token 且坐标精确；形状/外观问题用图像。'
+      + '（字符图**默认不压缩**，一行就是一格；确实要省 token 再加 compress:true。）',
     parameters: {
       radius: { type: 'number', description: '半径（默认 32，上限 96）' },
       mode: { type: 'string', description: 'floor（默认，脚下方块那一层）/ surface（地表图）/ column（竖列）；2026-10-22 起 cave 与 auto 已删除，传它们等于没传' },
@@ -3555,6 +3572,7 @@ export function apply(ctx, rawConfig) {
       layer: { type: 'number', description: 'floor 层的 y（默认 feetY-1）' },
       depth: { type: 'number', description: 'floor 层往下探几格找地面（默认 4，0–8）' },
       glyphStep: { type: 'number', description: '字符图抽稀步长（默认 2；1 最细）' },
+      compress: { type: 'boolean', description: '整行同字符压成 X*n（默认 false：给纯字符图，能看出形状；只在确实要省 token 时开）' },
       yTop: { type: 'number', description: '地表搜索起始高度偏移（默认 +10，仅地表图用）' },
       yBottom: { type: 'number', description: '向下搜索深度（默认 -24；地表图与竖列图用）' },
       format: { type: 'string', description: 'chars（默认）/ image / both' },
@@ -3654,7 +3672,7 @@ export function apply(ctx, rawConfig) {
       }
       if (mode === 'floor' && hm.counts) out.tiles = hm.counts
       if (format === 'chars' || format === 'both') {
-        out.glyphMap = McBot.glyphMap(hm.names, step, { x: hm.radius, y: hm.radius })
+        out.glyphMap = McBot.glyphMap(hm.names, step, { x: hm.radius, y: hm.radius }, { compress: args.compress === true })
       }
       if (format === 'image' || format === 'both') {
         const img = await sess.bot.mapImageAsync({
@@ -3724,8 +3742,11 @@ export function apply(ctx, rawConfig) {
       if (hm.mode === 'floor') {
         const t = hm.counts ?? {}
         lines.push(`能站 ${t.walkable ?? 0} 格 ｜ 墙 ${t.blocked ?? 0} ｜ 会掉下去 ${t.drop ?? 0} ｜ 液体 ${t.liquid ?? 0} ｜ 未加载 ${t.unknown ?? 0}`)
-        /* 2026-10-23 审计：符号说明与工具 description 重复，改成最短形式并顺手说明游程压缩。 */
-        lines.push('（·能站 #墙 v掉下去 ~水 ≈岩浆 ?未加载 ｜ X*n = 连续 n 个 X）')
+        /* 2026-10-23 审计：符号说明与工具 description 重复，改成最短形式并顺手说明游程压缩。
+         * 2026-10-23 晚：默认不压缩了，所以 X*n 的说明只在真的压缩时才出现。 */
+        lines.push(args.compress === true
+          ? '（·能站 #墙 v掉下去 ~水 ≈岩浆 ?未加载 ｜ X*n = 连续 n 个 X）'
+          : '（·能站 #墙 v掉下去 ~水 ≈岩浆 ?未加载）')
       }
       /* 2026-10-15：`purpose` 的紧凑摘要（导航/危险）—— 让模型不用自己从几十行字符图里数 */
       for (const l of nav.lines) lines.push(l)
@@ -3807,27 +3828,29 @@ export function apply(ctx, rawConfig) {
   ctx.tools.register(asTool({
     name: 'mc_move',
     description: '移动。mode="walk" 走过去（自动避障；**在水里会自动改成"直接游"**）；mode="fly" 创造直飞（约 9 格/秒，会先发飞行权限包）；'
-      + 'mode="jump" 原地跳一下（爬台阶/脱困，不需要坐标）；'
+      + 'mode="jump" 原地跳一下（不需要坐标）；'
       + 'mode="swim" 在水里游到 x/y/z（不给坐标就只上浮换气）。\n'
       + 'mode="boat" 开船（先 use 上船；下船用 mode="dismount"）。\n'
-      + '🔴 **一次只走 10 秒**。没走到返回 `arrived:false`+`remaining`+`hint`——**再叫一次往同一目标走**（比挂 90 秒好）。\n'
-      + '🔴 **在水里**寻路基本不动（A* 不把水当节点）：会自动直接游，上岸再交回寻路。'
-      + '**快淹死就 `mode:"swim"` 不给坐标**（只上浮换气）；水挖不掉，别 `mc_dig` 水。\n'
-      + '🔴 **默认不挖方块**（用户 2026-10-20 定）：走路一格都不挖，只绕路/跳/下蹲过缝；'
-      + '要挖穿挡路的方块必须显式 `noDig:false`（`mode:"walk-nodig"` 恒不挖）。\n'
-      + '🔴 **默认不垫 1×1 柱**（`allowTower:true` 才允许）；上高处走斜台阶，会报 `pillaredWith`。\n'
+      + '🔴 **一次只走 10 秒**。没走到返回 `arrived:false`+`remaining`+`hint`——**再叫一次往同一目标走**。\n'
+      + '🔴 水里会自动游；快淹死用 `mode:"swim"` 不给坐标（只上浮换气）。\n'
+      + '🔴 **默认不挖方块**：走路一格都不挖，只绕路/跳/下蹲过缝；'
+      + '要挖必须显式 `noDig:false`（`mode:"walk-nodig"` 恒不挖）。\n'
+      + '🔴 默认不垫 1×1 柱（`allowTower:true` 才允许）；上高处走斜台阶会报 `pillaredWith`。\n'
+      + '🪜 **一格台阶会先试着踩上去**（量真实位移才算成功）；站上去头顶被堵就跳不起来 —— 允许挖时只清头顶那格，不挖报 `stepUp.why="no-headroom"`。\n'
+      + '🔴 走不动会分清挡着的是什么：`entity`（实体，别挖）/ `lava`（岩浆，挖不动）/ `waiting_chunks`（区块没加载，等）/ `stepUp`（一格台阶）。\n'
       + '🧭 `intent` 决定"到"的标准：near（默认）/ stand / interact（2.2 格）/ same-level。\n'
-      + '🔴 **长程赶路只给 x/z 就够**（`xz:true`）：不必猜高度，按"到那一列"算（哪一层由寻路器定）—— 去几十格外的村子/矿口用这个，别编个 y 把自己挂半空。**给了 y 就按 y 走，xz 被忽略。**\n'
-      + '🔴 没走到时报 `pathLen`（剩余路径几格）+ `estCalls`（还要几次调用，一次 10 秒 ≈ 43 格）—— 用它分清"这趟走不完"和"路不通"。\n'
-      + '🔴 **每次结果都带 `above`**（脚底上方第 2 格 / 头顶净空 `headroom` / `canJump`）：要往上爬先看它，`canJump:false` 就是**跳不起来**（`note` 说清哪一格堵着），先挖开或换落点，**别反复 `mode:"jump"`**。\n'
-      + '🔴 掐断时报 `reason:"walk-hung"`+`hardLimitMs`（服务端不回包，**不是路不通**）；`digStalled`=路上挖方块卡在回包上。别原样第三次重叫：先 `noDig:true` 或换落点。\n'
-      + '🔴 **卡住时按执行顺序升**（`planStep`=最后试的那级）：开门→重算→跳→后退→**侧向绕行**→挖→垫柱；'
-      + '`planTried` 列出真试过哪几级（有 `breakAhead`=挖也没用）。同目标 90 秒内再叫会**从上次那级接着升**。',
+      + '🔴 **长程赶路只给 x/z 就够**（`xz:true`）：不必猜高度，按"到那一列"算（哪一层由寻路器定）—— 别编个 y 把自己挂半空。**给了 y 就按 y 走，xz 被忽略。**\n'
+      + '🔴 没走到时报 `pathLen`（剩余路径几格）+ `estCalls`（还要几次调用，一次 10 秒 ≈ 43 格）。\n'
+      + '🔴 结果带 `above`（头顶净空 `headroom` / `canJump`）：`canJump:false` 就是跳不起来（`note` 说哪格堵着），先挖开或换落点，别反复 `mode:"jump"`。\n'
+      + '🔴 掐断报 `reason:"walk-hung"`（服务端不回包，不是路不通）；`digStalled`=挖方块卡在回包上。别原样第三次重叫。\n'
+      + '🔴 **卡住时按执行顺序升**（`planStep`=最后试的那级）：允许挖（`noDig:false`）时 开门→重算→跳→**挖**→后退→绕行→垫柱；'
+      + '默认不挖时**没有"挖"这一级**：开门→重算→跳→后退→绕行→垫柱。'
+      + '`planTried` 列出真试过哪几级。同目标 90 秒内再叫会**从上次那级接着升**。',
     parameters: {
       x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
       mode: { type: 'string', description: 'walk / walk-nodig / fly / jump / swim / boat（创造缺省 fly；jump 不需坐标；swim 不给坐标=只上浮换气；boat 要先上船）' },
       noDig: { type: 'boolean', description: '走路时挖不挖方块（**默认不挖**）；要挖穿挡路的写 false' },
-      xz: { type: 'boolean', description: '长程赶路用：只给 x/z 就够（目标 y 不用猜，按"到那一列"算 GoalXZ）；**给了 y 就按 y 走，这个开关被忽略**；fly/boat 仍必须给 y' },
+      xz: { type: 'boolean', description: '长程赶路：只给 x/z 就够（按"到那一列"算 GoalXZ）；给了 y 就按 y 走；写 false 等于必须给 y；fly/boat 仍必须给 y' },
       budgetMs: { type: 'number', description: 'walk/swim 最长时间（≤10000）；swim 上浮默认 9000' },
       waterRecover: { type: 'boolean', description: '游不动时自动找出口（默认 true）' },
       allowTower: { type: 'boolean', description: '允许垫 1×1 柱往上爬（默认不许，容易摔死）' },
@@ -3860,6 +3883,12 @@ export function apply(ctx, rawConfig) {
        *    以前 `xz:true` 会把同时给的 y 静默吃掉（换成脚下高度），等于 y 白写；
        *    现在只有"没给 y"才按 xz 走，给了 y 就按三维（GoalNear），写没写 xz 都一样。 */
       const yGiven = args.y !== undefined && args.y !== null
+      /* 🔴 2026-10-24 通审：`xz` 这个参数**以前从来没人读** —— 真正决定"按列走"的只有"给没给 y"，
+       *    于是它是个幽灵参数（写 xz:true 没效果，写 xz:false 也没效果）。现在让它有用：
+       *    显式 `xz:false` + 没给 y ⇒ 当场说清楚（而不是悄悄按列走，让人以为 y 生效了）。 */
+      if (!yGiven && args.xz === false) {
+        throw new Error('写了 xz:false 就得给 y —— 不想猜高度就别写 xz:false（只给 x/z 就按"到那一列"走）')
+      }
       const wantsXZ = !yGiven
       if (args.x === undefined || args.z === undefined) {
         throw new Error('walk/fly 需要 x/z；只想跳一下请给 mode:"jump"，在水里上浮请给 mode:"swim"')
@@ -4200,7 +4229,9 @@ export function apply(ctx, rawConfig) {
       + '**再叫一次 mc_build、范围原样重发就行**，已经放对的格子会自动跳过（不会报"这格已经有方块"）。\n'
       + '🔴 也能**按图施工**：给 layers（从最底层往上，一层一个字符串，层内用 / 分行）+ legend（字符→方块名，. = 空着不管），'
       + '例如 layers:["BBB/B.B/BBB","BBB/BBB/BBB"] + legend:{"B":"planks"}。会先拆掉挡路的、再自下而上放；'
-      + '缺什么料直接报 missing（planks 这类泛名会按你手上那种木材落实成 oak_planks）；dryRun:true 只算不干。',
+      + '缺什么料直接报 missing（planks 这类泛名会按你手上那种木材落实成 oak_planks）；dryRun:true 只算不干。\n'
+      + '🔴 **层数模式一定要给原点 x/y/z**（不给就用脚下这格）：人被垫高、走开几步之后"脚下这格"就变了，'
+      + '重发会盖到别处去。结果里的 origin 就是这次用的原点，重发时原样带上。',
     parameters: {
       x1: { type: 'number' }, y1: { type: 'number' }, z1: { type: 'number' },
       x2: { type: 'number' }, y2: { type: 'number' }, z2: { type: 'number' },
@@ -4210,6 +4241,11 @@ export function apply(ctx, rawConfig) {
         type: 'array', items: { type: 'string' },
         description: '按图施工：从最底层往上，一层一个字符串，层内用 / 分行（给了这个就不用给 x1..z2）',
       },
+      /* 🔴 2026-10-24 用户实机：层数模式没有锚点 ⇒ 只能"原地起"，人一被垫高原点就漂，
+       *    结果在原地又盖一座、整个建筑跟着走。run() 一直支持 x/y/z，只是没暴露。 */
+      x: { type: 'number', description: '蓝图原点 x（只对 layers 有效；不给就用脚下这格）' },
+      y: { type: 'number', description: '蓝图原点 y（最底层那一层的地面高度；不给就用脚下这格）' },
+      z: { type: 'number', description: '蓝图原点 z（只对 layers 有效；不给就用脚下这格）' },
       legend: { type: 'object', additionalProperties: true, description: '蓝图图例：字符→方块名（"."/空格=空着不管）；可以写泛名 planks/log/bed' },
       orientation: { type: 'number', description: '蓝图绕竖轴转几个 90°（0..3，默认 0）' },
       dryRun: { type: 'boolean', description: 'true = 只算"要动几格、缺什么料"，一格都不动' },
@@ -4247,7 +4283,7 @@ export function apply(ctx, rawConfig) {
       + '**再叫一次 mc_dig 接着挖**就行（挖到的方块留在背包里，不会白挖）。',
     parameters: {
       name: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
-      maxDistance: { type: 'number', description: '搜索半径（默认 16；树/矿脉远的话给大一点，上限看场景）' },
+      maxDistance: { type: 'number', description: '搜索半径（**默认 8**；树/矿脉远的话给大一点，上限看场景）' },
       count: { type: 'number', description: '挖几个（默认 1，上限 16；一次挖不完就再叫一次）' },
       allowDangerous: { type: 'boolean', description: '允许挖自己脚下的支撑（默认拦，下面没落脚点就掉下去）' },
       digThrough: {
@@ -4712,7 +4748,9 @@ export function apply(ctx, rawConfig) {
       content: { type: 'string', description: 'write 的完整内容' },
       name: { type: 'string', description: 'put：存进去的名字（缺省用原名）' },
       query: { type: 'string', description: 'search 的关键词' },
-      limit: { type: 'number', description: 'search 最多几条（默认 30）' },
+      limit: { type: 'number', description: 'search 最多几条（默认 12，上限 100；每条超 160 字截断）；index+group 时最多列几个文件（默认 40）' },
+      group: { type: 'string', description: 'index：只看这一组（组名来自默认摘要，如 mc.example.com / (通用)）' },
+      verbose: { type: 'boolean', description: 'index：true = 全量文件清单 + README 全文（很费 token，只在真要找东西时用）' },
     },
     output: {
       schema: { type: 'object', properties: {}, additionalProperties: true },
@@ -4726,7 +4764,14 @@ export function apply(ctx, rawConfig) {
     async execute(args, exec) {
       const mem = memoryFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent))
       const action = String(args.action ?? 'index').toLowerCase()
-      if (action === 'index') return mem.overview()
+      if (action === 'index') {
+        /* 返回瘦身（用户 2026-10-23）：默认只给分组摘要；group 看一组；verbose 才给全量 */
+        return mem.overview({
+          brief: args?.verbose !== true,
+          group: args?.group ?? null,
+          limit: args?.limit ?? 40,
+        })
+      }
       if (action === 'kinds') return mem.kinds()
 
       // put：把工作区里的源文件复制进记忆（图片最常用；任何格式都行）

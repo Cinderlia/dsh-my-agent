@@ -575,7 +575,6 @@ export class McBot extends EventEmitter {
   /** 下线（实现在 `src\connection.mjs` 的 `disconnect`）。 */
   async disconnect (reason = '主动下线', { graceMs = 3000 } = {}) { return await disconnectImpl(this, reason, { graceMs }) }
 
-
   /* 路线图第 ④ 条第三十刀：认证/会话层（`authOnly` / `#makeSession` / `#refresh` / `#authenticate`）
    *  搬进 `src\auth-session.mjs` 了 —— 那里是全插件唯一接触凭据的地方。 */
   /** 只做认证、不连服（实现在 `src\auth-session.mjs` 的 `authOnly`）。 */
@@ -583,7 +582,6 @@ export class McBot extends EventEmitter {
 
   /** 账户描述符 → session（实现在 `src\auth-session.mjs` 的 `makeSession`）。 */
   async #makeSession (auth) { return await makeSession(this, auth) }
-
 
   /* 按键上报兼容层（player_input）—— 已整体移除（2026-10-02 用户决策）：上游连不了 26.2（mineflayer
    * 4.39.0 testedVersions 到 26.1；minecraft-data 3.117.0 只有 26.2 元数据、`minecraft-data('26.2')` 为 null）。
@@ -669,7 +667,7 @@ export class McBot extends EventEmitter {
   heightmap (opts = {}) { return heightmapOf(this.requireBot(), opts) }
 
   /** 字符地形图（无视觉也能读） */
-  static glyphMap (names, step = 2, selfIndex = null) { return glyphMapText(names, step, selfIndex) }
+  static glyphMap (names, step = 2, selfIndex = null, opts = {}) { return glyphMapText(names, step, selfIndex, opts) }
 
   /** 俯视地形 → RGBA 像素图（视觉模型看图像比看字符强）；异步版把"网格→像素"交给 Worker 池（默认关）。 */
   mapImage (opts = {}) { return mapImageOf(this.requireBot(), opts) }
@@ -718,6 +716,7 @@ export class McBot extends EventEmitter {
       /* 2026-10-23 审计：原来这里没有 cfg ⇒ movement.mjs 里 `ctx.cfg?.walkCanDig !== false` 恒真
        * （可选链短路），A* 不挖了、手写挖台阶补救却在挖。cfg 只塞进 #moveCtx 是漏接线。 */
       cfg: this.cfg,
+      moveGenOf: () => this._moveGen,   // 2026-10-24 通审：_moveGen 在实例上、不在 bot 上
     }
   }
 
@@ -745,6 +744,7 @@ export class McBot extends EventEmitter {
       beginMove: () => this.#beginMove(),
       releaseControls: () => this.#releaseControls(),
       cfg: this.cfg,   // 挖台阶补救要读 walkCanDig/walkCarveStep（2026-10-18 审计 Bug 3）
+      moveGenOf: () => this._moveGen,   // 同上：bot 上没有 _moveGen
     }
   }
   /* ─────────── 手上的东西 / 背包快照：已搬到 `src\inventory.mjs`（路线图第 ④ 条第七刀）─────────── */

@@ -332,6 +332,7 @@ section('⑧ 目标格 = 自己站的那一格 —— 必须跳起来放（pilla
     ok(calls.includes('place:air'), '🔴 真正发包那一刻是**离地**的', `calls=${calls.join(',')}`)
     ok(!calls.includes('place:ground'), '没有一次"站着放"（那必被服务端拒）', `calls=${calls.join(',')}`)
     ok(r.pillar === true, '结果里报 pillar:true（模型才知道自己刚垫高了一格）', JSON.stringify({ pillar: r.pillar }))
+    ok(/被垫高了 1 格/.test(r.pillarNote ?? ''), '并且明说"被垫高了 1 格、现在 y 多少"（2026-10-24 用户实机）', String(r.pillarNote ?? '').slice(0, 120))
   }
   // ② 目标 = 齐腰那一格（身体也占着）⇒ 同样要跳
   {

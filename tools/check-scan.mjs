@@ -8,6 +8,7 @@
  * 修法：加一个 `y` 参数**指定竖向中心**，并在返回里带上 `center`（真实窗口中心），
  * 别再让人把"这一层没有"读成"整座山都没有"。
  */
+import { readFileSync } from 'node:fs'
 import { Vec3 } from 'vec3'
 import { scanAround } from '../src/world-scan.mjs'
 
@@ -65,6 +66,13 @@ section('④ y 传垃圾值不炸（当没传）')
     const r = scanAround(b, { radius: 1, height: 1, y: bad })
     ok(r.center?.y === 72, `y=${JSON.stringify(bad)} ⇒ 回落脚底 72`, JSON.stringify(r.center))
   }
+}
+
+/* 🔴 2026-10-24 用户实机（问题清单第 12 条）：`if (isAir(...)) continue` 把 cave_air/void_air
+ *    也跳过了 ⇒ 点名找它们永远是"没找到"。 */
+{
+  const wsSrc = readFileSync(new URL('../src/world-scan.mjs', import.meta.url), 'utf8')
+  ok(/if \(!name \|\| blk\.name !== name\) continue/.test(wsSrc), '点名查空气变体（cave_air/void_air）时放行')
 }
 
 console.log(`\n${fail ? '❌' : '✅'} ${pass} 通过 / ${fail} 失败`)

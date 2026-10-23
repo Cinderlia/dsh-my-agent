@@ -14,6 +14,14 @@
 import { sleep, withTimeout } from './async-util.mjs'
 import { dropsNear } from './world-observer.mjs'
 
+/** 挖完先等这么久让**自动吸附**生效（脚边 1~2 格的掉落物会自己飞进背包）。 */
+export const PICKUP_GRACE_MS = 900
+
+/** 背包里一共几个东西 —— 判"捡没捡到"只能看它（实体 isValid 来不及变，见 grabDrops 的注释）。 */
+function invCountOf (b) {
+  try { return (b.inventory?.items?.() ?? []).reduce((s, i) => s + (Number(i?.count) || 0), 0) } catch { return 0 }
+}
+
 /**
  * 捡起刚挖出来的掉落物。
  *
@@ -33,10 +41,7 @@ export async function grabDrops (self, b, { radius = 8, budgetMs = 3_000 } = {},
    *    实机探针 `probe-drop.mjs` 里 `isValid` 根本来不及变 false（实体被移出 `bot.entities`
    *    的时机和我们数它的时机不重合）⇒ 明明捡到了也报 0（实机：原木 1 → 3，却一条
    *    "顺手捡回"都没有）。 */
-  const invCount = () => {
-    try { return (b.inventory?.items?.() ?? []).reduce((s, i) => s + (Number(i?.count) || 0), 0) } catch { return 0 }
-  }
-  const before = invCount()
+  const before = invCountOf(b)
   const t0 = Date.now()
   for (const { e } of drops) {
     const left = Math.min(budgetMs - (Date.now() - t0), self.callLeft() - 300)
@@ -54,5 +59,39 @@ export async function grabDrops (self, b, { radius = 8, budgetMs = 3_000 } = {},
     }
   }
   await sleep(120)          // 服务端把物品塞进背包有一点点延迟
-  return Math.max(0, invCount() - before)
+  return Math.max(0, invCountOf(b) - before)
+}
+
+/**
+ * 挖完**别马上跑过去捡** —— 先等一会儿，看自动吸附吃不吃得到（2026-10-24 用户：
+ *   「可不可以不马上捡，过一段时间没吸到再去拿」）。
+ *
+ * 为什么值得等：玩家身边约 1 格的掉落物会**自己飞过来**，而挖下来的东西绝大多数就掉在脚边。
+ *   以前每挖一格都立刻 grabDrops ⇒ 表现成"挖一个、动一下"，可那一步本来就白走。
+ *
+ * @returns {Promise<number>} 这段时间里**自己飞进背包**的个数（0 = 没吸到，该走过去拿了）
+ */
+export async function waitForPickup (self, b, { graceMs = PICKUP_GRACE_MS, radius = 3, at = null } = {}) {
+  const me = b?.entity?.position
+  if (!me) return 0
+  /* 2026-10-24 用户：「改成掉在**挖掘点 3 格以外**的」—— 判定以**挖掘点**为准，不是以人为准。
+   *   挖下来的东西就掉在那一格附近；人在 3~4 格外挖远处方块时，以人为中心量会把它们判成"远的"，
+   *   于是每挖一格都跑一趟。现在只看"掉落物离挖掘点多远"：3 格内的先等吸附。 */
+  const c = at ?? me
+  const near = dropsNear(b, 12).filter(({ e }) => {
+    const q = e?.position
+    if (!q) return false
+    return Math.hypot(Number(q.x) - Number(c.x), Number(q.z) - Number(c.z)) <= radius
+  })
+  if (!near.length) return 0
+  const before = invCountOf(b)
+  /* 边等边看：吸附通常 0.3~0.6 秒就吃到了，没必要傻等满 —— 吃到就提前收工。 */
+  const budget = Math.max(0, Number(graceMs) || PICKUP_GRACE_MS)
+  const t0 = Date.now()
+  while (Date.now() - t0 < budget) {
+    await sleep(Math.min(150, Math.max(30, budget - (Date.now() - t0))))
+    const got = invCountOf(b) - before
+    if (got > 0) return got
+  }
+  return 0
 }

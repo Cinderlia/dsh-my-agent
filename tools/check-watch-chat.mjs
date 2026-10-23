@@ -158,6 +158,19 @@ section('7. 限流（任何玩家说话都叫醒 ≠ 无限叫醒）')
   wd.disarm('自检结束', { notify: false })
 }
 
+// ── 8. 返回瘦身：mc_watch {action:"log"} 默认 12 条、每条截断 ────────────────
+section('8. 返回瘦身：mc_watch log 默认只回 12 条、每条最多 200 字（用户 2026-10-23）')
+{
+  const idx = readFileSync('index.js', 'utf8')
+  ok(/const cap = Math\.max\(1, Math\.min\(30, Number\(args\?\.limit\) \|\| 12\)\)/.test(idx),
+    '默认 12 条，上限 30')
+  ok(/const recent = wd\.log\.slice\(-cap\)\.map/.test(idx), '按 cap 取最近几条')
+  ok(/text\.length > 200 \? \{ \.\.\.e, text: text\.slice\(0, 200\) \+ '…' \} : e/.test(idx),
+    '单条超过 200 字截断并打点')
+  ok(/total: wd\.log\.length/.test(idx), '报总条数（知道"还有多少没看"）')
+  ok(/limit: \{ type: 'number', description: 'log：回最近几条/.test(idx), '参数表里有 limit')
+}
+
 // ── 收尾 ─────────────────────────────────────────────────────────────────────
 console.log(`\n结果：${pass}/${pass + fail} 通过，${fail} 失败`)
 process.exit(fail ? 1 : 0)
