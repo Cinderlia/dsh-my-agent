@@ -263,6 +263,8 @@ export async function runCollect (self, plan, ctx = {}) {
     }
 
     if (st.phase === 'pickup') {
+      st.pickupTries = (st.pickupTries ?? 0) + 1
+      if (st.pickupTries > 2) return fail('挖掉了但一直捡不到（已试着去捡 2 次）')
       const t = st.target
       const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6)
       if (!drops.length) return fail('挖掉了，但附近没看到掉落物实体（被捡走/掉进岩浆/没生成）')

@@ -160,7 +160,9 @@ export class JobBoard {
     this.current = job
     this.state = 'running'
     job.status = 'running'
-    job.startedAt = Date.now()
+    /* 🔴 只在**第一次**开始记时间：任务被 yieldFor 挂起后再恢复时，
+     *    这里会把 startedAt 冲掉，最终报告就变成"0.2 秒"（实测踩过）。 */
+    if (!job.startedAt) job.startedAt = Date.now()
     this.changed()
     this.log(`任务 ${job.id} 开始：${job.summary}`)
     Promise.resolve()

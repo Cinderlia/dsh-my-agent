@@ -28,7 +28,11 @@ import { isAir, isLiquid, isPassable } from './block-names.mjs'
  * 模块缓存挂在 `self._pf`（见 `src/plugins.mjs` 的 `setupPathfinder`）。
  */
 function goalBlockOf (self, x, y, z) {
-  const Goals = self?._pf?.Goals ?? self?._pf?.default?.Goals ?? null
+  /* 🔴 pathfinder 的导出是**小写** `goals`（`module.exports = { pathfinder, Movements, goals }`），
+   *    写成 `Goals` 会永远拿不到 —— 症状是每次 navi 都报「pathfinder 没挂上 Goals」。
+   *    这里两种都认，再兜一层 default。 */
+  const mod = self?._pf ?? null
+  const Goals = mod?.goals ?? mod?.Goals ?? mod?.default?.goals ?? mod?.default?.Goals ?? null
   const GoalBlock = Goals?.GoalBlock
   if (typeof GoalBlock !== 'function') return null
   return new GoalBlock(x, y, z)
