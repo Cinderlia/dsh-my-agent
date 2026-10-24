@@ -228,9 +228,9 @@ export async function runCraft (self, req, ctx = {}) {
     if (st.phase === 'gather') {
       if (!board || !job) return fail('内部错误：没有队列上下文，无法插入收集任务')
       /* 🔴 上一轮插的 collect 失败了？记一次、别原地重插（实测会死循环 235 个任务）。 */
-      if (st.__lastChildError) {
-        const e = st.__lastChildError
-        st.__lastChildError = null
+      if (st.__lastError) {
+        const e = st.__lastError
+        st.__lastError = null
         st.gatherFails = (st.gatherFails ?? 0) + 1
         notes.push(`收集失败（第 ${st.gatherFails} 次）：${e.error}`)
         if (st.gatherFails >= 2) {

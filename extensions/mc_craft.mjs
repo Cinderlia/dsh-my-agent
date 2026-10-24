@@ -78,12 +78,25 @@ export function listTablesNearby (bot, radius = 32, limit = 5) {
   } catch { return [] }
 }
 
+/**
+ * 取"产出正好是这个物品"的配方。
+ *
+ * 🔴 2026-10-25 实机：`bot.recipesAll(id, …)` 在 26.1 客户端上会**把别的配方也带回来**
+ *    （`iron_ingot` 拿到了 `iron_block = 9 iron_ingot` 那条），于是 planCraft 把
+ *    「做铁镐缺 3 个铁锭」算成「缺 1 个铁块」，整条链从一开始就错了。
+ *    这里按 `result.id === 目标 id` 硬过滤 —— 配方只能产出你要的东西。
+ */
+function onlyProducing (list, id) {
+  const want = Number(id)
+  return (list ?? []).filter((r) => Number(r?.result?.id) === want)
+}
+
 function recipesAllOf (bot, id, table) {
-  try { return bot.recipesAll(id, null, table) ?? [] } catch { return [] }
+  try { return onlyProducing(bot.recipesAll(id, null, table), id) } catch { return [] }
 }
 
 function recipesReady (bot, id, table, minCount) {
-  try { return bot.recipesFor(id, null, minCount, table) ?? [] } catch { return [] }
+  try { return onlyProducing(bot.recipesFor(id, null, minCount, table), id) } catch { return [] }
 }
 
 /**
@@ -271,6 +284,17 @@ export function planCraft (bot, itemId, want, table, opts = {}) {
     const have = haveOf(id)
     if (have >= need) return true
     if (depth <= 0) return lack(id, need, `层次太深（链条超过 ${maxDepth} 层）`)
+    /* 🔴 用户 2026-10-25：能**熔炼**得到的物品（铁锭/金锭/铜锭/玻璃…）优先走熔炼，
+     *    不要用合成配方 —— 否则 `iron_ingot` 会选中"铁块拆成 9 锭"那条配方，
+     *    整条链就变成"缺铁块"（实机：做铁镐报缺 iron_block）。
+     *    这里只报"需要熔炼"，具体交给 craft 的 decide → 插 smelt。 */
+    try {
+      const nm = itemNameOf(bot, id)
+      const src = smeltInputsFor(bot, nm)
+      if (Array.isArray(src) && src.length) {
+        return lack(id, need, `需要熔炼（${src.slice(0, 3).join(' / ')} → ${nm}）`)
+      }
+    } catch { /* 查不到熔炼表就按原逻辑走 */ }
     path.push({ id, name: itemNameOf(bot, id), need, have })
     try {
       let recipes = recipesAllOf(bot, id, table)
