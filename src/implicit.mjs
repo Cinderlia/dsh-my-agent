@@ -19,9 +19,12 @@ import Vec3 from 'vec3'
 import { isAir } from './block-names.mjs'
 
 /** 容器方块（有物品格、能开的那种） */
-/* 🔴 熔炉不算存储容器：mineflayer 的 openContainer 白名单里没有 furnace（要用 openBlock），
- *    当成箱子去开只会报 containerToOpen is neither a block nor an entity。 */
-export const CONTAINER_BLOCKS = ['chest', 'trapped_chest', 'barrel', 'shulker_box']
+/* 🔴 用户 2026-10-25："熔炉应该算箱子的，collect 的时候直接从熔炉里拿（如果有的话）。"
+ *    所以熔炉也列进来；打开时统一走 bot.openBlock（openContainer 的白名单里没有 furnace）。 */
+export const CONTAINER_BLOCKS = [
+  'chest', 'trapped_chest', 'barrel', 'shulker_box',
+  'furnace', 'blast_furnace', 'smoker',
+]
 /** 交互距离：专家用户定的 4.5 格 */
 export const CONTAINER_REACH = 4.5
 
@@ -181,10 +184,11 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
     groups.sort((a, c) => Number(a.full) - Number(c.full) || a.count - c.count)
     for (const g of groups) {
       if (need <= 0) break
-      const take = Math.min(need, g.count)
-      await win.withdraw(g.id, null, take)
-      got.push(take)
-      need -= take
+      /* 用户 2026-10-25："箱子拿物品直接拿一整组，拿够就走" —— 整组拿，不按零头切。 */
+      await win.withdraw(g.id, null, g.count)
+      const took = Math.min(need, g.count)
+      got.push(took)
+      need -= took
     }
     await sleep(200)
     const total = got.reduce((a, c) => a + c, 0)

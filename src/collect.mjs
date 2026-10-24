@@ -376,6 +376,16 @@ export async function runCollect (self, plan, ctx = {}) {
     return { handedOff: ok, text: ok ? `🔀 已转交 craft（制作 ${plan.name} ×${plan.count}），collect 退队` : '转交 craft 失败' }
   }
 
+  /* 🔴 用户 2026-10-25 实测：箱子已经给了 3 个原木，它却继续"扫描地面"→ 报数量不够清空队列。
+   *    开箱拿完/每轮开始前都要先看**背包够不够**，够了就收工。 */
+  {
+    const haveNow = familyCount(b, plan.product ?? plan.name)
+    if (haveNow >= plan.count) {
+      st.got = haveNow
+      return done()
+    }
+  }
+
   if (st.phase === 'find' && !st.scanned) {
     st.scanned = true
     const cands0 = Array.isArray(plan.blocks) && plan.blocks.length ? plan.blocks : [plan.block]

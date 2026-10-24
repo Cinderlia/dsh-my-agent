@@ -215,34 +215,10 @@ export async function runSmelt (self, req, ctx = {}) {
       }
       const need = req.count - have(b, req.itemId)
       if (need <= 0) { st.phase = 'take'; continue }
-      /* 原料：逐个来源找背包里有哪种 */
-      const src = req.inputs.find((n) => have(b, b.registry?.itemsByName?.[n]?.id) > 0)
-      if (!src) {
-        const inserted = board.yieldFor(job, {
-          kind: 'collect', agentId: job.agentId,
-          summary: `smelt 缺原料：收集 ${req.inputs[0]}`,
-          plan: planCollect(self, { name: req.inputs[0], count: need }),
-          run: (sig, child) => {
-            const p = planCollect(self, { name: req.inputs[0], count: need })
-            return p.ok ? runCollect(self, p, { signal: sig, movements, job: child, board, log }) : { ok: false, text: p.why }
-          },
-        })
-        if (!inserted) return fail('插 collect 失败（队列状态不对）')
-        notes.push(`插 collect：收 ${req.inputs[0]}`)
-        return { yielded: true, text: `⏸ 缺原料 ${src ?? req.inputs[0]}，已插 collect，smelt 挂起` }
-      }
-      /* 燃料：煤炭优先，其次木制品 */
-      const fuel = pickFuel(b, Math.min(need, 64), req.itemId)
-      if (!fuel) {
-        return fail('背包里没有可用燃料（需要煤/木炭/木头/木板/木棍）')
-      }
-      /* 🔴 openContainer 要求够得着：远一点点就会报
-       *    "containerToOpen is neither a block nor an entity"（实测就是这个误导人的错）
-       *    所以装料前先确认距离，太远就插 navi 走过去。 */
+      /* 距离：太远先插 navi */
       const meL = b.entity.position
       const dist = Math.hypot(meL.x - (f.x + 0.5), meL.y - (f.y + 0.5), meL.z - (f.z + 0.5))
       if (dist > 4.0) {
-        if (!board || !job) return fail('内部错误：没有队列上下文')
         const navPlan = buildNaviPlan(self, { x: f.x, y: f.y, z: f.z, radius: FURNACE_RADIUS })
         if (!navPlan.ok) return fail(`去熔炉失败：${navPlan.why}（距离 ${dist.toFixed(1)}）`)
         const inserted = board.yieldFor(job, {
@@ -256,20 +232,87 @@ export async function runSmelt (self, req, ctx = {}) {
         st.phase = 'load'
         return { yielded: true, text: '⏸ 熔炉够不着，已插 navi，smelt 挂起' }
       }
+
+      /* 🔴 用户 2026-10-25："补燃料也是状态机：打开熔炉看了，缺燃料，先看看背包，没有就 collect。"
+       *    所以先开窗**读槽位**，缺什么补什么；缺且背包没有才去 collect。 */
+      const idOf = (n) => b.registry?.itemsByName?.[n]?.id
+      let win = null
       try {
-        const win = await b.openBlock(blk)
-        try {
-          const srcId = b.registry?.itemsByName?.[src]?.id
-          await win.deposit(srcId, null, Math.min(need, 64))
-          await win.deposit(fuel.id, null, fuel.count)
-          notes.push(`装料：${src} ×${Math.min(need, 64)} + 燃料 ${fuel.name} ×${fuel.count}`)
-        } finally {
-          try { win.close?.() } catch { /* 已关 */ }
-        }
+        win = await b.openBlock(blk)
       } catch (e) {
-        return fail(`装料失败：${e.message}（熔炉 ${f.x},${f.y},${f.z} 实际方块 ${blk?.name}，距离 ${dist.toFixed(1)} 格）`)
+        return fail(`开熔炉失败：${e.message}（${f.x},${f.y},${f.z}，距离 ${dist.toFixed(1)}）`)
+      }
+      try {
+        const inputSlot = win.slots?.[0]
+        const fuelSlot = win.slots?.[1]
+        const inputCount = Number(inputSlot?.count ?? 0)
+        const fuelCount = Number(fuelSlot?.count ?? 0)
+        const needInput = Math.max(0, Math.min(need, 64) - inputCount)
+
+        /* 原料 */
+        const srcName = req.inputs.find((n) => have(b, idOf(n)) > 0) ?? null
+        if (needInput > 0 && !srcName) {
+          st.fuelRequested = st.fuelRequested ?? false
+          try { win.close?.() } catch { /* ignore */ }
+          if (st.missInput) {
+            return fail(`缺原料 ${req.inputs[0]}（背包里也没有），先收集它`)
+          }
+          st.missInput = true
+          const cplan = planCollect(self, { name: req.inputs[0], count: need })
+          if (!cplan.ok) return fail(`缺原料 ${req.inputs[0]}：${cplan.why}`)
+          const inserted = board.yieldFor(job, {
+            kind: 'collect', agentId: job.agentId,
+            summary: `smelt 缺原料：收集 ${req.inputs[0]} ×${need}`,
+            plan: cplan,
+            run: (sig, child) => runCollect(self, cplan, { signal: sig, movements, job: child, board, log }),
+          })
+          if (!inserted) return fail('插 collect 失败（队列状态不对）')
+          notes.push(`插 collect：原料 ${req.inputs[0]}`)
+          st.phase = 'load'
+          return { yielded: true, text: `⏸ 缺原料 ${req.inputs[0]}，已插 collect，smelt 挂起` }
+        }
+
+        /* 燃料：槽里已经够就不动；不够看背包；背包没有就 collect */
+        const fuelPick = pickFuel(b, Math.max(1, needInput || need), req.itemId)
+        const fuelEnough = fuelCount > 0 && (!fuelPick || fuelCount >= fuelPick.count)
+        if (!fuelEnough) {
+          if (fuelPick) {
+            await win.deposit(fuelPick.id, null, Math.max(1, (fuelPick.count ?? 1) - fuelCount))
+            notes.push(`补燃料：${fuelPick.name} ×${Math.max(1, (fuelPick.count ?? 1) - fuelCount)}`)
+          } else {
+            try { win.close?.() } catch { /* ignore */ }
+            if (st.fuelRequested) return fail('缺燃料（背包里也没有煤/木头），先收集燃料')
+            st.fuelRequested = true
+            const want = have(b, idOf('coal')) > 0 ? 'coal' : 'oak_log'
+            const fcount = want === 'coal' ? 2 : 3
+            const fplan = planCollect(self, { name: want, count: fcount })
+            if (!fplan.ok) return fail(`缺燃料：${fplan.why}`)
+            const inserted = board.yieldFor(job, {
+              kind: 'collect', agentId: job.agentId,
+              summary: `smelt 缺燃料：收集 ${want} ×${fcount}`,
+              plan: fplan,
+              run: (sig, child) => runCollect(self, fplan, { signal: sig, movements, job: child, board, log }),
+            })
+            if (!inserted) return fail('插 collect 失败（队列状态不对）')
+            notes.push(`插 collect：燃料 ${want}`)
+            st.phase = 'load'
+            return { yielded: true, text: `⏸ 缺燃料，已插 collect（${want}），smelt 挂起` }
+          }
+        }
+
+        /* 原料 */
+        if (needInput > 0 && srcName) {
+          await win.deposit(idOf(srcName), null, needInput)
+          notes.push(`装料：${srcName} ×${needInput}`)
+        }
+        st.missInput = false
+        st.fuelRequested = false
+      } finally {
+        try { win.close?.() } catch { /* 已关 */ }
       }
       st.phase = 'wait'
+      notes.push('等熔炉烧完')
+      continue
       notes.push('等熔炉烧完')
       continue
     }
