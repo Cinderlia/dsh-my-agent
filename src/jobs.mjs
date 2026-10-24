@@ -176,12 +176,27 @@ export class JobBoard {
       .catch((e) => this.fail(job.id, e))
   }
   get (id) { return [this.current, ...this.queue, ...this.done].find((j) => j?.id === String(id ?? '')) ?? null }
+  /**
+   * 把失败原因写给**队列里的下一个任务**（它正是那个"等这件事做完"的人）。
+   * 队列是线性的，下一个更清楚该怎么办：重试、换材料、还是放弃。
+   * 不写 parent：那不是队列，那是递归。
+   */
+  handFailureToNext (job, error) {
+    try {
+      const next = this.queue[0]
+      if (next?.state && typeof next.state === 'object') {
+        next.state.__lastError = { kind: job.kind, summary: job.summary, error, at: Date.now() }
+      }
+    } catch { /* 回写失败不影响任务本身 */ }
+  }
+
   finish (id, { text = '', data = null, ok = true } = {}) {
     const job = this.current
     if (!job || job.id !== String(id)) return false
     job.status = ok ? 'done' : 'failed'
     job.endedAt = Date.now()
     job.report = { text: String(text), data }
+    if (!ok) this.handFailureToNext(job, job.report.text || '失败')
     this.current = null
     this.archive(job)
     this.notify(job, `${ok ? '✅' : '❌'} ${job.summary}\n${job.report.text}`)
@@ -196,17 +211,7 @@ export class JobBoard {
     job.status = 'failed'
     job.endedAt = Date.now()
     job.error = String(err?.message ?? err ?? '未知错误')
-    /* 失败原因写给**队列里的下一个任务**（它正是那个"等这件事做完"的人）：
-     * 队列是线性的，下一个更清楚该怎么办 —— 重试、换材料、还是放弃。
-     * 不写 parentJob：那不是队列，那是递归。 */
-    try {
-      const next = this.queue[0]
-      if (next?.state && typeof next.state === 'object') {
-        next.state.__lastError = {
-          kind: job.kind, summary: job.summary, error: job.error, at: Date.now(),
-        }
-      }
-    } catch { /* 回写失败不影响任务本身 */ }
+    this.handFailureToNext(job, job.error)
     this.current = null
     this.archive(job)
     this.notify(job, `❌ ${job.summary} 失败：${job.error}`)
