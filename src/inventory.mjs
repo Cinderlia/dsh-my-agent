@@ -39,7 +39,7 @@ export function heldText (b) {
  * 为什么要有这一段（2026-10-13 用户报"它现在看不到自己身上的装备"）：
  * `bot.inventory.items()` 只回**背包范围**（`minecraft:inventory` 窗口的 `inventoryStart..inventoryEnd`
  * = 槽 9–44，也就是主背包 + 快捷栏）。5–8 的盔甲和 45 的副手**不在里面** —— 所以以前
- * `mc_inventory` / `mc_observe` 的"背包"里根本看不到身上穿着什么，AI 会以为自己光着，
+ * `mc_self` / `mc_observe` 的"背包"里根本看不到身上穿着什么，AI 会以为自己光着，
  * 于是把已经穿在身上的头盔又做一遍。
  *
  * 名字用 `bot.getEquipmentDestSlot()` 那套（`head` / `torso` / `legs` / `feet` / `off-hand`），
@@ -143,7 +143,7 @@ const badDurText = (bad) => {
 }
 
 /**
- * 上面那行的**文字版**（给 `mc_inventory` / `mc_observe` 用）：
+ * 上面那行的**文字版**（给 `mc_self` / `mc_observe` 用）：
  * - 全都好好的 ⇒ 一句"都还好，最紧的是 X"（**不报具体数字堆**，免得占地方）；
  * - 有快坏的 ⇒ 只列快坏的，`🔴 马上要坏` / `⚠️ 快坏了`，并标明是不是穿在身上；
  * - 一件会磨损的都没有 ⇒ `null`（调用方别 push 空行）。
@@ -165,7 +165,7 @@ export function durabilityText (b, opts = {}) {
  * 给"会磨损工具的动作"用（`mc_dig` / `mc_act{break}`）—— 这些动作每轮都在跑，
  * 全好时也念一句"都还好"就是稳定噪声。而缺了它后果很实：镐子在 `mc_dig`
  * **执行中间**爆掉时，AI 拿到的结果和"挖得好好的"一模一样，只能靠自己
- * `mc_inventory` 去查（通常不会查）。坏的时候输出与 `durabilityText` 逐字相同。
+ * `mc_self` 去查（通常不会查）。坏的时候输出与 `durabilityText` 逐字相同。
  */
 export function durWarnText (b, opts = {}) {
   const bad = toolDurability(b, opts).filter((i) => i.warn)
@@ -322,7 +322,7 @@ export function freeSlot (b, itemName = null) {
  */
 
 /**
- * 背包一览（`mc_inventory` 的正文）。
+ * 背包一览（`mc_self` 的正文）。
  *
  * 🔴 按**名字合计**，而且只报一次"手上"。
  * 实机教训（2026-10-07）：旧实现回 `{held, items}`，而 mineflayer 的 `inventory.items()`
@@ -455,7 +455,7 @@ export async function tossItem (b, { name = null, count = 1 } = {}, ctx = {}) {
   if (name) {
     const want = String(name)
     item = b.inventory.items().find((i) => i.name === want)
-    if (!item) throw new Error(`背包里没有 ${want}（用 mc_inventory 看有什么）`)
+    if (!item) throw new Error(`背包里没有 ${want}（用 mc_self 看有什么）`)
     if (b.heldItem?.name !== want) await t(b.equip(item, 'hand'), 'equip', `手持 ${want}`)
   }
   if (!item) throw new Error('手上没东西可丢')
@@ -470,7 +470,7 @@ export async function tossItem (b, { name = null, count = 1 } = {}, ctx = {}) {
     /* 🟡 2026-10-15 审计（报告 C 第 1 条）：`tossed` 永远是 `"名字xN"` 字符串（少丢时只加 `note`），
      *   所以调用方拿 `tossed !== false` 判成功是**恒真**的。这里补一个如实的结果位。 */
     ok: lost === n,
-    ...(lost === n ? {} : { note: `背包里只少了 ${Math.max(0, lost)} 个（想丢 ${n} 个）—— 东西可能还在地上或没丢出去，用 mc_inventory 看一眼` }),
+    ...(lost === n ? {} : { note: `背包里只少了 ${Math.max(0, lost)} 个（想丢 ${n} 个）—— 东西可能还在地上或没丢出去，用 mc_self 看一眼` }),
   }
 }
 

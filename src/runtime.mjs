@@ -38,7 +38,7 @@ import { TIMEOUTS, CALL_MS } from './budget.mjs'
  *
  * 现在的规矩：**任何错误都先进这里**，它保证
  *   ① 记 `lastError`（工具层据此给出人话）；
- *   ② 记一行日志（能被 `mc_diag` / 日志看到）；
+ *   ② 记一行日志（能被 `mc_probe` / 日志看到）；
  *   ③ **只在真有监听者时才 emit**（数量用 `listenerCount` 判断）—— 没人听就到此为止，绝不 throw；
  *   ④ 自己再兜一层 try/catch（监听者回调里抛错也不该带走进程）。
  * @param {object} self - McBot 实例

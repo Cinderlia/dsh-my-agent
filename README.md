@@ -48,7 +48,13 @@ pnpm add mineflayer-pathfinder mineflayer-collectblock mineflayer-tool mineflaye
 | `DSH_MC_AGENT_PERF` | `off` 关掉性能监测（默认开） |
 | `DSH_MC_AGENT_WORKERS` | Worker 线程池：**不给 = 关**；数字 = 池子上限（≤4）；`on` = 自动取 |
 | `DSH_MC_AGENT_AUTO` | 自主层开关 |
+| `DSH_MC_AGENT_TICK_END` | `off` 关掉 26.3+ 的 `tick_end` 补丁（默认开，见下） |
 | `MC_LOG_LEVEL` / `MC_LOG_MAX_BYTES` / `MC_LOG_KEEP` | 日志级别 / 单个大小 / 保留份数 |
+
+> **26.3 及以后的服务端**：已发布的 mineflayer 不发 `tick_end`，进服约 1.5 秒就会被
+> `invalid_player_movement` 踢下线（[mineflayer#4189](https://github.com/PrismarineJS/mineflayer/issues/4189)）。
+> 插件已在连接层自动补发（`src/tick-end.mjs`），老服务器自动跳过；上游发版修好后可用
+> `DSH_MC_AGENT_TICK_END=off` 关掉。
 
 ## 自检（不连服务器也能跑）
 

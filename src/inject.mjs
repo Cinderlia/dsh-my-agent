@@ -542,7 +542,7 @@ export function createInjector (deps) {
   ]
 
   /**
-   * **提示词注入状态**（给 UI / `mc_diag` 看）：每条各自"投出去了没有、为什么没有"。
+   * **提示词注入状态**（给 UI / `mc_probe` 看）：每条各自"投出去了没有、为什么没有"。
    *
    * 2026-09-16 加：用户在真机上反复报"没有任何我们的提示词"，而这件事**极难从外面判断**
    * （是没进 MC 模式？开关关了？文件不在？投递失败？）。与其让人猜，不如把判据摆出来：
@@ -603,7 +603,7 @@ export function createInjector (deps) {
         text: vpCur?.text ?? versionPromptText(PLUGIN_VERSION),
         defaultText: versionPromptText(PLUGIN_VERSION),
       },
-      // 保留 registered/segments 两个键名（前端与 mc_diag 在用）：现在两者同源 —— 都是"真的投了"
+      // 保留 registered/segments 两个键名（前端与 mc_probe 在用）：现在两者同源 —— 都是"真的投了"
       registered: {
         'agents-md': sent.includes('.dsh-mc-agent/RULES.md'),
         'workspace-agents-md': sent.includes('AGENTS.md'),

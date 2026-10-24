@@ -145,7 +145,7 @@ async function buildInner (self, { x1, y1, z1, x2, y2, z2, name = null, max = 64
       ? { hint: `⚠️ 有东西贴上来了（${dangerText(danger)}）—— 先处理它：\`mc_attack {}\` 打掉、或者 \`mc_move\` 躲开、\`mc_act {mode:"equip"}\` 换上装备。安全了再叫一次 mc_build（同一个范围就行，放对的会跳过）` }
       : noBudget && ok.length === 0
         ? { noBudget: true, callLeftMs, hint: `⚠️ 这次调用**自己没分到时间**（外层只剩 ${callLeftMs}ms）—— **一块都没放**。`
-          + '**这不等于那些格子还是空的**：先 `mc_scan` / `mc_map` 复核一下，'
+          + '**这不等于那些格子还是空的**：先 `mc_blocks` / `mc_map` 复核一下，'
           + '确认真没放再单独叫一次 mc_build（**别塞在 mc_task 里**）。' }
         : outOfMat
           ? { outOfMaterial: want, hint: `背包里 ${want} 已经用完了（还有 ${left} 个位置没放）—— 先 mc_craft {name:"${want}"} 或 mc_dig 补料，或者换一种方块；**别原样重发**` }

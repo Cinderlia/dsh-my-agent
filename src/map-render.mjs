@@ -286,7 +286,7 @@ export function navTargetsOf (map, target) {
  * `purpose`：`overview`（不加东西）/ `navigation`（目标相对位置 + 可站占比 + 建议）/
  *            `hazards`（先列岩浆/水/深坑/未加载的坐标）。
  *
- * 🔴 职责边界（用户明确要求）：**目标坐标由 `mc_scan` 提供；地形与危险由地图提供；
+ * 🔴 职责边界（用户明确要求）：**目标坐标由 `mc_blocks` 提供；地形与危险由地图提供；
  *    真实路线可达性交给 pathfinder；能不能挖由动作工具动手前再验证。**
  *    所以这段文案里**不许**出现"路是通的 / 能挖到"这类地图推不出来的结论。
  */
@@ -308,9 +308,9 @@ export function navSummaryOf (map, { purpose = 'overview', target = null } = {})
         lines.push(`🎯 目标 (${t.x}, ${t.y ?? '?'}, ${t.z}) ｜ 直线距离 ${t.d} 格 ｜ 方位 ${t.dir}`
           + `${t.dy == null ? '' : ` ｜ 相对本层 dy=${t.dy >= 0 ? '+' : ''}${t.dy}`}`)
       }
-      lines.push('（这只是**坐标和地形**：路通不通要 `mc_move`/pathfinder 真走一次；动手挖之前再 `mc_scan` 复核一眼目标还在不在。）')
+      lines.push('（这只是**坐标和地形**：路通不通要 `mc_move`/pathfinder 真走一次；动手挖之前再 `mc_blocks` 复核一眼目标还在不在。）')
     } else {
-      lines.push('🎯 没给 target：想算相对方位就把 `mc_scan` 找到的坐标用 `target:"x,y,z"` 传进来。')
+      lines.push('🎯 没给 target：想算相对方位就把 `mc_blocks` 找到的坐标用 `target:"x,y,z"` 传进来。')
     }
   }
 
@@ -523,7 +523,7 @@ export function pixelPayloadOf (hm, { scale = 4, markSelf = true } = {}) {
 /** 竖列图每格的字形（与地板图/地表图刻意不同：这里 `#` 就是"实心"，不掺"能不能站人"） */
 export const COLUMN_GLYPH = { solid: '#', air: '.', water: '~', lava: '≈', unloaded: '?' }
 export const COLUMN_LABEL = { solid: '实心', air: '空腔', water: '水', lava: '岩浆', unloaded: '未加载' }
-/** 一次最多往下看几格（再深就该用 mc_scan 或 mc_move 了） */
+/** 一次最多往下看几格（再深就该用 mc_blocks 或 mc_move 了） */
 export const COLUMN_MAX = 96
 /** 头顶一次最多往上看几格（默认 40） */
 export const COLUMN_UP_DEFAULT = 40

@@ -1818,6 +1818,14 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
   console.log(`  ${cfg.isMcPlusPreset('minecraft-plus') && !cfg.isMcPlusPreset('minecraft') && !cfg.isMcPlusPreset('standard') ? '✅' : '❌'} 🔴 MC+ 变体判定：minecraft-plus 是、minecraft/standard 不是`)
   const badPlus = await Promise.resolve().then(() => cfg.set('mcPlusPresets', 'minecraft-plus')).catch((e) => e.message)
   console.log(`  ${/必须是字符串数组/.test(String(badPlus)) ? '✅' : '❌'} mcPlusPresets 类型校验：${String(badPlus).slice(0, 40)}`)
+  // 🔴 2026-10-24 本机定制：mcMode.unrestricted（创造模式全权限）
+  console.log(`  ${cfg.mcUnrestricted === false ? '✅' : '❌'} mcMode.unrestricted 默认关（默认仍是隔离行为）`)
+  cfg.set('mcMode.unrestricted', true)
+  console.log(`  ${cfg.mcUnrestricted === true && cfg.mcMode.unrestricted === true ? '✅' : '❌'} 打开后 mcUnrestricted / mcMode.unrestricted 都是 true`)
+  const badUn = await Promise.resolve().then(() => cfg.set('mcMode.unrestricted', 'yes')).catch((e) => e.message)
+  console.log(`  ${String(badUn).includes('必须是 true/false') ? '✅' : '❌'} unrestricted 类型校验：${String(badUn).slice(0, 40)}`)
+  cfg.unset('mcMode.unrestricted')
+  console.log(`  ${cfg.mcUnrestricted === false ? '✅' : '❌'} unset 之后回到默认关`)
 
   // ①b 插件状态目录：配置 / 账户**不在工作区**（用户 2026-09-16："dsh 没给插件专门记配置的目录吗"）
   {
@@ -2015,6 +2023,25 @@ console.log('\n--- 全局配置 / mc_admin_config / MC 模式隔离 ---')
     const plainAdminOk = callGuard({ name: 'mc_admin_config', agent: { id: 'sess-P', ctx: plainCtxObj } })
     console.log(`  ${plainMcDeny && plainKitDeny ? '✅' : '❌'} 🔴 其他模式调 mc_status / mc_kit_memory 被 guard 硬拒（"不再暴露 mc 和 mckit"的第二道锁）`)
     console.log(`  ${plainAdminOk === undefined ? '✅' : '❌'} 其他模式**保留** mc_admin_config（它的用途就是在普通会话里管理）`)
+
+    // 🔴 2026-10-24 本机定制：mcMode.unrestricted = 创造模式全权限 —— guard 什么都不拦
+    //    ⚠️ guard 每次调用都现场读**插件实例**的 `pluginConfig`（不是上面那个局部 `cfg`），
+    //    所以要像下面白名单那条一样，走真实的 `mc_admin_config` 去改（立即生效、不用重启）。
+    await tools.get('mc_admin_config').execute({ action: 'set', path: 'mcMode.unrestricted', value: true }, A)
+    const unHits = [
+      ['MC 模式读 .credentials.yaml', { name: 'read', arguments: { path: 'C:\\Users\\x\\.dsh\\.credentials.yaml' }, agent: mcGuardAgent }],
+      ['MC 模式读 secrets/', { name: 'read', arguments: { path: 'E:\\x\\secrets\\note.md' }, agent: mcGuardAgent }],
+      ['MC 模式写 RULES.md', { name: 'write', arguments: { path: 'RULES.md', content: 'x' }, agent: mcGuardAgent }],
+      ['MC 模式调 mc_admin_config', { name: 'mc_admin_config', agent: mcGuardAgent }],
+      ['MC 模式读记忆根外文件', { name: 'read', arguments: { path: 'E:\\x\\README.md' }, agent: mcGuardAgent }],
+      ['普通会话调 mc_status', { name: 'mc_status', agent: { id: 'sess-P', ctx: plainCtxObj } }],
+      ['MC+ 读 .credentials.yaml', { name: 'read', arguments: { path: 'C:\\Users\\x\\.dsh\\.credentials.yaml' }, agent: plusAgent }],
+    ]
+    const stillDenied = unHits.filter(([, spec]) => callGuard(spec) !== undefined).map(([label]) => label)
+    console.log(`  ${stillDenied.length === 0 ? '✅' : '❌'} 🔓 全权限打开后 guard 一项都不拦${stillDenied.length ? '（还在拦：' + stillDenied.join(' / ') + '）' : ''}`)
+    await tools.get('mc_admin_config').execute({ action: 'unset', path: 'mcMode.unrestricted' }, A)
+    const restored = callGuard({ name: 'read', arguments: { path: 'C:\\Users\\x\\.dsh\\.credentials.yaml' }, agent: mcGuardAgent })
+    console.log(`  ${restored ? '✅' : '❌'} 关回去之后凭据硬拒立刻恢复（默认仍是隔离行为）`)
   }
 
   // ⑤ 会话建立时应用策略：MC 模式 → 工具白名单；MC+ → 不套限制；其他模式 → deny 摘掉 mc/mckit；

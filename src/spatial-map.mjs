@@ -102,7 +102,7 @@ function entryOf (b) {
   return e
 }
 
-/** 地图的账（`hits`/`misses`/`scans`/世界变更次数/缓存列数）—— 给 `mc_diag` 和测试看。 */
+/** 地图的账（`hits`/`misses`/`scans`/世界变更次数/缓存列数）—— 给 `mc_probe` 和测试看。 */
 export function spatialCacheStats (b) {
   const e = entryOf(b)
   return { hits: e.hits, misses: e.misses, scans: e.scans, version: e.ver, columns: e.cols.size }

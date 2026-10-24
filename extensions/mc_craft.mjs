@@ -958,7 +958,7 @@ async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null
               ? `；顺手把合成格里压着的 ${grid.join('、')} 点回背包了`
               : '（只把合成窗口关掉了，格子里的东西服务端会退回背包）')
             + '。过一会儿再叫一次 mc_craft 重试；'
-            + '要是还卡，就先 mc_scan 复核一眼现场（每次动手前我都会先把合成格里的材料点回背包）。')
+            + '要是还卡，就先 mc_blocks 复核一眼现场（每次动手前我都会先把合成格里的材料点回背包）。')
         }
         await closeMaybeWindow()
       }
@@ -1118,7 +1118,7 @@ export async function apply (api) {
       + '· `name` 可以写简称：`planks` 会自动选背包里那种原木对应的木板（选了哪个会写在结果里）。\n'
       + '· `list:true` 看配方/看当前能做什么；`dryRun:true` 只出计划不动手（拿不准就先 dryRun）。\n'
       + '· `count` 是"背包里**一共**要到几个"（默认 1）：已经够了就**一个都不做**，结果会如实说"一个都没做"。要"再做 4 个"就写 `{count:4, more:true}`。\n'
-      + '· 🔴 连着两三次都"超时"就先 `mc_scan` 复核现场（我每次动手前都会先把合成格里的材料点回背包）。\n'
+      + '· 🔴 连着两三次都"超时"就先 `mc_blocks` 复核现场（我每次动手前都会先把合成格里的材料点回背包）。\n'
       + '· `tree:true` 出**整套活儿**的依赖树（合成 + 要烧的 + 要挖的，连"挖它要什么镐"一起）——'
       + '比如 `{tree:true,name:"iron_pickaxe"}` ⇒ 铁镐 ← 铁锭 ← 烧 raw_iron ← 挖 iron_ore ← 石镐 ← 圆石… 全排出来。'
       + '**只出计划、不动手**；不知道该从哪一步开始时先看它。\n'

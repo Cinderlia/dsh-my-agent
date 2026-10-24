@@ -919,7 +919,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
    * 🔴 为什么必须做（2026-10-06 实机定位，用户原话「现在机器人走不了了」）：
    *   `withTimeout` 只是让 await 提前 reject，**不会取消底层的 collect 任务**。
    *   超时后它继续在后台按着 `forward`、占着 pathfinder 反复寻路 ⇒ 机器人"物理冻住"
-   *   （`mc_diag`：`forward:true` 而 `velocity` 全 0、位置一格不动，之后的 `mc_move`
+   *   （`mc_probe`：`forward:true` 而 `velocity` 全 0、位置一格不动，之后的 `mc_move`
    *   全部失败，只有重连才恢复）。`cancelTask()` 内部就是 `pathfinder.stop()` + 等
    *   `collectBlock_finished`，正好让采集循环停下来。core.mjs 的 `#cancelCollect` 同理。
    */
@@ -1174,7 +1174,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       L.push('**下一步你来定**（选一个直接做，不用问我）：')
       L.push(`· 挪开：\`mc_move\` 到旁边 3~5 格的普通地面；走不动就 \`mc_act {"mode":"place","name":"cobblestone","x":${Math.round(me?.x ?? 0)},"y":${Math.floor(me?.y ?? 64)},"z":${Math.round(me?.z ?? 0)}}\` 先垫脚`)
       L.push('· 是火/岩浆又下不去：先 \`mc_build\` 拿石头铺一条 1 格宽的路走过去')
-      L.push('· 血少先吃；确认脚下是什么用 `mc_scan`/`mc_map {mode:"floor"}`')
+      L.push('· 血少先吃；确认脚下是什么用 `mc_blocks`/`mc_map {mode:"floor"}`')
     } else if (ball) {
       /* 火球还在飞（`dragon_fireball`）：**落地才会变成上面那团云**，所以现在躲还来得及。 */
       const esc = ball.escape
@@ -1258,7 +1258,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
           + '**找到没找到都会再给你发一条**，说清我为什么动、往哪游、结果如何 —— 我不会偷偷接管）：'
         : '**下一步你来定**（我这次只在水里按了一下 jump 想把你抬上来，没横向跑、也没还手）：')
       L.push('· 上浮换气：`mc_move {"mode":"swim"}`（按住 jump 游上来，一次最多 3 秒；没上来就再叫一次同一个参数）')
-      L.push('· 出水之后往岸上走：`mc_move` 到最近的干燥方块；不知道岸在哪就先 `mc_scan {"radius":16}` 看一圈')
+      L.push('· 出水之后往岸上走：`mc_move` 到最近的干燥方块；不知道岸在哪就先 `mc_blocks {"radius":16}` 看一圈')
       L.push('· 水/岩浆是**流体，挖不掉** —— 别 `mc_dig` 水（白花一次调用）')
       L.push('· 血少（< 8）就先浮上来换气、再吃/躲；别在水下跟怪纠缠')
       L.push('选一个**直接做**，不用问我。')
@@ -1293,7 +1293,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       L.push('· 先看脚下和四周：`mc_observe {"distance":8}` 或 `mc_map {"mode":"column"}`（脚下/头顶是什么、有没有水/岩浆/虚空）')
       L.push('· 血少先吃/回血、躲开怪，**别急着继续往上爬**；要上去就走**斜台阶**（`mc_act {"mode":"break"}` 一格一格挖上去），'
         + '别反复垫柱子 —— 垫柱子要往自己脚下放方块，被服务端一拒人就在半空了')
-      L.push('· 垫柱子失败最常见的原因是**目标格被占 / 离得太远 / 手上有别的**：放之前先 `mc_inventory` 看手上、`mc_observe` 看脚下')
+      L.push('· 垫柱子失败最常见的原因是**目标格被占 / 离得太远 / 手上有别的**：放之前先 `mc_self` 看手上、`mc_observe` 看脚下')
       L.push('选一个**直接做**，不用问我。')
     } else {
       L.push(hurt
@@ -1427,7 +1427,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
         /* 🔴 2026-10-16 审计（P0-1，场景二）：以前这里**直接调 `bot.walkTo` / `bot.swimUp`**，
          *    完全不进动作调度器 —— 于是"表里写着 `mc_move` 占着 movement，实际驱动 bot 的是
          *    水下自救"，两者只靠 `_moveGen`（后进者赢）仲裁，谁都不告诉谁。
-         *    现在把它登记成一个**紧急级**动作：占 `movement`、有 actionId、能被 `mc_diag` 看见。
+         *    现在把它登记成一个**紧急级**动作：占 `movement`、有 actionId、能被 `mc_probe` 看见。
          *    `priority:'emergency'`（100）比 `mc_move` 的 `user`（60）高 ⇒ 它**真的会抢占**
          *    在跑的寻路（`src/action-scheduler.mjs` 的规矩：紧急级不受观察模式限制 ——
          *    拿命去"观察"没有意义），被抢的那个收到 abort、如实以"被抢占"收场。 */
@@ -1983,7 +1983,7 @@ export function createAuto ({ registry, logLine = () => {}, workspaceOf = null, 
       + '🔴 三条硬规矩（他明确要求过）：\n'
       + '· **不要问他"要我做什么"** —— 他不回话就是默认让你自己决定；你要的是"在做事"，不是"在等指令"。\n'
       + '· **不要用 `mc_events waitSec` 干等回复** —— 等回复不算行动；要等就让反射层等，你先把事做了。\n'
-      + '· 观察类工具（`mc_observe` / `mc_status` / `mc_scan` / `mc_inventory`）**不算行动**，只有 ③ 那类才算。\n'
+      + '· 观察类工具（`mc_observe` / `mc_status` / `mc_blocks` / `mc_self`）**不算行动**，只有 ③ 那类才算。\n'
       + (s.noActionStreak
         ? `\n⚠️ 你已经连着 ${s.noActionStreak} 轮只是说话/站着，没有任何实际行动。`
           + '这一轮**先动手再说话**：立刻挑最近的一棵树/一块石头开始挖，别再汇报、别再问。\n'

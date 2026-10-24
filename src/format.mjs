@@ -29,7 +29,7 @@ export function resolveHarnessHome () {
 
 /**
  * 把绝对路径里的宿主家目录换成 `$DSH_HOME`（审计报告 F12）。
- * `mc_capabilities` 以前直接回绝对路径 ⇒ 把主机用户名写进工具返回、进而进对话记录。
+ * `mc_probe` 以前直接回绝对路径 ⇒ 把主机用户名写进工具返回、进而进对话记录。
  * 换成 `$DSH_HOME/...` 后信息量不变（模型可以用环境变量解析），但不再泄露家目录。
  */
 export function redactPath (p) {

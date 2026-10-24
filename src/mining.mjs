@@ -146,7 +146,7 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
     return {
       broken: null, at: { x: pos.x, y: pos.y, z: pos.z },
       note: '那里本来就是空气（**我这边**读到的）—— 要么已经挖掉了，要么客户端的区块缓存旧了：'
-        + '先 `mc_scan` 看看附近实际有什么。'
+        + '先 `mc_blocks` 看看附近实际有什么。'
         + DESYNC_HINT,
     }
   }
@@ -257,7 +257,7 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
       ...(t.changed ? { tool: `${t.heldBefore} → ${t.held}` } : {}),
       ...(digMs != null ? { digMs } : {}),
       note: `服务端说这一格是 **${back}**，和我这边看到的 **${name}** 不一样（客户端区块旧了）—— 这次破坏没被认。`
-        + '先 `mc_scan` 复核一眼，别照着旧方块继续动手。'
+        + '先 `mc_blocks` 复核一眼，别照着旧方块继续动手。'
         + DESYNC_HINT,
     }
   }
@@ -295,7 +295,7 @@ export async function breakBlock (self, { x, y, z, allowDangerous = false } = {}
     ...(localGone && confirmed === false ? {
       note: '本地世界已经清掉了，但**没收到服务端的破坏回包** —— 服务端很可能拒了这次破坏'
         + '（领地保护 / 权限 / 反作弊 / 太远），客户端这边却把方块写成空气了。'
-        + '用 `mc_scan` 或 `mc_observe` 再确认一下，**别在空气上盖房、别走进你以为挖穿的墙**。'
+        + '用 `mc_blocks` 或 `mc_observe` 再确认一下，**别在空气上盖房、别走进你以为挖穿的墙**。'
         + (rolledBack ? '（我已经把本地那一格改回原样，免得寻路把它当成空洞）' : '')
         + DESYNC_HINT,
     } : {}),
@@ -346,7 +346,7 @@ export async function dig (self, {
   const fluid = name ?? (pos ? b.blockAt(new Vec3(pos.x, pos.y, pos.z))?.name : null)
   if (fluid && isLiquid(fluid)) {
     throw new Error(`${fluid} 是流体，挖不掉 —— 想从水里出来：mc_move {"mode":"swim"} 按住 jump 上浮换气，`
-      + '露出水面后再 mc_move 往岸上走（不知道岸在哪就先 mc_scan 找最近的干燥方块）。')
+      + '露出水面后再 mc_move 往岸上走（不知道岸在哪就先 mc_blocks 找最近的干燥方块）。')
   }
   // 先把要挖的方块列出来（collectBlock 要一份目标清单，它自己会走过去 + 捡掉落物）
   /* 📋 任务记账（用户 2026-10-08 路线图第 ②③ 条）：**一次要挖 4 个以上 = 一件"活儿"**。
@@ -503,7 +503,7 @@ export async function dig (self, {
       if (left < 900) {
         out.push(noBudget && okCount === 0
           ? `—— 这次调用**自己没分到时间**（外层只剩 ${callLeftMs}ms），**一个都没挖**。`
-            + '**这不等于那些方块还在**：先 `mc_scan` / `mc_map` 复核一下到底挖掉没有，'
+            + '**这不等于那些方块还在**：先 `mc_blocks` / `mc_map` 复核一下到底挖掉没有，'
             + '确认真没挖再单独叫一次 mc_dig（**别塞在 mc_task 里** —— 外层时间早被前面的步骤吃掉了）。'
           : `—— 这一轮的 ${callSecText()}用完了（挖到 ${okCount}/${targets.length}），`
             + `还有 ${targets.length - seen + 1} 个没挖：再叫一次 mc_dig 接着挖`)
@@ -622,7 +622,7 @@ export async function dig (self, {
             const back = rest.name ?? '别的方块'
             self.log(`⚠️ 服务端说 ${p} 是 ${back}，和我以为的 ${nm} 不一样 —— 客户端区块旧了？`)
             out.push(`没挖掉 ${nm} @ ${p}：服务端说这一格是 **${back}**，和我这边看到的 **${nm}** 不一样`
-              + '（客户端区块旧了）—— 先 `mc_scan` 复核一眼。'
+              + '（客户端区块旧了）—— 先 `mc_blocks` 复核一眼。'
               + DESYNC_HINT)
           } else if (now !== nm) {
             okCount++
@@ -640,7 +640,7 @@ export async function dig (self, {
               const back = restoreLocalBlock(b, p, Number(fresh?.stateId))
               out.push(`本地读到 ${nm} @ ${p} 已经变成 ${now}，但**没收到服务端的破坏回包**`
                 + ' —— 服务端很可能拒了这次破坏（够不着 / 领地保护 / 权限 / 反作弊）：别当成挖掉了，'
-                + '先 `mc_scan` 复核。'
+                + '先 `mc_blocks` 复核。'
                 + (back ? '（我已经把本地那一格改回原样，免得寻路把它当成空洞）' : '')
                 + DESYNC_HINT)
             }
@@ -662,7 +662,7 @@ export async function dig (self, {
               if (hint) out.push(`　（${hint}${where ? '：' + where : ''}）`)
             }
           } else out.push(`没挖成 ${nm} @ ${p}（原地挖完了，但那里**还是 ${now}**）`
-            + ' —— 服务端没认这次破坏（失步 / 领地保护 / 工具不对）：先 `mc_scan` 复核。'
+            + ' —— 服务端没认这次破坏（失步 / 领地保护 / 工具不对）：先 `mc_blocks` 复核。'
             + DESYNC_HINT)
         } catch (e) {
           /* 🔴 被新指令抢占（`interruptMove` / abort）：**这不是失败**，进度留着 —— 用户
@@ -690,7 +690,7 @@ export async function dig (self, {
     /* 工具快坏了就点一句。**只在有警告时**加 —— 这个动作每轮都在跑，
      * 全好时也念"都还好"就是稳定噪声。而缺了它的后果很实：`mc_dig {count:16}`
      * 一次能打掉几十点耐久，镐子在执行**中间**爆掉时，AI 拿到的结果
-     * 和"挖得好好的"一模一样，只能靠自己 `mc_inventory` 去查（通常不会查）。 */
+     * 和"挖得好好的"一模一样，只能靠自己 `mc_self` 去查（通常不会查）。 */
     const wear = durWarnText(b)
     if (wear) out.push(`⚠️ 工具：${wear}`)
     ctx.taskSettle(task, out, okCount, targets.length)

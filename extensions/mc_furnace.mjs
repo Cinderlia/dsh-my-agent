@@ -570,8 +570,8 @@ export async function apply (api) {
           if (got >= before + n) lines.push(`✅ 收走了熔炉里的 **${out.name ?? t.output} ×${n}**（背包里现在有 ${got} 个）`)
           /* 🔴 实机（2026-10-08）：服务端的 `set_slot` 有时比 1.2 秒还晚 ⇒ 旧文案会吓人地说"只多出 0 个"。
            *    输出槽已经空了 = 东西**确实**被收走了，只是背包那格还没同步 —— 按这个如实说。 */
-          else if (still === 0) lines.push(`✅ 收走了熔炉里的 **${out.name ?? t.output} ×${n}**（输出槽已经空了；背包同步慢一拍，过一会儿 \`mc_inventory\` 再看）`)
-          else lines.push(`⚠️ 取成品了，但背包里只多出 **${got - before}** 个（要的是 ${n} 个）—— 可能还在同步，过一会儿 \`mc_inventory\` 再看。`)
+          else if (still === 0) lines.push(`✅ 收走了熔炉里的 **${out.name ?? t.output} ×${n}**（输出槽已经空了；背包同步慢一拍，过一会儿 \`mc_self\` 再看）`)
+          else lines.push(`⚠️ 取成品了，但背包里只多出 **${got - before}** 个（要的是 ${n} 个）—— 可能还在同步，过一会儿 \`mc_self\` 再看。`)
           if (still > 0) lines.push(`　（输出槽里还剩 ${still} 个 —— 背包可能放不下，或者服务端还没处理完）`)
           return { text: lines.join('\n') }
         }
@@ -686,8 +686,8 @@ export async function apply (api) {
           if (real >= took) lines.push(`✅ 这一轮收到 **${out?.name ?? t.output} ×${took}**${ms > 0 ? `（盯了 ${(ms / 1000).toFixed(1)}s）` : ''}`)
           /* 🔴 实机（2026-10-08）：`takeOutput` 之后背包那格有时要 1 秒以上才更新（服务端 `set_slot` 晚到）。
            *    输出槽空了 = 确实收到了 —— 别因为背包还没同步就报"只多出 0 个"吓唬模型。 */
-          else if (slotLeft === 0) lines.push(`✅ 收走了 **${out?.name ?? t.output} ×${took}**（输出槽已经空了；背包同步慢一拍，过一会儿 \`mc_inventory\` 再看）`)
-          else lines.push(`⚠️ 取成品了，但背包里只多出 **${real}** 个（要的是 ${took} 个）—— 输出槽里还剩 ${slotLeft} 个，可能背包放不下；先 \`mc_inventory\` 看看`)
+          else if (slotLeft === 0) lines.push(`✅ 收走了 **${out?.name ?? t.output} ×${took}**（输出槽已经空了；背包同步慢一拍，过一会儿 \`mc_self\` 再看）`)
+          else lines.push(`⚠️ 取成品了，但背包里只多出 **${real}** 个（要的是 ${took} 个）—— 输出槽里还剩 ${slotLeft} 个，可能背包放不下；先 \`mc_self\` 看看`)
         } else if (leftIn) {
           lines.push(`⏳ 还在烧（当前这个 ${Math.round(prog * 100)}%${ms > 0 ? `，盯了 ${(ms / 1000).toFixed(1)}s` : ''}）`)
         } else {

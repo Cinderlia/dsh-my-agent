@@ -153,15 +153,15 @@ export function migrateTask (t) {
  */
 export const FAIL_KINDS = {
   'no-tool': { retryable: false, next: 'craft-tool', hint: '背包里没有能用的工具 —— 先 mc_craft 一把（木镐 = 3 木板 + 2 木棍）再继续' },
-  'no-target': { retryable: false, next: 'scan', hint: '附近找不到目标了 —— mc_scan / mc_move 换个方向或扩大范围，别在原地反复试' },
+  'no-target': { retryable: false, next: 'scan', hint: '附近找不到目标了 —— mc_blocks / mc_move 换个方向或扩大范围，别在原地反复试' },
   unreachable: { retryable: true, next: 'move-closer', hint: '够不着 —— 先 mc_move 走到它旁边（3 格以内）再动手' },
-  'server-refused': { retryable: true, next: 'reconnect', hint: '服务端没认这次动作（方块复原 / 没收到回包）—— 先 mc_scan 复核，并且先想一下那格是不是自己垫脚放上去的（别顺手 mc_connect {force:true}，那会让玩家看到你退出游戏）' },
+  'server-refused': { retryable: true, next: 'reconnect', hint: '服务端没认这次动作（方块复原 / 没收到回包）—— 先 mc_blocks 复核，并且先想一下那格是不是自己垫脚放上去的（别顺手 mc_connect {force:true}，那会让玩家看到你退出游戏）' },
   budget: { retryable: true, next: 'continue', hint: '这一轮的 11 秒用完了（**不是失败**）—— 用同样的参数再叫一次接着做' },
   timeout: { retryable: true, next: 'continue', hint: '超时了（**不等于没做成**：服务端可能已经执行）—— 先复核现场，再决定要不要重做' },
   preempted: { retryable: true, next: 'continue', hint: '被新的指令抢占了 —— 先把玩家要的事做完，再回来看这个任务' },
   full: { retryable: false, next: 'store', hint: '背包满了 —— 先 mc_chest 存一趟，或丢掉没用的' },
   aborted: { retryable: false, next: 'stop', hint: '被叫停了' },
-  unknown: { retryable: true, next: 'continue', hint: '说不清为什么没成 —— 先复核现场（mc_observe / mc_inventory）再试' },
+  unknown: { retryable: true, next: 'continue', hint: '说不清为什么没成 —— 先复核现场（mc_observe / mc_self）再试' },
 }
 
 /** 分类用的判据表（顺序有意义：先匹配到的赢） */
@@ -384,7 +384,7 @@ export function verdictText (outcome, detail = null) {
       + '这一份结果**没往台账上写**：先 `mc_task {action:"get"}` 看**现在**的步骤表，再决定要不要接着跑。'
   }
   return `❓ ${label}${tail} —— 时间到了/被打断，但**服务器可能已经做了**：先看一眼`
-    + '（`mc_observe` / `mc_inventory` / `mc_status`）再决定，别直接重做。'
+    + '（`mc_observe` / `mc_self` / `mc_status`）再决定，别直接重做。'
 }
 
 

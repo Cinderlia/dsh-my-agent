@@ -602,7 +602,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     /* 🔴 2026-10-17（用户实机：副手一直挂着 `shield 103/336`，它却报「没有盾牌，只能拉开距离」）：
      *    `b.inventory.items()` 只覆盖**背包 9..44 格**（主背包 + 快捷栏）—— 副手是 **45 格**、
      *    盔甲是 **5..8 格**，都不在里面 ⇒ 盾挂在副手 = 对这里完全不可见。
-     *    槽位表直接用 `src/inventory.mjs` 的 `EQUIP_SLOTS`（`mc_inventory` / 耐久功能一直在用，
+     *    槽位表直接用 `src/inventory.mjs` 的 `EQUIP_SLOTS`（`mc_self` / 耐久功能一直在用，
      *    别再手写一份槽号）。读不到就当没穿，绝不因此抛错。 */
     const equipped = []
     try {

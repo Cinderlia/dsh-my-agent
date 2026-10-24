@@ -40,6 +40,10 @@ import { tradeVillager } from './src/trade.mjs'
 import { buildBlueprint } from './src/blueprint.mjs'
 import { sleepInBed, wakeUp, farmArea } from './src/farm.mjs'
 import { PRIORITY, DEFAULT_WAIT_MS } from './src/action-scheduler.mjs'
+import { buildPrimitives } from './src/primitives.mjs'
+import { JobBoard } from './src/jobs.mjs'
+import { buildNaviPlan, previewRoute, runNavi, naviReportText } from './src/navi.mjs'
+import { movements as buildMovements } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
   readVersionPrompt, writeVersionPrompt, resetVersionPrompt, syncVersionPrompt,
@@ -2754,7 +2758,37 @@ export function apply(ctx, rawConfig) {
     return r.result
   }
 
+  /**
+   * **折叠名单**（2026-10-24 用户："map 保留，其他全部折叠"）。
+   *
+   * 这些工具**不再单独出现在工具面**（不 `register`、不进 `ourToolNames`），
+   * 但实现照旧注册进 `TOOL_HANDLERS` —— 由唯一入口 `mc_probe {what:"…"}` 路由过去。
+   *
+   * 为什么折叠：工具面 40+ 个名字里，有一半是"偶尔查一次"的环境/诊断能力，
+   * 每次请求都要在提示里占位。收进一个入口后，模型只在真要诊断时才想起它。
+   * 被原语完全覆盖的那两个（inventory / scan）更是重复：
+   * `mc_self` 已经给背包、`mc_blocks` 已经给方块。
+   */
+  const PROBE_ROUTES = {
+    inventory: 'mc_inventory',
+    scan: 'mc_scan',
+    diag: 'mc_diag',
+    caps: 'mc_capabilities',
+    capabilities: 'mc_capabilities',
+    sessions: 'mc_sessions',
+    prep: 'mc_prep',
+    ping: 'mc_ping',
+    lan: 'mc_lan',
+  }
+  const FOLDED_TO_PROBE = new Set(Object.values(PROBE_ROUTES))
+
   const asTool = (spec) => {
+    /* 折叠的工具：只留实现（给 mc_probe 路由），不注册、不进工具名清单 */
+    if (spec?.name && FOLDED_TO_PROBE.has(spec.name)) {
+      if (typeof spec.execute === 'function') TOOL_HANDLERS.set(spec.name, (args, exec) => spec.execute(args, exec))
+      logDebug(`折叠 ${spec.name} → mc_probe（不再单独暴露）`)
+      return null
+    }
     if (spec?.name && !ourToolNames.includes(spec.name)) ourToolNames.push(spec.name)
     /* 表里存的是**包过调度器**的 handler（仍然不重置 `setCallDeadline`，预算没被冲掉）：
      * 任务执行器调出去的子工具因此也走同一条路，不会"绕开锁直接改状态"。
@@ -2789,6 +2823,32 @@ export function apply(ctx, rawConfig) {
     })
   }
 
+  /**
+   * **原语**注册通道（2026-10-24 用户重构："原语立刻返回本地状态、粒度是动作"）。
+   *
+   * 与 `asTool` 的区别（三条，缺一条就不算原语）：
+   *   ① **不设调用截止时刻**（`setCallDeadline`）—— 原语没有"长动作"可言，它们只改本地状态；
+   *   ② **不进动作调度器**（`runScheduled`）—— 原语不该排队等别人的锁，也不该被抢占；
+   *   ③ **超时压到 2 秒**—— 原语里出现 2 秒以上的等待本身就是 bug（宁可报错也别挂住）。
+   * 返回值仍走 `lossless`（和工具同一套"有 text 用 text"的约定），但不加 `perfWrap`：
+   * 原语的耗时统计混进工具表里只会污染 `mc_diag {only:perf}`。
+   */
+  const asPrimitive = (spec) => {
+    if (spec?.name && !ourToolNames.includes(spec.name)) ourToolNames.push(spec.name)
+    if (spec?.name && typeof spec.execute === 'function') {
+      // 任务执行器也要能调它们（同一条路，但不经调度器 —— 原语不占资源）
+      TOOL_HANDLERS.set(spec.name, (args, exec) => spec.execute(args, exec))
+    }
+    return defineTool({
+      ...spec,
+      timeoutMs: Math.min(Number(spec?.timeoutMs) || 2_000, 2_000),
+      async execute(rawArgs, exec) {
+        const args = coerceNumberArgs(spec.parameters, rawArgs ?? {})
+        return lossless(await spec.execute(args, exec))
+      },
+    })
+  }
+
   /** 从 exec 里拿 agentId，再拿到当前会话的 McSession */
   const getSession = (exec) => {
     const agent = exec?.agent
@@ -2797,6 +2857,15 @@ export function apply(ctx, rawConfig) {
     // 好让只拿得到工作区路径的调用点（扩展 / GUI / express）也能落到当前会话的记忆根。
     noteAgent(agent)
     return registry.getOrCreate(agent.id)
+  }
+
+  /**
+   * 工具注册的唯一出口（原来是 `ctx.tools.register(asTool(...))` 的 36 处直接调用）。
+   * `asTool` 对被折叠的工具返回 `null` —— 这里跳过，于是"折叠"不需要改 36 个调用点。
+   */
+  const registerTool = (tool) => {
+    if (!tool) return () => {}
+    return ctx.tools.register(tool)
   }
 
   /* ── 状态与开关 ── */
@@ -2908,7 +2977,271 @@ export function apply(ctx, rawConfig) {
       x2: numOf(args?.x2, 'x2'), y2: numOf(args?.y2, 'y2'), z2: numOf(args?.z2, 'z2'),
     }
   }
-  ctx.tools.register(asTool({
+  /* ── 原语层（2026-10-24 架构重构）────────────────────────────────────────
+   * 9 个原语：移动 4（look / look_at / input / swing）+ 感知 4（self / block / blocks / entities）
+   * + 宏 1（apply）。它们只改本地状态、立即返回，不走调度器、不占 11 秒预算（见 asPrimitive）。
+   * 与工具的分工：`mc_move` 寻路、`mc_act` 复合身体操作、`mc_observe` 画面 都**保持不动**；
+   * 原语补的是"agent 自己握方向盘"那一层。 */
+  for (const spec of buildPrimitives({
+    getBot: (exec) => {
+      try { return getSession(exec).bot.requireBot() } catch { return null }
+    },
+    getSession,
+    text,
+  })) registerTool(asPrimitive(spec))
+
+  /* 唯一的"环境/诊断/低频感知"入口（2026-10-24 折叠：map 之外全部收进来） */
+  /* ── 异步工具框架 + 第一个：mc_navi ───────────────────────────────────────
+   * 用户 2026-10-24：「工具开始执行时返回一个报告，然后异步执行；结束或失败时向 agent
+   * 发送报告，平时不占用 agent。」完成报告走 `agent.steer`（和"连服提示"同一条通道），
+   * 会直接打断/唤醒 agent —— 不需要它轮询。 */
+  const jobBoard = new JobBoard({
+    inject: (agentId, text) => {
+      const agent = safeAgentById(agentId)
+      if (!agent) return false
+      try { registry.peek(agentId)?.interruptWait?.('job') } catch { /* 没在等就算了 */ }
+      try {
+        agent.steer(userMessage({
+          content: [{ type: 'text', text }],
+          source: { kind: 'plugin:dsh-mc-agent', form: 'notice', summary: '后台任务报告' },
+        }))
+        return true
+      } catch { return false }
+    },
+    log: (m) => logDebug(m),
+    /* 队列状态一变就调宿主去收窄/恢复工具面（用户：任务板非空就隐藏所有主动工具） */
+    onStateChange: (snap) => queueStateChanged(snap),
+  })
+
+  /* ── 队列闸门（用户 2026-10-24）───────────────────────────────────────────
+   * 「任务板非空就隐藏所有主动工具，不让 agent 操作。」
+   * 「当 agent 选择介入原语时…再隐藏其他所有非感知类原语，只给 agent 操作队列的原语。」
+   * 做法：用宿主的 `restrict({allow})` 叠一层（与 MC 模式白名单取交集），队列空了就撤销。
+   */
+  /** 队列非空时仍然可见的：感知类 + 文件/记忆 + 两个队列原语 */
+  const QUEUE_KEEP = new Set([
+    'mc_self', 'mc_block', 'mc_blocks', 'mc_entities', 'mc_look', 'mc_look_at',
+    'mc_status', 'mc_observe', 'mc_events', 'mc_map', 'mc_probe',
+    ...MC_FILE_TOOLS, MC_PRESENT_TOOL, 'mc_kit_memory',
+    'mc_interrupt', 'mc_stop',
+  ])
+  /** agentId → restrict 的撤销手柄 */
+  /* 用户 2026-10-24：「stop 原语必须常驻」—— 不论队列状态、不论哪种模式，它都不能被收掉。 */
+  const ALWAYS_ON_TOOLS = ['mc_stop']
+  const queueGateRelease = new Map()
+  const queueStateChanged = (snap) => {
+    const agentId = snap?.current?.agentId ?? snap?.queue?.[0]?.agentId
+    if (!agentId) return
+    const agent = safeAgentById(agentId)
+    if (!agent?.ctx) return
+    const prev = queueGateRelease.get(agentId)
+    const shouldGate = Boolean(snap.busy) || snap.state === 'intervening'
+    if (!shouldGate) {
+      if (prev) {
+        try { prev() } catch { /* 已经撤过 */ }
+        queueGateRelease.delete(agentId)
+        logDebug('队列空了：主动工具已恢复')
+      }
+      return
+    }
+    try {
+      if (prev) prev()
+      const t = scopedTools(agent.ctx)
+      if (!t) return
+      const allow = [...new Set([...QUEUE_KEEP, ...ALWAYS_ON_TOOLS])]
+      queueGateRelease.set(agentId, t.restrict({ allow }))
+      logDebug(`队列非空（${snap.state}）：已隐藏主动工具，只留感知类 + mc_interrupt / mc_stop`)
+    } catch (e) {
+      logLine('队列收窄工具面失败（guard 仍会拦）：' + String(e?.message).slice(0, 160))
+    }
+  }
+
+  /* ── 队列原语：mc_stop / mc_interrupt ─────────────────────────────────── */
+  registerTool(asPrimitive({
+    name: 'mc_stop',
+    description: '**停止一切**（原语）：中断正在跑的动作（走路 / 挖掘 / 打怪 / 交互），**清空后台任务队列**，'
+      + '并重置被动工具（台账、缓存这些不操作世界的）。之后可以重新下令。',
+    parameters: {},
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      const b = sess.bot.bot
+      const done = []
+      try { await sess.bot.interruptMove('mc_stop'); done.push('中断移动/采集') } catch { /* 没在跑 */ }
+      try { b?.pathfinder?.setGoal?.(null); b?.pathfinder?.stop?.(); done.push('停寻路') } catch { /* 没挂 pathfinder */ }
+      try { b?.stopDigging?.(); done.push('停挖') } catch { /* 没在挖 */ }
+      try { b?.deactivateItem?.(); done.push('停用手上物品') } catch { /* 没用 */ }
+      try {
+        for (const k of ['forward', 'back', 'left', 'right', 'jump', 'sneak', 'sprint']) b?.setControlState?.(k, false)
+        done.push('松开所有移动键')
+      } catch { /* 没连接 */ }
+      try { sess.bot.actionScheduler?.()?.releaseAll?.('mc_stop'); done.push('释放动作锁') } catch { /* 没占 */ }
+      const q = jobBoard.stopAll('被 mc_stop 停止')
+      return {
+        ok: true,
+        actions: done,
+        stoppedJob: q.stopped,
+        droppedJobs: q.dropped,
+        resets: q.resets,
+        queue: jobBoard.snapshot(),
+        text: `🛑 已停止：${done.length ? done.join(' / ') : '（本来就没在动）'}`
+          + `｜队列：停掉 ${q.stopped ? q.stopped.id : '无'}、清掉 ${q.dropped} 个排队`
+          + `｜被动工具重置 ${q.resets.length} 个${q.resets.length ? `（${q.resets.join('、')}）` : ''}`,
+      }
+    },
+  }))
+
+  registerTool(asPrimitive({
+    name: 'mc_interrupt',
+    description: '**介入任务队列**（原语 + 信号）—— ⚠️ **最后手段，通常不要用**：'
+      + '队列会自己依次跑完，走完/失败都会主动报告；队首只是慢、不是死了。'
+      + '只有**明显卡死 / 方向完全错了**才介入。调用即**冻结队列、停掉队首**；'
+      + '随后主动工具全部隐藏，只留感知类与这个原语，由它决定下一步：\n'
+      + '· 不给 `action` = 只介入看一眼（队列保持冻结，队首已停）\n'
+      + '· `action:"retry"` 把刚停掉的队首放回队首重试\n'
+      + '· `action:"skip"` 丢弃下一个排队任务\n'
+      + '· `action:"cancel"` 清空整个队列\n'
+      + '· `action:"resume"` 直接恢复队列（不重试、不清空）\n'
+      + '⏳ **冷却 60 秒**（介入与结束介入之后都算），冷却期内会被拒绝。要"全停"用常驻的 `mc_stop`。',
+    parameters: {
+      action: { type: 'string', description: 'resume / retry / skip / cancel；不给 = 只冻结并停队首' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const a = String(args.action ?? '').trim().toLowerCase()
+      if (!a) {
+        const gate = jobBoard.canInterrupt()
+        if (!gate.ok) {
+          const sec = Math.ceil(gate.waitMs / 1000)
+          return {
+            ok: false,
+            cooldownMs: gate.waitMs,
+            queue: jobBoard.snapshot(),
+            text: `⏳ 介入冷却中：还要等 ${sec} 秒才能再介入。`
+              + '建议：先让它自己跑完（走完/失败都会主动报告）；真要全停用 `mc_stop`。',
+          }
+        }
+        const r = jobBoard.interrupt('agent 介入：冻结队列并停掉队首')
+        if (!r.ok) {
+          return { ok: false, cooldownMs: r.cooldownMs, queue: jobBoard.snapshot(), text: `⏳ 介入冷却中：还要等 ${Math.ceil((r.cooldownMs ?? 0) / 1000)} 秒` }
+        }
+        const snap = jobBoard.snapshot()
+        const q = snap.queue.length
+        return {
+          ok: true, ...r, queue: snap,
+          text: `⏸ 已介入：${r.stopped ? `停掉队首 ${r.stopped.id}（${r.stopped.summary}）` : '（当时没有在跑的任务）'}`
+            + `｜还有 ${q} 个排队｜队列已冻结，主动工具已收起`
+            + `\n下一步用 mc_interrupt 选一个：retry（重试刚才那个）/ skip（丢下一个）/ cancel（清空）/ resume（恢复）`
+            + `\n（这只是临时处理；之后 60 秒内不能再介入，尽量让队列自己跑完）`,
+        }
+      }
+      const r = jobBoard.resolveInterrupt(a)
+      if (!r.ok) return { ok: false, text: `❌ ${r.why}` }
+      return { ok: true, action: r.action, detail: r.detail, queue: jobBoard.snapshot(), text: `▶ ${r.detail}` }
+    },
+  }))
+
+  registerTool(asTool({
+    name: 'mc_navi',
+    description: '**异步导航**：给一个 16 格内的目标，本地算好路线后**立刻返回计划**，然后后台自己走过去；'
+      + '走完/走挂会**主动**给你发一条报告（你不用等、也不用轮询）。\n'
+      + '· 目标：`x/y/z`（方块坐标）或 `player`（玩家名 —— 本地自动选他周围 4 格内、离他最近的可站格）\n'
+      + '· 半径上限 16 格（再远请分几步 / 用 mc_task 记进度）\n'
+      + '· **模式自适应（不用你管）**：创造=直接飞；旁观=直线穿过去；生存=寻路（背包有石头木板就搭桥垫脚、可挖穿）；冒险=只能绕和跳\n'
+      + '· 返回：目标/策略/直线距离/路线节点数/要垫几块/可垫方块数 + job id\n'
+      + '· 取消：`mc_probe {what:"jobs", args:{cancel:"job-xxx"}}`',
+    parameters: {
+      x: { type: 'number', description: '目标 x（方块坐标）' },
+      y: { type: 'number', description: '目标 y' },
+      z: { type: 'number', description: '目标 z' },
+      player: { type: 'string', description: '玩家名（给了就忽略 x/y/z）' },
+      radius: { type: 'number', description: '最大允许距离（默认 16，上限 16）' },
+      parkour: { type: 'boolean', description: '允许跑酷（默认 true）；false = 只走平路/搭方块' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      const b = sess.bot.requireBot()
+      const plan = buildNaviPlan(sess, args)
+      if (!plan.ok) return { ok: false, ...plan, text: naviReportText(plan) }
+      const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+      const { route, routeError } = previewRoute(sess, plan, { movements: mv })
+      /* 队列版：入队（或在空闲时立刻开始）。执行体交给任务板串行调度 ——
+       * 队列非空时宿主会把主动工具收起来（见 applyQueueGate）。 */
+      const queued = jobBoard.enqueue({
+        kind: 'navi',
+        agentId: agentIdOf(exec?.agent),
+        summary: `导航到 (${plan.target.x}, ${plan.target.y}, ${plan.target.z})`,
+        plan,
+        run: (signal) => runNavi(sess, plan, { signal, movements: mv }),
+      })
+      if (!queued.ok) {
+        return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
+      }
+      const job = queued.job
+      const where = queued.started
+        ? `▶ 立刻开始（job ${job.id}）`
+        : `⏳ 已排队第 ${queued.position} 位（job ${job.id}）——前面还有任务，队列非空时主动工具会被收起`
+      return {
+        ok: true,
+        jobId: job.id,
+        started: queued.started,
+        position: queued.position,
+        plan,
+        route,
+        ...(routeError ? { routeError } : {}),
+        text: naviReportText(plan, route, job.id, { started: queued.started, position: queued.position }) + (routeError ? `\n⚠️ ${routeError}` : ''),
+      }
+    },
+  }))
+
+  registerTool(asTool({
+    name: 'mc_probe',
+    description: '**入口路由**：查环境、连接、诊断、背包/方块扫描这类"偶尔查一次"的能力都从这里进（它们不再单独占工具名）。\n'
+      + '· `inventory` — 背包与装备明细（平时用 `mc_self`，这个给完整清单）\n'
+      + '· `scan` — 方块占比 / 点名找方块（平时用 `mc_blocks`）\n'
+      + '· `diag` — 内部状态 / 性能 / 提示词注入 / 调度器（`args.only` 选段）\n'
+      + '· `caps` — 支持哪些 MC 版本、mineflayer 版本、各种上限\n'
+      + '· `sessions` — 本机所有活跃 MC 会话（诊断"谁连着"）\n'
+      + '· `prep` — 去下界/末地前的装备自查（`args.for`）\n'
+      + '· `ping` — 探一个地址通不通/什么版本（`args.address`）\n'
+      + '· `lan` — 听局域网里的 MC 公告\n'
+      + '· `jobs` — 看后台任务（`args:{id:"job-…"}` 看一个；`args:{cancel:"job-…"}` 取消）\n'
+      + '`args` 原样转给被路由的那个实现（参数名和以前一样）。要地形图用 `mc_map`（没折叠）。',
+    parameters: {
+      what: { type: 'string', required: true, description: 'inventory / scan / diag / caps / sessions / prep / ping / lan / jobs' },
+      args: { type: 'object', description: '转给该能力的参数（如 {name:"oak_log",radius:16} / {address:"host:port"} / {only:"perf"}）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const what = String(args.what ?? '').trim().toLowerCase()
+      const a = args.args && typeof args.args === 'object' ? args.args : {}
+      /* jobs 不走 TOOL_HANDLERS：它是插件自己的任务板（异步工具的进度/取消入口） */
+      if (what === 'jobs') {
+        /* 队列只读视图。**取消不要在这里做**（用户：不允许 agent 直接操作队列）——
+         * 停/清空走 `mc_stop`，改队列走 `mc_interrupt`。 */
+        const snap = jobBoard.snapshot()
+        const one = a.id ? [snap.current, ...snap.queue, ...snap.done].find((j) => j?.id === String(a.id)) : null
+        if (a.id && !one) return { ok: false, text: `没有这个任务：${a.id}` }
+        const fmt = (j) => `· ${j.id} [${j.status}] ${j.summary}`
+          + (j.endedAt && j.startedAt ? `（${Math.round((j.endedAt - j.startedAt) / 1000)}s）` : '')
+        const lines = []
+        lines.push(`状态：${snap.state}${snap.frozen ? '（已冻结）' : ''}`)
+        if (snap.current) lines.push(`▶ 正在跑：${fmt(snap.current)}`)
+        if (snap.queue.length) lines.push(`⏳ 排队：${snap.queue.map(fmt).join(' / ')}`)
+        if (!snap.current && !snap.queue.length) lines.push('（队列是空的）')
+        if (a.cancel) lines.push('）取消任务请用 `mc_stop`（停一切）或 `mc_interrupt`（冻结/重试/跳过/清空）')
+        return { ok: true, queue: snap, ...(one ? { job: one } : {}), text: `📋 后台队列：${bs}n${lines.join(bs + 'n')}` }
+      }
+      const target = PROBE_ROUTES[what]
+      if (!target) throw new Error(`未知的 what="${what}"；可用：${[...Object.keys(PROBE_ROUTES), 'jobs'].join(' / ')}`)
+      const handler = TOOL_HANDLERS.get(target)
+      if (!handler) throw new Error(`「${what}」的实现没挂上（${target} 未注册）—— 这是插件内部问题`)
+      return await handler(a, exec)
+    },
+  }))
+
+  registerTool(asTool({
     name: 'mc_status',
     description: '看我在 Minecraft 里的状态：在线 / 坐标 / 朝向 / 血量 / 饱食度 / 手持物 / 模式（active 或 standby）/ 看门狗是否在守 / 最近 3 条聊天。\n'
       + '要完整明细（连接信息、看门狗全部开关、最近 5 条聊天原文）传 `verbose:true`。',
@@ -2945,7 +3278,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_lan',
     description: '探测**局域网里的 Minecraft 服务器**（只读：不连接）。只听原版"对局域网开放"的多播公告（`224.0.2.60:4445`），拿到地址+端口+MOTD。\n'
       + '🔴 不扫端口、不发探测包，所以**恒定在 `seconds` 秒内返回**（默认 3，上限 15）；拿到 host/port 后用 `mc_connect` 进服。\n'
@@ -2977,7 +3310,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_ping',
     description: '【单地址探测】**已知地址**时先问一句"你是谁、通不通"——发一次 Minecraft STATUS ping，拿 **通不通** / **版本** / **协议号** / **MOTD** / **人数** / **延迟**。\n'
       + '🔴 **不登录、不用账户、不进服**，拿到就断；超时自己兜，**不会挂住**。连不上时把原因说成人话（ECONNREFUSED=端口没人听 / ENOTFOUND=域名拼错 / 超时=防火墙或 enable-status=false）。\n'
@@ -3008,7 +3341,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_connect',
     description: '连接到 MC 服务器。**这里没有账号密码**——用哪个账户由「MC设置」里维护的账户决定：\n'
       + '先用 `mc_accounts` 看有哪些账户（用 `action:"use"` 选定，或用本工具的 `account` 参数指名 innerID）。\n'
@@ -3085,7 +3418,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_accounts',
     description: '【账户】列出 / 搜索 / 刷新 / 选定 MC 账户。**永远拿不到密码或 token**——只有基本信息。\n'
       + 'action：\n'
@@ -3155,7 +3488,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_stop',
     description: '停止本会话的 Minecraft：**先尝试优雅退出游戏，再清空本会话全部后台任务（看门狗在里面）**。\n'
       + '⚠️ 它**不会中断你自己当前这一轮**（你正跑在这轮里，自我 abort 会表现为 "tool call aborted"）。'
@@ -3177,7 +3510,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_disconnect',
     description: '从 MC 下线（当前会话的机器人退出游戏）。不影响其他会话的机器人。看门狗会自动关闭并提醒你。',
     parameters: { reason: { type: 'string' } },
@@ -3209,7 +3542,7 @@ export function apply(ctx, rawConfig) {
 
   /* ── 说话与事件 ── */
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_say',
     description: '在 MC 公屏说话（游戏里所有玩家能看到）。',
     parameters: { message: { type: 'string', required: true, description: '要说的话（单行，会被截断到 220 字）' } },
@@ -3228,7 +3561,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_watch',
     description: '看门狗控制（**唯一**的事件通知通道）。看门狗在**进服时自动挂载、退服时自动卸载**，'
       + '整局游戏期间持续运行：记录所有事件，命中唤醒条件就在**同一个对话里**提醒你——'
@@ -3270,7 +3603,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_config',
     description: '读写本会话的 MC 配置（看门狗唤醒条件、近距半径、心跳间隔、观察窗口、叫法等）。'
       + '不传参数 = 看当前配置 + 默认值。改配置传 patch；嵌套项用点号键，'
@@ -3314,7 +3647,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_capabilities',
     description: '【边界信息】这个插件能做什么、边界在哪：**支持的 MC 版本范围**（testedVersions）、底层 mineflayer 版本、'
       + '支持的登录方式、工具命名空间、各种上限（序列步数/记忆大小/事件队列）以及当前配置要点。\n'
@@ -3383,7 +3716,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_sessions',
     description: '列出当前所有活跃的 MC 会话实例（诊断用：确认各会话的 bot 状态、连接信息）。',
     parameters: {},
@@ -3396,7 +3729,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_events',
     description: '读取/消费当前会话的 MC 事件队列（**看门狗记下来的**：聊天、系统消息、受伤、上线/死亡/重连/断线）。'
       + '默认消费掉；`peek=true` 只看不清（**都是最早的先出**）。返回一行一条（时间 + 类型 + 内容），省 token。\n'
@@ -3466,7 +3799,7 @@ export function apply(ctx, rawConfig) {
 
   /* ── 世界读取 ── */
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_scan',
     description: '扫描我周围方块：给 name 就找这种方块的位置；不给就返回方块占比（分母不含空气）。'
       + '\n· 竖向窗口默认以脚底为中心 ±height；看高处传 `y` 指定中心。',
@@ -3551,7 +3884,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_map',
     description: '看周围地形。**默认给"脚下方块那一层"**（地板层图：这一层哪里是实心地面、哪里是坑/岩浆/未加载）：'
       + '· 能站 # 墙 v 会掉下去 ~ 水 ≈ 岩浆 ? 未加载。'
@@ -3765,7 +4098,7 @@ export function apply(ctx, rawConfig) {
   /* mc_entities（附近有谁）已于 2026-10-08 并进 mc_observe 的三段式感知（② 程序检测到）——
    * 用户要求「不要只让 AI 看截图，也不要只让 AI 读取方块坐标」，所以一次调用给全：图 + 程序侧实体（坐标/血量）。
    * 实体数据仍走 src/core.mjs 的 entities()（同一份判据），功能没有损失。 */
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_inventory',
     description: '看背包、装备栏和手持物品。',
     parameters: {},
@@ -3825,7 +4158,7 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_move',
     description: '移动。mode="walk" 走过去（自动避障；**在水里会自动改成"直接游"**）；mode="fly" 创造直飞（约 9 格/秒，会先发飞行权限包）；'
       + 'mode="jump" 原地跳一下（不需要坐标）；'
@@ -3914,7 +4247,7 @@ export function apply(ctx, rawConfig) {
 
   /* ── 行动：看向/走近/放置/破坏/使用/攻击/装备/丢弃（统一入口）── */
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_act',
     /* 🔴 2026-10-20 审计（用户："减少 token 消耗"）：每行只留"这个 mode 干什么 + 影响决策的行为"，
      *    参数细节交给下面那张参数表 —— 原来每个 mode 后面都跟着一长串解释，673 字里有近一半是重复的。 */
@@ -3995,7 +4328,7 @@ export function apply(ctx, rawConfig) {
   /* 钓鱼（用户 2026-10-22：「加一个钓鱼的功能」，随后「加工具，不要管预算」）——
    * 手里有竿就抛，盯浮标有没有明显往下沉（那就是咬钩），沉了收竿。
    * 实现在 `src/fish.mjs`：单次最多盯 8 秒，没咬钩浮标留在水里，**再叫一次接着盯**，不必重新抛。 */
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_fish',
     description: '**钓鱼**：自动抛竿 → 盯浮标 → 咬钩就收竿（浮标明显往下沉才算咬钩）。\n'
       + '· 手上有 fishing_rod 就用手上那把；没有就从背包换出来，都没有会告诉你先 `mc_craft {name:"fishing_rod"}`。\n'
@@ -4021,7 +4354,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_give',
     description: '**创造模式直接获取物品**（不走 /give 指令——那是协议级改槽位，非 OP 也能用）。'
       + '给英文物品 id，如 oak_planks / diamond_sword / white_concrete。clearAll=true 清空背包。'
@@ -4063,7 +4396,7 @@ export function apply(ctx, rawConfig) {
   /* 射箭（2026-10-22 用户：「这些拆了」——从 mc_act 独立出来）——
    * 弹道在 `src/shoot.mjs`：换弓回读 → 数箭 → hawkeye 算 yaw/pitch → 拉满 → 再瞄一次 → 放 → 数箭确认。
    * 用户 2026-10-19：「hawkeye 主要是水晶和末影龙」；2026-10-20：「shoot 完显示周围实体，和 attack 一样」。 */
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_shoot',
     description: '**射箭**：自动换弓、算弹道、拉满、放箭，射完报 12 格内身边有谁。\n'
       + '· 射水晶给 `x/y/z`；打龙 `who:"ender_dragon"`（自动瞄 +2.8 格）。\n'
@@ -4088,7 +4421,7 @@ export function apply(ctx, rawConfig) {
   }))
 
   /* 打实体（2026-10-22 用户：「这些拆了」）—— 目标选择/风筝/追击自成一族。 */
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_attack',
     description: '**打实体**：中英文名都认，24 格内会追上去；不给 who 就按 priority 挑。\n'
       + '· `kite:true` 放风筝：近战怪打一下退一步。\n'
@@ -4109,7 +4442,7 @@ export function apply(ctx, rawConfig) {
   }))
 
   /* 出发前自查（2026-10-22 用户：「这些拆了」）—— 它是**只读**的，跟动手类不是一族。 */
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_prep',
     description: '**出发前自查**：数真状态（装备/附魔/附魔台/书架/青金石/等级/末影之眼…），不靠记忆。\n'
       + '· `for:"nether"`（默认）查下界门槛；`for:"end"` 查末地门槛。',
@@ -4127,7 +4460,7 @@ export function apply(ctx, rawConfig) {
 
   /* 附魔台 / 铁砧 / 锻造台（2026-10-22 用户：「这些拆了」）—— 三个都是"对着方块 UI 操作"，
    * 共用"走到方块 → 打开 → 操作 → 确认"的骨架，合成一个工具、用 kind 分。 */
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_station',
     description: '**对着方块 UI 操作**：附魔台 / 铁砧 / 锻造台走同一个骨架。\n'
       + '· `kind:"enchant"`：`option` 选第几项（0/1/2），`item` 哪件（默认手上）。\n'
@@ -4161,7 +4494,7 @@ export function apply(ctx, rawConfig) {
    * 抄 mindcraft 的 tradeWithVillager / showVillagerTrades（src/agent/library/skills.js:1748-1904），
    * 但把"找谁/买第几条/买几次/买不买得起"做成两个 action：list 先看，buy 再买。
    * 实现在 src/trade.mjs（openVillager 只认村民、count 必须显式给、realPrice 含涨价，都写在那个文件头上）。 */
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_trade',
     description: '**村民交易**（附魔书、钻石工具、食物这些中期最划算的来源）：走同一个工具、两个 action。\n'
       + '· `action:"list"`（默认）：走到村民旁边、开界面、把它卖什么全列出来（序号 / 要什么 / 给什么 / 已换几次 / 材料够换几次）。\n'
@@ -4189,7 +4522,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_sequence',
     description: '**按顺序执行一串世界交互**（替代"写脚本"）：适合"走到这里放几个方块，再走到那里放几个"这类连串动作。\n'
       + 'steps 是数组，每项 op 可为：wait(sec) / move(x,y,z,mode,noDig) / look(x,y,z 或 who) / toward(who) / '
@@ -4221,7 +4554,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_build',
     description: '批量搭方块：把 (x1,y1,z1)–(x2,y2,z2) 这个实心长方体用 name 方块搭出来（会自己走近/垫脚，上限 max 个）。'
       + '适合"搭一面墙/一根柱子/一个平台"，比一个个 mc_act{place} 省事。结果带 used/held。\n'
@@ -4276,7 +4609,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_dig',
     description: '挖方块：给 name 挖最近的，或给 pos 挖指定坐标；count 可连续挖多个（会自己换成对的工具；结果带 held）。\n'
       + '🔴 **一次只挖 10 秒的量**（用户要求：单次调用别超过 11 秒）。没挖完会返回"这一轮的 11 秒用完了"——'
@@ -4318,7 +4651,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_task',
     description: '长活儿进度台账（挖 4 个以上自动开），存记忆根 tasks.json，掉线重连都还在。\n'
       + '`run` 一轮推进一步；`resume` 复核；`plan`/`step` 记账。',
@@ -4450,7 +4783,7 @@ export function apply(ctx, rawConfig) {
     },
   }))
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_command',
     description: '以玩家身份执行服务器指令。**白名单可配置**（默认 tp/give/time/weather/say/gamemode/effect/'
       + 'setblock/fill/clone/summon/title/clear/xp）。要放行别的指令，在**普通会话**里用 `mc_admin_config` 改 '
@@ -4524,7 +4857,7 @@ export function apply(ctx, rawConfig) {
     return abs
   }
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_kit_image',
     description: '图像能力。**SVG 是编辑语言**：布局/画矩形框/加文字（含中文）/拼网格，'
       + '都可以直接写 SVG 文本（用 write 存成 .svg），再用这个工具光栅化成 PNG。\n'
@@ -4658,7 +4991,7 @@ export function apply(ctx, rawConfig) {
    *   · 开 → 回 `base + 相对路径` 的**完整 URL**，只有开启时才开服务。
    * 两种状态都仍然**只认发布区**（`.express/`）里的文件。
    */
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_kit_express',
     description: '把**发布区**（**记忆根**下的 `.express/`，不是工作区里的 `.dsh-mc-agent/.express/`）里的文件换成"给用户的东西"。\n'
       + '· 入参：`path` —— 发布区下的文件（相对按**记忆根**解析，`.express/x.png` 与 `.dsh-mc-agent/.express/x.png` 都认；绝对照用）；\n'
@@ -4722,7 +5055,7 @@ export function apply(ctx, rawConfig) {
    * 任意格式文件可读写（含图片），**不执行任何东西**。
    * ------------------------------------------------------------------------ */
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_kit_memory',
     description: '长期记忆（跨会话、重启后还在），放 `.dsh-mc-agent/`，按服务器建子文件夹（`_global/` 放通用的）。\n'
       + '**索引自己维护** `README.md`（插件每轮注入它的内容 + 目录树，改了记忆顺手更新它）。\n'
@@ -5381,7 +5714,11 @@ export function apply(ctx, rawConfig) {
       return
     }
     if (agent.id) noWorkspaceRefused.delete(String(agent.id))
-    const kind = isMc ? (isPlus ? 'mc-plus' : 'mc') : 'other'
+    /* 🔴 本机定制（2026-10-24，用户："绕过 MC 模式限制，创造模式获得所有操作权限"）：
+     *    `mcMode.unrestricted` 打开时，MC 模式**也当 MC+**——不套白名单、不限制文件根、admin 可见。
+     *    判据用同一个开关，guard 那边同步放行（见下面的 `mcUnrestricted`）。 */
+    const isUnrestricted = pluginConfig.mcUnrestricted === true
+    const kind = isMc ? ((isPlus || isUnrestricted) ? 'mc-plus' : 'mc') : 'other'
     if (mcPolicyKind.get(agent) === kind) return
     // 套新的之前先撤销旧限制（kind 变了；幂等：没套过就没有手柄）
     const prev = mcRestrictRelease.get(agent)
@@ -5415,16 +5752,21 @@ export function apply(ctx, rawConfig) {
 
     if (agent.id) {
       mcModeAgentIds.add(String(agent.id))
-      if (isPlus) mcPlusAgentIds.add(String(agent.id))
+      if (isPlus || isUnrestricted) mcPlusAgentIds.add(String(agent.id))
       else mcPlusAgentIds.delete(String(agent.id))
     }
     ensureMemoryRoot(agent)        // ← 首次发起 MC 模式会话 = 建 `.dsh-mc-agent/`（README / RULES.md）的时机
     // 🔴 2026-09-18：**这里不再投提示词**。投递搬到"每个请求组装之前"（`agent/pre-step` → `reconcileNotices`），
     //    因为模式在第一次请求之前还可能被改（宿主允许空白期反复切 preset）。
     //    这条日志只是"模式已生效"的标记；真投出去时 `reconcileNotices` 自己会记一行。
-    logLine(`${isPlus ? 'MC+ 模式' : 'MC 模式'}生效（preset=${id ?? '?'}，${agent.id}）提示词将在首次请求组装前投递`)
+    logLine(`${isPlus ? 'MC+ 模式' : isUnrestricted ? 'MC 模式（创造模式全权限）' : 'MC 模式'}生效（preset=${id ?? '?'}，${agent.id}）提示词将在首次请求组装前投递`)
 
-    if (isPlus) return   // MC+：不套白名单（见上面注释）；guard 对它只保留凭据路径拒绝
+    // MC+ / 全权限：不套白名单（见上面注释）；guard 对 MC+ 只保留凭据路径拒绝、对全权限什么都不留
+    if (isPlus) return
+    if (isUnrestricted) {
+      logLine('🔓 mcMode.unrestricted 已开：MC 模式不套工具白名单（全部工具可用、文件不限记忆根、mc_admin_* 可调）')
+      return
+    }
 
     // ② 工具可见性：**白名单**（用户 2026-09-16 真机投诉："这个 agent 怎么还能用 pwsh！不是只暴露我们指定的工具吗！"）
     //
@@ -5523,6 +5865,10 @@ export function apply(ctx, rawConfig) {
       const presetId = agent ? mcPresetIdOf(agent) : null
       const isMc = pluginConfig.isMcModePreset(presetId)
       const isPlus = pluginConfig.isMcPlusPreset(presetId)
+      /* 🔴 本机定制（2026-10-24）：`mcMode.unrestricted` = "创造模式全权限"。
+       *    打开后这里**什么都不拦**：凭据路径、secrets/、受保护文件、admin 工具、
+       *    非 MC 会话里的 mc_* 全部放行（用户明确要求"连凭据硬拒也去掉"）。 */
+      if (pluginConfig.mcUnrestricted === true) return undefined
 
       // ① 凭据硬拒：两种 MC 模式都保留（"凭据不进模型上下文"是插件不变式）
       if ((isMc || isPlus) && /^(read|edit|write|glob|grep|ls|cat|read_image|mc_kit_memory)$/i.test(name)) {
@@ -5712,7 +6058,7 @@ export function apply(ctx, rawConfig) {
 
   /* ── 管理工具：只有**非 MC 模式**会话能用（MC 模式看不见 + 调了被 guard 拒）── */
 
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_admin_config',
     description: '【管理】读写 dsh-mc-agent 的**全局配置**（指令白名单、MC 模式工具暴露、记忆目录…）。\n'
       + '⚠️ **MC 模式会话调不动它**（在普通会话或 MC+ 模式里改）。\n'
@@ -5721,7 +6067,9 @@ export function apply(ctx, rawConfig) {
       + '可用键：`commandWhitelist`（数组；"tp" 精确、"/^gi.*/" 正则、"*" 全放行）· '
       + '`mcModePresets`（哪些 preset 算 MC 模式，应含 MC+ 的 id）· `mcPlusPresets`（MC+ 变体：开放全部工具）· '
       + '`mcMode.allowOtherTools`（MC 模式**额外**放行的工具）· `mcMode.allowCompanionTools`（配套插件工具，默认 true）· '
-      + '`mcMode.hideAdminTools`（默认 true）· `stopOnDanger`（true = 遇险打断动作；默认 false 只提醒）· '
+      + '`mcMode.hideAdminTools`（默认 true）· `mcMode.unrestricted`（**本机定制**：true = 创造模式全权限，'
+      + 'MC 模式不白名单、文件不限记忆根、admin 可调、guard 连凭据/secrets 也不拦；默认 false）· '
+      + '`stopOnDanger`（true = 遇险打断动作；默认 false 只提醒）· '
       + '`chatLog`/`chatLogDays`（聊天记录进记忆 `chat-log.md`，默认开、留 7 天）· '
       + '`expressEnabled`（文件分享开关）· '
       + '`expressBase`（分享 base，如 https://example.com）· `memoryDir`（记忆根目录）· '
@@ -5862,7 +6210,7 @@ export function apply(ctx, rawConfig) {
     if (!all && asked.length) out.availableSections = known
     return out
   }
-  ctx.tools.register(asTool({
+  registerTool(asTool({
     name: 'mc_diag',
     /* 🔴 2026-10-17（用户实机：`mc_diag` 一次输出几万字符，AI 只想知道其中一节）：
      *    加 `only` 分节。同时把描述压短腾出 token 预算（`check-token-budget` 只剩几十字符余量）。 */

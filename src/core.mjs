@@ -265,7 +265,7 @@ export { MC_DEPS, loadMcDep, loadPathfinder, resetMcDepCache, resetPathfinderCac
  *
  * 🔴 2026-10-06 补充（实机"机器人走不了了"的根因）：对 mineflayer-collectblock
  *    这种**后台还在跑**的任务，光松控制位不够 —— 它自己会立刻把 `forward` 按回去，
- *    机器人就"物理冻住"：`mc_diag` 显示 `forward:true` 而 `velocity` 全 0、位置一格不动，
+ *    机器人就"物理冻住"：`mc_probe` 显示 `forward:true` 而 `velocity` 全 0、位置一格不动，
  *    之后的 `mc_move` 也全部失败（15 秒只挪 0.03 格），只有重连才恢复。
  *    必须显式 `cancelTask()` 把那个循环停下来，见 `#cancelCollect`。
  * ========================================================================== */
@@ -324,7 +324,7 @@ export class McBot extends EventEmitter {
   /** 统一动作调度器（阶段 P0：只记账，不拦人）。懒建与实现在 `src/action-scheduler.mjs`。 */
   actionScheduler () { return actionSchedulerOf(this) }
 
-  /** 调度器一眼视图（`mc_diag` 用）：谁在占什么、撞过几次车 */
+  /** 调度器一眼视图（`mc_probe` 用）：谁在占什么、撞过几次车 */
   actionSnapshot () { return this.actionScheduler().snapshot() }
 
   /** 这个工具该登记哪些资源（`null` = 只读工具 / 不认识的工具 ⇒ 根本不进调度器） */
@@ -779,7 +779,7 @@ export class McBot extends EventEmitter {
   /** 挖方块（`mc_dig` 的正文：走过去 → 换工具 → 认服务端的破坏回包 → 捡掉落物）—— 实现在 `src\mining.mjs`（`dig`）。 */
   async dig (opts = {}) { return await digImpl(this, opts, this.#mineCtx()) }
 
-  /** 背包一览（`mc_inventory` 的正文）—— 实现在 `src\inventory.mjs`（`inventoryView`） */
+  /** 背包一览（`mc_self` 的正文）—— 实现在 `src\inventory.mjs`（`inventoryView`） */
   inventory () { return inventoryView(this.requireBot()) }
 
   /* ───────────── 朝向（"看向我"就该用工具，不要用 /tp 指令） ───────────── */
@@ -973,7 +973,7 @@ export class McBot extends EventEmitter {
 /**
  * 边界信息：这个插件"能连哪些 MC 版本"、用的 mineflayer 是哪一版。
  * 数据源是 mineflayer 的模块级常量 `lib/version.js`（`testedVersions` 决定上界拒绝）。
- * 给 `mc_capabilities` 工具用；**不连服、不产生副作用**。
+ * 给 `mc_probe` 工具用；**不连服、不产生副作用**。
  */
 export function libraryInfo () {
   const out = { mineflayer: null, testedVersions: [], oldest: null, latest: null, dataVersions: null, error: null, yggdrasilCompat: yggCompat }

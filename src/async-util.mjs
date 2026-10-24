@@ -40,7 +40,7 @@ export function withTimeout (promise, ms, label) {
         const err = new Error(`${label} 超时（${ms}ms）：这一步在限定时间内没做完`
           + '（常见原因：目标够不着、寻路失败，或服务端没回应）。'
           + '控制位已经松开；如果是挖方块/采集，后台任务也已经停掉。'
-          + '可以换个近一点/好走的目标点重试，或先用 mc_status / mc_diag 看状态。')
+          + '可以换个近一点/好走的目标点重试，或先用 mc_status / mc_probe 看状态。')
         err.mcTimeout = true
         throw err
       }
@@ -148,7 +148,7 @@ export async function waitUntil (cond, {
  *   而且**大多数"方块复原"根本不是失步**：pathfinder 的 `allow1by1towers` + `scafoldingBlocks`
  *   （`plugins.mjs:221-223`）会在爬不上去时**拿背包里的方块垫在自己脚下**，原木正是首选垫脚料
  *   （`place-items.mjs` 的 `pickPlaceItem`："手里多的排前面"）。垫的那格恰好就是它刚挖掉的坐标
- *   ⇒ 下一次 `mc_scan` 在那里读到 `spruce_log` ⇒ 模型以为"挖掉的方块又回来了"。
+ *   ⇒ 下一次 `mc_blocks` 在那里读到 `spruce_log` ⇒ 模型以为"挖掉的方块又回来了"。
  *   10-15 会话里 `(-12,70,-12)` 被"挖掉" 4 次、`mc_dig {count:16}` 的账对不上（挖 13 根只进 7 根，
  *   差的那几根就是被拿去垫脚了）—— 全是这一条。
  *
@@ -158,7 +158,7 @@ export async function waitUntil (cond, {
 export const DESYNC_HINT =
   '先按顺序查：① **那格是不是我自己垫脚/搭高放上去的方块**？寻路器爬不上去时会拿背包里的方块'
   + '垫在自己脚下（`mc_move` 返回值里的 `pillared`），垫的那格常常就是刚挖掉的坐标，'
-  + '`mc_scan` 会把它读成"方块复原了"；'
+  + '`mc_blocks` 会把它读成"方块复原了"；'
   + '② 真怀疑客户端缓存旧了，就走远 32 格再走回来（区块会重发），这不打扰玩家；'
   + '③ **别顺手用 `mc_connect {force:true}`** —— 它是先断开再重登，服务器会向全服广播"你离开了游戏"，'
   + '**玩家会真的看到你退游戏几秒**。确实非做不可，就先 `mc_say` 跟玩家说一声。'

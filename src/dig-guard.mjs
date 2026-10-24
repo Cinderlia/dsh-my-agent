@@ -30,7 +30,7 @@ export function collectBusy (b) {
  *   `dig()` 用 `withTimeout` 给 collectBlock 设了 90 秒上限，但 **`withTimeout` 只是让
  *   await 提前 reject，并不会取消底层的 collect 任务**。超时后那个任务继续在后台跑：
  *   它自己按着 `forward`、占着 pathfinder 反复寻路，于是机器人"物理冻住"——
- *   `mc_diag` 里 `controlState.forward === true` 而 `velocity` 全 0、位置一格不动，
+ *   `mc_probe` 里 `controlState.forward === true` 而 `velocity` 全 0、位置一格不动，
  *   之后的 `mc_move` 也全部失败（15 秒只挪 0.03 格），**只有重连才恢复**。
  *
  *   `collectBlock.cancelTask()` 内部就是 `bot.pathfinder.stop()` + 等
@@ -93,7 +93,7 @@ export async function cancelCollect (b, ctx = {}) {
       try {
         log?.(cleared
           ? '⚠️ 采集任务没停下来（等不到 collectBlock_finished）—— 已清空它队列里剩下的目标，机器人可以继续走路'
-          : '⚠️ 采集任务停不下来、队列也清不掉 —— 建议先 mc_scan 复核；**不要**顺手 mc_connect {force:true}（那是真退出再进服，玩家会看到）')
+          : '⚠️ 采集任务停不下来、队列也清不掉 —— 建议先 mc_blocks 复核；**不要**顺手 mc_connect {force:true}（那是真退出再进服，玩家会看到）')
       } catch {}
     }
   }

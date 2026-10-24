@@ -5,7 +5,7 @@
  *   ① **不反向 import `core.mjs`**；② 不直接 import mineflayer（只往下依赖 `block-names.mjs`
  *   与 `world-observer.mjs`）；③ **只读、同步、不改状态**。
  *
- * 🔴 这两个视图是**公开方法**（`index.js` 的状态条与 `mc_status`/`mc_diag`、`extensions\mc_observe.mjs`
+ * 🔴 这两个视图是**公开方法**（`index.js` 的状态条与 `mc_status`/`mc_probe`、`extensions\mc_observe.mjs`
  *    的"程序检测到"、`selfcheck.mjs` 都从**实例**上调 `bot.status()` / `bot.connectionView()`）
  *    ⇒ `core.mjs` 里留**同名薄包装**，调用方一行都不用改。
  *

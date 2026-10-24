@@ -182,7 +182,7 @@ export function farmSpotsNear (b, { radius = 4, count = 6, y = null } = {}) {
 export function sleepErrorText (msg) {
   const m = String(msg ?? '')
   if (/not night|thunderstorm/i.test(m)) return '现在不是夜里（也不在下雷雨）—— 床这会儿点不着。等天黑（`mc_status` 能看时间），或者干脆别睡。'
-  if (/occupied/i.test(m)) return '那张床已经有人躺着了 —— 换一张（`mc_scan {name:"bed"}` 看附近还有没有）。'
+  if (/occupied/i.test(m)) return '那张床已经有人躺着了 —— 换一张（`mc_blocks {name:"bed"}` 看附近还有没有）。'
   if (/monsters nearby/i.test(m)) return '周围有怪，躺不下去 —— 先把怪清掉（`mc_attack {who:"zombie"}`），或者插火把把附近点亮。'
   if (/too far/i.test(m)) return '离床太远（服务端点不到）—— 走到床跟前再叫一次。'
   if (/only half bed/i.test(m)) return '那只是半张床（另一半被拆了）—— 补一张床，或者换一张。'
@@ -340,7 +340,7 @@ export async function farmArea (self, args = {}, ctx = {}) {
   if (args.seed != null && String(args.seed).trim() !== '' && !seedPick) {
     return {
       ok: false, reason: 'no-seed',
-      text: `背包里没有 "${args.seed}" 这种种子（` + '`mc_inventory` 看有什么；`wheat_seeds`/`carrot`/`potato`/`beetroot_seeds` 都能种）。',
+      text: `背包里没有 "${args.seed}" 这种种子（` + '`mc_self` 看有什么；`wheat_seeds`/`carrot`/`potato`/`beetroot_seeds` 都能种）。',
     }
   }
 
@@ -370,7 +370,7 @@ export async function farmArea (self, args = {}, ctx = {}) {
     return {
       ok: false, reason: 'no-hoe', soil: willTill.map((s) => s.soil),
       text: `要锄地但**背包里没有锄头**（${willTill.length} 格土等着锄）—— 先 \`mc_craft {name:"wooden_hoe"}\`（2 木板 + 2 木棍），再来。`
-        + (seedPick ? '' : ' 顺带：种子也没有，`mc_inventory` 看看有没有 `wheat_seeds`。'),
+        + (seedPick ? '' : ' 顺带：种子也没有，`mc_self` 看看有没有 `wheat_seeds`。'),
     }
   }
 
@@ -488,7 +488,7 @@ export async function farmArea (self, args = {}, ctx = {}) {
     + (skipped.length ? `；跳过 ${skipped.length} 格` : '')
     + (failed.length ? `；失败 ${failed.length} 格（${failed.slice(0, 3).map((f) => `${f.pos.x},${f.pos.z}:${f.why}`).join(' / ')}）` : '')
     + (skipped.some((s) => s.why === 'budget') ? '；时间到了，剩下的再叫一次就好' : '')
-    + (planted ? `\n🌱 长熟要一会儿：` + [...new Set(done.map((d) => CROP_TO_SEED[d.crop] ?? d.crop))].join('、') + ' —— 别原地等，去干别的，回头用 `mc_scan` 看 `age`。' : '')
+    + (planted ? `\n🌱 长熟要一会儿：` + [...new Set(done.map((d) => CROP_TO_SEED[d.crop] ?? d.crop))].join('、') + ' —— 别原地等，去干别的，回头用 `mc_blocks` 看 `age`。' : '')
   return {
     ok: planted > 0 || tilled > 0 || harvested > 0,
     planted, tilled, harvested,

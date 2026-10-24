@@ -215,7 +215,7 @@ export async function tradeVillager (self, args = {}, ctx = {}) {
   if (!pool.length) {
     return {
       ok: false, action, reason: 'no-villager',
-      hint: `附近 ${radius} 格内没有村民。先用 \`mc_scan {name:"villager", radius:48}\` 或 \`mc_observe\` 找村子/村民，`
+      hint: `附近 ${radius} 格内没有村民。先用 \`mc_blocks {name:"villager", radius:48}\` 或 \`mc_observe\` 找村子/村民，`
         + '再 \`mc_move {x, z}\` 走过去（村民会自己走动，到了再叫一次）。流浪商人也能交易但 mineflayer 的 openVillager 不认它，得用原版界面手动点。',
     }
   }
@@ -372,14 +372,14 @@ export async function tradeVillager (self, args = {}, ctx = {}) {
     return {
       ok: false, action, villager: label, index, cost, give, closed, reason: 'trade-error',
       used: done, gain, spent,
-      hint: `换到一半出错（${err?.message ?? err}）。已经换成的 ${done} 次不会退 —— 先 \`mc_inventory\` 看看，然后再叫一次。`,
+      hint: `换到一半出错（${err?.message ?? err}）。已经换成的 ${done} 次不会退 —— 先 \`mc_self\` 看看，然后再叫一次。`,
     }
   }
   if (done <= 0) {
     return {
       ok: false, action, villager: label, index, cost, give, closed, reason: 'not-confirmed',
       gain, spent,
-      hint: '交易包发出去了，但它的"已换次数"没动 —— 大概率是材料被别的窗口/手滑挪走了。先 `mc_inventory` 看一眼再叫一次。',
+      hint: '交易包发出去了，但它的"已换次数"没动 —— 大概率是材料被别的窗口/手滑挪走了。先 `mc_self` 看一眼再叫一次。',
     }
   }
   return {

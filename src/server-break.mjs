@@ -137,7 +137,7 @@ export function watchServerBreak (b, pos) {
  * 为什么要它（2026-10-23 实机，用户转来的报告「刚挖掉的方块读成空气，得换目标或绕一下才行」）：
  *   `mineflayer/lib/plugins/digging.js` 的 `finishDigging()` 到点就 `bot._updateBlockState(pos, 0)`，
  *   **根本不等服务端**。服务端要是**静默**拒了这次破坏（不发复原包），本地就永久留着一个“幽灵空位”：
- *   寻路觉得那儿是通的、地图画成空气、`mc_scan` 也当它没了 —— 等真走过去才发现是实心墙。
+ *   寻路觉得那儿是通的、地图画成空气、`mc_blocks` 也当它没了 —— 等真走过去才发现是实心墙。
  *   所以“没收到服务端回包”这种情况必须把本地改回去，别让幻影坑继续骗后续的判断。
  *
  * @param {object} b mineflayer bot

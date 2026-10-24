@@ -95,6 +95,19 @@ export const DEFAULT_CONFIG = {
      * 想收紧就把它设成 false（或把某个名字从 `MC_COMPANION_TOOLS` 里去掉）。
      */
     allowCompanionTools: true,
+    /**
+     * **【本机定制】创造模式全权限开关**（默认 `false` = 原行为）。
+     *
+     * 用户 2026-10-24：「先在代码里绕过 MC 模式限制，让创造模式获得所有操作权限」。
+     * 打开之后 MC 模式**完全等同 MC+**，而且连凭据硬拒也一起去掉：
+     *   · 工具可见面：不再白名单（宿主挂的全部工具都可见）；
+     *   · 文件工具：不再限制在 `.dsh-mc-agent/`、受保护文件（RULES.md/AGENTS.md/config.json）也能写；
+     *   · `mc_admin_*`：可见、可调；
+     *   · guard：凭据 / `secrets/` / 受保护文件**一律放行**（模型能读到 `.credentials.yaml` 了）；
+     *   · 非 MC 模式会话里的 `mc_*` / `mc_kit_*` 也一并放行。
+     * 🔴 这就是"没有隔离"的意思，只该在自己的单机/创造服上开。
+     */
+    unrestricted: false,
   },
   /**
    * `mcModePresets` 里哪些算 **MC+ 变体**（在 MC 模式基础上开放标准模式全部工具）。
@@ -606,7 +619,14 @@ export class PluginConfig {
     return {
       allowOtherTools: Array.isArray(v?.allowOtherTools) ? v.allowOtherTools.map(String) : [],
       hideAdminTools: v?.hideAdminTools !== false,
+      allowCompanionTools: v?.allowCompanionTools !== false,
+      unrestricted: v?.unrestricted === true,
     }
+  }
+
+  /** 本机定制：创造模式全权限（见 `DEFAULT_CONFIG.mcMode.unrestricted`） */
+  get mcUnrestricted () {
+    return this.get('mcMode')?.unrestricted === true
   }
 
   get memoryDir () {
@@ -763,11 +783,11 @@ function validate (top, rest, value) {
       if (!isStrArray) throw new Error(`${key} 必须是字符串数组（工具名，精确匹配）`)
       return
     }
-    if (key === 'mcMode.hideAdminTools') {
-      if (typeof value !== 'boolean') throw new Error('mcMode.hideAdminTools 必须是 true/false')
+    if (key === 'mcMode.hideAdminTools' || key === 'mcMode.allowCompanionTools' || key === 'mcMode.unrestricted') {
+      if (typeof value !== 'boolean') throw new Error(`${key} 必须是 true/false`)
       return
     }
-    if (key !== 'mcMode') throw new Error(`未知配置项 "${key}"；mcMode 下可用：allowOtherTools / hideAdminTools`)
+    if (key !== 'mcMode') throw new Error(`未知配置项 "${key}"；mcMode 下可用：allowOtherTools / hideAdminTools / allowCompanionTools / unrestricted`)
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
       throw new Error('mcMode 必须是对象，如 {"allowOtherTools":[],"hideAdminTools":true}')
     }

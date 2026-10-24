@@ -300,13 +300,13 @@ export async function recoverFromWater (self, opts = {}, ctx = {}) {
     moved: movedTotal,
     tried: [...tried],
     log,
-    note: `试了 ${maxRounds} 条路线都没走通 —— 别在原地继续游，换个方向或者叫我用 mc_scan 看看四周`,
+    note: `试了 ${maxRounds} 条路线都没走通 —— 别在原地继续游，换个方向或者叫我用 mc_blocks 看看四周`,
     state: waterStateOf(b),
   }
 }
 
 /**
- * 给 AI 看的一段话（走 `agent.steer` 送出去，或塞进 `mc_diag`）。
+ * 给 AI 看的一段话（走 `agent.steer` 送出去，或塞进 `mc_probe`）。
  * **每一次自动救援都必须调用它** —— 这就是"绝不偷偷接管"。
  */
 export function waterReportText (res, trigger = null) {
@@ -324,6 +324,6 @@ export function waterReportText (res, trigger = null) {
   for (const l of res.log ?? []) lines.push(`· ${l}`)
   lines.push(res.escaped === true
     ? '我**没有**替你决定接下来去哪 —— 原来的任务要不要继续，你看一眼再定。'
-    : '要救我：给个明确的目标（岸在哪 / 往哪个方向），或者用 mc_scan 看一眼四周再决定。')
+    : '要救我：给个明确的目标（岸在哪 / 往哪个方向），或者用 mc_blocks 看一眼四周再决定。')
   return lines.join('\n')
 }

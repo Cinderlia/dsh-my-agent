@@ -278,7 +278,7 @@ function cacheOf (b) {
   return e
 }
 
-/** 缓存的账（`hits` / `misses` / `scans` / 世界变更次数）—— 给 `mc_diag` 和测试看。 */
+/** 缓存的账（`hits` / `misses` / `scans` / 世界变更次数）—— 给 `mc_probe` 和测试看。 */
 export function terrainCacheStats (b) {
   const e = cacheOf(b)
   return { hits: e.hits, misses: e.misses, scans: e.scans, version: e.version }

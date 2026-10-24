@@ -35,7 +35,7 @@ export const PLACE_TIMEOUT_MS = 2_500
  * 在目标周围找一块**能站的地面**当落脚点（"走过去放"用）。找不到返回 `null`。
  *
  * 🔴 为什么不能直接朝 `pos.y` 走（用户 2026-10-13 实机报的"搭路一直搭到空气上"）：
- *    搭桥 / 搭高的目标 y 本来就在半空，而 `mc_map`/`mc_scan` 给的"地表高度"在树林里是树冠、
+ *    搭桥 / 搭高的目标 y 本来就在半空，而 `mc_map`/`mc_blocks` 给的"地表高度"在树林里是树冠、
  *    山上是最高的石头 —— 朝那个 y 走过去，pathfinder 会一路**垫方块把自己顶上去**。
  *    改成"站到目标旁边的地面上，再伸手放"。
  */
@@ -271,7 +271,7 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
   await sleep(200)
 
   // 🔴 必须**验证**：旧版不管成没成都是 `placed: item.name` → 真机被投诉的"报假成功"
-  //    （mc_build 说 placed，mc_scan 复查一格没放下）
+  //    （mc_build 说 placed，mc_blocks 复查一格没放下）
   const now = b.blockAt(pos)?.name ?? null
   /* 🔴 2026-10-19（用户实机：连插两个火把，两次都回「❌ 动作失败 / 服务端可能拒了这次放置」，
    *    但 `now` 明明写着 `wall_torch` —— 火把**好端端贴在墙上**了）：
@@ -351,7 +351,7 @@ export async function placeEntityItem (self, { x, y, z, name = null } = {}, ctx 
   /* 参考方块 = 目标格本身（水里 / 空气里都能点），朝向取"上面"：船就浮在这一格的水面上。
    * 目标格不是水、下面是水/陆地也行 —— 服务端按"点到的这一格 + 这个面"算落点。 */
   let ref = b.blockAt(pos) ?? b.blockAt(pos.offset(0, -1, 0))
-  if (!ref) throw new Error(`${pos.x},${pos.y},${pos.z} 未加载 —— 先走过去或 mc_scan 看一眼`)
+  if (!ref) throw new Error(`${pos.x},${pos.y},${pos.z} 未加载 —— 先走过去或 mc_blocks 看一眼`)
   /* 🔴 2026-10-20 实机：给的是"水面**上方**那一格"（空气）时，`blockAt(pos)` 拿到的是 air 方块，
    *    `block_place` 对着空气发 ⇒ 服务端直接忽略（不报错、也不生成）。玩家瞄准的永远是水面本身。
    *    所以参考格是空气就往下摸最多 3 格，摸到水/地面为止。 */

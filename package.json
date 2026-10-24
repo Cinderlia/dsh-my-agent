@@ -51,7 +51,9 @@
   ],
   "dependencies": {
     "mineflayer": "^4.37.1",
-    "vec3": "^0.1.7"
+    "vec3": "^0.1.7",
+    "@miner-org/mineflayer-baritone": "^4.6.2",
+    "mineflayer-pathfinder": "^2.4.5"
   },
   "optionalDependencies": {
     "sharp": "^0.35.3"
@@ -62,9 +64,15 @@
     "@deepseek-ai/schemastery": "*"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh-llm": { "optional": true },
-    "@deepseek-ai/dsh-tools": { "optional": true },
-    "@deepseek-ai/schemastery": { "optional": true }
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@deepseek-ai/dsh-llm": "*",

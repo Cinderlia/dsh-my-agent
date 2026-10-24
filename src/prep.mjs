@@ -1,5 +1,5 @@
 /**
- * 出发前的装备自查 —— `mc_prep {for:"nether" | "end"}`。
+ * 出发前的装备自查 —— `mc_probe {what:"prep", args:{for:"nether"|"end"}}`。
  *
  * 用户 2026-10-19：「把附魔台 / 青金石 / 书架也加进前置清单」。规矩写在 `RULES.md`（进下界前
  * 先做附魔台、把装备附上魔），但**规矩是文字，模型不一定照做**；这个模式把规矩变成一次**读真状态**
@@ -228,6 +228,6 @@ export function prepCheck (b, opts = {}) {
     if (c.ok === false) lines.push(`     ↳ ${c.tip}`)
   }
   if (unsure.length) lines.push(`❓ 这几样数不出来，自己确认一下：${unsure.map((c) => c.label).join('、')}`)
-  if (bad.length) lines.push(`缺的补完再走（\`mc_prep {, for:"${kind}"}\` 可以再查一次）。`)
+  if (bad.length) lines.push(`缺的补完再走（\`mc_probe {what:"prep", args:{for:"${kind}"}}\` 可以再查一次）。`)
   return { text: lines.join('\n'), ok: bad.length === 0, for: kind, checks, missing: bad.map((c) => c.label) }
 }

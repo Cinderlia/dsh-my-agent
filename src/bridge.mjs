@@ -320,7 +320,7 @@ async function bridgeAcrossInner (self, { dir, count = 1, name = null, minHealth
     placed: placed.length, walked, placedAt: placed, ...(skipped.length ? { skipped: skipped.length } : {}),
     ...(warned.length ? { warnings: warned.slice(0, 8), warningCount: warned.length } : {}),
     held: heldText(b), ...extra,
-    hint: '**别在当前这一格继续硬铺**：先 mc_scan / mc_map 看看前面到底什么样（多半是服务端拒了放置、或脚下已经不是实地）。'
+    hint: '**别在当前这一格继续硬铺**：先 mc_blocks / mc_map 看看前面到底什么样（多半是服务端拒了放置、或脚下已经不是实地）。'
       + '已经铺好的格子会跳过，处理完再叫一次同一个方向就行。',
   })
 

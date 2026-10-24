@@ -9,7 +9,7 @@
  *   · `cpuMs`   —— 这次调用真的烧了多少 CPU（`process.cpuUsage()` 前后差）
  *   · `loopMaxMs` / `loopP99Ms` —— 调用期间**事件循环延迟**的最大值 / 99 分位
  *
- * 判据（`perfVerdict()` 会把结论直接写成中文，`mc_diag` 的 `perf` 段原样给模型看）：
+ * 判据（`perfVerdict()` 会把结论直接写成中文，`mc_probe` 的 `perf` 段原样给模型看）：
  *   · `cpuMs` 接近 `wallMs`（比值高）⇒ **CPU 密集**，会阻塞事件循环 ⇒ 值得搬进 Worker。
  *     候选：`src/map-render.mjs` 的 `floorMapOf()`/`heightmapOf()`（96×96 列 × 每列十几次
  *     **同步** `blockAt()`）、`src/png.mjs` 的 `encodePng()`、`extensions/mc_view-render.mjs` 的渲染。
@@ -63,7 +63,7 @@ const toMs = (ns) => Math.round(Number(ns) / 1e5) / 10
  *
  * ⚠️ 为什么用 `AsyncLocalStorage` 而不是一个"当前动作"变量：等待发生在**跨 `await` 之后**，
  *    而工具调用是可以并发跑两个的 —— 用一个模块级变量记"现在是谁"，等 `await` 回来时
- *    早就被另一个动作改掉了，会把 `mc_move` 的寻路等待记到 `mc_scan` 头上。
+ *    早就被另一个动作改掉了，会把 `mc_move` 的寻路等待记到 `mc_blocks` 头上。
  *    ALS 跟着异步调用链走，天然分得清。
  */
 const als = new AsyncLocalStorage()
@@ -245,7 +245,7 @@ export function cpuShareOf (wallMs, cpuMs) {
   return { cpuRatio: Math.min(1, raw), cpuRatioRaw: raw, cpuOverWall: cpuMs > wallMs * 1.05 }
 }
 
-/** 给 `mc_diag` 的结构化快照 */
+/** 给 `mc_probe` 的结构化快照 */
 export function perfSnapshot () {
   if (!perfEnabled()) {
     return { enabled: false, note: '已用 DSH_MC_AGENT_PERF=off 关掉（想开就删掉这个环境变量）' }
@@ -349,7 +349,7 @@ export function perfVerdict (calls = []) {
   const slow = all.filter((c) => c._wallP95 >= 1000)
   const out = []
   /* 贴着 bot 的工具：里面**读世界**那一段依赖实时游戏状态，搬走 = 拿过期快照做决定 */
-  const BOT_COUPLED = new Set(['mc_observe', 'mc_map', 'mc_scan', 'mc_move', 'mc_dig', 'mc_build', 'mc_act', 'mc_task', 'mc_inventory', 'mc_chest', 'mc_furnace'])
+  const BOT_COUPLED = new Set(['mc_observe', 'mc_map', 'mc_blocks', 'mc_move', 'mc_dig', 'mc_build', 'mc_act', 'mc_task', 'mc_self', 'mc_chest', 'mc_furnace'])
   if (heavy.length) {
     out.push('🐌 CPU 密集（会阻塞事件循环，**值得搬 Worker**）：'
       + heavy.map((c) => `${c.name}（p95 墙钟 ${c._wallP95}ms / p95 CPU ${c._cpuP95}ms = ${Math.round((c.cpuRatio ?? 0) * 100)}%`
@@ -398,7 +398,7 @@ export function perfVerdict (calls = []) {
   return out
 }
 
-/** 多行文本（`mc_diag` / 日志 / 人工看） */
+/** 多行文本（`mc_probe` / 日志 / 人工看） */
 export function perfText (snap = null) {
   const s = snap ?? perfSnapshot()
   if (!s.enabled) return `📊 性能监测：${s.note}`

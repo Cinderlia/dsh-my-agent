@@ -287,7 +287,7 @@ export async function apply (api) {
       const wantPos = Number.isFinite(Number(args.x)) && Number.isFinite(Number(args.y)) && Number.isFinite(Number(args.z))
       let box = findContainerBlock(bot, { x: args.x, y: args.y, z: args.z, radius })
       /* 🔴 2026-10-08 审计 H6：**给了坐标却在那里找不到箱子**时，以前会照走"没箱子就放一个"这条路
-       *    ⇒ 在脚边另造一个新箱子，然后对着它存/取。AI 从 `mc_scan` 拿到坐标、y 记错一格，
+       *    ⇒ 在脚边另造一个新箱子，然后对着它存/取。AI 从 `mc_blocks` 拿到坐标、y 记错一格，
        *    就会把家当存进一个自己不知道的新箱子，或者对着新箱子说"箱子里没有 coal"。
        *    给了坐标就**只认那个坐标**：找不到就如实说，并列出附近真实的箱子。 */
       if (!box && wantPos) {
@@ -302,7 +302,7 @@ export async function apply (api) {
           '　→ 我**没有**另放新箱子（免得你把东西存进一个自己不知道的箱子）。',
         ]
         lines.push(near.length ? `　附近 ${radius} 格内真实的箱子：${show.join('、')}` : `　附近 ${radius} 格内也没有箱子。`)
-        lines.push('　→ 坐标用 `mc_scan` 或 `mc_chest {action:"list"}` 里报的那一个；不想给坐标就直接 `mc_chest {action:"put",name:"…"}`（我会用最近的箱子）。')
+        lines.push('　→ 坐标用 `mc_blocks` 或 `mc_chest {action:"list"}` 里报的那一个；不想给坐标就直接 `mc_chest {action:"put",name:"…"}`（我会用最近的箱子）。')
         logLine(`mc_chest：给的坐标 (${args.x},${args.y},${args.z}) 上没有箱子，没另放`)
         return { text: lines.join('\n') }
       }
@@ -426,7 +426,7 @@ export async function apply (api) {
       const lines = [...head]
       lines.push(`　搬之前：${before}`)
       if (real.length) lines.push(`　✅ ${action === 'put' ? '真放进去了' : '真拿出来了'}（按箱子数量核对）：${real.join('、')}`)
-      else if (moved.length) lines.push(`　⚠️ 动作发出去了（${moved.join('、')}），但**箱子里的数量没变** —— 服务端可能没认这次点击：再叫一次 mc_chest，或用 mc_diag 看窗口`)
+      else if (moved.length) lines.push(`　⚠️ 动作发出去了（${moved.join('、')}），但**箱子里的数量没变** —— 服务端可能没认这次点击：再叫一次 mc_chest，或用 mc_probe 看窗口`)
       else lines.push(`　⚠️ 一个都没搬动`)
       if (cut) lines.push(`　⏳ ${cut}`)
       if (failed.length) {

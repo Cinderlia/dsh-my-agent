@@ -25,6 +25,7 @@
  */
 
 import { ensureDepGuard, isLandmineError, describeDepGuard } from './dep-guard.mjs'
+import { installTickEnd, describeTickEnd } from './tick-end.mjs'
 import { sleep } from './async-util.mjs'
 import { dashUuid } from './accounts.mjs'
 import { makeSession } from './auth-session.mjs'
@@ -202,12 +203,27 @@ export async function connect (self, opts = {}, ctx = {}) {
       },
     })
     b._createdAt = Date.now()
+    /* 🔴 2026-10-24：26.3 起服务端每个客户端 tick 只收一个位置包，靠 `tick_end` 清零；
+     *    已发布的 mineflayer（4.39.0）从不发它 ⇒ 进服约 1.5 秒、第二个位置包就被
+     *    `multiplayer.disconnect.invalid_player_movement` 硬踢（上游 issue #4189）。
+     *    这里每个 bot 一创建就补上，对老服务器无害（那个包不存在时写入会抛、内部吞掉）。 */
+    try {
+      const te = installTickEnd(b)
+      if (te.installed && te.reason === 'installed') self.log(describeTickEnd(te))
+    } catch (e) { self.log('tick_end 补丁没挂上：' + e.message) }
 
     let dupe = false
     b.on('error', (e) => { ctx.reportError?.(e) })
     b.on('kicked', (r) => {
       const text = typeof r === 'string' ? r : JSON.stringify(r)
-      self.lastError = `被踢: ${text.slice(0, 300)}`
+      /* 2026-10-24：同一个报错在新版服务端上还有第二种成因 —— 客户端发了服务端
+       * 跟不上的协议版本（如 26.3 服只认 ≥26.2 的移动格式，经过协议转换也可能被判非法）。
+       * 那时补了 tick_end 也会被踢，所以专门给出"换个 version 再连"的下一步。 */
+      const moveKick = /invalid_player_movement/.test(text)
+      self.lastError = moveKick
+        ? `被踢: ${text.slice(0, 200)} —— 服务端认为我的移动包非法。若是新版服务端（26.3+），`
+          + '要么协议版本对不上（mc_connect 显式给 version，如 "26.2"/"26.3"），要么没补上 tick_end（见 mineflayer#4189）。'
+        : `被踢: ${text.slice(0, 300)}`
       // 「已连接」类顶号错误短时间重试（服务器放掉旧会话要几秒）
       if (/already connected|already logged/i.test(text) && Date.now() - b._createdAt < 9000) dupe = true
       else self.autoReconnect = false
@@ -234,7 +250,7 @@ export async function connect (self, opts = {}, ctx = {}) {
         }
       } catch { /* 记不上不影响断线处理 */ }
       /* 统一动作调度器（阶段 P0）：连接断了，**上一个连接留下的"谁在占什么"全不作数了**。
-       * 不清的话，重连后 `mc_diag` 会显示一堆早就结束的动作还占着 movement / interaction，
+       * 不清的话，重连后 `mc_probe` 会显示一堆早就结束的动作还占着 movement / interaction，
        * 等 P1 真的开始拦人时就会变成"重连之后什么都动不了"。 */
       try { self.actionScheduler?.().releaseAll?.('断线了') } catch { /* 清不掉不影响断线处理 */ }
       clearSilenceWatch(self)

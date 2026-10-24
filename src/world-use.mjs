@@ -107,7 +107,7 @@ export async function useBlock (b, { x, y, z, who = null } = {}, ctx = {}) {
           ...(typeof w.containerItems === 'function' ? { slots: w.containerItems().length } : {}),
         }
         /* 🔴 2026-10-19 实机（真 bug）：原来这里**直接 return，窗口一直开着** —— 实测对合成台
-         * `mc_act {mode:"use"}` 之后，`mc_diag only=crafting` 恒报 `open: {type:"crafting"}`，
+         * `mc_act {mode:"use"}` 之后，`mc_probe only=crafting` 恒报 `open: {type:"crafting"}`，
          * 那次调用的 outcome 还变成了 `unknown`（"时间到了/被打断，服务器可能已经做了"）。
          * 开着的窗口还会挡住后面的 mc_craft / mc_chest / mc_furnace（它们各自要先 closeWindow）。
          * 这个工具本来就**没有**"在窗口里操作"的能力（合成走 mc_craft、存取走 mc_chest），
@@ -124,7 +124,7 @@ export async function useBlock (b, { x, y, z, who = null } = {}, ctx = {}) {
       usedBlock: blk.name, at, opened: false,
       note: `${blk.name} 的窗口**没有打开**（等了 1.2 秒）—— 包发出去了但服务端没回应：`
         + '够不着（要 4.5 格内、看得见）/ 被别的玩家占着 / 位置读错了。别当成开成功了。'
-        + '先 mc_move 走近再试，或者 mc_scan 看一眼那格到底是什么',
+        + '先 mc_move 走近再试，或者 mc_blocks 看一眼那格到底是什么',
     }
   }
   // ② 门/活板门/栅栏门/按钮/拉杆：方块状态应该翻转
@@ -207,7 +207,7 @@ export async function useItem (b, { hold = 0, x, y, z } = {}, ctx = {}) {
   const t = ctx.t ?? ((p) => p)
   const item = b.heldItem
   if (!item) {
-    throw new Error('手上没东西 —— 先用 mc_act{mode:"equip",name:"…"} 拿到手上（mc_inventory 看背包里有什么）')
+    throw new Error('手上没东西 —— 先用 mc_act{mode:"equip",name:"…"} 拿到手上（mc_self 看背包里有什么）')
   }
   // 别把一轮 11 秒全用来"按住不放"：最多 3 秒，且**给松手留 400ms 余量**。
   // 🔴 这个余量是必需的：松手包（`deactivateItem`）也要过 `#t` 的预算闸门，
@@ -284,7 +284,7 @@ export async function useItem (b, { hold = 0, x, y, z } = {}, ctx = {}) {
      * 盾/望远镜/山羊角/三叉戟/工具/桶 用完数量不变本来就是正常的。 */
     const REUSABLE = /^(bow|crossbow|shield|spyglass|goat_horn|trident|flint_and_steel|fishing_rod|shears|elytra|carrot_on_a_stick|warped_fungus_on_a_stick|.*_axe|.*_hoe|.*_pickaxe|.*_shovel|.*_sword|bucket|water_bucket|lava_bucket|milk_bucket|powder_snow_bucket)$/
     if (after >= item.count && !REUSABLE.test(item.name)) {
-      out.note = `手上还是 ${after} 个（没少）—— 这一下可能没真用出去（服务端不回执这类动作，用 mc_inventory 复核）`
+      out.note = `手上还是 ${after} 个（没少）—— 这一下可能没真用出去（服务端不回执这类动作，用 mc_self 复核）`
     }
   }
   /* 🔴 船 / 矿车 / 刷怪蛋 / 盔甲架：**对着空气用**是发不出来的（服务端要"对着某一格用" + 一个
@@ -429,7 +429,7 @@ export async function equip (self, { name = null, to = null } = {}, ctx = {}) {
   if (name == null) throw new Error('要给 name（如 iron_helmet / diamond_sword）；只想脱装备就只给 to')
 
   const item = b.inventory.items().find((i) => i.name === String(name))
-  if (!item) throw new Error(`背包里没有 ${name}（用 mc_inventory 看有什么；**身上穿着的在"装备栏"那一行**）`)
+  if (!item) throw new Error(`背包里没有 ${name}（用 mc_self 看有什么；**身上穿着的在"装备栏"那一行**）`)
   const d = dest ?? equipDestOf(item.name)
   const isHand = d === 'hand'
   const slot = slotOf(d)
@@ -456,8 +456,8 @@ export async function equip (self, { name = null, to = null } = {}, ctx = {}) {
       ? {}
       : {
           note: isHand
-            ? `换手没成功（现在手上是 ${held}）—— 那一叠可能被占用了，或刚被用掉；再叫一次 mc_act{mode:"equip",name:"${name}"}，先用 mc_inventory 看还剩什么`
-            : `没穿上 ${d}（那一格现在是 ${now ? now.name : '空'}）—— 那一叠可能被占用了，或刚被用掉；先 mc_inventory 看一眼还剩什么`,
+            ? `换手没成功（现在手上是 ${held}）—— 那一叠可能被占用了，或刚被用掉；再叫一次 mc_act{mode:"equip",name:"${name}"}，先用 mc_self 看还剩什么`
+            : `没穿上 ${d}（那一格现在是 ${now ? now.name : '空'}）—— 那一叠可能被占用了，或刚被用掉；先 mc_self 看一眼还剩什么`,
         }),
   }
 }
@@ -499,7 +499,7 @@ export async function enchantTable (self, args = {}, ctx = {}) {
     if (blk.name !== 'enchanting_table') throw new Error(`(${args.x},${args.y},${args.z}) 是 ${blk.name}，不是附魔台`)
   } else {
     blk = b.findBlock({ matching: (x) => x?.name === 'enchanting_table', maxDistance: 4 })
-    if (!blk) throw new Error('附近 4 格内没有附魔台 —— 先 mc_scan {name:"enchanting_table"} 找一座，或者把 x/y/z 给我')
+    if (!blk) throw new Error('附近 4 格内没有附魔台 —— 先 mc_blocks {name:"enchanting_table"} 找一座，或者把 x/y/z 给我')
   }
   const at = `${blk.position.x},${blk.position.y},${blk.position.z}`
 
@@ -546,7 +546,7 @@ export async function enchantTable (self, args = {}, ctx = {}) {
     const slot = pick?.slot ?? heldSlot()
     if (slot == null) {
       throw new Error(want
-        ? `背包里没有 ${want} —— 要附魔的东西得先在手边（或者名字写对：mc_inventory 看一眼）`
+        ? `背包里没有 ${want} —— 要附魔的东西得先在手边（或者名字写对：mc_self 看一眼）`
         : '附魔台槽 0 是空的：先用手拿着要附魔的东西，或者点名 item（如 item:"iron_pickaxe"）')
     }
     await t(Promise.resolve(b.moveSlotItem(slot, 0)), 'act', '把待附魔的那件放进附魔槽')
@@ -632,7 +632,7 @@ export async function enchantTable (self, args = {}, ctx = {}) {
       await t(Promise.resolve(table.takeTargetItem()), 'act', '把附魔好的那件拿回来')
     }
   } catch (e) {
-    note = `没能自动把槽 0 那件拿回背包（${e.message}）—— 关窗口时服务端会把它退回背包，用 mc_inventory 确认一下`
+    note = `没能自动把槽 0 那件拿回背包（${e.message}）—— 关窗口时服务端会把它退回背包，用 mc_self 确认一下`
   }
   try { if (typeof b.closeWindow === 'function') await t(Promise.resolve(b.closeWindow(table)), 'act', '关掉附魔台') } catch { /* 关不掉不影响结果 */ }
 
@@ -648,7 +648,7 @@ export async function enchantTable (self, args = {}, ctx = {}) {
     ...(enText ? { enchants: enText } : {}),
     ...(note ? { note } : {}),
     text: `🔮 附魔完成（选项 ${option}）：${newItem?.name ?? target ?? '那件'}`
-      + (enText ? ` → **${enText}**` : '（没读回附魔属性，用 mc_inventory 看一眼那件）')
+      + (enText ? ` → **${enText}**` : '（没读回附魔属性，用 mc_self 看一眼那件）')
       + (lapis ? '\n槽 1 剩的青金石在关窗时已退回背包。' : ''),
   }
 }
@@ -669,7 +669,7 @@ function findWorkBlock (b, args, re, label, radius = 4) {
     return blk
   }
   const blk = b.findBlock({ matching: (x) => ok(x?.name), maxDistance: radius })
-  if (!blk) throw new Error(`附近 ${radius} 格内没有${label} —— 先 mc_scan 找一座，或者把 x/y/z 给我`)
+  if (!blk) throw new Error(`附近 ${radius} 格内没有${label} —— 先 mc_blocks 找一座，或者把 x/y/z 给我`)
   return blk
 }
 
@@ -768,7 +768,7 @@ export async function anvilTable (self, args = {}, ctx = {}) {
   const s1 = pick1?.slot ?? heldSlot()
   if (s1 == null) {
     throw new Error(want1
-      ? `背包里没有 ${want1} —— 要放进铁砧的东西得在手边（名字写对没：mc_inventory 看一眼）`
+      ? `背包里没有 ${want1} —— 要放进铁砧的东西得在手边（名字写对没：mc_self 看一眼）`
       : '铁砧槽 0 是空的：先用手拿着要处理的东西，或者点名 item（如 item:"iron_pickaxe"）')
   }
   const first = table.slots[s1]
@@ -795,7 +795,7 @@ export async function anvilTable (self, args = {}, ctx = {}) {
       at, action, from: first?.name ?? null, name: newName, got: got?.name ?? null, renamed: Boolean(got),
       ...(err ? { note: `服务端那边报了 ${err.message}，但背包里确实有一件叫「${newName}」的` } : {}),
       text: `⚒️ 铁砧改名：${first?.name ?? '那件'} → **「${newName}」**`
-        + (got ? `（背包里那件是 ${got.name}）` : '（没能从背包里复核到，用 mc_inventory 看一眼）'),
+        + (got ? `（背包里那件是 ${got.name}）` : '（没能从背包里复核到，用 mc_self 看一眼）'),
     }
   }
 
@@ -836,9 +836,9 @@ export async function anvilTable (self, args = {}, ctx = {}) {
   return {
     at, action, first: first?.name ?? null, second: want2, combined: merged, got: desc,
     ...(merged ? {} : { why: `件数 ${sig0.n}→${sig1.n}、总剩余耐久 ${sig0.dur}→${sig1.dur}：看不出合并真的发生了（服务端可能拒了：材料对不上 / 超过 39 级）` }),
-    ...(got ? {} : { note: '合并命令发出去了，但没能在背包里复核到结果 —— 用 mc_inventory 看一眼' }),
+    ...(got ? {} : { note: '合并命令发出去了，但没能在背包里复核到结果 —— 用 mc_self 看一眼' }),
     text: `⚒️ 铁砧合并完成：${first?.name ?? ''} + ${want2}`
-      + (desc ? ` → **${desc}**` : '（没复核到结果，用 mc_inventory 看一眼）'),
+      + (desc ? ` → **${desc}**` : '（没复核到结果，用 mc_self 看一眼）'),
   }
 }
 
@@ -873,7 +873,7 @@ export async function smithingTable (self, args = {}, ctx = {}) {
   const baseSlot = base?.slot ?? heldSlot()
   if (baseSlot == null) {
     throw new Error(wantBase
-      ? `背包里没有 ${wantBase}（底座）—— 名字写对没：mc_inventory 看一眼`
+      ? `背包里没有 ${wantBase}（底座）—— 名字写对没：mc_self 看一眼`
       : '锻造台底座槽是空的：先用手拿着要升级/纹饰的那件，或者点名 item（如 item:"diamond_chestplate"）')
   }
   // 附加材料
@@ -940,7 +940,7 @@ export async function smithingTable (self, args = {}, ctx = {}) {
     at, base: base?.item?.name ?? wantBase ?? null, addition: wantAdd, template: tpl.item.name,
     smithed: true, got: desc, inBag,
     ...(takeErr || !inBag
-      ? { note: `成品是 ${desc}，但${takeErr ? `没拿回背包（${takeErr.message}）` : '没能从背包里复核到'} —— 关窗口时服务端会把它退回背包，用 mc_inventory 确认一下` }
+      ? { note: `成品是 ${desc}，但${takeErr ? `没拿回背包（${takeErr.message}）` : '没能从背包里复核到'} —— 关窗口时服务端会把它退回背包，用 mc_self 确认一下` }
       : {}),
     text: `🔨 锻造台完成：${base?.item?.name ?? wantBase} + ${wantAdd}（模板 ${tpl.item.name}）→ **${desc}**`,
   }

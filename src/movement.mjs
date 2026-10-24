@@ -48,7 +48,7 @@ function recoverCtxOf (self, ctx) {
  * 把走路目标的 y 收到底面：那个 y **站不住**时，往下找最近能站的一层。
  *
  * 🔴 为什么必须有（用户 2026-10-13 实机报的"搭路一直搭到空气上"）：
- *    AI 给的走路目标 y 常常是**半空**——`mc_map`/`mc_scan` 报的"地表高度"在树林里是树冠顶、
+ *    AI 给的走路目标 y 常常是**半空**——`mc_map`/`mc_blocks` 报的"地表高度"在树林里是树冠顶、
  *    在山上是最高的石头，从实体/玩家那抄来的 y 也可能是对方站在高处时的值。
  *    `goals.GoalNear` 是按**三维距离**算的，于是 pathfinder 为了"离那个 y 近一点"，
  *    会一路**垫方块把自己顶上去**（返回值里的 `pillared`）——玩家看到的就是"往空气上搭"。
@@ -285,7 +285,7 @@ export async function swimUp (self, { hold = 3_000 } = {}, ctx = {}) {
       ? {
           remaining: 1,
           hint: air != null && air >= 18
-            ? '已经浮到水面、气在恢复 —— 接着用 mc_move 往岸上走（不知道岸在哪就先 mc_scan 找干燥方块）'
+            ? '已经浮到水面、气在恢复 —— 接着用 mc_move 往岸上走（不知道岸在哪就先 mc_blocks 找干燥方块）'
             : '还在水里 —— 再叫一次 mc_move{"mode":"swim"} 接着上浮；水挖不掉，别去 mc_dig 水',
         }
       : { note: '已经出水了' }),
@@ -770,7 +770,7 @@ async function walkToOnce (self, target, { arrive = 1.6, budget = self.cfg.moveB
   //    先直接游；上了岸、还有时间，再把剩下的路交给 pathfinder 走完。
   //    ⚠️ 判据用 `#inWaterNow`：`entity.isInWater` 在泡水柱里会读出 undefined（实机踩过）。
   /* 🔴 2026-10-22 第二次实机（另一个会话 @ (8,18,2)：**站在实心地面上、泡在 1 格深的水里**）：
-   *    mc_diag 明确报 `onGround:true, inWater:true`，可泳路径连跑 4.6s 是 `moved:0 / movedVertical:0`、
+   *    mc_probe 明确报 `onGround:true, inWater:true`，可泳路径连跑 4.6s 是 `moved:0 / movedVertical:0`、
    *    换方向、强制上浮（fixups:2）全无效 —— 因为人本来就是站着的，游泳控制器按"浮着"那套推，
    *    一点位移都出不来。站在实心地上时**交给 pathfinder 走**（浅水它本来就会蹚过去）。
    *    只有真的悬在水里（onGround 不是 true）才走游泳。 */
@@ -3209,7 +3209,7 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
           ...roadInfo(), ...moveInfo(), ...fellInfo(end),
           hint: emptyNoPath
             ? `${fellNote(end)}寻路**没路可走**（被墙 / 水 / 悬崖挡住，或目标在实心方块里）：离目标还有 ${left.toFixed(1)} 格。`
-              + '先 `mc_scan` 看挡路的是什么：是方块就 `mc_act{mode:"break"}` 挖开；'
+              + '先 `mc_blocks` 看挡路的是什么：是方块就 `mc_act{mode:"break"}` 挖开；'
               + '**是沟/缺口就 `mc_act{mode:"bridge"}`**（寻路插件不会水平搭桥，只会报没路）——'
               + '朝对岸那一格铺过去（x/y/z 给对岸**脚下一层**的坐标）。换个目标点再叫 mc_move 也一样走不通。'
             : `寻路插件报的"到了"**不是我这次的目标**（另一次寻路到点时顺手把我这次 goto 一起 resolve 掉了）`
@@ -3446,12 +3446,12 @@ export async function walkPathfinder (self, target, { arrive = 1.6, budget = sel
                    + '照实机的办法来：先 `mc_act {mode:"break",x:…,y:…,z:…}` 挖掉**脚前那一格**，再用同样方式挖掉它**头顶那一格**，然后叫 `mc_move` 走一步。'
                  : '')
                + `—— **别原地重试了**（已经替你换过 ${repathCount} 次策略都没用）：把长路**拆成几段**，`
-               + '先走到中间一个能站住的点、再走下一段；或者用 `mc_scan` 看挡在中间的是什么（墙 / 水 / 栅栏 / 半砖）。'
+               + '先走到中间一个能站住的点、再走下一段；或者用 `mc_blocks` 看挡在中间的是什么（墙 / 水 / 栅栏 / 半砖）。'
                + '　要是"脚下明明没东西却还是走不动"，可能是我这边的世界和服务端对不上（客户端预测的方块缓存）——'
                + '走远 32 格再回来让区块重发。'
                + DESYNC_HINT
              : noProgress && !timeUp
-             ? '—— **是真没走通**（一格没挪、也没靠近）：先 `mc_act {mode:"jump"}` 蹦一下（可能是卡在方块里 / 台阶上），再 `mc_scan` 看脚下和目标那格是什么；换个近一点的目标点通常更快。'
+             ? '—— **是真没走通**（一格没挪、也没靠近）：先 `mc_act {mode:"jump"}` 蹦一下（可能是卡在方块里 / 台阶上），再 `mc_blocks` 看脚下和目标那格是什么；换个近一点的目标点通常更快。'
                   + '　要是"脚下明明没东西却还是走不动"，可能是我这边的世界和服务端对不上（客户端预测的方块缓存）——'
                   + '走远 32 格再回来让区块重发。'
                   + DESYNC_HINT

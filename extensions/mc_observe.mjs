@@ -60,7 +60,7 @@ async function atlasForRender () {
 
 export const name = 'mc_observe'
 
-/** 动作类工具：会移动机器人或改变世界的。只读类（mc_status/mc_scan/mc_inventory…）不门禁。 */
+/** 动作类工具：会移动机器人或改变世界的。只读类（mc_status/mc_blocks/mc_self…）不门禁。 */
 const DEFAULT_GATED = [
   'mc_move', 'mc_act', 'mc_dig', 'mc_build', 'mc_give', 'mc_command', 'mc_sequence', 'mc_furnace', 'mc_chest',
 ]
@@ -180,8 +180,8 @@ export async function apply (api) {
           + '）手上没有够新的图会被**直接拒绝**'
           + `（让你先调 mc_observe）。看一眼后最多连着做 ${maxActions} 个动作${spanText}，超了再看一次。\n`
           + '嫌紧可以改（立即生效）：写 `.dsh-mc-agent/view.json`，如 {"maxActions":8} 或 {"gate":false}。\n'
-        : '👁 **什么时候看，你自己定**：只读查询（mc_status / mc_inventory / '
-          + 'mc_scan…）不用看；**动手前先看一眼**最划算 —— 挖/放/拆/建、走路找路、'
+        : '👁 **什么时候看，你自己定**：只读查询（mc_status / mc_self / '
+          + 'mc_blocks…）不用看；**动手前先看一眼**最划算 —— 挖/放/拆/建、走路找路、'
           + '确认玩家或怪在哪、看不清、被卡住；一张图够做一段；'
           + '环境变了（走远/天黑/挨打）就再看一眼。\n')
       + (gateEnabled
@@ -324,7 +324,7 @@ export async function apply (api) {
       const stamp = new Date(nowMs).toTimeString().slice(0, 8)
 
       /* 背包（紧凑）：同名合计、只列最多的 10 样 —— 统一感知接口里要"背包"，
-       * 这样普通寻路/换工具/整理背包不用再单独调一次 `mc_inventory`。 */
+       * 这样普通寻路/换工具/整理背包不用再单独调一次 `mc_self`。 */
       let inv = null
       try {
         const all = bot.inventory.items()

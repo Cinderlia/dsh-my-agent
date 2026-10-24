@@ -265,7 +265,7 @@ export function waterExitSearch (b, { feet = null, radius = WATER_RADIUS, up = W
        *   两种完全不同的情况：「看遍了，真没有」和「有块地方压根没加载，我没看」。前者该换方向，
        *   后者该先靠近 / 等加载。分开说，别让 AI 拿着半张地图下结论。 */
       note: unknownCells > 0
-        ? `半径 ${radius} 格 / 上下 ${up}+${down} 格以内（翻了 ${scanned} 格）没找到出口，而且有 ${unknownCells} 格因为**区块没加载**根本没看到 —— 这不算"确认没有出口"。先游回自己认得的地方，或者叫我用 mc_scan 看一眼再定`
+        ? `半径 ${radius} 格 / 上下 ${up}+${down} 格以内（翻了 ${scanned} 格）没找到出口，而且有 ${unknownCells} 格因为**区块没加载**根本没看到 —— 这不算"确认没有出口"。先游回自己认得的地方，或者叫我用 mc_blocks 看一眼再定`
         : `半径 ${radius} 格 / 上下 ${up}+${down} 格以内（翻了 ${scanned} 格）没找到任何出口 —— **别在原地一直游**，换个方向再叫我一次`,
     }
   }

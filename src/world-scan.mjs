@@ -11,7 +11,7 @@
  *   · `entitiesNear(b, …)`   —— 附近有谁：名字 / 坐标 / 距离 / 上下差 / 血量 / 是不是远程。
  *
  * 🔴 `core.mjs` 里留了**同名薄包装**（`scan()` / `entities()`），因为它们俩是**公开方法** ——
- *    调用方（`index.js` 的 `mc_scan`、`extensions\mc_observe.mjs` 的"程序检测到"、套件）用的是
+ *    调用方（`index.js` 的 `mc_blocks`、`extensions\mc_observe.mjs` 的"程序检测到"、套件）用的是
  *    `bot.scan()` / `bot.entities()`，而不是"`core.mjs` 导出了这个名字"，re-export 救不了方法。
  *    薄包装里照样先 `requireBot()`，保持"不在线就抛"的语义。
  */

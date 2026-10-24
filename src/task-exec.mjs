@@ -54,6 +54,8 @@ export const OP_TOOL = {
   smelt: 'mc_furnace', smelting: 'mc_furnace',
   move: 'mc_move', goto: 'mc_move', travel: 'mc_move',
   store: 'mc_chest', take: 'mc_chest', chest: 'mc_chest',
+  /* 折叠后这两个工具名不再对外暴露，但 `TOOL_HANDLERS` 里仍留着它们的实现
+   * （见 index.js 的 asTool 折叠分支）—— 任务执行器继续用老名字调，参数不用改。 */
   scan: 'mc_scan', status: 'mc_status', observe: 'mc_observe',
   inventory: 'mc_inventory',
   equip: 'mc_act', attack: 'mc_act', place: 'mc_act', break: 'mc_act',
@@ -294,7 +296,7 @@ export class TaskExecutor {
               return {
                 ok: false, manual: true, rounds, task: brief(), lines,
                 reason: '步骤都走完了，但现场复核目标还没达成',
-                hint: '先 mc_observe / mc_inventory 复核；确实没达成就在 mc_task {action:"plan"} 里补一步，或者自己动手做完再 mc_task {action:"done"}',
+                hint: '先 mc_observe / mc_self 复核；确实没达成就在 mc_task {action:"plan"} 里补一步，或者自己动手做完再 mc_task {action:"done"}',
               }
             }
             this.ledger.finish(t.taskId, { ok: true, note: '步骤都走完了（目标没法自动复核，按步骤算完成）' })
@@ -406,7 +408,7 @@ export class TaskExecutor {
           lines.push(`❓ ${step.id} 结果未知（时间到或被抢占 —— 服务器可能已经做了）`)
           return {
             ok: false, outcome: 'unknown', rounds, task: brief(), lines,
-            hint: '先 mc_observe / mc_inventory 复核现场，再 mc_task {action:"run"} 接着做（别直接重做）',
+            hint: '先 mc_observe / mc_self 复核现场，再 mc_task {action:"run"} 接着做（别直接重做）',
           }
         }
 

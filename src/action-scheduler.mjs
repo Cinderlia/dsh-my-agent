@@ -13,7 +13,7 @@
  *   · 默认模式 `observe-only`：冲突**只记日志 + 记在返回值里**，动作照旧执行；
  *   · **不许碰** `interruptMove()` / `_moveGen` / `_ctrlLease` —— 抢占仍然只有 `interruptMove` 一条路，
  *     这一层不自己造第二套"移动代次"（用户点名的第 4 条）；
- *   · 只读工具（`mc_observe` / `mc_status` / `mc_inventory` / `mc_scan` / `mc_map` …）**根本不进来**
+ *   · 只读工具（`mc_observe` / `mc_status` / `mc_self` / `mc_blocks` / `mc_map` …）**根本不进来**
  *     （`resourceSpecOf()` 认不出就不包）—— 读坐标不该阻塞寻路。
  *
  * ─────────────────────────── 为什么要有它 ───────────────────────────
@@ -122,7 +122,7 @@ export function modeFromEnv () {
 
 /** `mc_act` 几个动作共用一个工具名 ⇒ 按 `mode` 分资源。
  *  2026-10-22：`shoot` / `attack` / `prep` / `enchant` / `anvil` / `smithing` 已拆成独立工具
- *  （`mc_shoot` / `mc_attack` / `mc_prep` / `mc_station`），资源登记跟着搬到 `TOOL_SPEC`。 */
+ *  （`mc_shoot` / `mc_attack` / `mc_probe` / `mc_station`），资源登记跟着搬到 `TOOL_SPEC`。 */
 const ACT_MODE_RES = {
   look: [],
   toward: ['movement'],
@@ -160,7 +160,7 @@ export const TOOL_SPEC = {
   /* 射箭：换弓（背包）+ 拉弓瞄准（交互），射完还要转头找下一个目标 */
   mc_shoot: { resources: ['combat', 'inventory', 'interaction'] },
   /* 只读自查（数装备/等级/眼），跟 mc_status 一类，不占资源 */
-  mc_prep: { resources: [] },
+  mc_probe: { resources: [] },
   mc_station: { resources: ['inventory', 'interaction'] },
   mc_fish: { resources: ['interaction', 'inventory'] },
   /* 台账动作（list/get/plan/step/…）是纯记账，不占资源；只有 `run` 真的会动手，
@@ -301,7 +301,7 @@ export class ActionScheduler {
     return out
   }
 
-  /** 给 `mc_diag` / 日志看的一眼视图 */
+  /** 给 `mc_probe` / 日志看的一眼视图 */
   snapshot () {
     return {
       mode: this.mode,
@@ -316,7 +316,7 @@ export class ActionScheduler {
     }
   }
 
-  /** 多行文本（`mc_diag` / 日志用） */
+  /** 多行文本（`mc_probe` / 日志用） */
   describe () {
     const list = this.list()
     const extra = [

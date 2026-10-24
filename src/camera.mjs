@@ -123,6 +123,6 @@ export async function lookAt (b, { x, y, z, who = null } = {}) {
     yaw: Number(b.entity.yaw.toFixed(3)), pitch: Number(b.entity.pitch.toFixed(3)),
     note: (ent ? '已经转头了（对着当时的坐标）—— 会动的东西转完头就已经不在那儿了：'
       + '要打它就用 mc_act{shoot,who:…}（那一刻实时重测），别拿 lookingAt 当目标现在的位置。' : '已经转头了')
-      + '（包由物理循环发出，服务端不回执；没转过去就再叫一次或先 mc_diag 看控制位）',
+      + '（包由物理循环发出，服务端不回执；没转过去就再叫一次或先 mc_probe 看控制位）',
   }
 }
