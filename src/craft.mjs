@@ -223,10 +223,28 @@ export async function runCraft (self, req, ctx = {}) {
 
     /* ── ④ 执行合成（切片） ── */
     if (st.phase === 'craft') {
-      const plan = planCraft(b, req.itemId, req.count, st.table)
+      /* 🔴 用工作台之前**复核它还在不在**：坐标可能来自过期扫描（方块被拆/没加载），
+       *    直接拿去 activateBlock 会因为 block 是 undefined 崩在 mineflayer 里（实测）。 */
+      /* 🔴 planCraft / runPlan 的 table 参数要的是**方块对象**（不是 {x,y,z}）——
+       *    传坐标会在 mineflayer 的 craft 里 `block.position.offset` 崩掉（实测）。
+       *    这里统一转成 block，并顺手复核它还在不在。 */
+      let tableBlock = null
+      if (st.table) {
+        tableBlock = b.blockAt(new Vec3(st.table.x, st.table.y, st.table.z))
+        if (!tableBlock || !String(tableBlock.name).includes('crafting_table')) {
+          notes.push(`工作台 ${st.table.x},${st.table.y},${st.table.z} 不在了（${tableBlock?.name ?? '未加载'}），重新找`)
+          st.table = null
+          tableBlock = null
+          st.phase = 'table'
+          continue
+        }
+      }
+      const plan = planCraft(b, req.itemId, req.count, tableBlock)
       if (!plan.ok) { st.phase = 'plan'; continue }
       try {
-        await runPlan(b, plan.steps, st.table, CRAFT_SLICE_MS, notes, () => 0)
+        /* runPlan 的第二个参数是**整个 plan 对象**（它自己读 plan.steps）——传 steps 会炸 */
+        /* msLeftFn 要给**剩余毫秒**，给 0 会被当成"一点时间都没有"直接空转（实测） */
+        await runPlan(b, plan, tableBlock, CRAFT_SLICE_MS, notes, () => CRAFT_SLICE_MS)
         const got = have(b, req.itemId)
         if (got >= req.count) { st.phase = 'cleanup'; continue }
         return {
