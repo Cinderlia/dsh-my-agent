@@ -274,12 +274,22 @@ export async function runSmelt (self, req, ctx = {}) {
       continue
     }
 
-    /* ── ③ 等烧完 ── */
+    /* ── ③ 等烧完（用户 2026-10-25：bot 要有耐心）──
+     *    每个物品 10 秒（200 tick），再留 6 秒预热。之前只等 4 秒就开始取，
+     *    结果一件都没烧好，又回去装料，循环到死。 */
     if (st.phase === 'wait') {
       const f = st.furnace
       const blk = f ? b.blockAt(new Vec3(f.x, f.y, f.z)) : null
       if (!blk) { st.phase = 'find'; continue }
-      await new Promise((r) => setTimeout(r, Math.min(4000, 800 + req.count * 1200)))
+      const total = Math.min(180_000, 6_000 + Math.max(1, req.count) * 10_500)
+      st.waitUntil = st.waitUntil ?? (Date.now() + total)
+      const left = st.waitUntil - Date.now()
+      if (left > 0) {
+        log(`等熔炉烧完：还要 ${Math.ceil(left / 1000)} 秒`)
+        await new Promise((r) => setTimeout(r, Math.min(left, 12_000)))
+        continue
+      }
+      st.waitUntil = null
       st.phase = 'take'
       continue
     }

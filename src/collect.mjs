@@ -78,6 +78,19 @@ export function familyOf (name) {
   return null
 }
 
+/**
+ * 挖这个方块**实际掉什么**（背包里要数的名字）。
+ * 🔴 2026-10-25 实机：`collect iron_ore` 挖掉后掉的是 `raw_iron`，
+ *    但校验一直按 `iron_ore` 数背包 ⇒ 永远"没捡到"⇒ 换下一个目标继续挖（多挖十几块）。
+ */
+export function productOf (blockName) {
+  const n = String(blockName ?? '').toLowerCase()
+  for (const [item, blocks] of Object.entries(ITEM_SOURCE)) {
+    if (Array.isArray(blocks) && blocks.includes(n)) return item
+  }
+  return n
+}
+
 /** 目标名的"同族物品名"列表（含自己） */
 export function itemCandidates (name, registry) {
   const n = String(name ?? '').trim().toLowerCase()
@@ -155,7 +168,8 @@ export function planCollect (self, args = {}) {
   }
   /* 生物掉落：物品不是方块、但能由某个生物掉落 → 走 attack（不是"合成品"） */
   return {
-    ok: true, craft: false, name, block: block ?? null, blocks: candidates, count, mode, creative,
+    ok: true, craft: false, name, block: block ?? null, blocks: candidates,
+    product: productOf(block ?? name), count, mode, creative,
     radius: COLLECT_RADIUS, reach: DIG_REACH,
     ...(mobs.length ? { mobs } : {}),
     strategy: creative ? 'give' : block ? 'dig' : mobs.length ? 'attack' : 'dig',
@@ -389,7 +403,7 @@ export async function runCollect (self, plan, ctx = {}) {
           if (!inserted) return fail('插入攻击任务失败（队列状态不对）')
           steps.push(`插入攻击 ${mob}`)
           st.phase = 'verify'
-          st.before = familyCount(b, plan.name)
+          st.before = familyCount(b, plan.product ?? plan.name)
           return { yielded: true, text: `⏸ 已插入攻击任务（打 ${mob}），collect 挂起等待掉落` }
       }
       const cands = Array.isArray(plan.blocks) && plan.blocks.length ? plan.blocks : [plan.block]
@@ -468,7 +482,7 @@ export async function runCollect (self, plan, ctx = {}) {
         st.phase = 'approach'
         continue
       }
-      st.before = familyCount(b, plan.name)
+      st.before = familyCount(b, plan.product ?? plan.name)
       try {
         /* 8 秒还没挖完 → 多半是服务端没回 blockUpdate（假死/被拒），别无限等 */
         await Promise.race([
@@ -487,25 +501,25 @@ export async function runCollect (self, plan, ctx = {}) {
     }
 
     if (st.phase === 'verify') {
-      let after = familyCount(b, plan.name)
+      let after = familyCount(b, plan.product ?? plan.name)
       const deadline = Date.now() + PICKUP_WAIT_MS
       const t0v = Date.now()
       while (Date.now() < deadline) {
         await sleep(200)
-        after = familyCount(b, plan.name)
+        after = familyCount(b, plan.product ?? plan.name)
         if (after > st.before) break
         /* 🔴 用户 2026-10-25："我怀疑其实 bot 捡起来了，但是它以为自己没捡起来"。
          *    掉落物实体**消失**（被吸走/被捡）也该算捡到了 —— 背包同步常慢一两秒，
          *    只盯背包会误判成"没捡到"，然后去挖下一个，结果多挖。 */
         if (Date.now() - t0v > 1500) {
           const t = st.target
-          const left = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6)
+          const left = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.product ?? plan.name)
           if (!left.length) {
             st.got += 1
             steps.push('掉落物实体已消失 → 视为已捡起')
             st.phase = 'find'
             st.toolRequested = false
-            st.before = familyCount(b, plan.name)
+            st.before = familyCount(b, plan.product ?? plan.name)
             after = st.before
             break
           }
@@ -527,7 +541,7 @@ export async function runCollect (self, plan, ctx = {}) {
       st.pickupTries = (st.pickupTries ?? 0) + 1
       if (st.pickupTries > 4) return fail('挖掉了但一直捡不到（已试着去捡 4 次）')
       const t = st.target
-      const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.name)
+      const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.product ?? plan.name)
       if (!drops.length) {
         /* 掉落物没了（被抢/掉岩浆/没生成）：**不算失败** —— 回去挖下一个补上。
          * 只有"附近全挖完还不够"才失败（见上面 find 阶段）。 */
@@ -551,7 +565,7 @@ export async function runCollect (self, plan, ctx = {}) {
       if (!inserted) return fail('插入捡取任务失败（队列状态不对）')
       steps.push('插入导航去捡掉落物')
       st.phase = 'verify'
-      st.before = familyCount(b, plan.name)
+      st.before = familyCount(b, plan.product ?? plan.name)
       return { yielded: true, text: '⏸ 已插入 navi 去捡掉落物，collect 挂起等待' }
     }
 

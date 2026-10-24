@@ -19,10 +19,9 @@ import Vec3 from 'vec3'
 import { isAir } from './block-names.mjs'
 
 /** 容器方块（有物品格、能开的那种） */
-export const CONTAINER_BLOCKS = [
-  'chest', 'trapped_chest', 'barrel', 'furnace', 'blast_furnace', 'smoker',
-  'dispenser', 'dropper', 'hopper', 'shulker_box',
-]
+/* 🔴 熔炉不算存储容器：mineflayer 的 openContainer 白名单里没有 furnace（要用 openBlock），
+ *    当成箱子去开只会报 containerToOpen is neither a block nor an entity。 */
+export const CONTAINER_BLOCKS = ['chest', 'trapped_chest', 'barrel', 'shulker_box']
 /** 交互距离：专家用户定的 4.5 格 */
 export const CONTAINER_REACH = 4.5
 
