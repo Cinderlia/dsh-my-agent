@@ -346,7 +346,13 @@ export async function runSmelt (self, req, ctx = {}) {
         const win = await b.openBlock(blk)
         try {
           const before = have(b, req.itemId)
-          await win.withdraw(req.itemId, null, Math.min(req.count - before, 64))
+          /* 熔炉输出槽是 2：先从这里拿，别从输入槽把原料当成品拿走 */
+          const out = win.slots?.[2]
+          if (out && out.type === req.itemId) {
+            await win.withdraw(req.itemId, null, Math.min(req.count - before, out.count))
+          } else {
+            await win.withdraw(req.itemId, null, Math.min(req.count - before, 64))
+          }
           await new Promise((r) => setTimeout(r, 300))
           const after = have(b, req.itemId)
           if (after > before) notes.push(`取出 ${req.itemName} ×${after - before}`)

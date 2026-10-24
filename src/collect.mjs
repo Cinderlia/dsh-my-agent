@@ -360,6 +360,15 @@ export async function runCollect (self, plan, ctx = {}) {
   /* ①' 箱子也翻过了、还是找不到 → 合成品就转 craft（用户 2026-10-25：先箱子，没有不报错，再转 craft）
    *    用户 2026-10-25："collect 铁锭 → 合成品，转交 craft 铁锭。" */
   if (plan.craft) {
+    /* 🔴 先看背包：已经有足够的量就直接完成，不要又去开一炉。
+     *    （实测：背包里已有 9 个铁锭，collect 还是转 craft 又烧了一炉。） */
+    const haveNow = familyCount(b, plan.name)
+    if (haveNow >= plan.count) {
+      return {
+        ok: true, collected: haveNow, name: plan.name, ms: Date.now() - t0, via: 'inventory',
+        text: `✅ 背包里已经有 ${plan.name} ×${haveNow}（要 ${plan.count}），不用再收集/合成`,
+      }
+    }
     if (!board || !job) throw new Error('内部错误：没有队列上下文，无法转交 craft')
     const { resolveCraftRequest, runCraft } = await import('./craft.mjs')
     const req = resolveCraftRequest(self, { name: plan.name, count: plan.count })
