@@ -16,13 +16,10 @@
  *                        ▲
  *                     interrupt
  * ========================================================================== */
-
 /** 介入冷却：两次介入之间至少要隔这么久（用户 2026-10-24：「介入模式加个冷却时间」） */
 export const INTERRUPT_COOLDOWN_MS = 60_000
-
 let seq = 0
 const nextId = () => `job-${Date.now().toString(36)}-${(++seq).toString(36)}`
-
 export class JobBoard {
   /**
    * @param {Object} deps
@@ -52,7 +49,6 @@ export class JobBoard {
     this.lastInterruptAt = 0
     this.lastResolvedAt = 0
   }
-
   /**
    * 现在能不能介入？冷却期内一律不行 —— 用户要求「加个冷却时间，同时不鼓励 agent 介入」：
    * 反复 interrupt/resume 会把队列搅成筛子，而且 agent 本来就不该管队列。
@@ -64,12 +60,24 @@ export class JobBoard {
     const left = base + this.interruptCooldownMs - now
     return left > 0 ? { ok: false, waitMs: left } : { ok: true }
   }
-
   /* ── 被动工具注册：`mc_stop` 会把它们重置 ── */
   registerPassiveReset (name, fn) {
     if (typeof fn === 'function') this.passiveResets.set(String(name), fn)
   }
-
+  /**
+   * 紧凑的队列快照文本（用户 2026-10-25：**队列随快照一起展示**）。
+   * 给工具返回 / 任务报告末尾附一行，agent 不用另外查就知道队伍长什么样。
+   */
+  snapshotText () {
+    const s = this.snapshot()
+    const lines = []
+    const stateText = s.state === 'intervening' ? '已冻结（介入中）' : s.state === 'running' ? '执行中' : '空闲'
+    lines.push(`📋 队列[${stateText}]`)
+    if (s.current) lines.push(`  ▶ ${s.current.id}（${s.current.summary}）`)
+    if (s.queue.length) lines.push('  ⏳ ' + s.queue.map((j) => `${j.id}（${j.summary}）`).join(' → '))
+    if (!s.current && !s.queue.length) lines.push('  （空）')
+    return lines.join('\n')
+  }
   /** 队列快照（给工具返回 / 宿主判据用） */
   snapshot () {
     return {
@@ -81,11 +89,9 @@ export class JobBoard {
       busy: Boolean(this.current) || this.queue.length > 0,
     }
   }
-
   brief (j) {
     return { id: j.id, kind: j.kind, summary: j.summary, status: j.status, startedAt: j.startedAt, endedAt: j.endedAt }
   }
-
   /**
    * 入队并（可能）立刻开始。**立刻返回**，不等执行。
    * @param {Object} spec {kind, agentId, summary, plan, run(signal, job)=>Promise<{text,data}>}
@@ -103,7 +109,6 @@ export class JobBoard {
     this.changed()
     return { ok: true, job, position: this.queue.indexOf(job) + (this.current ? 1 : 0), started: this.current === job }
   }
-
 /** 造一个任务对象（enqueue / yieldFor 共用） */
   makeJob ({ kind, agentId, summary, plan = null, run = null, state = undefined }) {
     return {
@@ -122,7 +127,6 @@ export class JobBoard {
       controller: typeof AbortController === 'function' ? new AbortController() : null,
     }
   }
-
   /**
    * **插队 + 挂起自己**（用户 2026-10-24 定的核心机制）。
    *
@@ -151,7 +155,6 @@ export class JobBoard {
     this.pump()
     return true
   }
-
   /** 队列推进：没在跑的、没冻结的、有排队的 → 启动下一个 */
   pump () {
     if (this.current || this.state === 'frozen' || this.state === 'intervening') return
@@ -170,9 +173,7 @@ export class JobBoard {
       .then((r) => this.finish(job.id, { ...(r ?? {}), ok: r?.ok !== false }))
       .catch((e) => this.fail(job.id, e))
   }
-
   get (id) { return [this.current, ...this.queue, ...this.done].find((j) => j?.id === String(id ?? '')) ?? null }
-
   finish (id, { text = '', data = null, ok = true } = {}) {
     const job = this.current
     if (!job || job.id !== String(id)) return false
@@ -187,7 +188,6 @@ export class JobBoard {
     this.changed()
     return true
   }
-
   fail (id, err) {
     const job = this.current
     if (!job || job.id !== String(id)) return false
@@ -202,7 +202,6 @@ export class JobBoard {
     this.changed()
     return true
   }
-
   /**
    * **转交**（用户 2026-10-24）：当前任务把活交给另一个任务，**自己退队**、不再恢复。
    *
@@ -224,7 +223,6 @@ export class JobBoard {
     this.pump()
     return true
   }
-
   /**
    * **介入**（用户第 ⑤ 条）：冻结队列 + 停队首 + 进入 intervening（宿主据此只留感知 + 这个原语）。
    * @returns {{stopped:Object|null, queued:number}}
@@ -247,7 +245,6 @@ export class JobBoard {
     this.changed()
     return { ok: true, stopped: stopped ? this.brief(stopped) : null, queued: this.queue.length }
   }
-
   /**
    * 介入之后的选择（**唯一**允许的四种；不允许直接改队列）。
    * @param {'resume'|'retry'|'skip'|'cancel'} action
@@ -281,7 +278,6 @@ export class JobBoard {
     this.changed()
     return { ok: true, action: act, detail }
   }
-
   /**
    * **stop**（用户第 ⑥ 条）：停当前 + 清空队列 + 重置被动工具。
    * @returns {{stopped:Object|null, dropped:number, resets:string[]}}
@@ -308,7 +304,6 @@ export class JobBoard {
     this.log(`stop：停了 ${stopped?.id ?? '无'}，清掉 ${dropped} 个排队，重置 ${resets.length} 个被动工具`)
     return { stopped: stopped ? this.brief(stopped) : null, dropped, resets }
   }
-
   /** 给 agent 的完成报告（唯一推送口） */
   notify (job, text) {
     const body = [
@@ -320,12 +315,10 @@ export class JobBoard {
     try { ok = Boolean(this.inject(job.agentId, body)) } catch (e) { this.log(`注入任务报告失败：${e?.message ?? e}`) }
     if (!ok) this.log(`任务 ${job.id} 的报告没能投给 agent（会话不在了？）：${text.slice(0, 80)}`)
   }
-
   archive (job) {
     this.done.unshift(job)
     if (this.done.length > this.keep) this.done.length = this.keep
   }
-
   changed () {
     try { this.onStateChange(this.snapshot()) } catch (e) { this.log(`队列状态回调失败：${e?.message ?? e}`) }
   }

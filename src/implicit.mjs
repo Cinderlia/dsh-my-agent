@@ -167,11 +167,20 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
     if (!item) return { ok: false, text: `❌ 不认识的物品 ${plan.item}` }
     let need = plan.count
     // 容器里的物品：按名字匹配（槽位里可能有多个同类）
+    /* 🔴 用户 2026-10-25：「collect 从箱子里拿物品，不要小家子气，直接整组整组拿，
+     *    优先拿不到堆叠上限的组，不够再拿满组。」 */
     const slots = win.slots ?? []
-    for (let i = 0; i < slots.length && need > 0; i++) {
-      const it = slots[i]
+    const stackMax = item.stackSize ?? 64
+    const groups = []
+    for (const it of slots) {
       if (!it || it.type !== item.id) continue
-      const take = Math.min(need, it.count)
+      groups.push({ count: it.count, full: it.count >= stackMax })
+    }
+    // 先零头（不满一组），再满组
+    groups.sort((a, c) => Number(a.full) - Number(c.full) || a.count - c.count)
+    for (const g of groups) {
+      if (need <= 0) break
+      const take = Math.min(need, g.count)
       await win.withdraw(item.id, null, take)
       got.push(take)
       need -= take

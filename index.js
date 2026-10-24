@@ -3066,7 +3066,7 @@ export function apply(ctx, rawConfig) {
         plan,
         route,
         ...(routeError ? { routeError } : {}),
-        text: naviReportText(plan, route, job.id, { started: queued.started, position: queued.position }) + (routeError ? `\n⚠️ ${routeError}` : ''),
+        text: naviReportText(plan, route, job.id, { started: queued.started, position: queued.position }) + '\n\n' + jobBoard.snapshotText() + (routeError ? `\n⚠️ ${routeError}` : ''),
       }
     },
   }))
@@ -3112,7 +3112,7 @@ export function apply(ctx, rawConfig) {
         position: queued.position,
         plan,
         text: `📦 收集 ${plan.name} ×${plan.count}｜${plan.craft ? '合成品 → 转交 craft' : plan.creative ? '创造：直接拿' : `生存：${plan.radius} 格内找 ${plan.block}`}
-${where}——走完会主动报告`,
+${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       }
     },
   }))
@@ -3202,7 +3202,7 @@ ${where}——走完会主动报告`,
       })
       if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
       const where = queued.started ? `▶ 立刻开始（job ${queued.job.id}）` : `⏳ 已排队第 ${queued.position} 位（job ${queued.job.id}）`
-      return { ok: true, jobId: queued.job.id, started: queued.started, position: queued.position, ...req, text: craftRequestText(req) + '\n' + where }
+      return { ok: true, jobId: queued.job.id, started: queued.started, position: queued.position, ...req, text: craftRequestText(req) + '\n' + where + '\n\n' + jobBoard.snapshotText() }
     },
   }))
   registerTool(asTool({
