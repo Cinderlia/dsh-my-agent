@@ -123,15 +123,53 @@ export function findTargets (b, blockName, radius = COLLECT_RADIUS, want = 1) {
     .sort((a, c) => a.d - c.d)
 }
 
-/** 附近掉落物实体（item），按距离升序 */
-function dropsNear (b, pos, r = 6) {
+/**
+ * 从 item 实体的 metadata 里读物品 id（读不到返回 null）。
+ * mineflayer 把 slot 放在 metadata[8]（部分版本 7），形状可能是 `{itemId}` 或 `{itemId:{value}}`。
+ */
+function itemIdOfEntity (e) {
+  const meta = e?.metadata
+  if (!Array.isArray(meta)) return null
+  for (const idx of [8, 7]) {
+    const v = meta[idx]
+    if (!v) continue
+    const raw = (typeof v === 'object' && 'value' in v) ? v.value : v
+    if (typeof raw === 'number') return raw
+    if (raw && typeof raw === 'object') {
+      const id = raw.itemId
+      if (typeof id === 'number') return id
+      if (id && typeof id === 'object' && typeof id.value === 'number') return id.value
+    }
+  }
+  return null
+}
+
+/**
+ * 附近掉落物实体（item），按距离升序。
+ * **只挑目标物品**：能从 metadata 读到 itemId 的才严格比对；
+ * 读不到（老版本/元数据没解析）才退回"有掉落物就算候选"，并标 `unknown:true`。
+ */
+function dropsNear (b, pos, r = 6, wantName = null) {
   const out = []
   for (const e of Object.values(b.entities ?? {})) {
     if (!e?.position) continue
     const nm = String(e.name ?? e.displayName ?? '')
     if (!/^(item|Item)$/.test(nm)) continue
     const d = Math.hypot(e.position.x - pos.x, e.position.y - pos.y, e.position.z - pos.z)
-    if (d <= r) out.push({ x: e.position.x, y: e.position.y, z: e.position.z, d })
+    if (d > r) continue
+    const id = itemIdOfEntity(e)
+    /* 🔴 只在**明确**不是目标物品时才跳过：用 registry 反查名字。
+     *    反查不到（io 解析不出/版本差异）一律当候选 —— 宁可多跑一趟，
+     *    也不能因为"读不准"把该捡的掉落物跳过（实测踩过：5 次挖完一次都没去捡）。 */
+    let unknown = true
+    if (id !== null) {
+      const it = b.registry?.items?.[id] ?? null
+      if (it?.name) {
+        unknown = false
+        if (wantName && it.name !== wantName) continue
+      }
+    }
+    out.push({ x: e.position.x, y: e.position.y, z: e.position.z, d, itemId: id, unknown })
   }
   return out.sort((a, c) => a.d - c.d)
 }
@@ -264,11 +302,20 @@ export async function runCollect (self, plan, ctx = {}) {
 
     if (st.phase === 'pickup') {
       st.pickupTries = (st.pickupTries ?? 0) + 1
-      if (st.pickupTries > 2) return fail('挖掉了但一直捡不到（已试着去捡 2 次）')
+      if (st.pickupTries > 4) return fail('挖掉了但一直捡不到（已试着去捡 4 次）')
       const t = st.target
-      const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6)
-      if (!drops.length) return fail('挖掉了，但附近没看到掉落物实体（被捡走/掉进岩浆/没生成）')
+      const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.name)
+      if (!drops.length) {
+        /* 掉落物不见了（被别人捡走 / 掉进岩浆 / 没生成）：**不立刻判死** ——
+         * 换下一个目标继续挖，连续 3 次都空手才报失败（用户在旁边抢掉落物就是这种场景）。 */
+        st.missed = (st.missed ?? 0) + 1
+        steps.push(`掉落物不见了（第 ${st.missed} 次）`)
+        if (st.missed >= 3) return fail(`连续 ${st.missed} 次挖到了却没捡到（掉落物被抢走/掉进岩浆/没生成）`)
+        st.phase = 'find'
+        continue
+      }
       const drop = drops[0]
+      if (drop.unknown) steps.push('掉落物读不到物品 id，按位置去捡（可能捡错）')
       if (!board || !job) return fail('内部错误：没有队列上下文，无法插入捡取任务')
       const navPlan = buildNaviPlan(self, { x: Math.floor(drop.x), y: Math.floor(drop.y), z: Math.floor(drop.z), radius: COLLECT_RADIUS })
       if (!navPlan.ok) return fail(`去捡掉落物失败：${navPlan.why}`)

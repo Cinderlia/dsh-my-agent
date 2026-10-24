@@ -167,21 +167,21 @@ export class JobBoard {
     this.log(`任务 ${job.id} 开始：${job.summary}`)
     Promise.resolve()
       .then(() => (job.run ?? (() => { throw new Error('没有可执行体') }))(job.controller?.signal, job))
-      .then((r) => this.finish(job.id, r ?? {}))
+      .then((r) => this.finish(job.id, { ...(r ?? {}), ok: r?.ok !== false }))
       .catch((e) => this.fail(job.id, e))
   }
 
   get (id) { return [this.current, ...this.queue, ...this.done].find((j) => j?.id === String(id ?? '')) ?? null }
 
-  finish (id, { text = '', data = null } = {}) {
+  finish (id, { text = '', data = null, ok = true } = {}) {
     const job = this.current
     if (!job || job.id !== String(id)) return false
-    job.status = 'done'
+    job.status = ok ? 'done' : 'failed'
     job.endedAt = Date.now()
     job.report = { text: String(text), data }
     this.current = null
     this.archive(job)
-    this.notify(job, `✅ ${job.summary}\n${job.report.text}`)
+    this.notify(job, `${ok ? '✅' : '❌'} ${job.summary}\n${job.report.text}`)
     this.state = 'idle'
     this.pump()
     this.changed()
