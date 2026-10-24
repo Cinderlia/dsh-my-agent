@@ -829,7 +829,7 @@ async function clearCraftGrid (bot, msLeft = () => Infinity) {
   return moved
 }
 
-async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null) {
+export async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null) {
   const done = []
   /* 🔴 bot 是裸 mineflayer bot，`msLeft()` 在 McBot 上 —— 由调用方把函数递进来 */
   const msLeft = () => msLeftFn?.() ?? Infinity
@@ -1107,6 +1107,13 @@ async function runPlan (bot, plan, table, timeoutMs, notes = [], msLeftFn = null
 
 export async function apply (api) {
   const { ctx, asTool, getSession, logLine } = api
+  /* 🔴 2026-10-25：合成改由 src/craft.mjs 的**队列状态机**接管（缺料自动 collect、
+   * 工作台自动找/放/回收、超时切片）。这个老扩展默认不再注册工具，避免同名冲突；
+   * 想回到旧行为设 DSH_MC_AGENT_LEGACY_CRAFT=on。 */
+  if (process.env.DSH_MC_AGENT_LEGACY_CRAFT !== 'on') {
+    logLine('mc_craft 老扩展已停用（改由 craft 状态机接管；想用旧的设 DSH_MC_AGENT_LEGACY_CRAFT=on）')
+    return
+  }
   dbgLog = (m) => { if (process.env.DSH_MC_AGENT_CRAFT_DEBUG === '1') logLine(`mc_craft[调试] ${m}`) }
 
   ctx.tools.register(asTool({

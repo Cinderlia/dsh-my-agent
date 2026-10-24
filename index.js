@@ -46,6 +46,7 @@ import { JobBoard } from './src/jobs.mjs'
 import { buildNaviPlan, previewRoute, runNavi, naviReportText } from './src/navi.mjs'
 import { planCollect, runCollect } from './src/collect.mjs'
 import { buildTargets, checkRange, needsWalk, walkNear, runBatch, batchText } from './src/batch.mjs'
+import { resolveCraftRequest, runCraft, craftRequestText } from './src/craft.mjs'
 import { movements as buildMovements } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -81,30 +82,24 @@ import { statusPing, parseAddress, formatAddress, flattenMotd } from './src/ping
 import { ServerHistory } from './src/serverhistory.mjs'
 import { buildConnectPrompt } from './src/connect-prompt.mjs'
 import { waitForEvents } from './src/wait.mjs'
-
 export const name = 'dsh-mc-agent'
 export const inject = ['webServer', 'tools']
-
 /** 插件版本（`mc_capabilities` 会报给他；读不到就 unknown） */
 const PLUGIN_VERSION = (() => {
   try { return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? 'unknown' } catch { return 'unknown' }
 })()
-
 /* ============================ HTTP 工具与信任栅栏 ============================ */
 /* 与 @deepseek-ai/dsh-client-connection 的 /api 同款栅栏（DNS-rebinding + 跨站），
  * 非认证层。照抄 dsh-serve 的实现，保持同源插件行为一致。 */
-
 function isLoopbackHostname(hostname) {
   if (hostname === 'localhost' || hostname === '[::1]') return true
   const parts = hostname.split('.')
   return parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255)
     && parts[0] === '127'
 }
-
 function parseAuthority(authority) {
   try { return new URL(`http://${authority}`) } catch { return undefined }
 }
-
 function isTrustedAuthority(hostUrl, trustedHosts) {
   return trustedHosts.some((entry) => {
     const entryUrl = parseAuthority(entry)
@@ -116,7 +111,6 @@ function isTrustedAuthority(hostUrl, trustedHosts) {
       : entryUrl.host === hostUrl.host
   })
 }
-
 function isTrustedRequest(headers, trustedHosts) {
   const host = headers.host
   if (typeof host !== 'string') return false
@@ -128,16 +122,13 @@ function isTrustedRequest(headers, trustedHosts) {
   if (origin === undefined) return true
   try { return new URL(origin).host === hostUrl.host } catch { return false }
 }
-
 function sendJson(res, status, body) {
   const data = JSON.stringify(body)
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(data) })
   res.end(data)
 }
-
 /** 请求体上限（**字节**，不是字符）。 */
 const MAX_BODY_BYTES = 1_000_000
-
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let data = ''
@@ -168,7 +159,6 @@ function readJsonBody(req) {
     req.on('close', () => done(resolve, {}))
   })
 }
-
 /**
  * Config = 纯**行为配置**（与"连哪个服"无关）。
  * 连接参数全在 mc_connect 工具里；0.1 时代的遗留 fallback 字段
@@ -181,7 +171,6 @@ function readJsonBody(req) {
  */
 let z = null
 try { z = (await import('@deepseek-ai/schemastery')).default ?? null } catch { /* 宿主没喂 ⇒ 不要 Config */ }
-
 /**
  * 默认"喊我"触发词（正则，大小写不敏感）。聊天里命中这些词才算在叫我。
  *
@@ -195,15 +184,11 @@ export const DEFAULT_MENTIONS = [
   'deepseek', 'deep\\s*seek', '\\bds\\b', '\\bdsh\\b', '\\bai\\b', 'agent',
   '机器人', '麦块',
 ]
-
 export const Config = z ? z.object({
   // ── 行为配置 ──
   mentions: z.array(z.string()).default(DEFAULT_MENTIONS),
 }) : undefined
-
-
 /* ======================== 每会话独立实例 ======================== */
-
 /**
  * 一个会话的 MC 状态：独立 McBot + 事件队列 + 看门狗。
  * 不同会话的 McSession 互不干扰。
@@ -240,7 +225,6 @@ class McSession {
     this._wired = false
     this._wiredHandlers = []
   }
-
   /**
    * 打断本会话正在进行的 `mc_events {waitSec}` 等待（看门狗注入前调用）。
    * 只置一个标记：等待循环每 250ms 看一眼，见到就立刻返回（工具一返回，step 结束，唤醒文案当场投出去）。
@@ -249,19 +233,15 @@ class McSession {
     this.waitInterruptedAt = Date.now()
     this.waitInterruptReason = reason ? String(reason) : null
   }
-
   /* ── 事件绑定（懒绑：首次使用时才 wire，避免未连接的 bot 产生无意义事件）── */
-
   ensureWired(pluginCtx) {
     if (this._wired) return
     this._wired = true
     const self = this
-
     /* 🔴 审计：这些监听挂在 `this.bot` 上，销毁时必须摘掉 —— 否则销毁后的 session 还被
      * bot 一直持有（闭包里的 self / pluginCtx 跟着活着），bot 断开时还会往已经没人看的
      * `events` 里写。用 `on()` 统一登记，`#unwire()` 里摘。 */
     const on = (ev, fn) => { this.bot.on(ev, fn); this._wiredHandlers.push([ev, fn]) }
-
     on('log', (line) => pluginCtx.logger?.info?.(`[${self.agentId}] ${line}`))
     on('spawn', (e) => self.#pushEvent('lifecycle', `已上线 ${e.sub} @ ${JSON.stringify(e.position)}`))
     on('death', (e) => self.#pushEvent('lifecycle', `我死了 @ ${JSON.stringify(e.position)}`))
@@ -273,7 +253,6 @@ class McSession {
     on('system', ({ text }) => self.#pushEvent('system', text))
     on('damage', (e) => self.#pushEvent('damage', `血量降到 ${e.health} @ ${JSON.stringify(e.position)}`))
   }
-
   /** 摘掉 `ensureWired()` 挂上的全部 bot 监听（销毁时调用，防止 session 被 bot 反向持有）。 */
   #unwire() {
     for (const [ev, fn] of this._wiredHandlers) {
@@ -281,9 +260,7 @@ class McSession {
     }
     this._wiredHandlers = []
   }
-
   /* ── 清理 ── */
-
   destroy() {
     try { this.watchdog?.disarm('会话结束') } catch {}
     try { this.#unwire() } catch {}
@@ -300,17 +277,13 @@ class McSession {
     this.watchdog = null
     this.events = []
   }
-
   /* ── 事件队列 ── */
-
   /** 公开的事件入队（看门狗注入失败时也要留个痕，见审计报告 F4）。 */
   pushEvent(kind, text, extra = {}) { this.#pushEvent(kind, text, extra) }
-
   #pushEvent(kind, text, extra = {}) {
     this.events.push({ seq: ++this.eventSeq, at: Date.now(), kind, text, ...extra })
     if (this.events.length > this.maxEvents) this.events.splice(0, this.events.length - this.maxEvents)
   }
-
   drainEvents(limit = 20, kind = null) {
     const taken = []
     const rest = []
@@ -321,7 +294,6 @@ class McSession {
     this.events = rest
     return taken
   }
-
   /* 🔴 审计报告 F5：以前 `peek` 取**最新** N 条（`slice(-limit)`）而消费取**最早** N 条，
    *    同一个队列两个方向，描述里又没说 ⇒ 模型 peek 一遍、再消费一遍，拿到的完全是两批。
    *    现在两边都是**最早的先出**（队列语义），`peek` 只是不删。 */
@@ -333,9 +305,7 @@ class McSession {
     }
     return out
   }
-
   /* ── 模式 ── */
-
   modeView() {
     return {
       mode: this.mode,
@@ -348,26 +318,20 @@ class McSession {
       watch: this.watchdog?.status() ?? null,
     }
   }
-
   /* ── "喊我"判定 ── */
-
   /* 🔴 审计：这里原来还有一对 `mentionRegex()` / `isCalled()`，两个毛病：
    *  ① `mentionRegex()` 的缓存判据是 `this._mentionRe?.source !== this.config.mentions.join('|')`，
    *     但它赋值的是 `mentions.map((p) => `(?:${p})`).join('|')` —— `.source` 永远带 `(?:)` 包装，
    *     跟裸 `join('|')` **恒不相等** ⇒ 恒真条件，每次调用都重建正则；
    *  ② 全仓（含 client.js / selfcheck.mjs / tools/）**没有任何调用点**，真正在用的是 `calledBy()`。
    * 两个都删了。 */
-
   /** 这段文本里出现了哪几个"喊我"的叫法（按 mentions 的书写顺序，返回命中的模式原文）。 */
   calledBy(text) {
     const s = String(text ?? '')
     return this.config.mentions.filter((p) => { try { return new RegExp(`(?:${p})`, 'i').test(s) } catch { return false } })
   }
 }
-
-
 /* ======================== 全局注册表 ======================== */
-
 /**
  * 管理所有活跃的 McSession。按 agentId 索引。
  * 插件卸载时统一清理。
@@ -381,7 +345,6 @@ class McRegistry {
     /** @type {Map<string, McSession>} */
     this.sessions = new Map()
   }
-
   /** 获取当前会话的 McSession（不存在就创建） */
   getOrCreate(agentId) {
     let sess = this.sessions.get(agentId)
@@ -393,10 +356,8 @@ class McRegistry {
     }
     return sess
   }
-
   /** 只读查询：不存在就返回 undefined（**不要**用 getOrCreate——查状态不该建实例） */
   peek(agentId) { return this.sessions.get(agentId) }
-
   /** 销毁某个会话的实例 */
   destroy(agentId) {
     const sess = this.sessions.get(agentId)
@@ -406,7 +367,6 @@ class McRegistry {
       this.ctx.logger?.info?.(`[dsh-mc-agent] 销毁会话实例：${agentId}`)
     }
   }
-
   /** 销毁所有（插件卸载时） */
   destroyAll() {
     for (const [id, sess] of this.sessions) {
@@ -414,7 +374,6 @@ class McRegistry {
     }
     this.sessions.clear()
   }
-
   /** 列出所有活跃实例（诊断用） */
   listSessions() {
     return [...this.sessions.entries()].map(([id, sess]) => ({
@@ -428,10 +387,7 @@ class McRegistry {
     }))
   }
 }
-
-
 /* ======================== 看门狗（绑定到具体 McSession）======================== */
-
 /**
  * 拿到（或创建）本会话的看门狗。
  * 看门狗要往会话里注入消息，必须绑 agent —— 在这里补齐并随时刷新引用。
@@ -450,10 +406,7 @@ function ensureWatchdog (ctx, sess, agent, promptSignal = null, gate = null) {
   if (gate) sess.watchdog.gate = gate
   return sess.watchdog
 }
-
-
 /* ============================ 插件主体 ============================ */
-
 export function apply(ctx, rawConfig) {
   /* 拿得到 schemastery 时，宿主按 Config schema 把 `mentions` 的默认值填好；拿不到时（官方 desktop）
      cordis 原样透传（甚至整个 config 是 undefined）—— 这里兜一次。
@@ -461,7 +414,6 @@ export function apply(ctx, rawConfig) {
   const config = { ...(rawConfig ?? {}) }
   if (!Array.isArray(config.mentions)) config.mentions = [...DEFAULT_MENTIONS]
   const registry = new McRegistry(ctx, config)
-
   /* ── 插件状态目录（**配置 + 账户库**）：`$DSH_HOME/dsh-mc-agent/` ──────────────────
    * 🔴 2026-09-16 用户要求：配置和账户**不该躺在工作区里** —— 工作区是项目的家，
    *    插件有插件自己的家。宿主（app-boot）`ctx.provide('dshHomePath', …)` 给了这个路径，
@@ -470,7 +422,6 @@ export function apply(ctx, rawConfig) {
   const dshHomePath = (() => { try { return ctx.get('dshHomePath') } catch { return undefined } })()
   const stateDir = resolveStateDir({ dshHomePath, stateDirOverride: process.env.DSH_MC_AGENT_DIR })
   registry.lockDir = stateDir      // 会话锁文件也放插件自己的家（别写进插件包目录）
-
   /* ── 记忆 / 提示词：挂在**会话工作区**下，不再假设"插件装在工作区里" ──────────────
    * 抽取成标准插件后，包可能装在 `node_modules/` 或任意目录，**不能**再用 `__dirname/..` 推工作区。
    * 正路：宿主给工具的 `exec.agent.session.header.cwd` 就是该会话的工作区（tool-fs 同款来源）。
@@ -483,7 +434,6 @@ export function apply(ctx, rawConfig) {
     const cwd = agent?.session?.header?.cwd
     return typeof cwd === 'string' && cwd.trim() !== '' ? cwd : null
   }
-
   /* ── 记忆按会话分（本机补丁 2026-10-06，用户要求）────────────────────────────
    * 起因：用户 m07514「现在不同会话用的是同一份记忆，我新建存档和会话了，它还是之前的」。
    * 之前的记忆根是**全局**的（`config.memoryDir` 一设，所有会话共用一份），
@@ -519,20 +469,17 @@ export function apply(ctx, rawConfig) {
     if (id && cwd) lastAgentByCwd.set(cwd, id)
     return id
   }
-
   /** 记忆**基根**（不含按会话分的子目录）—— 播种时要的是它，不能用 memoryRootFor（它可能已落到会话根） */
   const memoryBaseFor = (cwd) => {
     const explicit = process.env.DSH_MC_AGENT_MEMORY_DIR ?? pluginConfig.memoryDir
     return explicit || (cwd ? join(cwd, '.dsh-mc-agent') : (process.env.DSH_MC_AGENT_DIR ? stateDir : join(stateDir, 'memory')))
   }
-
   const memoryRootFor = (cwd, agentId = null) => {
     const base = memoryBaseFor(cwd)
     if (pluginConfig.memoryPerSession !== true) return base
     const id = agentId ?? (cwd ? lastAgentByCwd.get(cwd) ?? null : null)
     return id ? join(base, 'sessions', sessionDirName(id)) : base
   }
-
   /**
    * 老版本（≤0.3.x）把**全局** config/accounts 放在 `<工作区>/.dsh-mc-agent/`：每个工作区首次见到时搬一次。
    * ⚠️ config.json 现在是**本插件按工作区**的配置（src/wsconfig.mjs），不再是旧遗留：
@@ -560,7 +507,6 @@ export function apply(ctx, rawConfig) {
       } catch (e) { logLine(`${label}搬迁失败（保留旧位置）：${e.message}`) }
     }
   }
-
   /** 按工作区缓存 MemoryStore（同一工作区不重复扫盘） */
   const memoryCache = new Map()
   const memoryFor = (cwd, agentId = null) => {
@@ -576,11 +522,9 @@ export function apply(ctx, rawConfig) {
     }
     return store
   }
-
   /** 按工作区的配置（`<记忆根>/config.json`，src/wsconfig.mjs）：读值 / 改三个提示词开关 */
   const wsCfgValues = (cwd) => workspaceConfigValues(memoryRootFor(cwd))
   const wsCfgPatch = (cwd, partial) => patchWorkspaceConfig(memoryRootFor(cwd), partial)
-
   const pluginConfig = new PluginConfig(stateDir)
   /** 无会话上下文时用的兜底记忆库（`capabilities` / 扩展 api / 全局注入用） */
   const memory = memoryFor(null)
@@ -610,7 +554,6 @@ export function apply(ctx, rawConfig) {
   }
   /** 这个会话的工作区根（mc_kit_image / 地图落盘用）；拿不到就给个兜底目录 */
   const workspaceRootFor = (agent) => workspaceOf(agent) ?? join(stateDir, 'workspace')
-
   /**
    * 按 sessionId 找**这个会话选中的工作区**：
    *   ① 活着的 agent（`agent.session.header.cwd`，首选，最准）；
@@ -621,7 +564,6 @@ export function apply(ctx, rawConfig) {
     const sid = String(sessionId ?? '').trim()
     if (!sid) return null
     const live = workspaceOf(safeAgentById(sid))
-
     if (live) return live
     try {
       const q = ctx.get('sessionQuery')
@@ -631,7 +573,6 @@ export function apply(ctx, rawConfig) {
       return typeof cwd === 'string' && cwd.trim() ? cwd : null
     } catch { return null }
   }
-
   /** 按 sessionId 找 agent（HTTP 那几个接口用；拿不到就 null） */
   const safeAgentById = (sessionId) => {
     if (!sessionId) return null
@@ -647,7 +588,6 @@ export function apply(ctx, rawConfig) {
     + `｜工具定义 ${toolDefKind() === 'host' ? '宿主 @deepseek-ai/dsh-tools' : '自带兜底'}`
     + `｜Config ${Config ? 'schema（宿主 schemastery）' : '无（宿主 schemastery 不可用）'}`
     + `｜日志 ${['quiet', 'info', 'debug'][logLevel()] ?? 'info'}（MC_LOG_LEVEL 可调）`)
-
   /* ─────────── 发布区（`.dsh-mc-agent/.express/`）：地址用**工作区 uuid** ───────────
    * 用户 2026-09-17 定稿：`<base>/api/dsh-mc-agent/express/<工作区 uuid>/<剩余路径>`。
    * uuid 直接从宿主的工作区注册表拿（`ctx.workspaceRegistry.list()` 是**同步**的，`path` 已 realpath 规范化）——
@@ -667,7 +607,6 @@ export function apply(ctx, rawConfig) {
   /** 启动后多久查第一次更新：别跟插件初始化抢资源，也别让首屏等它 */
   const START_UPDATE_CHECK_MS = 15_000
   const EXPRESS_MAX_BYTES = 32 * 1024 * 1024
-
   /** 宿主的工作区注册表（可能还没就绪 → 返回空表，别抛） */
   const workspaceRows = () => {
     try {
@@ -675,7 +614,6 @@ export function apply(ctx, rawConfig) {
       return Array.isArray(rows) ? rows : []
     } catch { return [] }
   }
-
   /** cwd → 工作区 uuid（比对 realpath 规范化后的路径；查不到 = null） */
   const workspaceIdOfCwd = (cwd) => {
     const s = typeof cwd === 'string' ? cwd.trim() : ''
@@ -688,7 +626,6 @@ export function apply(ctx, rawConfig) {
     }
     return null
   }
-
   /** 工作区 uuid → cwd（注册表里的规范路径） */
   const workspaceCwdById = (id) => {
     const key = String(id ?? '')
@@ -696,7 +633,6 @@ export function apply(ctx, rawConfig) {
     for (const w of workspaceRows()) if (String(w?.id) === key) return String(w.path)
     return null
   }
-
   /** cwd → 工作区显示名（注册表里的 `title`；查不到 = null。前端回退路径尾段） */
   const workspaceTitleOfCwd = (cwd) => {
     const s = typeof cwd === 'string' ? cwd.trim() : ''
@@ -712,7 +648,6 @@ export function apply(ctx, rawConfig) {
     }
     return null
   }
-
   /* ─────────── 「文件分享」页要的两件事：看现状 / 清除数据（用户 2026-09-17 定）───────────
    * · 现状 = 这个工作区的发布区在哪、攒了几个文件、多大（分享模式本身是全局配置，见 configView）；
    * · 清除 = 用户确认后把 `.express/` 下的东西**全删掉**（目录自己留着，AI 不用重新建）。
@@ -736,7 +671,6 @@ export function apply(ctx, rawConfig) {
     if (existsSync(root)) walk(root)
     return { dir: root, exists: existsSync(root), files, bytes }
   }
-
   const clearShared = (cwd) => {
     const root = expressRootOf(memoryRootFor(cwd))
     const before = sharedStat(cwd)
@@ -750,7 +684,6 @@ export function apply(ctx, rawConfig) {
     logLine(`「文件分享」清除分享数据：${root}（${before.files} 个文件 / ${before.bytes} 字节）`)
     return { ...before, existed: true, removed: before.files }
   }
-
   /* ─────────── 「MC设置 → 记忆」页要的两件事：看目录内容 / 打开所在位置 ───────────
    * 用户 2026-10-20：「把『文件分享』那页改成『记忆』，分享那些开关一律不要了，
    *   只显示**这个会话的记忆文件在哪**（lessons.md / world.md …），并且能打开文件夹」。
@@ -783,7 +716,6 @@ export function apply(ctx, rawConfig) {
       dirs,
     }
   }
-
   /**
    * 用系统文件管理器打开记忆目录（给了 `name` 就在里面**选中**那个文件）。
    *
@@ -821,7 +753,6 @@ export function apply(ctx, rawConfig) {
     logLine(`「记忆」打开所在位置：${target}`)
     return { opened: true, dir, target }
   }
-
   /**
    * 「当前地址」= 浏览器**实际在用**的那个地址（在线 base 的默认值 / 「获取当前」按钮的值）。
    *
@@ -869,7 +800,6 @@ export function apply(ctx, rawConfig) {
     const proto = fwd === 'https' || fwd === 'http' ? fwd : (req?.socket?.encrypted ? 'https' : 'http')
     return normalizeExpressBase(`${proto}://${host}`) ?? ''
   }
-
   /* ─────────── MC账户库：元数据在 $DSH_HOME/dsh-mc-agent/accounts.json，凭据只进宿主凭据服务 ───────────
    * 🔴 LLM 永远拿不到密码/token：工具只回基本信息；凭据只在这两个 helper 里出现，且不外传。
    * ------------------------------------------------------------------------ */
@@ -896,7 +826,6 @@ export function apply(ctx, rawConfig) {
       logDebug(`账户库就绪：${accounts.list().length} 个账户｜凭据服务 ${accounts.credentialsReady ? '可用' : '不可用（拒绝存密码）'}`)
     }).catch((e) => { logLine(`凭据索引刷新失败（不影响启动）：${e?.message ?? e}`) })
   })
-
   /** 账户 → core 的 auth 描述符（**唯一**读凭据的地方；返回值含密码，绝不外传） */
   const resolveAuth = async (innerID = null) => {
     const acc = accounts.resolve(innerID)
@@ -958,7 +887,6 @@ export function apply(ctx, rawConfig) {
       },
     }
   }
-
   /**
    * 登录成功后回写：皮肤站账户把**档案名/UUID/账号 id** 更新进账户库，并把**新令牌**存回凭据服务。
    * ⚠️ 只对皮肤站账户做 name/uuid 覆盖：离线账户的 UUID 是"按名字派生"的，写死会毁掉这个语义。
@@ -988,7 +916,6 @@ export function apply(ctx, rawConfig) {
       await accounts.refreshCredentialIndex()
     } catch (e) { ctx.logger?.warn?.(`[dsh-mc-agent] 回写账户信息失败：${e.message}`) }
   }
-
   /** 把"需要用户处理"的提示拼进错误里（让 LLM 知道该叫用户去「MC设置」） */
   const withUserHint = (e, label) => {
     if (!e?.needUserAction) return e
@@ -997,22 +924,17 @@ export function apply(ctx, rawConfig) {
     out.needUserAction = true
     return out
   }
-
   // 注入用的 AbortSignal（插件生命周期）。`sessionController.prompt` 是 @Remote 方法，
   // 签名 (request, signal)，**必须传 signal**——否则 undefined.throwIfAborted() 直接炸。
   const promptAbort = new AbortController()
   ctx.effect(() => () => { try { promptAbort.abort() } catch {} }, 'dsh-mc-agent: prompt signal')
-
   ctx.effect(() => () => { registry.destroyAll() })
-
   /* ─────────── HTTP API：状态条 UI 用（状态查询 / 强制停止 / 普通停止）─────────── */
-
   /** 运行期信任列表（--trusted-host 等） */
   const liveTrustedHosts = () => {
     const runtime = ctx.get('webRuntime')
     return runtime !== undefined && Array.isArray(runtime.trustedHosts) ? runtime.trustedHosts : []
   }
-
   /**
    * **强制停止**某个会话的 MC —— 用户 2026-09-16 定的语义与顺序：
    *
@@ -1045,7 +967,6 @@ export function apply(ctx, rawConfig) {
       /* 调度器清账的结果（见 ② 后面的 `releaseAll`）—— 清不掉要说出来，别假装干净了 */
       released: null, releaseError: null,
     }
-
     /** 停 LLM：优先 sessionController.cancel（宿主正路），退到 agent.cancel */
     const cancelLLM = () => {
       try {
@@ -1055,7 +976,6 @@ export function apply(ctx, rawConfig) {
       } catch (e) { out.stopLLMError = String(e?.message ?? e) }
       return false
     }
-
     /**
      * 等它真的停下来（running → 其它）。拿不到 status 就只给一小段缓冲，别白等。
      * 详见 packages/core/agent-loop/src/agent.ts 的 `get status()`。
@@ -1070,14 +990,12 @@ export function apply(ctx, rawConfig) {
       }
       return !known
     }
-
     // ① 先停 LLM
     if (cancelTurn) {
       out.stoppedLLM = cancelLLM()
       out.order.push('stop-llm')
       await waitIdle(1500)
     }
-
     // ② 先尝试退出游戏（关看门狗 → 优雅 quit → 走不掉才强断）
     if (sess?.watchdog) { try { sess.watchdog.disarm(reason, { notify: false }) } catch {} }
     if (sess) {
@@ -1097,7 +1015,6 @@ export function apply(ctx, rawConfig) {
       const rel = sess?.bot?.actionScheduler?.()?.releaseAll?.(`强制停止：${reason}`)
       out.released = rel ?? null
     } catch (e) { out.releaseError = String(e?.message ?? e) }
-
     // ③ 再强清该会话全部后台任务
     //
     // 🔴 2026-09-24：**只杀属于本会话的 job**。宿主 `jobs-local` 的 `list(caller)` 口径是
@@ -1128,18 +1045,15 @@ export function apply(ctx, rawConfig) {
       } catch (e) { out.jobsError = String(e?.message ?? e) }
     }
     out.order.push('kill-jobs')
-
     // ④ 最后再停一次 LLM（收尾，避免状态异常）
     if (cancelTurn) {
       out.finalStopLLM = cancelLLM()
       out.order.push('stop-llm-final')
       await waitIdle(800)
     }
-
     ctx.logger?.info?.(`[dsh-mc-agent] 强制停止 ${sessionId}｜${JSON.stringify(out)}`)
     return out
   }
-
   /* ─────────── 归档保护（用户 2026-09-15 补充要求）───────────
    * "会话归档前要自动强行停止，或者阻止归档。"
    *
@@ -1150,7 +1064,6 @@ export function apply(ctx, rawConfig) {
    * 为什么能包：`archiveSession` 是 workspace 服务上的普通方法（`workspace/src/index.ts:243`），
    * 不是抽象/私有；卸载时还原原方法。
    * ------------------------------------------------------------------------ */
-
   /**
    * 安装归档保护。
    *
@@ -1184,13 +1097,11 @@ export function apply(ctx, rawConfig) {
     logDebug('已挂上归档保护（归档前自动停止 MC）')
     scope.logger?.info?.('[dsh-mc-agent] 已挂上归档保护（归档前自动停止 MC）')
   }
-
   if (ctx.get('workspaceRegistry') === undefined) {
     ctx.inject(['workspaceRegistry'], (scope) => installArchiveGuard(scope))
   } else {
     installArchiveGuard(ctx)
   }
-
   /**
    * 「MC设置」模态框的后端（账户 / 认证服务器 / 指令白名单）。
    * 🔴 响应里**永远没有密码或 token**；错误统一 200 + `{ok:false,error,needUserAction?,hint?}`，
@@ -1198,7 +1109,6 @@ export function apply(ctx, rawConfig) {
    */
   let authProbe = null
   const probeBot = () => (authProbe ??= new McBot({ instanceId: 'auth-probe', lockDir: stateDir }))
-
   /**
    * 设置页要的那几项配置（集中一处，GET/PATCH 共用）。
    * 全局键来自 PluginConfig（`$DSH_HOME/dsh-mc-agent/config.json`）；
@@ -1263,7 +1173,6 @@ export function apply(ctx, rawConfig) {
       workspaceConfigFile: hasWorkspace ? wsConfigPath(memoryRootFor(cwd)) : null,
     }
   }
-
   /**
    * 「连接到MC」弹窗的**局域网探测**（🔴 后端做，前端只拿结果）：
    *   ① 被动多播听一小段拿候选（src/lan.mjs——不发包、不扫段）；
@@ -1304,17 +1213,14 @@ export function apply(ctx, rawConfig) {
     }
     return { servers, seconds: secs, ...(lanWarnings.length ? { warnings: lanWarnings } : {}) }
   }
-
   /* `checkUpdate` 定义在 `handleSettingsApi` 里（它要用路由那些闭包），启动钩子却在外层 ——
    * 用这个盒子把函数递出来（用户 2026-10-21：开 DSH 就该查一次）。 */
   const updaterRef = { check: null }
-
   const handleSettingsApi = async (req, res, path, url) => {
     const ok = (body) => sendJson(res, 200, { ok: true, ...body })
     // ⚠️ DELETE **也带 body**（前端把 innerID/id 放在 body 里）——只有 GET 没有 body。
     //    E2E 实测踩过：早先按 "GET/DELETE 都不读体" 写，两个删除接口全废。
     const body = req.method === 'GET' ? {} : await readJsonBody(req)
-
     /* 前端**门控**要的那份名单（哪些 preset 算 MC 模式）：极小、只读、不需要 sessionId / 工作区。
      * 绝不能挂在 `settingsGate` 后面 —— 否则浏览器拿不到名单就静默退回兜底值，
      * 按钮显示与否会和服务端口径不一致（2026-09-16 自查出来的自伤）。 */
@@ -1334,7 +1240,6 @@ export function apply(ctx, rawConfig) {
         latestVersion: lib.latest,
       })
     }
-
     /* ── 「连接到MC」弹窗（2026-10-04）：服务器地址历史 + 局域网探测 ──────────────
      * 都**不需要工作区**（历史是全局的；探测是纯网络动作），所以不走 settingsGate。 */
     if (path === '/api/mc/servers' && req.method === 'GET') {
@@ -1351,7 +1256,6 @@ export function apply(ctx, rawConfig) {
     if (path === '/api/mc/lan' && req.method === 'POST') {
       return ok(await probeLan({ seconds: body.seconds }))
     }
-
     /**
      * 客户端报上来的 `cwd` 能不能当工作区用。
      *
@@ -1430,7 +1334,6 @@ export function apply(ctx, rawConfig) {
       url.searchParams.get('sessionId') ?? b?.sessionId,
       url.searchParams.get('cwd') ?? b?.cwd,
     ).then((r) => (r ? r.cwd : null))
-
     /* 账户 / 认证服务器是**全局**数据（`$DSH_HOME/dsh-mc-agent/accounts.json` + 凭据库），
      * 不绑工作区：从插件菜单等"无工作区"入口打开设置也要能增删账户 —— 所以这组**不走 settingsGate**。
      * （顺带"点开设置即建档 .dsh-mc-agent"的副作用改由 config GET 承担，见下。） */
@@ -1596,7 +1499,6 @@ export function apply(ctx, rawConfig) {
       if (cwd && Object.keys(wsPatch).length) wsCfgPatch(cwd, wsPatch)
       return ok(configView(cwd))
     }
-
     /* ── 「MC设置 → 文件分享」：这个工作区的发布区现状 / 清除分享数据 ──────────────
      * 分享**模式与 base** 是全局配置（走 `/api/mc/config`）；这两个接口是**按工作区**的：
      *   · GET    看发布区在哪、攒了多少（页面上显示，省得用户去翻文件夹）；
@@ -1619,7 +1521,6 @@ export function apply(ctx, rawConfig) {
       if (!gate.ok) return sendJson(res, 400, { ok: false, error: gate.error })
       return ok(clearShared(gate.cwd))
     }
-
     /* ── 「MC设置 → 记忆」：这个会话的记忆目录 + 里面有哪些文件 + 打开所在位置 ────────
      * 用户 2026-10-20：原来那页是「文件分享」，现在整页换成「记忆」——
      * 分享开关/base/清除全部下线，这页只回答：**我的记忆存在哪**、**里面有什么**、**帮我打开它**。
@@ -1640,14 +1541,12 @@ export function apply(ctx, rawConfig) {
       const dir = memoryRootFor(gate.cwd, agentIdOf(safeAgentById(sid)))
       return ok(await openInFileManager(dir, body?.name ? String(body.name) : null))
     }
-
     /* ── 更新（「MC设置 → 更新」页，用户 2026-10-20）─────────────────────────────
      * 🔴 这个插件是 `link:<源码目录>` 装的（npm 上没有包），所以「新版本」**只可能来自 git 远端**：
      *   比对本地 HEAD 与 `<remote>/<branch>`，落后的提交 + `CHANGELOG.md` 新增的那几行 = "新版加了什么"。
      *   源优先级：**gitee → origin**（用户：优先用 gitee，github 兜底）。结果缓存 10 分钟，
      *   红点靠 `GET /api/mc/update` 轮询，别每次开页面都真去 fetch。 */
     /* 下面三个在**插件作用域**（不是每个请求里）—— 见 §「更新」那段开头的说明 */
-
     /** 跑一条 git 命令（不弹窗、带超时）。返回 `{ code, out, err }`，**永不抛**。 */
     const gitRun = async (args, timeoutMs = 20000, cwd = PLUGIN_ROOT) => {
       const { spawn } = await import('node:child_process')
@@ -1672,7 +1571,6 @@ export function apply(ctx, rawConfig) {
         child.on('close', (code) => { clearTimeout(timer); fin({ code, out, err }) })
       })
     }
-
     /** 从 `git diff` 里挑出 CHANGELOG 的**新增行**（比整篇 CHANGELOG 更贴近"这次加了什么"）。 */
     const changelogAddedOf = (diffText) => {
       const out = []
@@ -1681,7 +1579,6 @@ export function apply(ctx, rawConfig) {
       }
       return out.join('\n').trim().slice(0, 4000)
     }
-
     /* ── 复制安装（目录里没有 `.git`）的「覆盖式更新」────────────────────────────
      * 用户 2026-10-20 在 Windows 服务器上遇到的：插件是**整份复制**进宿主 `node_modules` 的，
      * 那份目录自己没 `.git` ⇒ 没有远端可比、也没法拉。做法改成：
@@ -1692,7 +1589,6 @@ export function apply(ctx, rawConfig) {
       'https://github.com/blueziii/dsh-mc-agent.git',
     ]
     const INSTALL_MARK = '.dsh-mc-agent-install.json'
-
     const stampNow = () => {
       const d = new Date()
       const p = (n) => String(n).padStart(2, '0')
@@ -1736,7 +1632,6 @@ export function apply(ctx, rawConfig) {
       return { base: null, dir: null, url: null, errors }
     }
     const dropClone = (base) => { try { if (base) rmSync(base, { recursive: true, force: true }) } catch { /* 临时目录，清不掉也没事 */ } }
-
     /** 覆盖时哪些不碰：`.git`、`node_modules`、上次的备份目录。 */
     const copyKeepOut = (srcPath) => {
       const name = basename(srcPath)
@@ -1856,7 +1751,6 @@ export function apply(ctx, rawConfig) {
         dropClone(clone.base)
       }
     }
-
     /**
      * 查有没有新版本。`force` = 忽略 10 分钟缓存（用户点了「检查更新」）。
      * 返回值恒是对象（`ok:false` 时 `reason` 说人话），前端直接照着渲染。
@@ -1891,7 +1785,6 @@ export function apply(ctx, rawConfig) {
         updateCache.data = data
         return data
       }
-
       const inside = await gitRun(['rev-parse', '--is-inside-work-tree'], 8000)
       if (inside.code !== 0 || String(inside.out).trim() !== 'true') {
         /* 用户 2026-10-20：有人是把包**复制**进宿主 node_modules 的（没有 .git）⇒ 走覆盖式更新 */
@@ -1901,17 +1794,14 @@ export function apply(ctx, rawConfig) {
       }
       data.mode = 'git'
       data.isRepo = true
-
       const br = await gitRun(['rev-parse', '--abbrev-ref', 'HEAD'], 8000)
       data.branch = String(br.out).trim() || 'main'
       const head = await gitRun(['rev-parse', '--short', 'HEAD'], 8000)
       data.currentCommit = String(head.out).trim() || null
-
       const st = await gitRun(['status', '--porcelain'], 8000)
       const dirtyList = String(st.out).split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
       data.dirty = dirtyList.length
       data.dirtyFiles = dirtyList.slice(0, 20)
-
       const rm = await gitRun(['remote'], 8000)
       data.remotes = String(rm.out).split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
       data.source = ['gitee', 'origin'].find((x) => data.remotes.includes(x)) ?? data.remotes[0] ?? null
@@ -1920,14 +1810,12 @@ export function apply(ctx, rawConfig) {
         data.reason = '这个仓库一个远端都没配（`git remote` 是空的），不知道去哪找新版本。'
         return remember()
       }
-
       const fetched = await gitRun(['fetch', data.source, '--prune', '--quiet'], 30000)
       if (fetched.code !== 0) {
         data.ready = false
         data.reason = `拉不到 ${data.source}：${(fetched.err || fetched.out || '').trim().slice(0, 300) || `exit ${fetched.code}`}`
         return remember()
       }
-
       const ref = `${data.source}/${data.branch}`
       const has = await gitRun(['rev-parse', '--verify', '--quiet', `refs/remotes/${ref}`], 8000)
       if (has.code !== 0) {
@@ -1937,12 +1825,10 @@ export function apply(ctx, rawConfig) {
       }
       const lc = await gitRun(['rev-parse', '--short', ref], 8000)
       data.latestCommit = String(lc.out).trim() || null
-
       const cnt = await gitRun(['rev-list', '--left-right', '--count', `HEAD...${ref}`], 8000)
       const parts = String(cnt.out).trim().split(/\s+/)
       data.ahead = Number(parts[0]) || 0
       data.behind = Number(parts[1]) || 0
-
       if (data.behind > 0) {
         const lg = await gitRun(['log', '--no-decorate', '--pretty=%h\t%s', `HEAD..${ref}`, '-n', '20'], 10000)
         data.commits = String(lg.out).split(/\r?\n/).filter(Boolean).map((line) => {
@@ -1962,7 +1848,6 @@ export function apply(ctx, rawConfig) {
       }
       return remember()
     }
-
     /** 真去拉。只在能拉时才动手；失败把 git 的原话原样给用户。 */
     const applyUpdate = async () => {
       const info = await checkUpdate(true)
@@ -1986,9 +1871,7 @@ export function apply(ctx, rawConfig) {
         needRestart: true,
       }
     }
-
     updaterRef.check = checkUpdate
-
     /* ── 更新（用户 2026-10-20）：`GET /api/mc/update` 查 / `POST /api/mc/update/apply` 拉 ──
      * 🔴 这两条**不要求工作区**：红点要出现在"新会话页"上，那时候根本还没有工作区。 */
     if (path === '/api/mc/update' && req.method === 'GET') {
@@ -1999,7 +1882,6 @@ export function apply(ctx, rawConfig) {
       const r = await applyUpdate()
       return r.ok ? ok(r) : sendJson(res, 400, { ok: false, error: r.error })
     }
-
     /* ── 提示词（「MC设置 → 提示词」页 = `.dsh-mc-agent/RULES.md` + `<记忆根>/版本提示.md`）──
      * 🔴 两份都是**按会话工作区**的**文件**（用户 2026-10-08：规则放文件里，会话自己去读）。
      *   · GET  **可无工作区** —— 无则**只读**返回内置默认（前端展示用，不建档）；
@@ -2153,7 +2035,6 @@ export function apply(ctx, rawConfig) {
     }
     throw new Error(`未知的设置接口：${req.method} ${path}`)
   }
-
   /**
    * 发布区服务：`GET/HEAD /api/dsh-mc-agent/express/<工作区 uuid>/<剩余路径>`
    *   → `<工作区>/.dsh-mc-agent/.express/<剩余路径>`（**子目录可以有**）。
@@ -2221,14 +2102,11 @@ export function apply(ctx, rawConfig) {
       return true
     }
   }
-
   const handleMcApi = async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost')
     const path = url.pathname
-
     // 🔴 2026-09-17：发布区**不再挂在 `/api/mc` 下**（旧地址 `/api/mc/dsh-mc-agent/<目录名>/…` 已停用）。
     //    新地址是 `/api/dsh-mc-agent/express/<工作区 uuid>/…`，由**自己的顶层前缀路由**服务（见 shareRoute）。
-
     if (req.method === 'GET' && path === '/api/mc/status') {
       const sessionId = url.searchParams.get('sessionId') ?? ''
       const sess = registry.peek(sessionId)
@@ -2250,11 +2128,9 @@ export function apply(ctx, rawConfig) {
         timeouts: sess.bot.stats?.timeouts ?? 0,
       })
     }
-
     if (req.method === 'GET' && path === '/api/mc/sessions') {
       return sendJson(res, 200, { ok: true, sessions: registry.listSessions() })
     }
-
     /* ── 「MC设置」入口的模式门控（2026-09-16；2026-09-18 调整）─────────────
      * 前端只该在 **MC 模式**的会话里显示设置入口（普通会话显示过按钮，出过事故）。
      * 这里给出**与 restrict/guard 完全同一个判据**（isMcModeAgent）的真值。
@@ -2323,7 +2199,6 @@ export function apply(ctx, rawConfig) {
       }
       return sendJson(res, 200, { ok: true, sessionId, mcMode, mcPlus, hasWorkspace, diag })
     }
-
     if (req.method === 'POST' && path === '/api/mc/stop') {
       const body = await readJsonBody(req)
       const sessionId = String(body.sessionId ?? '')
@@ -2336,7 +2211,6 @@ export function apply(ctx, rawConfig) {
       })
       return sendJson(res, 200, { ok: true, ...result })
     }
-
     /* ── 「连接到MC」弹窗点「连接」/ 局域网行：**注入提示词 + 让该会话跑一轮** ──────────
      * 🔴 这里**只注入、不真连**：真正的连接由 LLM 去调 `mc_connect` 完成（用户 2026-10-04 定）。
      * 🔴 注入走**插件提示行**（`source.kind='plugin:dsh-mc-agent'`），**绝不冒充用户发言**；
@@ -2373,7 +2247,6 @@ export function apply(ctx, rawConfig) {
       logLine(`连接到MC：已${asUser ? '投递玩家消息' : '注入提示词'}（${address}｜${accountLabel}｜via=${via}）`)
       return sendJson(res, 200, { ok: true, injected: true, asUser, address, account: accountLabel })
     }
-
     /* ── 「MC设置」模态框用的接口（门控名单 / 账户 / 认证服务器 / 白名单 / 提示词 / 文件分享 / 服务器历史与探测）──
      * 🔴 2026-09-17 隔离实例实测抓到的**真 bug**：`/api/mc/presets` 一直没进这个分派名单
      *    （它只在 `handleSettingsApi` 里判过），于是真机上它一律 404 —— 前端只能靠
@@ -2393,10 +2266,8 @@ export function apply(ctx, rawConfig) {
         return sendJson(res, Number(e?.statusCode) || 200, err)
       }
     }
-
     return sendJson(res, 404, { ok: false, error: `unknown endpoint ${req.method} ${path}` })
   }
-
   const apiRoute = {
     kind: 'prefix',
     path: '/api/mc',
@@ -2413,7 +2284,6 @@ export function apply(ctx, rawConfig) {
     },
   }
   ctx.effect(() => ctx.webServer.register(apiRoute), 'dsh-mc-agent: /api/mc 路由')
-
   /**
    * 发布区服务路由（用户 2026-09-17 定稿）：`/api/dsh-mc-agent/express/<工作区 uuid>/<剩余路径>`。
    *
@@ -2457,12 +2327,10 @@ export function apply(ctx, rawConfig) {
     },
   }
   ctx.effect(() => ctx.webServer.register(shareRoute), 'dsh-mc-agent: /api/dsh-mc-agent 路由（发布区）')
-
   // 启动自检标记：确认"插件到底加载了没"（同时写 dsh-mc-agent.log 与宿主日志）
   const startup = `插件已加载｜pid=${process.pid}｜每会话独立实例｜工具注册中…`
   logLine(startup)
   ctx.logger?.info?.(`[dsh-mc-agent] ${startup}`)
-
   /* ─────────── 「遗言」网：未处理拒绝会要了整个 Harness 的命，至少把原因留下来 ───────────
    * 背景（2026-09-17 真机）：宿主的 `installFailLoud`（`apps/cli/src/profile-boot.ts:311` →
    * `packages/boot/app-boot/src/index.ts:652`）把**任何**未处理拒绝当致命，打印
@@ -2481,7 +2349,6 @@ export function apply(ctx, rawConfig) {
       logLine(`⚠️ 未处理拒绝（宿主可能会因此 exit(1)，栈如下，请据此定位）：${stack.split('\n').slice(0, 6).join(' ⏎ ')}`)
     })
   } catch (e) { logLine(`装未处理拒绝记录器失败（不影响使用）：${e?.message ?? e}`) }
-
   /* ─────────── 「别让它崩」闸：把寻路那几种**正常结局**的未处理拒绝拦下来 ───────────
    * 2026-10-20（GitHub issue #1，用户报的一晚上闪退 3 次）：`mc_move` 被抢占之后，
    * `mineflayer-pathfinder` 会把上一次的 goto reject 成 `PathStopped`，而它已经没人 await 了
@@ -2504,7 +2371,6 @@ export function apply(ctx, rawConfig) {
       }, 'dsh-mc-agent: 未处理拒绝守卫补挂')
     }
   } catch (e) { logLine(`装未处理拒绝守卫失败（不影响使用）：${e?.message ?? e}`) }
-
   /* ─────────── 开 DSH 时查一次更新（用户 2026-10-21：「可以做到开 dsh 检查一次吗」）───────────
    * 只查一次、不重试，约 15 秒后跑（别跟插件初始化抢资源）；结果落进 `updateCache`，
    * 于是红点和更新页第一次打开就是现成的，不用等 git。查失败只记 debug，绝不打扰。
@@ -2524,7 +2390,6 @@ export function apply(ctx, rawConfig) {
       return () => clearTimeout(t)
     }, 'dsh-mc-agent: 启动查一次更新')
   }
-
   /* ─────────── 「闪退」网：uncaughtException 至少留下栈 ───────────
    * 2026-10-18：mineflayer-pathfinder 的 tick 监听在某次 `placingBlock` 为 undefined 时抛错，
    * 从 setInterval 回调冒到进程级 ⇒ 宿主直接弹"应用无法启动或已意外停止"。
@@ -2540,8 +2405,6 @@ export function apply(ctx, rawConfig) {
       logLine(`🔴 未捕获异常（可能是宿主崩掉的原因，栈如下）：${stack.split('\n').slice(0, 8).join(' ⏎ ')}`)
     })
   } catch (e) { logLine(`装未捕获异常记录器失败（不影响使用）：${e?.message ?? e}`) }
-
-
   /**
    * 紧凑 JSON（2026-10-18 审计）：把 `null` / `undefined` / 空对象 / 空数组先剔掉，
    * 再 `JSON.stringify` 成**一行**。
@@ -2568,7 +2431,6 @@ export function apply(ctx, rawConfig) {
     }
     try { return JSON.stringify(strip(v)) } catch { return JSON.stringify(v) }
   }
-
   /**
    * 工具输出渲染：有 text 就用 text，否则走 compactJson（单行、去空字段）。
    *
@@ -2585,7 +2447,6 @@ export function apply(ctx, rawConfig) {
   })
   /** 保留两位小数（省 token：`-3.366740127096657` → `-3.37`；不是数字就原样返回） */
   const round2 = (n) => (Number.isFinite(Number(n)) ? Math.round(Number(n) * 100) / 100 : n)
-
   /**
    * 给动作结果补"三种结局"（用户 2026-10-08 路线图第 ⑥ 条）。
    *
@@ -2604,14 +2465,12 @@ export function apply(ctx, rawConfig) {
     const same = JSON.stringify(cfg) === JSON.stringify(defaults)
     return same ? { config: cfg } : { config: cfg, defaults }
   }
-
   const withOutcome = (res, opts = {}) => {
     if (!res || typeof res !== 'object' || Array.isArray(res)) return res
     if (res.outcome) return res
     const outcome = outcomeOf(res, opts)
     return { ...res, outcome, outcomeText: verdictText(outcome) }
   }
-
   /**
    * 工具定义统一入口：
    *   ① 返回值无损化（宿主要求无损 JSON；mineflayer 到处返回 Vec3 类实例）
@@ -2627,7 +2486,6 @@ export function apply(ctx, rawConfig) {
    *    （看地图、写 SVG、读回自己存的图都要用），但路径由 guard 硬限在 `<工作区>/.dsh-mc-agent/`。
    */
   const MC_FILE_TOOLS = ['read', 'write', 'edit', 'glob', 'grep', 'read_image']
-
   /**
    * MC 模式白名单里的**交付工具**：`present`（宿主 `@deepseek-ai/dsh-tool-present`）。
    *
@@ -2657,7 +2515,6 @@ export function apply(ctx, rawConfig) {
     'compress', 'decompress', 'search_context', 'acp_status', 'acp_cache', 'acp_read_original_image',
   ]
   const MC_PRESENT_TOOL = 'present'
-
   /**
    * 从一次工具调用里取"要碰的路径"：是文件工具才返回（不是 → null；是但没给路径 → 空串）。
    * 路径参数名按宿主用 `path`，也兼容 harness 的 `file_path`；glob/grep 的目录参数同样是 `path`。
@@ -2672,7 +2529,6 @@ export function apply(ctx, rawConfig) {
     if (v === undefined || v === null) return ''
     return String(v)
   }
-
   /** `present` 那次调用里要交付的文件路径列表（不是 present → null） */
   const presentPaths = (exec) => {
     if (String(exec?.name ?? '') !== MC_PRESENT_TOOL) return null
@@ -2680,10 +2536,8 @@ export function apply(ctx, rawConfig) {
     if (!Array.isArray(files)) return []
     return files.map((f) => String(f?.path ?? '')).filter(Boolean)
   }
-
   /** 我们自己注册的工具名（MC 模式做工具白名单时要带上它们，否则会被 restrict 一并滤掉） */
   const ourToolNames = []
-
   /**
    * 工具注册的**唯一漏斗**（核心工具和所有扩展都走它）。
    *
@@ -2705,7 +2559,6 @@ export function apply(ctx, rawConfig) {
    * 存的是**裸 `execute`**（不是 `asTool` 包过的那层）：外面那层每次都会
    * `setCallDeadline(CALL_MS)` 重新给 11 秒，会把执行器自己那一轮的预算冲掉。 */
   const TOOL_HANDLERS = new Map()
-
   /**
    * 写动作统一走**动作调度器**（用户 2026-10-14 设计「统一动作调度」的**阶段 P0：只记账**）。
    *
@@ -2760,7 +2613,6 @@ export function apply(ctx, rawConfig) {
     if (r.status === 'busy') return { busy: true, blockedBy: r.blockedBy, note: r.note, waitedMs: r.waitedMs ?? 0 }
     return r.result
   }
-
   /**
    * **折叠名单**（2026-10-24 用户："map 保留，其他全部折叠"）。
    *
@@ -2784,7 +2636,6 @@ export function apply(ctx, rawConfig) {
     lan: 'mc_lan',
   }
   const FOLDED_TO_PROBE = new Set(Object.values(PROBE_ROUTES))
-
   const asTool = (spec) => {
     /* 折叠的工具：只留实现（给 mc_probe 路由），不注册、不进工具名清单 */
     if (spec?.name && FOLDED_TO_PROBE.has(spec.name)) {
@@ -2834,7 +2685,6 @@ export function apply(ctx, rawConfig) {
       return null
     }
   }
-
   /**
    * **原语**注册通道（2026-10-24 用户重构："原语立刻返回本地状态、粒度是动作"）。
    *
@@ -2865,7 +2715,6 @@ export function apply(ctx, rawConfig) {
       return null
     }
   }
-
   /** 从 exec 里拿 agentId，再拿到当前会话的 McSession */
   const getSession = (exec) => {
     const agent = exec?.agent
@@ -2875,7 +2724,6 @@ export function apply(ctx, rawConfig) {
     noteAgent(agent)
     return registry.getOrCreate(agent.id)
   }
-
   /**
    * 工具注册的唯一出口（原来是 `ctx.tools.register(asTool(...))` 的 36 处直接调用）。
    * `asTool` 对被折叠的工具返回 `null` —— 这里跳过，于是"折叠"不需要改 36 个调用点。
@@ -2892,9 +2740,7 @@ export function apply(ctx, rawConfig) {
       return () => {}
     }
   }
-
   /* ── 状态与开关 ── */
-
   /**
    * `mc_status` 的**省 token 视图**（默认）。
    *
@@ -2917,7 +2763,6 @@ export function apply(ctx, rawConfig) {
       return bars.length ? { boss: formatBossBars(bars), bossBars: bars } : {}
     } catch { return {} }
   }
-
   const statusLean = (sess, s, w) => {
     const bits = [s.online ? `🟢 ${sess.mode}` : `⚪ ${sess.mode}`]
     if (sess.bot.reconnecting || sess.bot.reconnectPending) bits.push('重连中')
@@ -2971,7 +2816,6 @@ export function apply(ctx, rawConfig) {
     }
     return lines.join('\n')
   }
-
   /* audit 2026-10-22（用户：全量审计 + 减少 token 消耗）：坐标参数一律走 numOf/coordOf/boxOf。
    *   以前直接写 Number(args.x) —— 传 "12abc" / {} / null 只会得到 NaN，一路灌进 GoalNear(NaN)，
    *   最后回报一句 NoPath。AI 看到的是谜语，而不是「你 x 写错了」。现在缺参 / 非数字 / Infinity
@@ -2987,7 +2831,6 @@ export function apply(ctx, rawConfig) {
     if (INTENT_VALUES.has(t)) return t
     throw new Error('参数 intent 只能是 near / stand / interact / same-level（现在是 "' + t + '"）')
   }
-
   function numOf (v, label) {
     const n = Number(v)
     if (!Number.isFinite(n)) throw new Error('参数 ' + label + ' 必须是数字，收到的是 ' + JSON.stringify(v ?? null))
@@ -3003,7 +2846,6 @@ export function apply(ctx, rawConfig) {
     }
   }
   logLine('开始注册原语层…')
-
   /* ── 原语层（2026-10-24 架构重构）────────────────────────────────────────
    * 9 个原语：移动 4（look / look_at / input / swing）+ 感知 4（self / block / blocks / entities）
    * + 宏 1（apply）。它们只改本地状态、立即返回，不走调度器、不占 11 秒预算（见 asPrimitive）。
@@ -3016,7 +2858,6 @@ export function apply(ctx, rawConfig) {
     getSession,
     text,
   })) registerTool(asPrimitive(spec))
-
   /* 唯一的"环境/诊断/低频感知"入口（2026-10-24 折叠：map 之外全部收进来） */
   /* ── 异步工具框架 + 第一个：mc_navi ───────────────────────────────────────
    * 用户 2026-10-24：「工具开始执行时返回一个报告，然后异步执行；结束或失败时向 agent
@@ -3039,7 +2880,6 @@ export function apply(ctx, rawConfig) {
     /* 队列状态一变就调宿主去收窄/恢复工具面（用户：任务板非空就隐藏所有主动工具） */
     onStateChange: (snap) => queueStateChanged(snap),
   })
-
   /* ── 队列闸门（用户 2026-10-24）───────────────────────────────────────────
    * 「任务板非空就隐藏所有主动工具，不让 agent 操作。」
    * 「当 agent 选择介入原语时…再隐藏其他所有非感知类原语，只给 agent 操作队列的原语。」
@@ -3082,7 +2922,6 @@ export function apply(ctx, rawConfig) {
       logLine('队列收窄工具面失败（guard 仍会拦）：' + String(e?.message).slice(0, 160))
     }
   }
-
   /* ── 队列原语：mc_stop / mc_interrupt ─────────────────────────────────── */
   registerTool(asPrimitive({
     name: 'mc_stop',
@@ -3129,7 +2968,6 @@ export function apply(ctx, rawConfig) {
       }
     },
   }))
-
   registerTool(asPrimitive({
     name: 'mc_interrupt',
     description: '**介入任务队列**（原语 + 信号）—— ⚠️ **最后手段，通常不要用**：'
@@ -3179,7 +3017,6 @@ export function apply(ctx, rawConfig) {
       return { ok: true, action: r.action, detail: r.detail, queue: jobBoard.snapshot(), text: `▶ ${r.detail}` }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_navi',
     description: '**异步导航**：给一个 16 格内的目标，本地算好路线后**立刻返回计划**，然后后台自己走过去；'
@@ -3233,7 +3070,6 @@ export function apply(ctx, rawConfig) {
       }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_collect',
     description: '**收集物品**：给物品名，本地自己找 → 走过去 → 挖 → 确认捡到。\n'
@@ -3280,7 +3116,6 @@ ${where}——走完会主动报告`,
       }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_place',
     description: '**放方块（支持批处理）**：单格 / 一行 / 一面墙 / 一个实心长方体。\n'
@@ -3335,7 +3170,41 @@ ${where}——走完会主动报告`,
       return { ok: result.failed.length === 0 && result.skipped.length === 0, ...result, text: batchText('🧱 放', result, bt.targets.length) }
     },
   }))
-
+  registerTool(asTool({
+    name: 'mc_craft',
+    description: '🧱 **合成物品**（状态机）：只给"要什么 + 几个"，**不用先看背包**。\n'
+      + '· 本地自己算合成链（递归配方），缺料**自动去收集**（插 collect）\n'
+      + '· 需要工作台时：16 格内有 → 走过去用；没有但背包有 → 放到脚边用；\n'
+      + '  背包也没有 → **自己先做一个工作台**（缺木料再收集）；都失败会报原因\n'
+      + '· 合成完**回收自己放的工作台**\n'
+      + '· 异步：入队后立刻返回，完成/失败会主动报告（同 mc_navi / mc_collect）\n'
+      + '· `count` 是"要几个"（默认 1，上限 64）',
+    parameters: {
+      name: { type: 'string', required: true, description: '要合成的物品（oak_planks / stick / wooden_pickaxe / crafting_table …）' },
+      count: { type: 'number', description: '要几个（默认 1，上限 64）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      sess.bot.requireBot()
+      const req = resolveCraftRequest(sess, args)
+      if (!req.ok) return { ok: false, ...req, text: `❌ ${req.why}` }
+      const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+      const queued = jobBoard.enqueue({
+        kind: 'craft',
+        agentId: agentIdOf(exec?.agent),
+        summary: `合成 ${req.itemName} ×${req.count}`,
+        plan: req,
+        run: (signal, job) => runCraft(sess, req, {
+          signal, movements: mv, job, board: jobBoard,
+          log: (m) => logDebug('[craft] ' + m),
+        }),
+      })
+      if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
+      const where = queued.started ? `▶ 立刻开始（job ${queued.job.id}）` : `⏳ 已排队第 ${queued.position} 位（job ${queued.job.id}）`
+      return { ok: true, jobId: queued.job.id, started: queued.started, position: queued.position, ...req, text: craftRequestText(req) + '\n' + where }
+    },
+  }))
   registerTool(asTool({
     name: 'mc_probe',
     description: '**入口路由**：查环境、连接、诊断、背包/方块扫描这类"偶尔查一次"的能力都从这里进（它们不再单独占工具名）。\n'
@@ -3381,7 +3250,6 @@ ${where}——走完会主动报告`,
       return await handler(a, exec)
     },
   }))
-
   registerTool(asTool({
     name: 'mc_status',
     description: '看我在 Minecraft 里的状态：在线 / 坐标 / 朝向 / 血量 / 饱食度 / 手持物 / 模式（active 或 standby）/ 看门狗是否在守 / 最近 3 条聊天。\n'
@@ -3418,7 +3286,6 @@ ${where}——走完会主动报告`,
       return { text: statusLean(sess, s, w) }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_lan',
     description: '探测**局域网里的 Minecraft 服务器**（只读：不连接）。只听原版"对局域网开放"的多播公告（`224.0.2.60:4445`），拿到地址+端口+MOTD。\n'
@@ -3450,7 +3317,6 @@ ${where}——走完会主动报告`,
       }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_ping',
     description: '【单地址探测】**已知地址**时先问一句"你是谁、通不通"——发一次 Minecraft STATUS ping，拿 **通不通** / **版本** / **协议号** / **MOTD** / **人数** / **延迟**。\n'
@@ -3481,7 +3347,6 @@ ${where}——走完会主动报告`,
       return { ...r, text }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_connect',
     description: '连接到 MC 服务器。**这里没有账号密码**——用哪个账户由「MC设置」里维护的账户决定：\n'
@@ -3505,7 +3370,6 @@ ${where}——走完会主动报告`,
       const innerID = args.account ? String(args.account) : (sess.selectedAccount ?? null)
       const resolved = await resolveAuth(innerID)
       sess.selectedAccount = resolved.innerID
-
       const opts = { auth: resolved.auth }
       if (args.host)      opts.host      = String(args.host)
       if (args.port)      opts.port      = Number(args.port)
@@ -3519,7 +3383,6 @@ ${where}——走完会主动报告`,
           .then(() => persistAuth(resolved, profile, session))
           .catch((e) => logLine(`登录后回写账户信息失败（不影响本次进服）：${e?.message ?? e}`))
       }
-
       try {
         await sess.bot.connect(opts)
       } catch (e) {
@@ -3558,7 +3421,6 @@ ${where}——走完会主动报告`,
       }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_accounts',
     description: '【账户】列出 / 搜索 / 刷新 / 选定 MC 账户。**永远拿不到密码或 token**——只有基本信息。\n'
@@ -3578,7 +3440,6 @@ ${where}——走完会主动报告`,
     async execute(args, exec) {
       const action = String(args.action ?? 'list').toLowerCase()
       const sess = getSession(exec)
-
       if (action === 'list') {
         return {
           accounts: accounts.list(),
@@ -3588,7 +3449,6 @@ ${where}——走完会主动报告`,
         }
       }
       if (action === 'search') return accounts.search(args.query)
-
       if (action === 'use') {
         const id = String(args.innerID ?? '').trim()
         if (!id) throw new Error('use 要给 innerID（先 action:"list" 看看有哪些账户）')
@@ -3600,7 +3460,6 @@ ${where}——走完会主动报告`,
           note: '本会话之后 mc_connect 就用这个账户（要进服请再调 mc_connect）',
         }
       }
-
       if (action === 'refresh') {
         const innerID = args.innerID ? String(args.innerID) : (sess.selectedAccount ?? accounts.resolve()?.innerID ?? null)
         const resolved = await resolveAuth(innerID)
@@ -3624,11 +3483,9 @@ ${where}——走完会主动报告`,
           account: accounts.view(accounts.get(resolved.innerID)),
         }
       }
-
       throw new Error(`未知 action："${action}"（可用 list/search/use/refresh）`)
     },
   }))
-
   registerTool(asTool({
     name: 'mc_disconnect',
     description: '从 MC 下线（当前会话的机器人退出游戏）。不影响其他会话的机器人。看门狗会自动关闭并提醒你。',
@@ -3658,9 +3515,7 @@ ${where}——走完会主动报告`,
       }
     },
   }))
-
   /* ── 说话与事件 ── */
-
   registerTool(asTool({
     name: 'mc_say',
     description: '在 MC 公屏说话（游戏里所有玩家能看到）。',
@@ -3679,7 +3534,6 @@ ${where}——走完会主动报告`,
       }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_watch',
     description: '看门狗控制（**唯一**的事件通知通道）。看门狗在**进服时自动挂载、退服时自动卸载**，'
@@ -3721,7 +3575,6 @@ ${where}——走完会主动报告`,
       return wd.status()
     },
   }))
-
   registerTool(asTool({
     name: 'mc_config',
     description: '读写本会话的 MC 配置（看门狗唤醒条件、近距半径、心跳间隔、观察窗口、叫法等）。'
@@ -3765,7 +3618,6 @@ ${where}——走完会主动报告`,
       return { ...configPair(wd.config) }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_capabilities',
     description: '【边界信息】这个插件能做什么、边界在哪：**支持的 MC 版本范围**（testedVersions）、底层 mineflayer 版本、'
@@ -3834,7 +3686,6 @@ ${where}——走完会主动报告`,
       }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_sessions',
     description: '列出当前所有活跃的 MC 会话实例（诊断用：确认各会话的 bot 状态、连接信息）。',
@@ -3847,7 +3698,6 @@ ${where}——走完会主动报告`,
       }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_events',
     description: '读取/消费当前会话的 MC 事件队列（**看门狗记下来的**：聊天、系统消息、受伤、上线/死亡/重连/断线）。'
@@ -3868,7 +3718,6 @@ ${where}——走完会主动报告`,
       const sess = getSession(exec)
       const limit = Math.min(Math.max(Number(args.limit ?? 20), 1), 100)
       const kind = args.kind ? String(args.kind) : null
-
       // 可选阻塞等待（吸收原 mc_wait）。⚠️ 等待逻辑在 src/wait.mjs：**看门狗唤醒会打断它**
       //    —— 否则 steer 注入要等这个工具跑完（2026-09-19 真机：用户空等特别久）。
       const waitSec = Math.min(Math.max(Number(args.waitSec ?? 0), 0), 5)   // 上限 5 秒（用户 2026-10-19：等太久了）
@@ -3883,7 +3732,6 @@ ${where}——走完会主动报告`,
         interrupted = r.interrupted
         interruptReason = r.reason
       }
-
       const list = args.peek
         ? sess.peekEvents(limit, kind)
         : sess.drainEvents(limit, kind)
@@ -3915,9 +3763,7 @@ ${where}——走完会主动报告`,
       return { text: lines.join('\n') }
     },
   }))
-
   /* ── 世界读取 ── */
-
   registerTool(asTool({
     name: 'mc_scan',
     description: '扫描我周围方块：给 name 就找这种方块的位置；不给就返回方块占比（分母不含空气）。'
@@ -4002,7 +3848,6 @@ ${where}——走完会主动报告`,
       return r
     },
   }))
-
   registerTool(asTool({
     name: 'mc_map',
     description: '看周围地形。**默认给"脚下方块那一层"**（地板层图：这一层哪里是实心地面、哪里是坑/岩浆/未加载）：'
@@ -4101,7 +3946,6 @@ ${where}——走完会主动报告`,
       const purposeArg = String(args.purpose ?? '').toLowerCase()
       const purpose = purposeArg === 'navigation' || purposeArg === 'hazards' ? purposeArg : 'overview'
       const nav = navSummaryOf(hm, { purpose, target: args.target })
-
       const out = {
         center: hm.center, radius: hm.radius, unloadedTiles: hm.unloaded, mode: hm.mode,
         ...(hm.layer ? { layer: hm.layer } : {}),
@@ -4133,7 +3977,6 @@ ${where}——走完会主动报告`,
         })
         const png = encodePng(img.width, img.height, img.rgba)
         out.image = { width: img.width, height: img.height, bytes: png.length, scale: img.scale }
-
         // ① 内联给模型/前端看
         const att = ctx.get('attachments')
         if (att && typeof att.saveImage === 'function') {
@@ -4213,7 +4056,6 @@ ${where}——走完会主动报告`,
       return out
     },
   }))
-
   /* mc_entities（附近有谁）已于 2026-10-08 并进 mc_observe 的三段式感知（② 程序检测到）——
    * 用户要求「不要只让 AI 看截图，也不要只让 AI 读取方块坐标」，所以一次调用给全：图 + 程序侧实体（坐标/血量）。
    * 实体数据仍走 src/core.mjs 的 entities()（同一份判据），功能没有损失。 */
@@ -4227,9 +4069,7 @@ ${where}——走完会主动报告`,
       return sess.bot.inventory()
     },
   }))
-
   /* ── 行动 ── */
-
   /* 周围实体快照（用户 m01114：走完一步要能看见"身边有谁"，不用再单独叫 mc_entities）。
    * 只列 12 格内、最多 6 个；附近没人就返回 {}（常态零额外 token）。 */
   /* 🔴 2026-10-23 审计（用户："怎么全是item"）：掉落物统一叫 item，地上摊着几件就把真怪挤没了。
@@ -4276,7 +4116,6 @@ ${where}——走完会主动报告`,
       ...(junk ? { junk: { count: junk, nearest: Number(junkNearest.toFixed(1)) } } : {}),
     }
   }
-
   registerTool(asTool({
     name: 'mc_move',
     description: '移动。mode="walk" 走过去（自动避障；**在水里会自动改成"直接游"**）；mode="fly" 创造直飞（约 9 格/秒，会先发飞行权限包）；'
@@ -4363,9 +4202,7 @@ ${where}——走完会主动报告`,
       return { ...withOutcome(await sess.bot.walkTo(target, { budget: callBudget(args.budgetMs), noTower: args.allowTower !== true, noDig, intent: intentArgOf(args.intent), waterRecover: typeof args.waterRecover === 'boolean' ? args.waterRecover : undefined, xz: wantsXZ }), { expect: 'moved' }), ...aroundOf(sess) }
     },
   }))
-
   /* ── 行动：看向/走近/放置/破坏/使用/攻击/装备/丢弃（统一入口）── */
-
   registerTool(asTool({
     name: 'mc_act',
     /* 🔴 2026-10-20 审计（用户："减少 token 消耗"）：每行只留"这个 mode 干什么 + 影响决策的行为"，
@@ -4443,7 +4280,6 @@ ${where}——走完会主动报告`,
       }
     },
   }))
-
   /* 钓鱼（用户 2026-10-22：「加一个钓鱼的功能」，随后「加工具，不要管预算」）——
    * 手里有竿就抛，盯浮标有没有明显往下沉（那就是咬钩），沉了收竿。
    * 实现在 `src/fish.mjs`：单次最多盯 8 秒，没咬钩浮标留在水里，**再叫一次接着盯**，不必重新抛。 */
@@ -4472,7 +4308,6 @@ ${where}——走完会主动报告`,
       return withOutcome({ text: `${head}：${r.message}${tail}`, ...r })
     },
   }))
-
   registerTool(asTool({
     name: 'mc_give',
     description: '**创造模式直接获取物品**（不走 /give 指令——那是协议级改槽位，非 OP 也能用）。'
@@ -4511,7 +4346,6 @@ ${where}——走完会主动报告`,
       })
     },
   }))
-
   /* 射箭（2026-10-22 用户：「这些拆了」——从 mc_act 独立出来）——
    * 弹道在 `src/shoot.mjs`：换弓回读 → 数箭 → hawkeye 算 yaw/pitch → 拉满 → 再瞄一次 → 放 → 数箭确认。
    * 用户 2026-10-19：「hawkeye 主要是水晶和末影龙」；2026-10-20：「shoot 完显示周围实体，和 attack 一样」。 */
@@ -4538,7 +4372,6 @@ ${where}——走完会主动报告`,
       return { ...withOutcome({ ...(await bot.shoot({ who: args.who, x: args.x, y: args.y, z: args.z, count: args.count, waitTime: args.waitTime, lead: args.lead, weapon: args.weapon, aim: args.aim, maxDist: args.maxDist })), ...bossBarsField(bot) }), ...aroundOf(sess) }
     },
   }))
-
   /* 打实体（2026-10-22 用户：「这些拆了」）—— 目标选择/风筝/追击自成一族。 */
   registerTool(asTool({
     name: 'mc_attack',
@@ -4559,7 +4392,6 @@ ${where}——走完会主动报告`,
       return withOutcome({ ...(await bot.attack(args)), ...bossBarsField(bot) })
     },
   }))
-
   /* 出发前自查（2026-10-22 用户：「这些拆了」）—— 它是**只读**的，跟动手类不是一族。 */
   registerTool(asTool({
     name: 'mc_prep',
@@ -4576,7 +4408,6 @@ ${where}——走完会主动报告`,
       return withOutcome({ ...(prepCheck(sess.bot.requireBot(), { for: args.for })) })
     },
   }))
-
   /* 附魔台 / 铁砧 / 锻造台（2026-10-22 用户：「这些拆了」）—— 三个都是"对着方块 UI 操作"，
    * 共用"走到方块 → 打开 → 操作 → 确认"的骨架，合成一个工具、用 kind 分。 */
   registerTool(asTool({
@@ -4608,7 +4439,6 @@ ${where}——走完会主动报告`,
       throw new Error(`未知 kind："${kind}"（可用 enchant / anvil / smithing）`)
     },
   }))
-
   /* 村民交易（用户 2026-10-23：「1档和2档做一下」—— 一档第一条）。
    * 抄 mindcraft 的 tradeWithVillager / showVillagerTrades（src/agent/library/skills.js:1748-1904），
    * 但把"找谁/买第几条/买几次/买不买得起"做成两个 action：list 先看，buy 再买。
@@ -4640,7 +4470,6 @@ ${where}——走完会主动报告`,
       })
     },
   }))
-
   registerTool(asTool({
     name: 'mc_sequence',
     description: '**按顺序执行一串世界交互**（替代"写脚本"）：适合"走到这里放几个方块，再走到那里放几个"这类连串动作。\n'
@@ -4672,7 +4501,6 @@ ${where}——走完会主动报告`,
       return { ...r, ...aroundOf(sess) }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_build',
     description: '批量搭方块：把 (x1,y1,z1)–(x2,y2,z2) 这个实心长方体用 name 方块搭出来（会自己走近/垫脚，上限 max 个）。'
@@ -4727,7 +4555,6 @@ ${where}——走完会主动报告`,
       })
     },
   }))
-
   registerTool(asTool({
     name: 'mc_dig',
     description: '挖方块：给 name 挖最近的，或给 pos 挖指定坐标；count 可连续挖多个（会自己换成对的工具；结果带 held）。\n'
@@ -4810,7 +4637,6 @@ ${where}——走完会主动报告`,
       return { result: lines, text: lines.join('\n') }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_task',
     description: '长活儿进度台账（挖 4 个以上自动开），存记忆根 tasks.json，掉线重连都还在。\n'
@@ -4942,7 +4768,6 @@ ${where}——走完会主动报告`,
       return { text: lines.join('\n') }
     },
   }))
-
   registerTool(asTool({
     name: 'mc_command',
     description: '以玩家身份执行服务器指令。**白名单可配置**（默认 tp/give/time/weather/say/gamemode/effect/'
@@ -4993,7 +4818,6 @@ ${where}——走完会主动报告`,
       return { sent: `共 ${sent.length} 条`, commands: sent, count: sent.length }
     },
   }))
-
   /* ── 图像：SVG 为编辑语言（写/引图/光栅化/保存）──
    * 用户的思路：SVG 是文本，AI 本来就会写——拼网格/画框/加文字（含中文）都在 SVG 里表达，
    * 我们只补它做不到的两件事：**把外部图片塞进 SVG**（embed）和 **SVG→PNG**（render）。
@@ -5005,7 +4829,6 @@ ${where}——走完会主动报告`,
    *    产出文件卡片：可预览、可打开；正文里写行内代码的文件名也会变成可点链接）。
    *    所以现在只负责**把图落到工作区**，交付交给 `present`。
    * ------------------------------------------------------------------------ */
-
   /** 把用户给的路径解析到**这个会话的工作区**内（不许越界） */
   const insideWorkspace = (raw, agent) => {
     const root = workspaceRootFor(agent)
@@ -5016,7 +4839,6 @@ ${where}——走完会主动报告`,
     }
     return abs
   }
-
   registerTool(asTool({
     name: 'mc_kit_image',
     description: '图像能力。**SVG 是编辑语言**：布局/画矩形框/加文字（含中文）/拼网格，'
@@ -5079,13 +4901,11 @@ ${where}——走完会主动报告`,
         return inWs(raw)
       }
       /* 🔴 用户 2026-09-16：结果里**不再**塞任何 express 字段（'不要乱给已有工具加'）——取路径统一走 mc_kit_express。 */
-
       switch (action) {
         case 'info': {
           const p = inWs(args.path)
           return await ImageEngine.info(p)
         }
-
         case 'embed': {
           const r = await ImageEngine.embed(inWs(args.path), {
             asTag: true, x: args.x ?? 0, y: args.y ?? 0, width: args.width, height: args.height,
@@ -5096,7 +4916,6 @@ ${where}——走完会主动报告`,
             tag: r.tag, note: r.note,
           }
         }
-
         case 'render': {
           if (!args.svg && !args.svgPath) throw new Error('render 需要 svg 文本或 svgPath')
           const r = await ImageEngine.render({
@@ -5108,7 +4927,6 @@ ${where}——走完会主动报告`,
           const saved = ImageEngine.save(out, r.png)
           return { rendered: `${r.width}x${r.height}`, ...saved }
         }
-
         case 'grid': {
           const r = await ImageEngine.grid({
             paths: (args.paths ?? []).map((p) => inWs(p)),
@@ -5124,7 +4942,6 @@ ${where}——走完会主动报告`,
               + '再 mc_kit_image{action:"render"} 光栅化成 PNG。',
           }
         }
-
         case 'save': {
           if (!args.svg && !args.path) throw new Error('save 需要 svg（文本）或 path（要复制的文件）')
           const out = needOut('mc-image.svg')
@@ -5133,13 +4950,11 @@ ${where}——走完会主动报告`,
           const { readFileSync } = await import('node:fs')
           return { ...ImageEngine.save(out, readFileSync(src)), kind: 'copy', from: src }
         }
-
         default:
           throw new Error(`未知 action："${action}"（可用 info/embed/render/grid/save）`)
       }
     },
   }))
-
   /**
    * 发布区取链接：**唯一**的"把文件端给用户"的入口（用户 2026-09-16 定）。
    *
@@ -5209,12 +5024,10 @@ ${where}——走完会主动报告`,
       return { enabled: true, url, rel: ref.rel }
     },
   }))
-
   /* ── 长期记忆（游戏外通用能力，所以叫 mc_kit_ 不叫 mc_）──
    * 固定 <工作区>/.dsh-mc-agent/：AI 维护 README.md 索引，按服务器建子文件夹，
    * 任意格式文件可读写（含图片），**不执行任何东西**。
    * ------------------------------------------------------------------------ */
-
   registerTool(asTool({
     name: 'mc_kit_memory',
     description: '长期记忆（跨会话、重启后还在），放 `.dsh-mc-agent/`，按服务器建子文件夹（`_global/` 放通用的）。\n'
@@ -5266,7 +5079,6 @@ ${where}——走完会主动报告`,
         })
       }
       if (action === 'kinds') return mem.kinds()
-
       // put：把工作区里的源文件复制进记忆（图片最常用；任何格式都行）
       if (action === 'put') {
         const src = insideWorkspace(args.source, exec?.agent)
@@ -5277,14 +5089,12 @@ ${where}——走完会主动报告`,
         }
         return mem.put({ source: src, name: args.name, path: args.path, server })
       }
-
       // 只在"没显式给 server 且没给 path"时，才用当前所在服兜底
       let server = args.server
       if (server === undefined && args.path === undefined) {
         const sess = getSession(exec)
         server = sess.bot.sub ?? null      // 不在线 → null → 落进 _global
       }
-
       const sel = { path: args.path, topic: args.topic, server }
       switch (action) {
         case 'read': {
@@ -5324,9 +5134,7 @@ ${where}——走完会主动报告`,
    *    调用点在下面"MC 模式判据"之后（那里才拿得到 isMcModeAgent 等依赖）。
    *    这里只留个指路牌，别再往这儿写注入/台账的逻辑。
    * ------------------------------------------------------------------------ */
-
   const ensureMemoryRoot = (agent) => ensureMemoryRootForCwd(workspaceOf(agent), noteAgent(agent))
-
   /* ─────────── MC 模式：权限隔离 + 专属指导（用户 2026-09-16 要求）───────────
    * 判定"是不是 MC 模式"：`agentPresets.composedPreset(agent.ctx)` 落在配置的
    * `mcModePresets` 里。然后做三件事：
@@ -5334,7 +5142,6 @@ ${where}——走完会主动报告`,
    *   ② 工具执行：注册**全局 guard** 硬拒 mc_admin_*（即使隐藏失效也调不动）
    *   ③ 提示词：注入 dsh-mc-agent 专属指导（宿主的 AGENTS.md 注入之外，另加这一段）
    * ------------------------------------------------------------------------ */
-
   /** 自动创建 preset 时的显示名（preset.yml 里的 `name:`） */
   const MC_PRESET_NAME = 'MC模式'
   /**
@@ -5344,7 +5151,6 @@ ${where}——走完会主动报告`,
    *    所以复制完必须把**元数据**改回来（`preset.yml` 是显示文本，不是 composition，可以自己写）。
    */
   const MC_PRESET_DESCRIPTION = '可以加入Minecraft Java版服务器，模拟玩家进行交互。'
-
   /** `~` 开头的 preset 根展开成绝对路径（宿主的 root 配置允许写 `~`） */
   /**
    * 自动建出来的 preset 的**人设**（persona）。
@@ -5358,7 +5164,6 @@ ${where}——走完会主动报告`,
    * 系统提示词**由宿主按这个 preset 自动注入**，插件不再自己往 systemPrompt 里塞（用户要求）。
    */
   const MC_PERSONA_TEXT = '你在一台真实的 Minecraft Java 版服务器里扮演一名玩家：你的"身体"是一台无头机器人，能观察世界、移动、挖掘和建造。'
-
   /**
    * 「MC+模式」的补充说明（随版本硬编码、无开关；**只投给 MC+ 会话**，见 `reconcileNotices`）。
    *
@@ -5375,12 +5180,10 @@ ${where}——走完会主动报告`,
     '· 行事准则（`.dsh-mc-agent/RULES.md`）与看门狗与 MC 模式相同；管理工具 `mc_admin_*` 对本模式可见。',
     '适合"不局限于游戏内"的任务与定制要求——但游戏内的事，仍然优先用 MC 工具与游戏内交流来办。',
   ].join('\n')
-
   const expandHome = (p) => {
     const s = String(p ?? '')
     return s.startsWith('~') ? join(homedir(), s.slice(1).replace(/^[/\\]+/, '')) : s
   }
-
   /** 只有**我们建的**那份才修：persona 键名对不对（以"本版本源 preset"为标尺） */
   const repairPersonaKeyIfNeeded = (svc, id, { composition, sourceKey, mine, stillComplete }) => {
     const mineKey = personaTextKeyOf(composition)
@@ -5392,7 +5195,6 @@ ${where}——走完会主动报告`,
       : `MC 模式 preset「${id}」persona 键名需要修正，但这次没改成（下次启动再试；必要时手动编辑 agent.cordis.yml）`)
     return fixed
   }
-
   /**
    * 复制完官方 preset 之后，把**我们自己的几处**覆盖上去：
    *   ① persona（官方那句 "You are a helpful software engineer assistant." + `complete: true` 都不要）
@@ -5418,7 +5220,6 @@ ${where}——走完会主动报告`,
       return true
     } catch (e) { logLine(`改 preset 的 persona/shell/工具组失败（不影响挂载）：${e.message}`); return false }
   }
-
   /**
    * 这份部署里**能加载哪些** MC 模式需要的工具组？
    *
@@ -5469,7 +5270,6 @@ ${where}——走完会主动报告`,
     if (missing.length) logLine(`这些工具包在本部署的 preset 里没人引用 → 不往 MC 模式 preset 里加：${missing.join(', ')}`)
     return availableGroups
   }
-
   /**
    * 给**已存在**的 preset 补工具组（用 `leave`/`meta` 分支时用；不动别的行）。
    *
@@ -5505,7 +5305,6 @@ ${where}——走完会主动报告`,
       return true
     } catch (e) { logLine(`补 preset 工具组失败（不影响挂载）：${e.message}`); return false }
   }
-
   /** preset 目录（用户可写根下那个），拿不到就 null */
   const mcPresetDir = (svc, id) => {
     try {
@@ -5514,7 +5313,6 @@ ${where}——走完会主动报告`,
       return userRoot ? join(expandHome(userRoot), id) : null
     } catch { return null }
   }
-
   /** 读组成文本（`list()` 给的行里有 path = composition 文件） */
   const compositionOf = (row) => {
     try {
@@ -5523,7 +5321,6 @@ ${where}——走完会主动报告`,
     } catch { return null }
   }
   const hash16 = (s) => (s == null ? null : createHash('sha256').update(String(s)).digest('hex').slice(0, 16))
-
   /**
    * 把 `preset.yml`（显示名 / 简介 / 排序）写回去。
    * ⚠️ 只写**元数据**：composition（`agent.cordis.yml`）一根手指都不碰 ——
@@ -5543,7 +5340,6 @@ ${where}——走完会主动报告`,
       return true
     } catch (e) { logLine(`写 preset 简介失败（不影响使用）：${e.message}`); return false }
   }
-
   /**
    * 我们的"自建标记"：写在 preset 目录里（dot 文件，宿主不认它是 preset 内容）。
    * 作用：**下次启动能认出自建的那份**，从而"检查不对就重建"；用户改过的一律不碰。
@@ -5575,7 +5371,6 @@ ${where}——走完会主动报告`,
       return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null
     } catch { return null }
   }
-
   /** 宿主 agentPresets 服务（可能晚就绪 → 必须走 inject 等，别用 apply 时的 ctx.get） */
   let agentPresetsSvc = null
   ctx.inject(['agentPresets'], (scope) => {
@@ -5583,7 +5378,6 @@ ${where}——走完会主动报告`,
     // 🔴 同上：preset 自检/自建失败只能记日志，不能让 rejection 漏出去（fail-loud → exit(1)）
     void ensureMcPreset().catch((e) => logLine(`MC 模式 preset 自检失败（不影响启动）：${e?.message ?? e}`))
   })
-
   /**
    * **MC 模式 preset 的初始化自检**（用户 2026-09-16 定，两次追加要求）：
    *   ① 没有 → 自动建一个（复制官方 preset）
@@ -5615,7 +5409,6 @@ ${where}——走完会主动报告`,
       const wanted = pluginConfig.mcModePresets
       const existingId = wanted.find((id) => rows.has(id))
       const source = pickPresetSource(ids, svc.defaultId)
-
       if (existingId) {
         const row = rows.get(existingId)
         const dir = mcPresetDir(svc, existingId)
@@ -5704,7 +5497,6 @@ ${where}——走完会主动报告`,
         }
         return
       }
-
       // preset id 必须是目录名（宿主 `PRESET_ID = /^[a-z0-9][a-z0-9-]*$/`）。
       // 🔴 2026-10-15 审计（报告 E 第 5 条）：这里原来写"`dsh-mc-agent` 带下划线、永远不可能是
       //    preset id"——错的（它是连字符，完全合法）。`pickPresetTarget` 现在会把插件自己的 id 排除掉。
@@ -5737,10 +5529,8 @@ ${where}——走完会主动报告`,
       logLine(`自动创建 MC 模式 preset 失败（不影响其它功能）：${e?.message ?? e}`)
     }
   }
-
   /** 诊断用：每个 agent 最近一次看到的 preset id（`/api/mc/mode` 会报出来） */
   const lastPresetSeen = new WeakMap()
-
   /**
    * 现场问出这个 agent 的 preset id（拿不到 → null）。
    *
@@ -5759,12 +5549,9 @@ ${where}——走完会主动报告`,
       return null
     } catch { return null }
   }
-
   const isMcModeAgent = (agent) => pluginConfig.isMcModePreset(mcPresetIdOf(agent))
-
   /** MC+ 变体判据（MC 模式基础上开放标准模式全部工具）；名单与语义见 src/config.mjs isMcPlusPreset */
   const isMcPlusAgent = (agent) => pluginConfig.isMcPlusPreset(mcPresetIdOf(agent))
-
   /* ── 提示词注入 / 通知台账 / 记忆根播种 ─────────────────────────────────
    * 原来这几摊子就写在这儿（666 行），2026-10-20 搬进了 `src/inject.mjs`：
    * 它和"工具"没关系，讲的是"该不该塞提示词 / 哪些指令发过了 / 新会话播种哪些文件"。
@@ -5791,8 +5578,6 @@ ${where}——走完会主动报告`,
         versionPromptTitle, workspaceConfigValues, workspaceOf,
         workspaceRootFor, wsCfgValues, wsConfigPath,
   })
-
-
   /**
    * 看门狗的**模式闸门**：只有"仍然是 MC 模式"的会话才允许它往会话里注入。
    *
@@ -5803,7 +5588,6 @@ ${where}——走完会主动报告`,
    * @returns {() => boolean} 供 `Watchdog#gate` 用的回调
    */
   const watchdogGate = (sess) => () => isMcModeAgent(sess?.watchdog?.agent)
-
   /** 取某个 agent scope 上的 tools 服务：restrict **必须**用 scoped 服务，否则会被宿主拒绝 */
   const scopedTools = (agentCtx) => {
     const pickers = [() => agentCtx.get('tools'), () => agentCtx.tools]
@@ -5815,17 +5599,14 @@ ${where}——走完会主动报告`,
     }
     return null
   }
-
   /* 🔴 2026-09-16：这里原来有一段"麦块模式专属指导"（通过系统提示注入）。
    * 用户要求**删掉显式注入**，而且它的内容（单对话 / 记忆 / 看门狗 / 指令是最后手段 / 别乱挖乱建）
    * 已经全部写在 `.dsh-mc-agent/AGENTS.md`（用户 亲自给的那版）里 —— 留着就是重复。 */
-
   /**
    * 这个 agent 当前套用的**工具曝光策略**（'mc' / 'mc-plus' / 'other'；没套过 = 不存在）。
    * 由 `applyMcModePolicy` 按现场判据重算；kind 没变就不动（幂等）。
    */
   const mcPolicyKind = new WeakMap()
-
   /**
    * 工具限制的**撤销手柄**：`tools.restrict()` 返回的 disposer（mc 白名单与 other 的 deny 共用）。
    *
@@ -5839,7 +5620,6 @@ ${where}——走完会主动报告`,
    *    （admin/文件边界这些在 **guard** 里，每次调用现场判，切模式立刻自愈，不需要撤销。）
    */
   const mcRestrictRelease = new WeakMap()
-
   /**
    * 已确认属于 MC 模式的会话 id（给前端 `/api/mc/mode` 兜底用）。
    * 主路径是现场问 `agentPresets`（见 handleMcApi 的 /api/mc/mode），
@@ -5850,7 +5630,6 @@ ${where}——走完会主动报告`,
   const mcPlusAgentIds = new Set()
   /** 因为"没选中工作区"被拒绝进入 MC 模式的会话（`/api/mc/mode` 用它报原因） */
   const noWorkspaceRefused = new Set()
-
   /**
    * 按**现场判据**给这个 agent 套工具曝光策略（三种去向）：
    *   · `mc`（MC模式）—— 白名单：mc 工具 + 文件工具 + present + allowOtherTools；
@@ -5887,7 +5666,6 @@ ${where}——走完会主动报告`,
       try { prev() } catch (e) { logLine(`撤销上一轮工具限制失败（guard 仍会兜底）：${e?.message ?? e}`) }
     }
     mcPolicyKind.set(agent, kind)
-
     if (kind === 'other') {
       if (agent.id) { mcModeAgentIds.delete(String(agent.id)); mcPlusAgentIds.delete(String(agent.id)) }
       /* 🔴 2026-10-25 用户：「你不是创造模式吗？更新一下会话级工具呗」——
@@ -5926,7 +5704,6 @@ ${where}——走完会主动报告`,
       }
       return
     }
-
     if (agent.id) {
       mcModeAgentIds.add(String(agent.id))
       if (isPlus || isUnrestricted) mcPlusAgentIds.add(String(agent.id))
@@ -5937,14 +5714,12 @@ ${where}——走完会主动报告`,
     //    因为模式在第一次请求之前还可能被改（宿主允许空白期反复切 preset）。
     //    这条日志只是"模式已生效"的标记；真投出去时 `reconcileNotices` 自己会记一行。
     logLine(`${isPlus ? 'MC+ 模式' : isUnrestricted ? 'MC 模式（创造模式全权限）' : 'MC 模式'}生效（preset=${id ?? '?'}，${agent.id}）提示词将在首次请求组装前投递`)
-
     // MC+ / 全权限：不套白名单（见上面注释）；guard 对 MC+ 只保留凭据路径拒绝、对全权限什么都不留
     if (isPlus) return
     if (isUnrestricted) {
       logLine('🔓 mcMode.unrestricted 已开：MC 模式不套工具白名单（全部工具可用、文件不限记忆根、mc_admin_* 可调）')
       return
     }
-
     // ② 工具可见性：**白名单**（用户 2026-09-16 真机投诉："这个 agent 怎么还能用 pwsh！不是只暴露我们指定的工具吗！"）
     //
     // 🔴 以前是"allowOtherTools 非空才走白名单"——默认为空 ⇒ 只 deny 了我们自己的管理工具，
@@ -5994,7 +5769,6 @@ ${where}——走完会主动报告`,
       logLine(`MC 模式工具白名单**没生效**（${String(e?.message).slice(0, 160)}）—— 管理工具与文件越界仍由 guard 兜底，下次再试`)
     }
   }
-
   /**
    * 退出 MC 模式（切回普通模式）：**撤回提示行 + 把工具策略换成"非 MC"档**。
    *
@@ -6027,7 +5801,6 @@ ${where}——走完会主动报告`,
       logLine(`已退出 MC 模式（preset=${lastPresetSeen.get(agent) ?? '?'}，${agent.id ?? '?'}）：${was === 'mc' ? '工具白名单已撤销' : 'MC+ 工具面已恢复为普通限制'}`)
     }
   }
-
   // ③ 硬保证（不管可见性怎样）：按模式分档的**调用级兜底**。
   //
   //    · MC 模式：管理工具调不动 + 文件工具只能碰 `<工作区>/.dsh-mc-agent/` + 受保护文件只读；
@@ -6046,7 +5819,6 @@ ${where}——走完会主动报告`,
        *    打开后这里**什么都不拦**：凭据路径、secrets/、受保护文件、admin 工具、
        *    非 MC 会话里的 mc_* 全部放行（用户明确要求"连凭据硬拒也去掉"）。 */
       if (pluginConfig.mcUnrestricted === true) return undefined
-
       // ① 凭据硬拒：两种 MC 模式都保留（"凭据不进模型上下文"是插件不变式）
       if ((isMc || isPlus) && /^(read|edit|write|glob|grep|ls|cat|read_image|mc_kit_memory)$/i.test(name)) {
         const text = JSON.stringify(exec?.arguments ?? {})
@@ -6065,7 +5837,6 @@ ${where}——走完会主动报告`,
         }
       }
       if (isPlus) return undefined   // MC+：其余放行（文件全工作区；admin 可见；受保护文件按宿主默认）
-
       if (!isMc) {
         // 非 MC 模式：mc_* / mc_kit_* 硬拒（mc_admin_* 例外——它的用途就是在普通会话里管理）
         if (agent && (/^mc_kit_/i.test(name) || (/^mc_/i.test(name) && !/^mc_admin_/i.test(name)))) {
@@ -6073,13 +5844,11 @@ ${where}——走完会主动报告`,
         }
         return undefined
       }
-
       // ── 以下只对 MC 模式生效 ──────────────────────────────────────────────
       // ② 管理工具：MC 模式一律拒绝（隐藏之外再上一道硬锁）
       if (name.startsWith('mc_admin_')) {
         return 'MC 模式会话不能读取或修改 dsh-mc-agent 配置——请在普通会话里用 mc_admin_config 改。'
       }
-
       if (/^(read|edit|write|ops_replace|glob|grep|ls|cat|read_image|mc_kit_memory)$/i.test(name)) {
         const args = exec?.arguments ?? {}
         // 受保护文件（RULES.md / AGENTS.md / config.json，src/protected.mjs）：**可读不可写**。
@@ -6103,7 +5872,6 @@ ${where}——走完会主动报告`,
           return rejectionText()
         }
       }
-
       // ③ 🔴 用户 2026-09-16："读写文件都只能在记忆文件夹内！"
       //    文件工具（read/write/edit/read_image/glob/grep）的路径一律解析到
       //    `<工作区>/.dsh-mc-agent/` 之内；**没给路径也算越界**（glob/grep 不给路径 = 扫整个工作区）。
@@ -6133,7 +5901,6 @@ ${where}——走完会主动报告`,
           return `MC 模式只能在记忆文件夹（${root}）里读写文件；这个路径在外面：${rel}`
         }
       }
-
       // ④ `present`：**只能交付本会话工作区内的文件**（`.dsh-mc-agent/` 与 `out/` 都在里面）。
       //    宿主自己也要求"文件已存在且在工作区里"，这里只是把边界说清、给可读的拒绝理由。
       const delivering = presentPaths(exec)
@@ -6150,7 +5917,6 @@ ${where}——走完会主动报告`,
       return undefined
     })
   } catch (e) { logLine(`注册 MC 模式 guard 失败：${e.message}`) }
-
   // agent 建立 / 首轮开始 / **模式被选上** 时应用策略。
   // 🔴 2026-09-16 真机事故：只挂 `agent/created` + `agent/session-start` 是不够的 ——
   //    preset 完全可能在 agent 建好之后才选上（在会话里点「MC模式」芯片），宿主为这种情况
@@ -6186,7 +5952,6 @@ ${where}——走完会主动报告`,
         touch(safeAgentById(sessionId))
       }))
     } catch { /* 老宿主没有这个事件 */ }
-
     /* 🔴🔴 2026-09-18 **提示词的挂载点**（用户："应该切换到正确的挂载点……而是在对话开始后设置
      *    工具/注入提示词"）。宿主给的时序是：`agent/created`（setup 完成 = preset 已 mount）
      *    → `agent/session-start` → **首次请求组装**，而 `agent/pre-step` 正是"消息已经被领走、
@@ -6232,9 +5997,7 @@ ${where}——走完会主动报告`,
     } catch { /* 老宿主没有这条瀑布 */ }
     return () => { for (const off of handlers) { try { off?.() } catch {} } }
   }, 'dsh-mc-agent: mc-mode policy')
-
   /* ── 管理工具：只有**非 MC 模式**会话能用（MC 模式看不见 + 调了被 guard 拒）── */
-
   registerTool(asTool({
     name: 'mc_admin_config',
     description: '【管理】读写 dsh-mc-agent 的**全局配置**（指令白名单、MC 模式工具暴露、记忆目录…）。\n'
@@ -6280,16 +6043,13 @@ ${where}——走完会主动报告`,
       }
     },
   }))
-
   logLine(`核心工具注册完成：${ourToolNames.length} 个（含原语/队列/批处理）`)
-
   /* ─────────── 扩展点：其他 Agent 往 extensions/ 丢文件就能加工具 ───────────
    * 需求 6 的另一半："其他 Agent 要保留为它做扩展、写 Agent 的能力"。
    * 任何 .mjs 导出 `apply(api)` 即可；api 里给了 asTool / getSession / registry /
    * memory / ctx / config。这样别的会话可以给它加能力而**不用改这个文件**。
    * 说明文档：dsh-mc-agent/extensions/README.md
    * ------------------------------------------------------------------------ */
-
   ctx.effect(() => {
     const dir = fileURLToPath(new URL('./extensions/', import.meta.url))
     if (!existsSync(dir)) return
@@ -6320,9 +6080,7 @@ ${where}——走完会主动报告`,
       }
     })()
   }, 'dsh-mc-agent: extensions')
-
   /* ── 诊断 ── */
-
   /* 开着的容器窗口 + 合成格里的东西。
    * 🔴 为什么要有这个：`bot.inventory.items()` 只列背包+快捷栏（`inventoryStart=9`），
    * **不含合成格**（自己背包的 2×2 在 slot 1~4，工作台的 3×3 在 slot 1~9）。
@@ -6348,7 +6106,6 @@ ${where}——走完会主动报告`,
     }
     return Object.keys(out).length ? out : null
   }
-
   /* audit 2026-10-22（用户：全量审计 + 减少 token 消耗）：mc_diag 两处浪费
    *   1) 断线分支完全无视 only，照样塞 perf / terrainCache / workers 和整份 promptInjection
    *      （实测一次约 5 KB），而断线时 AI 只想知道我在不在线；
@@ -6493,5 +6250,4 @@ ${where}——走完会主动报告`,
     },
   }))
 }
-
 export default { name, inject, Config, apply }
