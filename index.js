@@ -2715,7 +2715,16 @@ export function apply(ctx, rawConfig) {
       return null
     }
   }
-  /** 从 exec 里拿 agentId，再拿到当前会话的 McSession */
+  /**
+ * 把 McSession 转成各模块期望的 `self`：`{ bot: <mineflayer bot>, _pf: <pathfinder 模块> }`。
+ *
+ * 2026-10-25 实机：`mc_craft` 直接报「还没进服」—— 因为 index.js 把 **McSession**
+ * 当成 self 传进去了（`sess.bot` 是 McBot，不是 mineflayer bot，没有 `entity`）。
+ * navi / collect / craft / smelt 这几个模块要的都是**裸 mineflayer bot**。
+ */
+  const botView = (sess) => ({ bot: sess?.bot?.bot ?? null, _pf: sess?.bot?._pf ?? null })
+
+/** 从 exec 里拿 agentId，再拿到当前会话的 McSession */
   const getSession = (exec) => {
     const agent = exec?.agent
     if (!agent) throw new Error('拿不到当前会话（exec.agent 不可用）')
@@ -3038,7 +3047,7 @@ export function apply(ctx, rawConfig) {
     async execute (args, exec) {
       const sess = getSession(exec)
       const b = sess.bot.requireBot()
-      const plan = buildNaviPlan(sess, args)
+      const plan = buildNaviPlan(botView(sess), args)
       if (!plan.ok) return { ok: false, ...plan, text: naviReportText(plan) }
       const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
       const { route, routeError } = previewRoute(sess, plan, { movements: mv })
@@ -3049,7 +3058,7 @@ export function apply(ctx, rawConfig) {
         agentId: agentIdOf(exec?.agent),
         summary: `导航到 (${plan.target.x}, ${plan.target.y}, ${plan.target.z})`,
         plan,
-        run: (signal) => runNavi(sess, plan, { signal, movements: mv }),
+        run: (signal) => runNavi(botView(sess), plan, { signal, movements: mv }),
       })
       if (!queued.ok) {
         return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
@@ -3087,7 +3096,7 @@ export function apply(ctx, rawConfig) {
     async execute (args, exec) {
       const sess = getSession(exec)
       sess.bot.requireBot()
-      const plan = planCollect(sess, args)
+      const plan = planCollect(botView(sess), args)
       if (!plan.ok) return { ok: false, ...plan, text: `❌ ${plan.why}` }
       const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
       const queued = jobBoard.enqueue({
@@ -3095,7 +3104,7 @@ export function apply(ctx, rawConfig) {
         agentId: agentIdOf(exec?.agent),
         summary: `收集 ${plan.name} ×${plan.count}`,
         plan,
-        run: (signal, job) => runCollect(sess, plan, {
+        run: (signal, job) => runCollect(botView(sess), plan, {
           signal, movements: mv, job, board: jobBoard,
           log: (m) => logDebug('[collect] ' + m),
         }),
@@ -3187,7 +3196,7 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
     async execute (args, exec) {
       const sess = getSession(exec)
       sess.bot.requireBot()
-      const req = resolveCraftRequest(sess, args)
+      const req = resolveCraftRequest(botView(sess), args)
       if (!req.ok) return { ok: false, ...req, text: `❌ ${req.why}` }
       const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
       const queued = jobBoard.enqueue({
@@ -3195,7 +3204,7 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         agentId: agentIdOf(exec?.agent),
         summary: `合成 ${req.itemName} ×${req.count}`,
         plan: req,
-        run: (signal, job) => runCraft(sess, req, {
+        run: (signal, job) => runCraft(botView(sess), req, {
           signal, movements: mv, job, board: jobBoard,
           log: (m) => logDebug('[craft] ' + m),
         }),
