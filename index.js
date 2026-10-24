@@ -3224,7 +3224,10 @@ export function apply(ctx, rawConfig) {
         agentId: agentIdOf(exec?.agent),
         summary: `收集 ${plan.name} ×${plan.count}`,
         plan,
-        run: (signal) => runCollect(sess, plan, { signal, movements: mv, log: (m) => logDebug('[collect] ' + m) }),
+        run: (signal, job) => runCollect(sess, plan, {
+          signal, movements: mv, job, board: jobBoard,
+          log: (m) => logDebug('[collect] ' + m),
+        }),
       })
       if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
       const job = queued.job

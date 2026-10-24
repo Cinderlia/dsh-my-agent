@@ -1,27 +1,30 @@
 /* ============================================================================
- * collect —— **收集物品**（用户 2026-10-24 定义的"工具"：本地脚本自己把活干完）
+ * collect —— **收集物品**（用户 2026-10-24 定义的"工具"）
  * ----------------------------------------------------------------------------
  * 规则（用户原话）：
  *   · 参数是要收集的物品；
  *   · **创造模式直接拿**；
- *   · **生存模式只支持"自然方块"**这类能直接采集的东西；
- *     合成品直接**转交 craft**（craft 还没实现，这里只占位并说清楚）；
- *   · 本地 find 16 格内的目标 → navi 过去 → dig → **比对前后背包**确认掉落物有没有捡起 →
- *     没捡起就 navi 到掉落物上 → 确认收到才算成功；
- *   · 任意一步失败 → 返回**失败原因**（不是笼统的"失败了"）。
+ *   · **生存模式只支持"自然方块"**这类能直接采集的东西；合成品转交 craft（占位）；
+ *   · 本地 find 16 格内的目标 → 满足条件**直接挖**；不满足 → **把 navi 插到自己前面**，
+ *     自己挂起等它；navi 跑完回到自己，重新判定距离，够了就继续；
+ *   · 挖完**比对前后背包**确认掉落物被捡起，没捡起就插一个 navi 去捡；
+ *   · 任意一步失败 → 返回**失败原因**。
  *
- * 与 navi 的分工：navi 是异步队列里的独立任务；collect **自己**跑在执行体内、内部同步等
- * navi 结束 —— 它不能在队列里再排一个 navi（会自己等自己，死锁）。
+ * 🔴 架构要点（用户纠正过）：这里**不是**内部同步调用 navi，而是：
+ *     `board.yieldFor(job, {kind:'navi', …})` → 子任务插到队首、自己挂起排第二；
+ *     子任务跑完，队列重新调用本函数的 `run()`，从 `job.state` 恢复进度。
+ *     所以 `runCollect` 是**状态机**，每一步只推进一个阶段，需要别人帮忙时立即 yield 返回。
  * ========================================================================== */
 import Vec3 from 'vec3'
 import { isAir } from './block-names.mjs'
+import { buildNaviPlan, runNavi } from './navi.mjs'
 
 /** 采集半径（用户定的 16 格） */
 export const COLLECT_RADIUS = 16
+/** 够得着的距离：≤ 这个值就直接挖，不排 navi */
+export const DIG_REACH = 4.2
 /** 等掉落物进背包的最长时间 */
 const PICKUP_WAIT_MS = 2500
-/** 单个物品最多挖几次（防止一块挖不出来时死循环） */
-const MAX_DIG_TRIES = 3
 
 /**
  * 物品名 → 它从哪种**方块**掉（只在"名字不是方块"时才用）。
@@ -30,7 +33,6 @@ const MAX_DIG_TRIES = 3
 export const ITEM_SOURCE = {
   diamond: ['diamond_ore', 'deepslate_diamond_ore'],
   coal: ['coal_ore', 'deepslate_coal_ore'],
-  charcoal: ['coal_ore', 'deepslate_coal_ore'],
   redstone: ['redstone_ore', 'deepslate_redstone_ore'],
   lapis_lazuli: ['lapis_ore', 'deepslate_lapis_ore'],
   emerald: ['emerald_ore', 'deepslate_emerald_ore'],
@@ -53,7 +55,6 @@ export const ITEM_SOURCE = {
   blaze_rod: ['blaze'],
   zombie_flesh: ['zombie', 'husk', 'drowned'],
   spider_eye: ['spider', 'cave_spider'],
-  honey_bottle: ['bee'],
   sugar_cane: ['sugar_cane'],
   wheat: ['wheat'],
   carrot: ['carrots'],
@@ -62,7 +63,7 @@ export const ITEM_SOURCE = {
   apple: ['oak_leaves', 'dark_oak_leaves'],
 }
 
-/** 这个名字是不是"能直接挖的方块" */
+/** 这个名字是不是"能直接挖的方块"（返回方块名；不是就 null） */
 export function blockNameOf (name, registry) {
   const n = String(name ?? '').trim().toLowerCase()
   if (!n) return null
@@ -83,7 +84,6 @@ export function planCollect (self, args = {}) {
   const creative = mode === 'creative'
   const reg = b.registry ?? null
   const block = blockNameOf(name, reg)
-  /* 名字既不是方块、也没有来源映射 ⇒ 合成品/加工品：按用户规则转 craft（占位） */
   if (!creative && !block) {
     return {
       ok: false,
@@ -94,13 +94,8 @@ export function planCollect (self, args = {}) {
     }
   }
   return {
-    ok: true,
-    name,
-    block: block ?? null,
-    count,
-    mode,
-    creative,
-    radius: COLLECT_RADIUS,
+    ok: true, name, block: block ?? null, count, mode, creative,
+    radius: COLLECT_RADIUS, reach: DIG_REACH,
     strategy: creative ? 'give' : 'dig',
   }
 }
@@ -114,25 +109,7 @@ export function invCount (b, name) {
   return n
 }
 
-/** 等一小会儿（可被 signal 打断） */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
-/**
- * 走到某个坐标（用调用方给的 movements；失败抛错并带原因）。
- * `Goals` 必须由调用方递进来 —— pathfinder 的 Goals 挂在**插件模块**上（`self._pf.Goals`），
- * 不在 bot 上，也不该在这里硬 import（pathfinder 是可选依赖）。
- */
-async function walkTo (b, movements, Goals, x, y, z, { timeoutMs = 30_000 } = {}) {
-  const pf = b.pathfinder
-  if (!pf) throw new Error('没有可用的 pathfinder')
-  const goal = Goals?.GoalNear ? new Goals.GoalNear(new Vec3(x, y, z), 2) : null
-  if (!goal) throw new Error('pathfinder 的 Goals 没挂上（先 mc_move 一次让它初始化）')
-  if (movements) { try { pf.setMovements(movements) } catch { /* 老版本 */ } }
-  await Promise.race([
-    pf.goto(goal),
-    new Promise((_, rej) => setTimeout(() => { try { pf.stop?.() } catch {} ; rej(new Error(`走过去超时（${Math.round(timeoutMs / 1000)} 秒）`)) }, timeoutMs)),
-  ])
-}
 
 /** 找附近目标方块（按距离升序） */
 export function findTargets (b, blockName, radius = COLLECT_RADIUS, want = 1) {
@@ -146,135 +123,168 @@ export function findTargets (b, blockName, radius = COLLECT_RADIUS, want = 1) {
     .sort((a, c) => a.d - c.d)
 }
 
-/**
- * 执行收集。**会阻塞到干完**（由任务队列把它当异步任务跑）。
- * @returns {Promise<{ok:boolean, collected:number, name:string, ms:number, steps:string[], text:string}>}
- */
-export async function runCollect (self, plan, { signal = null, movements = null, log = () => {} } = {}) {
-  const b = self?.bot
-  const t0 = Date.now()
-  const steps = []
-  if (!b?.entity) throw new Error('执行时已经掉线了')
-  if (!plan?.ok) throw new Error(plan?.why ?? '规划失败')
-  const goals = self?._pf?.Goals ?? self?._pf?.default?.Goals ?? null
-
-  /* ① 创造模式：直接拿 */
-  if (plan.creative) {
-    let given = 0
-    try {
-      const item = b.registry?.itemsByName?.[plan.name]
-      if (!item) throw new Error(`不认识的物品 ${plan.name}`)
-      const before = invCount(b, plan.name)
-      for (let i = 0; i < plan.count; i += item.stackSize ?? 64) {
-        const chunk = Math.min(plan.count - i, item.stackSize ?? 64)
-        const slot = b.inventory.firstEmptySlot('items')
-        if (slot === null || slot === undefined) throw new Error('背包满了，腾个位置再拿')
-        await b.creative.setInventorySlot(slot, item.id, chunk)
-        given += chunk
-      }
-      const after = invCount(b, plan.name)
-      if (after <= before) throw new Error('创造模式塞物品没生效（背包没变化）')
-      steps.push(`创造模式直接拿 ${after - before} 个`)
-      return { ok: true, collected: after - before, name: plan.name, ms: Date.now() - t0, steps, via: 'give', text: `✅ 创造模式直接拿到 ${plan.name} ×${after - before}` }
-    } catch (e) {
-      return { ok: false, collected: given, name: plan.name, ms: Date.now() - t0, steps, text: `❌ 创造模式取物失败：${e.message}` }
-    }
+/** 附近掉落物实体（item），按距离升序 */
+function dropsNear (b, pos, r = 6) {
+  const out = []
+  for (const e of Object.values(b.entities ?? {})) {
+    if (!e?.position) continue
+    const nm = String(e.name ?? e.displayName ?? '')
+    if (!/^(item|Item)$/.test(nm)) continue
+    const d = Math.hypot(e.position.x - pos.x, e.position.y - pos.y, e.position.z - pos.z)
+    if (d <= r) out.push({ x: e.position.x, y: e.position.y, z: e.position.z, d })
   }
-
-  /* ② 生存模式：找 → 走 → 挖 → 验证捡起 → 捡 */
-  const need = plan.count
-  let gained = 0
-  let lastWhy = null
-  for (let round = 0; round < need; round++) {
-    if (signal?.aborted) throw new Error('被取消')
-    const before = invCount(b, plan.name)
-    const targets = findTargets(b, plan.block, plan.radius, 1)
-    if (!targets.length) {
-      lastWhy = `附近 ${plan.radius} 格内没有 ${plan.block}`
-      break
-    }
-    const t = targets[0]
-    log(`第 ${round + 1} 个：${plan.block} @ ${t.x},${t.y},${t.z}（${t.d.toFixed(1)} 格）`)
-    // 走过去
-    try {
-      await walkTo(b, movements, goals, t.x, t.y, t.z)
-      steps.push(`走到 ${t.x},${t.y},${t.z}`)
-    } catch (e) {
-      lastWhy = `走不过去：${e.message}`
-      break
-    }
-    // 挖
-    let dug = false
-    for (let attempt = 0; attempt < MAX_DIG_TRIES && !dug; attempt++) {
-      const blk = b.blockAt(new Vec3(t.x, t.y, t.z))
-      if (!blk || isAir(blk.name) || blk.name !== plan.block) {
-        lastWhy = attempt === 0 ? `那格已经不是 ${plan.block}（${blk?.name ?? '未加载'}）` : lastWhy
-        break
-      }
-      try {
-        if (typeof b.canDigBlock === 'function' && !b.canDigBlock(blk)) throw new Error('够不着或没有合适的工具')
-        await b.dig(blk)
-        dug = true
-        steps.push(`挖掉 ${blk.name}`)
-      } catch (e) {
-        lastWhy = `挖不动：${e.message}`
-        await sleep(300)
-      }
-    }
-    if (!dug) break
-    // 等自动吸附，再比对背包
-    let after = before
-    const deadline = Date.now() + PICKUP_WAIT_MS
-    while (Date.now() < deadline) {
-      await sleep(200)
-      after = invCount(b, plan.name)
-      if (after > before) break
-    }
-    if (after > before) {
-      gained += after - before
-      steps.push(`背包 +${after - before}（${plan.name}）`)
-      continue
-    }
-    // 没进背包：走到掉落物上
-    const drop = Object.values(b.entities ?? {}).find((e) =>
-      e?.position && /^item$|^Item$/.test(String(e.name ?? e.displayName ?? '')) &&
-      Math.hypot(e.position.x - (t.x + 0.5), e.position.y - (t.y + 0.5), e.position.z - (t.z + 0.5)) <= 6)
-    if (drop) {
-      try {
-        await walkTo(b, movements, goals, Math.floor(drop.position.x), Math.floor(drop.position.y), Math.floor(drop.position.z), { timeoutMs: 15_000 })
-        steps.push('走到掉落物上')
-      } catch (e) { lastWhy = `去捡掉落物失败：${e.message}` }
-    } else {
-      lastWhy = '挖掉了，但附近没看到掉落物实体（可能被别人捡走/掉进岩浆/没生成）'
-    }
-    // 再等一会儿
-    const deadline2 = Date.now() + PICKUP_WAIT_MS
-    while (Date.now() < deadline2) {
-      await sleep(200)
-      after = invCount(b, plan.name)
-      if (after > before) break
-    }
-    if (after > before) {
-      gained += after - before
-      steps.push(`捡起 +${after - before}`)
-    } else {
-      lastWhy = lastWhy ?? '挖掉了但没捡到（背包没变化）'
-      break
-    }
-  }
-
-  const ok = gained >= need
-  return {
-    ok,
-    collected: gained,
-    name: plan.name,
-    ms: Date.now() - t0,
-    steps,
-    ...(ok ? {} : { why: lastWhy ?? `只收到 ${gained}/${need}` }),
-    text: ok
-      ? `✅ 收集到 ${plan.name} ×${gained}（${((Date.now() - t0) / 1000).toFixed(1)} 秒）`
-      : `❌ 收集 ${plan.name} 失败：${lastWhy ?? `只收到 ${gained}/${need}`}`,
-  }
+  return out.sort((a, c) => a.d - c.d)
 }
 
-export { walkTo }
+/** 创造模式：直接拿（并回读背包确认） */
+async function runCreative (b, plan) {
+  const item = b.registry?.itemsByName?.[plan.name]
+  if (!item) throw new Error(`不认识的物品 ${plan.name}`)
+  const before = invCount(b, plan.name)
+  for (let i = 0; i < plan.count; i += item.stackSize ?? 64) {
+    const chunk = Math.min(plan.count - i, item.stackSize ?? 64)
+    const slot = b.inventory.firstEmptySlot('items')
+    if (slot === null || slot === undefined) throw new Error('背包满了，腾个位置再拿')
+    await b.creative.setInventorySlot(slot, item.id, chunk)
+  }
+  const after = invCount(b, plan.name)
+  if (after <= before) throw new Error('创造模式塞物品没生效（背包没变化）')
+  return after - before
+}
+
+/**
+ * 执行（**可恢复的状态机**）。每次被队列调用时推进到下一个"要等别人"的点。
+ *
+ * `ctx` = { signal, movements, job, board, log }
+ * 需要移动时：`board.yieldFor(job, {kind:'navi', …})` 然后 `return { yielded: true }`。
+ */
+export async function runCollect (self, plan, ctx = {}) {
+  const { signal = null, movements = null, job = null, board = null, log = () => {} } = ctx
+  const b = self?.bot
+  if (!b?.entity) throw new Error('执行时已经掉线了')
+  if (!plan?.ok) throw new Error(plan?.why ?? '规划失败')
+  const t0 = Number(job?.startedAt ?? Date.now())
+
+  /* 创造模式：一把干完 */
+  if (plan.creative) {
+    const got = await runCreative(b, plan)
+    return { ok: true, collected: got, name: plan.name, ms: Date.now() - t0, via: 'give', text: `✅ 创造模式直接拿到 ${plan.name} ×${got}` }
+  }
+
+  const st = job
+    ? (job.state ??= { phase: 'find', got: 0, target: null, before: 0, tries: 0 })
+    : { phase: 'find', got: 0, target: null, before: 0, tries: 0 }
+  const steps = (st.steps ??= [])
+  const fail = (why) => ({ ok: false, collected: st.got, name: plan.name, ms: Date.now() - t0, steps, why, text: `❌ 收集 ${plan.name} 失败：${why}` })
+  const done = () => ({
+    ok: true, collected: st.got, name: plan.name, ms: Date.now() - t0, steps,
+    text: `✅ 收集到 ${plan.name} ×${st.got}（${((Date.now() - t0) / 1000).toFixed(1)} 秒，${steps.length} 步）`,
+  })
+
+  for (let guard = 0; guard < 64; guard++) {
+    if (signal?.aborted) throw new Error('被取消')
+
+    if (st.phase === 'find') {
+      if (st.got >= plan.count) return done()
+      const targets = findTargets(b, plan.block, plan.radius, 1)
+      if (!targets.length) return fail(`附近 ${plan.radius} 格内没有 ${plan.block}`)
+      st.target = targets[0]
+      st.phase = 'approach'
+      log(`目标 ${plan.block} @ ${st.target.x},${st.target.y},${st.target.z}（${st.target.d.toFixed(1)} 格）`)
+      continue
+    }
+
+    if (st.phase === 'approach') {
+      const t = st.target
+      if (!t) { st.phase = 'find'; continue }
+      const me = b.entity.position
+      const d = Math.hypot(me.x - (t.x + 0.5), me.y - t.y, me.z - (t.z + 0.5))
+      if (d <= plan.reach) { st.phase = 'dig'; continue }
+      /* 距离不够 → 把 navi 插到自己前面，自己挂起 */
+      if (!board || !job) return fail('内部错误：没有队列上下文，无法插入导航任务')
+      const navPlan = buildNaviPlan(self, { x: t.x, y: t.y, z: t.z, radius: COLLECT_RADIUS })
+      if (!navPlan.ok) return fail(`走到目标失败：${navPlan.why}`)
+      const inserted = board.yieldFor(job, {
+        kind: 'navi',
+        agentId: job.agentId,
+        summary: `collect: 前往 ${t.x},${t.y},${t.z}`,
+        plan: navPlan,
+        run: (sig) => runNavi(self, navPlan, { signal: sig, movements }),
+      })
+      if (!inserted) return fail('插入导航任务失败（队列状态不对）')
+      steps.push(`插入导航 → ${t.x},${t.y},${t.z}（${d.toFixed(1)} 格）`)
+      return { yielded: true, text: `⏸ 距离 ${d.toFixed(1)} 格，已插入 navi，collect 挂起等待` }
+    }
+
+    if (st.phase === 'dig') {
+      const t = st.target
+      const blk = t ? b.blockAt(new Vec3(t.x, t.y, t.z)) : null
+      if (!blk || isAir(blk.name) || blk.name !== plan.block) {
+        st.phase = 'find'
+        continue
+      }
+      if (typeof b.canDigBlock === 'function' && !b.canDigBlock(blk)) {
+        st.tries += 1
+        if (st.tries >= 3) return fail(`挖不动 ${plan.block}（够不着或没有合适的工具）`)
+        st.phase = 'approach'
+        continue
+      }
+      st.before = invCount(b, plan.name)
+      try {
+        await b.dig(blk)
+      } catch (e) {
+        st.tries += 1
+        if (st.tries >= 3) return fail(`挖 ${plan.block} 出错：${e.message}`)
+        st.phase = 'find'
+        continue
+      }
+      steps.push(`挖掉 ${plan.block}`)
+      st.phase = 'verify'
+      continue
+    }
+
+    if (st.phase === 'verify') {
+      let after = st.before
+      const deadline = Date.now() + PICKUP_WAIT_MS
+      while (Date.now() < deadline) {
+        await sleep(200)
+        after = invCount(b, plan.name)
+        if (after > st.before) break
+      }
+      if (after > st.before) {
+        st.got += after - st.before
+        steps.push(`背包 +${after - st.before}`)
+        st.phase = 'find'
+        st.tries = 0
+        continue
+      }
+      st.phase = 'pickup'
+      continue
+    }
+
+    if (st.phase === 'pickup') {
+      const t = st.target
+      const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6)
+      if (!drops.length) return fail('挖掉了，但附近没看到掉落物实体（被捡走/掉进岩浆/没生成）')
+      const drop = drops[0]
+      if (!board || !job) return fail('内部错误：没有队列上下文，无法插入捡取任务')
+      const navPlan = buildNaviPlan(self, { x: Math.floor(drop.x), y: Math.floor(drop.y), z: Math.floor(drop.z), radius: COLLECT_RADIUS })
+      if (!navPlan.ok) return fail(`去捡掉落物失败：${navPlan.why}`)
+      const inserted = board.yieldFor(job, {
+        kind: 'navi',
+        agentId: job.agentId,
+        summary: `collect: 去捡掉落物 ${Math.floor(drop.x)},${Math.floor(drop.y)},${Math.floor(drop.z)}`,
+        plan: navPlan,
+        run: (sig) => runNavi(self, navPlan, { signal: sig, movements }),
+      })
+      if (!inserted) return fail('插入捡取任务失败（队列状态不对）')
+      steps.push('插入导航去捡掉落物')
+      st.phase = 'verify'
+      st.before = invCount(b, plan.name)
+      return { yielded: true, text: '⏸ 已插入 navi 去捡掉落物，collect 挂起等待' }
+    }
+
+    return fail(`未知阶段 ${st.phase}`)
+  }
+  return fail('推进次数超限（可能卡在某个阶段）')
+}

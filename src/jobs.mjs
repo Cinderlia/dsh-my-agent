@@ -95,7 +95,18 @@ export class JobBoard {
     if (this.state === 'intervening') {
       return { ok: false, why: '队列正在被介入（agent 正在处理队首任务），先 mc_interrupt 选一个动作再继续', current: this.current ? this.brief(this.current) : null }
     }
-    const job = {
+    const job = this.makeJob({ kind, agentId, summary, plan, run })
+    this.queue.push(job)
+    const wasIdle = !this.current && this.state === 'idle'
+    this.log(`任务 ${job.id} 入队（第 ${this.queue.length} 位）：${job.summary}`)
+    if (wasIdle) this.pump()
+    this.changed()
+    return { ok: true, job, position: this.queue.indexOf(job) + (this.current ? 1 : 0), started: this.current === job }
+  }
+
+/** 造一个任务对象（enqueue / yieldFor 共用） */
+  makeJob ({ kind, agentId, summary, plan = null, run = null, state = undefined }) {
+    return {
       id: nextId(),
       kind: String(kind ?? 'job'),
       agentId: agentId ? String(agentId) : null,
@@ -106,15 +117,39 @@ export class JobBoard {
       endedAt: null,
       report: null,
       error: null,
+      state,
       run: typeof run === 'function' ? run : null,
       controller: typeof AbortController === 'function' ? new AbortController() : null,
     }
-    this.queue.push(job)
-    const wasIdle = !this.current && this.state === 'idle'
-    this.log(`任务 ${job.id} 入队（第 ${this.queue.length} 位）：${job.summary}`)
-    if (wasIdle) this.pump()
+  }
+
+  /**
+   * **插队 + 挂起自己**（用户 2026-10-24 定的核心机制）。
+   *
+   * 语义：当前任务干到一半发现"得先让别人干件事"，就把那个任务**插到自己前面**，
+   * 自己挂起排到它后面；等前面的跑完，队列会**重新调用**自己的 `run()` ——
+   * 这时从 `job.state` 里恢复进度继续（所以 run 必须写成可恢复的状态机）。
+   *
+   * 典型用法（mc_collect）：
+   *   if (距离太远) { board.yieldFor(job, { kind:'navi', …, run: … }); return { yielded: true } }
+   *
+   * @returns {boolean} 真的插进去了（不是当前任务就返回 false）
+   */
+  yieldFor (job, spec = {}) {
+    if (!job || this.current !== job) return false
+    if (this.state === 'frozen' || this.state === 'intervening') return false
+    const child = this.makeJob(spec)
+    job.status = 'waiting'
+    job.waitingOn = child.id
+    this.current = null
+    /* unshift 顺序：先放自己、再放子任务 ⇒ 子任务在前，自己在后 */
+    this.queue.unshift(job)
+    this.queue.unshift(child)
+    this.state = 'running'
+    this.log(`任务 ${job.id} 挂起，插入子任务 ${child.id}（${child.summary}）`)
     this.changed()
-    return { ok: true, job, position: this.queue.indexOf(job) + (this.current ? 1 : 0), started: this.current === job }
+    this.pump()
+    return true
   }
 
   /** 队列推进：没在跑的、没冻结的、有排队的 → 启动下一个 */
