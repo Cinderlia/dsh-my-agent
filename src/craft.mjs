@@ -227,15 +227,14 @@ export async function runCraft (self, req, ctx = {}) {
     /* ── ② 缺普通材料 → 插 collect ── */
     if (st.phase === 'gather') {
       if (!board || !job) return fail('内部错误：没有队列上下文，无法插入收集任务')
-      /* 🔴 上一轮插的 collect 失败了？记一次、别原地重插（实测会死循环 235 个任务）。 */
+      /* 🔴 用户 2026-10-25 定的队列语义：
+       *    插到队首的任务**失败了 = 条件不满足 = 直接报错**，不重试、不计数。
+       *    （插队成功后自己就挂起了，根本不存在"循环"——之前的重试计数是多余的，
+       *      真正的循环来自"失败了还回 plan 重来"。） */
       if (st.__lastError) {
         const e = st.__lastError
         st.__lastError = null
-        st.gatherFails = (st.gatherFails ?? 0) + 1
-        notes.push(`收集失败（第 ${st.gatherFails} 次）：${e.error}`)
-        if (st.gatherFails >= 2) {
-          return fail(`收集 ${st.gather?.name ?? '材料'} 连续失败 ${st.gatherFails} 次：${e.error}`)
-        }
+        return fail(`条件不满足：收集 ${st.gather?.name ?? '材料'} 失败 —— ${e.error}`)
       }
       const plan = planCollect(self, st.gather)
       if (!plan.ok) return fail(`收集 ${st.gather.name} 失败：${plan.why}`)
@@ -245,7 +244,13 @@ export async function runCraft (self, req, ctx = {}) {
         plan,
         run: (sig, child) => runCollect(self, plan, { signal: sig, movements, job: child, board, log }),
       })
-      if (!inserted) return fail('插入收集任务失败（队列状态不对）')
+      if (!inserted) {
+        /* 没插进去 = 队列状态不对（不是条件不满足）→ 重试几次是正常的 */
+        st.insertTries = (st.insertTries ?? 0) + 1
+        if (st.insertTries > 3) return fail('队列状态异常：连续 3 次插不进收集任务')
+        continue
+      }
+      st.insertTries = 0
       st.gathers += 1
       notes.push(`插入 collect：${st.gather.name} ×${st.gather.count}`)
       st.phase = 'plan'
