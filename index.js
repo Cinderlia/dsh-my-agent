@@ -44,6 +44,7 @@ import { buildPrimitives } from './src/primitives.mjs'
 import { JobBoard } from './src/jobs.mjs'
 import { buildNaviPlan, previewRoute, runNavi, naviReportText } from './src/navi.mjs'
 import { planCollect, runCollect } from './src/collect.mjs'
+import { buildTargets, checkRange, needsWalk, walkNear, runBatch, batchText } from './src/batch.mjs'
 import { movements as buildMovements } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -3244,6 +3245,58 @@ ${where}——走完会主动报告`,
   }))
 
   registerTool(asTool({
+    name: 'mc_place',
+    description: '**放方块（支持批处理）**：单格 / 一行 / 一面墙 / 一个实心长方体。\n'
+      + '· `mode:"block"`（默认）—— 放一格\n'
+      + '· `mode:"line"` —— 从 (x,y,z) 沿 `dir` 铺 `length` 格\n'
+      + '· `mode:"wall"` —— 从 (x,y,z) 到 (x2,z2) 铺一面**竖直墙**，`height` 层（给 y2 就按那个高度）\n'
+      + '· `mode:"volume"` —— (x,y,z) 到 (x2,y2,z2) 的实心长方体\n'
+      + '**目标超出触及范围（4.2 格）会自动走过去**，不用你另外叫移动；\n'
+      + '**超过 16 格会直接失败并报原因**，请确认坐标或先移动。\n'
+      + '一次最多干 10 秒，没放完会返回"时间用完了 + 从哪格接着放"，再叫一次即可。',
+    parameters: {
+      x: { type: 'number', required: true, description: '起点 x' },
+      y: { type: 'number', required: true, description: '起点 y' },
+      z: { type: 'number', required: true, description: '起点 z' },
+      name: { type: 'string', description: '方块名（不给就用背包第一种整方块）' },
+      mode: { type: 'string', description: 'block（默认）/ line / wall / volume' },
+      dir: { type: 'string', description: 'line 方向：north/south/west/east（默认 east）' },
+      length: { type: 'number', description: 'line 铺几格（默认 4，上限 32）' },
+      height: { type: 'number', description: 'wall 几层高（默认 3，上限 32）' },
+      x2: { type: 'number', description: 'wall/volume 的另一角 x' },
+      y2: { type: 'number', description: 'volume 的另一角 y（wall 可选：按它的高度方向铺）' },
+      z2: { type: 'number', description: 'wall/volume 的另一角 z' },
+    },
+    output: text(),
+    timeoutMs: CALL_MS + 1_000,
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      sess.bot.requireBot()
+      const bt = buildTargets(args)
+      if (!bt.ok) return { ok: false, text: `❌ ${bt.why}` }
+      const b = sess.bot.bot
+      const rg = checkRange(b, bt.targets)
+      if (!rg.ok) return { ok: false, text: `❌ 放不了：${rg.why}` }
+      const Goals = sess.bot?._pf?.goals ?? sess.bot?._pf?.Goals ?? null
+      if (needsWalk(b, bt.targets[0])) {
+        const w = await walkNear(b, Goals, bt.targets[0].x, bt.targets[0].y, bt.targets[0].z)
+        if (!w.ok) return { ok: false, text: `❌ 走不到起点：${w.why}` }
+      }
+      const deadline = Date.now() + Math.max(2000, CALL_MS - 800)
+      const wantName = args.name ? String(args.name) : null
+      const result = await runBatch(bt.targets, async (t) => {
+        try {
+          await sess.bot.placeBlock({ x: t.x, y: t.y, z: t.z, name: wantName })
+          return { ok: true }
+        } catch (e) {
+          return { ok: false, why: e?.message ?? String(e) }
+        }
+      }, { deadline })
+      return { ok: result.failed.length === 0 && result.skipped.length === 0, ...result, text: batchText('🧱 放', result, bt.targets.length) }
+    },
+  }))
+
+  registerTool(asTool({
     name: 'mc_probe',
     description: '**入口路由**：查环境、连接、诊断、背包/方块扫描这类"偶尔查一次"的能力都从这里进（它们不再单独占工具名）。\n'
       + '· `inventory` — 背包与装备明细（平时用 `mc_self`，这个给完整清单）\n'
@@ -4667,6 +4720,10 @@ ${where}——走完会主动报告`,
       maxDistance: { type: 'number', description: '搜索半径（**默认 8**；树/矿脉远的话给大一点，上限看场景）' },
       count: { type: 'number', description: '挖几个（默认 1，上限 16；一次挖不完就再叫一次）' },
       allowDangerous: { type: 'boolean', description: '允许挖自己脚下的支撑（默认拦，下面没落脚点就掉下去）' },
+      mode: { type: 'string', description: '**批处理**：block（默认，单格）/ column（往下挖 depth 格）/ line（沿 dir 挖 length 格）—— 给坐标时用' },
+      depth: { type: 'number', description: 'column 模式挖几格（默认 4，上限 32）' },
+      length: { type: 'number', description: 'line 模式挖几格（默认 4，上限 32）' },
+      dir: { type: 'string', description: 'line 方向：north/south/west/east（默认 east）' },
       digThrough: {
         type: 'boolean',
         description: '允不允许**挖穿挡路的方块**走过去（默认 false = 只绕路、不挖墙）。'
@@ -4677,8 +4734,42 @@ ${where}——走完会主动报告`,
     timeoutMs: CALL_MS + 1_000,
     async execute(args, exec) {
       const sess = getSession(exec)
+      /* ── 批处理 + 自动导航（用户 2026-10-24）─────────────────────────────
+       * · `mode: column/line` → 一次挖一列/一行；
+       * · 目标超出触及（4.2 格）→ **本地自己 navi 过去**（不麻烦 LLM）；
+       * · 目标超出 16 格 → 直接失败，报原因并建议重新确认坐标/先移动。 */
+      const batchMode = String(args.mode ?? '').toLowerCase()
+      if (batchMode && batchMode !== 'block') {
+        const bt = buildTargets(args)
+        if (!bt.ok) return { ok: false, text: `❌ ${bt.why}` }
+        const rg = checkRange(sess.bot.bot, bt.targets)
+        if (!rg.ok) return { ok: false, text: `❌ 挖不了：${rg.why}` }
+        const b = sess.bot.bot
+        const Goals = sess.bot?._pf?.goals ?? sess.bot?._pf?.Goals ?? null
+        if (needsWalk(b, bt.targets[0])) {
+          const w = await walkNear(b, Goals, bt.targets[0].x, bt.targets[0].y, bt.targets[0].z)
+          if (!w.ok) return { ok: false, text: `❌ 走不到第一个目标点：${w.why}` }
+        }
+        const deadline = Date.now() + Math.max(2000, CALL_MS - 800)
+        const result = await runBatch(bt.targets, async (t) => {
+          const lines = await sess.bot.dig({ pos: new Vec3(t.x, t.y, t.z), count: 1, noDig: args.digThrough !== true, allowDangerous: args.allowDangerous === true })
+          const text = (lines ?? []).join(' ')
+          return { ok: !/失败|够不着|挖不动|没有|超时/.test(text), why: text.slice(0, 80) }
+        }, { deadline })
+        return { ok: result.failed.length === 0 && result.skipped.length === 0, ...result, text: batchText('⛏ 挖', result, bt.targets.length) }
+      }
       const pos = (args.x !== undefined && args.y !== undefined && args.z !== undefined)
         ? coordOf(args) : null
+      /* 单点也要检查范围 + 自动走过去 */
+      if (pos) {
+        const rg = checkRange(sess.bot.bot, [pos])
+        if (!rg.ok) return { ok: false, text: `❌ 挖不了：${rg.why}` }
+        if (needsWalk(sess.bot.bot, pos)) {
+          const Goals = sess.bot?._pf?.goals ?? sess.bot?._pf?.Goals ?? null
+          const w = await walkNear(sess.bot.bot, Goals, pos.x, pos.y, pos.z)
+          if (!w.ok) return { ok: false, text: `❌ 走不到目标：${w.why}` }
+        }
+      }
       const lines = await sess.bot.dig({
         name: args.name ? String(args.name) : null, pos,
         /* 2026-10-23：默认搜索半径 16 → 8。16 格外的矿一律要被走过去，而"走过去"正是
