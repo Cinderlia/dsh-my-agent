@@ -520,36 +520,24 @@ export async function runCollect (self, plan, ctx = {}) {
     }
 
     if (st.phase === 'verify') {
-      let after = familyCount(b, plan.product ?? plan.name)
-      const deadline = Date.now() + PICKUP_WAIT_MS
-      const t0v = Date.now()
+      /* 用户 2026-10-25：「collect 以物品进背包为准，不要反复插 navi。」
+       * 挖完先等背包涨（vanilla 吸附 1~2 秒）；涨了就继续挖下一个。 */
+      const prod = plan.product ?? plan.name
+      const before = st.before
+      let after = familyCount(b, prod)
+      const deadline = Date.now() + 4000
       while (Date.now() < deadline) {
-        await sleep(200)
-        after = familyCount(b, plan.product ?? plan.name)
-        if (after > st.before) break
-        /* 🔴 用户 2026-10-25："我怀疑其实 bot 捡起来了，但是它以为自己没捡起来"。
-         *    掉落物实体**消失**（被吸走/被捡）也该算捡到了 —— 背包同步常慢一两秒，
-         *    只盯背包会误判成"没捡到"，然后去挖下一个，结果多挖。 */
-        if (Date.now() - t0v > 1500) {
-          const t = st.target
-          const left = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.product ?? plan.name)
-          if (!left.length) {
-            st.got += 1
-            steps.push('掉落物实体已消失 → 视为已捡起')
-            st.phase = 'find'
-            st.toolRequested = false
-            st.before = familyCount(b, plan.product ?? plan.name)
-            after = st.before
-            break
-          }
-        }
+        await sleep(300)
+        after = familyCount(b, prod)
+        if (after > before) break
       }
-      if (after > st.before) {
-        st.got += after - st.before
-        steps.push(`背包 +${after - st.before}`)
+      if (after > before) {
+        st.got += after - before
+        steps.push(`背包 +${after - before}`)
         st.phase = 'find'
         st.tries = 0
         st.toolRequested = false
+        st.naviDone = false
         continue
       }
       st.phase = 'pickup'
@@ -557,34 +545,48 @@ export async function runCollect (self, plan, ctx = {}) {
     }
 
     if (st.phase === 'pickup') {
-      st.pickupTries = (st.pickupTries ?? 0) + 1
-      if (st.pickupTries > 4) return fail('挖掉了但一直捡不到（已试着去捡 4 次）')
-      const t = st.target
-      const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.product ?? plan.name)
-      if (!drops.length) {
-        /* 掉落物没了（被抢/掉岩浆/没生成）：**不算失败** —— 回去挖下一个补上。
-         * 只有"附近全挖完还不够"才失败（见上面 find 阶段）。 */
+      const prod = plan.product ?? plan.name
+      /* 同一个掉落物**只插一次 navi**；插过还没捡到就再等 3 秒，然后认丢、继续挖。 */
+      if (st.naviDone) {
+        await sleep(3000)
+        const now = familyCount(b, prod)
+        if (now > st.before) {
+          st.got += now - st.before
+          steps.push(`等到了吸附：+${now - st.before}`)
+          st.phase = 'find'
+          st.before = now
+          st.naviDone = false
+          continue
+        }
         st.lost = (st.lost ?? 0) + 1
-        steps.push(`掉落物不见了（第 ${st.lost} 个，继续挖下一个）`)
+        steps.push(`捡不到（已插过 navi 并等过），继续挖下一个`)
+        st.naviDone = false
+        st.phase = 'find'
+        continue
+      }
+      const t = st.target
+      const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, prod)
+      if (!drops.length) {
+        st.lost = (st.lost ?? 0) + 1
+        steps.push('掉落物不见了，继续挖下一个')
         st.phase = 'find'
         continue
       }
       const drop = drops[0]
-      if (drop.unknown) steps.push('掉落物读不到物品 id，按位置去捡（可能捡错）')
-      if (!board || !job) return fail('内部错误：没有队列上下文，无法插入捡取任务')
+      if (!board || !job) return fail('内部错误：没有队列上下文')
       const navPlan = buildNaviPlan(self, { x: Math.floor(drop.x), y: Math.floor(drop.y), z: Math.floor(drop.z), radius: COLLECT_RADIUS })
-      if (!navPlan.ok) return fail(`去捡掉落物失败：${navPlan.why}`)
+      if (!navPlan.ok) { st.naviDone = true; continue }
       const inserted = board.yieldFor(job, {
-        kind: 'navi',
-        agentId: job.agentId,
+        kind: 'navi', agentId: job.agentId,
         summary: `collect: 去捡掉落物 ${Math.floor(drop.x)},${Math.floor(drop.y)},${Math.floor(drop.z)}`,
         plan: navPlan,
         run: (sig) => runNavi(self, navPlan, { signal: sig, movements }),
       })
       if (!inserted) return fail('插入捡取任务失败（队列状态不对）')
-      steps.push('插入导航去捡掉落物')
+      st.naviDone = true
+      steps.push('插入导航去捡掉落物（只插一次）')
       st.phase = 'verify'
-      st.before = familyCount(b, plan.product ?? plan.name)
+      st.before = familyCount(b, prod)
       return { yielded: true, text: '⏸ 已插入 navi 去捡掉落物，collect 挂起等待' }
     }
 
