@@ -95,6 +95,38 @@ export function findPlaceSpot (b, radius = 4) {
 }
 
 /**
+ * 放工作台（作为**子任务**跑）：先找 4 格内可依附的空气格，不行再垫脚下。
+ * 成功后把结果写回父状态 `st`（table / placedTable），父状态机继续走 craft。
+ */
+export async function placeTableNearby (self, st, notes = []) {
+  const b = self?.bot
+  if (!b?.entity) return { ok: false, text: '❌ 放工作台：掉线了' }
+  const spot = findPlaceSpot(b, 4)
+  if (spot) {
+    try {
+      await b.placeBlock({ x: spot.x, y: spot.y, z: spot.z, name: 'crafting_table' })
+      st.table = { x: spot.x, y: spot.y, z: spot.z }
+      st.placedTable = { ...st.table }
+      notes.push(`放了工作台 ${spot.x},${spot.y},${spot.z}（做完回收）`)
+      return { ok: true, text: `🧱 放好工作台 ${spot.x},${spot.y},${spot.z}` }
+    } catch (e) {
+      notes.push(`放到 ${spot.x},${spot.y},${spot.z} 失败：${e.message}`)
+    }
+  }
+  // 兜底：垫脚下
+  try {
+    const me = b.entity.position.floored()
+    await b.placeBlock({ x: me.x, y: me.y - 1, z: me.z, name: 'crafting_table' })
+    st.table = { x: me.x, y: me.y - 1, z: me.z }
+    st.placedTable = { ...st.table }
+    notes.push(`垫脚放了工作台 ${me.x},${me.y - 1},${me.z}（做完回收）`)
+    return { ok: true, text: `🧱 垫脚放好工作台 ${me.x},${me.y - 1},${me.z}` }
+  } catch (e) {
+    return { ok: false, text: `❌ 放工作台失败：${e.message}（附近没有可依附的位置，垫脚也被拒）` }
+  }
+}
+
+/**
  * 执行（**状态机**）。`ctx` = { signal, movements, job, board, log }
  */
 export async function runCraft (self, req, ctx = {}) {
@@ -124,11 +156,41 @@ export async function runCraft (self, req, ctx = {}) {
   for (let guard = 0; guard < 40; guard++) {
     if (signal?.aborted) throw new Error('被取消')
 
-    /* ── ① 算链 ── */
+    /* ── ① 算链 → **插入"规划"子任务**（用户 2026-10-25：没有规划就插规划工具） ── */
     if (st.phase === 'plan') {
-      const plan = planCraft(b, req.itemId, req.count, null)
-      if (plan.ok) { st.phase = 'craft'; continue }
-      const missing = plan.missing ?? []
+      if (!board || !job) return fail('内部错误：没有队列上下文，无法插入规划任务')
+      const inserted = board.yieldFor(job, {
+        kind: 'craft_plan', agentId: job.agentId,
+        summary: `规划 ${req.itemName} ×${req.count} 的合成链`,
+        plan: req,
+        run: async () => {
+          const plan = planCraft(b, req.itemId, req.count, null)
+          st.lastPlan = {
+            ok: plan.ok,
+            steps: plan.steps?.length ?? 0,
+            missing: (plan.missing ?? []).map((m) => ({
+              name: m.name, id: m.id, need: m.need, have: m.have, why: m.why,
+            })),
+          }
+          return {
+            ok: true,
+            text: plan.ok
+              ? `计划 ${plan.steps?.length ?? 0} 步，材料齐`
+              : `缺 ${st.lastPlan.missing.length} 项：${st.lastPlan.missing.map((m) => `${m.name}(要${m.need}有${m.have})`).join('、')}`,
+          }
+        },
+      })
+      if (!inserted) return fail('插入规划任务失败（队列状态不对）')
+      st.phase = 'decide'
+      return { yielded: true, text: '⏸ 已插入规划任务，craft 挂起' }
+    }
+
+    /* ── ② 按规划结果决定下一步 ── */
+    if (st.phase === 'decide') {
+      const lp = st.lastPlan
+      if (!lp) { st.phase = 'plan'; continue }
+      if (lp.ok) { st.phase = 'craft'; continue }
+      const missing = lp.missing ?? []
       log('缺料：' + missing.map((m) => `${m.name}(要${m.need}有${m.have})`).join('、'))
       const tableMiss = missing.find((m) => m.name === 'crafting_table')
       const other = missing.find((m) => m.name !== 'crafting_table')
@@ -159,12 +221,27 @@ export async function runCraft (self, req, ctx = {}) {
       return { yielded: true, text: `⏸ 缺 ${st.gather.name}，已插入收集任务，craft 挂起等待` }
     }
 
-    /* ── ③ 工作台 ── */
+    /* ── ③ 工作台（用户 2026-10-25 的分支表）────────────────────────────
+     *   有工作台但碰不到      → 插 navi
+     *   没有、背包里有        → 插 place（放下再用）
+     *   没有、背包没有、材料够 → 插 craft（做工作台）
+     *   没有、背包没有、材料不够 → 插 collect（收木料）
+     */
     if (st.phase === 'table') {
       if (!board || !job) return fail('内部错误：没有队列上下文')
+
+      /* 3.1 有工作台：够得着就记住，够不着就插 navi */
       const tables = listTablesNearby(b, TABLE_RADIUS, 5)
       if (tables.length) {
         const t = tables[0]
+        const me = b.entity.position
+        const d = Math.hypot(me.x - (t.x + 0.5), me.y - t.y, me.z - (t.z + 0.5))
+        if (d <= 4.2) {
+          st.table = { x: t.x, y: t.y, z: t.z }
+          st.phase = 'craft'
+          notes.push(`用附近的工作台 ${t.x},${t.y},${t.z}（${d.toFixed(1)} 格）`)
+          continue
+        }
         const navPlan = buildNaviPlan(self, { x: t.x, y: t.y, z: t.z, radius: 16 })
         if (navPlan.ok) {
           const inserted = board.yieldFor(job, {
@@ -176,49 +253,52 @@ export async function runCraft (self, req, ctx = {}) {
           if (inserted) {
             st.table = { x: t.x, y: t.y, z: t.z }
             st.phase = 'craft'
-            notes.push(`用附近的工作台 ${t.x},${t.y},${t.z}`)
-            return { yielded: true, text: '⏸ 已插入导航（去工作台），craft 挂起' }
+            notes.push(`插 navi：去工作台 ${t.x},${t.y},${t.z}（${d.toFixed(1)} 格）`)
+            return { yielded: true, text: '⏸ 工作台够不着，已插 navi，craft 挂起' }
           }
         }
+        notes.push(`导航到工作台失败：${navPlan.why}`)
       }
+
       const tableId = b.registry?.itemsByName?.crafting_table?.id
-      if (tableId != null && have(b, tableId) > 0) {
-        const spot = findPlaceSpot(b, 4)
-        if (spot) {
-          try {
-            await b.placeBlock({ x: spot.x, y: spot.y, z: spot.z, name: 'crafting_table' })
-            st.placedTable = { x: spot.x, y: spot.y, z: spot.z }
-            st.table = st.placedTable
-            st.phase = 'craft'
-            notes.push(`放了一个工作台 ${spot.x},${spot.y},${spot.z}（做完会回收）`)
-            continue
-          } catch (e) { log('放工作台失败：' + e.message) }
-        }
-        try {
-          const me = b.entity.position.floored()
-          const under = new Vec3(me.x, me.y - 1, me.z)
-          await b.placeBlock({ x: under.x, y: under.y, z: under.z, name: 'crafting_table' })
-          st.placedTable = { x: under.x, y: under.y, z: under.z }
-          st.table = st.placedTable
-          st.phase = 'craft'
-          notes.push(`垫脚放了工作台 ${under.x},${under.y},${under.z}（做完会回收）`)
-          continue
-        } catch (e) { log('垫脚放工作台也失败：' + e.message) }
-      }
       if (tableId == null) return fail('这个版本没有 crafting_table 物品（registry 里查不到）')
-      const tableReq = { ok: true, itemId: tableId, itemName: 'crafting_table', count: 1 }
-      const inserted = board.yieldFor(job, {
-        kind: 'craft', agentId: job.agentId,
-        summary: 'craft 缺工作台：先做一个工作台',
-        plan: tableReq,
-        run: (sig, child) => runCraft(self, tableReq, { signal: sig, movements, job: child, board, log }),
-      })
-      if (!inserted) return fail('插入"合成工作台"失败（队列状态不对）')
-      st.misses += 1
-      if (st.misses > 2) return fail('工作台：放了/做了两次还是用不了（可能被方块占住或合成窗口打不开）')
-      notes.push('插入子任务：合成工作台')
-      st.phase = 'table'
-      return { yielded: true, text: '⏸ 没有可用工作台，已插入"合成工作台"，craft 挂起' }
+
+      /* 3.2 没有工作台、背包里有 → 插 place 子任务 */
+      if (have(b, tableId) > 0) {
+        const inserted = board.yieldFor(job, {
+          kind: 'place_table', agentId: job.agentId,
+          summary: 'craft 放置工作台',
+          run: async () => placeTableNearby(self, st, notes),
+        })
+        if (!inserted) return fail('插入"放置工作台"失败（队列状态不对）')
+        st.phase = 'craft'
+        return { yielded: true, text: '⏸ 背包有工作台，已插 place，craft 挂起' }
+      }
+
+      /* 3.3 背包也没有：材料够就插 craft（做工作台），不够就插 collect（收木料） */
+      const tablePlan = planCraft(b, tableId, 1, null)
+      if (tablePlan.ok) {
+        const tableReq = { ok: true, itemId: tableId, itemName: 'crafting_table', count: 1 }
+        const inserted = board.yieldFor(job, {
+          kind: 'craft', agentId: job.agentId,
+          summary: 'craft 缺工作台：先做一个工作台',
+          plan: tableReq,
+          run: (sig, child) => runCraft(self, tableReq, { signal: sig, movements, job: child, board, log }),
+        })
+        if (!inserted) return fail('插入"合成工作台"失败（队列状态不对）')
+        st.misses += 1
+        notes.push('插 craft：做一个工作台')
+        st.phase = 'table'
+        return { yielded: true, text: '⏸ 没有工作台（材料够），已插 craft 做工作台，craft 挂起' }
+      }
+      const need = (tablePlan.missing ?? [])[0]
+      if (need) {
+        st.gather = { name: need.name, count: Math.max(1, Number(need.need) - Number(need.have)) }
+        st.phase = 'gather'
+        notes.push(`做工作台的材料不够，先收 ${st.gather.name} ×${st.gather.count}`)
+        continue
+      }
+      return fail('没有工作台、背包没有、材料也凑不齐（规划没给出缺料项）')
     }
 
     /* ── ④ 执行合成（切片） ── */
