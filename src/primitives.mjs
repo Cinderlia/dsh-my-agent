@@ -412,8 +412,8 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
       + '· `input`：`{forward,jump,...}`；给了就按这次的值设，**没给的键保持原样**\n'
       + '· `releaseAll:true`：先把所有键松开再应用',
     parameters: {
-      look: { type: 'object', description: '{yaw,pitch} 或 {x,y,z} 或 {who}；不给就不动视角' },
-      input: { type: 'object', description: '{forward/back/left/right/jump/sneak/sprint} 布尔值' },
+      look: { type: 'object', additionalProperties: true, description: '{yaw,pitch} 或 {x,y,z} 或 {who}；不给就不动视角' },
+      input: { type: 'object', additionalProperties: true, description: '{forward/back/left/right/jump/sneak/sprint} 布尔值' },
       releaseAll: { type: 'boolean', description: 'true = 先松开所有键' },
     },
     output: text(),

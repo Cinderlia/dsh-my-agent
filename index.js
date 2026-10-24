@@ -3311,7 +3311,7 @@ ${where}——走完会主动报告`,
       + '`args` 原样转给被路由的那个实现（参数名和以前一样）。要地形图用 `mc_map`（没折叠）。',
     parameters: {
       what: { type: 'string', required: true, description: 'inventory / scan / diag / caps / sessions / prep / ping / lan / jobs' },
-      args: { type: 'object', description: '转给该能力的参数（如 {name:"oak_log",radius:16} / {address:"host:port"} / {only:"perf"}）' },
+      args: { type: 'object', additionalProperties: true, description: '转给该能力的参数（如 {name:"oak_log",radius:16} / {address:"host:port"} / {only:"perf"}）' },
     },
     output: text(),
     async execute (args, exec) {
