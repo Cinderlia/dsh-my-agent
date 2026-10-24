@@ -209,6 +209,45 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
     },
   }
 
+  /* ── 丢弃原语（用户 2026-10-25）：朝指定方向丢，立即返回 ── */
+  const mcToss = {
+    name: 'mc_toss',
+    description: '🗑 **丢弃物品**（原语，立即执行）：从背包丢出指定物品与数量。\n'
+      + '· 给 `dir` 就朝那个方向扔（north/south/east/west/up/down）；不给就朝当前视线\n'
+      + '· 要丢给**玩家**请用工具 `mc_toss_to`（它会先走过去）',
+    parameters: {
+      name: { type: 'string', required: true, description: '物品名（英文 id，如 cobblestone）' },
+      count: { type: 'number', description: '丢几个（默认 1）' },
+      dir: { type: 'string', description: '方向：north/south/east/west/up/down（不给=当前朝向）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const b = botOf(exec)
+      const want = String(args.name ?? '').trim().toLowerCase()
+      if (!want) return { ok: false, text: '❌ 要丢什么？给物品名' }
+      const items = b.inventory.items()
+      const it = items.find((x) => x.name === want) ?? items.find((x) => x.name.endsWith(want))
+      if (!it) {
+        return { ok: false, text: `❌ 背包里没有 ${want}（有：${items.slice(0, 10).map((x) => x.name).join(', ') || '空'}）` }
+      }
+      const count = Math.max(1, Math.min(Number(args.count ?? 1) || 1, it.count))
+      const dir = String(args.dir ?? '').toLowerCase()
+      const YAW = { south: 0, west: 90, north: 180, east: 270 }
+      try {
+        if (dir === 'up') b.look?.(b.entity.yaw, -Math.PI / 2, false)
+        else if (dir === 'down') b.look?.(b.entity.yaw, Math.PI / 2, false)
+        else if (YAW[dir] != null) b.look?.(YAW[dir] * Math.PI / 180, 0, false)
+        await b.toss(it.type, null, count)
+        return {
+          ok: true, name: it.name, count, dir: dir || null,
+          text: `🗑 丢出 ${it.name} ×${count}${dir ? `（朝 ${dir}）` : ''}，背包还剩 ${it.count - count}`,
+        }
+      } catch (e) {
+        return { ok: false, text: `❌ 丢失败：${e.message}` }
+      }
+    },
+  }
+
   const mcSwing = {
     name: 'mc_swing',
     description: '挥一下主手（**原语**：只发一次动画包，立即返回，不判定是否打中）。\n'
@@ -458,11 +497,12 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
     },
   }
 
-  return [mcLook, mcLookAt, mcInput, mcSwing, mcSelf, mcBlock, mcBlocks, mcEntities, mcApply]
+  return [mcLook, mcLookAt, mcInput, mcSwing, mcSelf, mcBlock, mcBlocks, mcEntities, mcApply, mcToss]
 }
 
 /** 原语名清单（index.js 用来把它们排除在"工具预算/调度器"之外） */
 export const PRIMITIVE_NAMES = [
+  'mc_toss',
   'mc_look', 'mc_look_at', 'mc_input', 'mc_swing',
   'mc_self', 'mc_block', 'mc_blocks', 'mc_entities',
   'mc_apply',
