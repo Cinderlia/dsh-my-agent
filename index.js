@@ -3214,9 +3214,6 @@ export function apply(ctx, rawConfig) {
       const sess = getSession(exec)
       sess.bot.requireBot()
       const plan = planCollect(sess, args)
-      if (plan.needsCraft) {
-        return { ok: false, needsCraft: true, text: `🧩 ${plan.why}` }
-      }
       if (!plan.ok) return { ok: false, ...plan, text: `❌ ${plan.why}` }
       const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
       const queued = jobBoard.enqueue({
@@ -3240,7 +3237,7 @@ export function apply(ctx, rawConfig) {
         started: queued.started,
         position: queued.position,
         plan,
-        text: `📦 收集 ${plan.name} ×${plan.count}｜${plan.creative ? '创造：直接拿' : `生存：${plan.radius} 格内找 ${plan.block}`}
+        text: `📦 收集 ${plan.name} ×${plan.count}｜${plan.craft ? '合成品 → 转交 craft' : plan.creative ? '创造：直接拿' : `生存：${plan.radius} 格内找 ${plan.block}`}
 ${where}——走完会主动报告`,
       }
     },

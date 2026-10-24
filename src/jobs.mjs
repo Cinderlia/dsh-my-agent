@@ -204,6 +204,28 @@ export class JobBoard {
   }
 
   /**
+   * **转交**（用户 2026-10-24）：当前任务把活交给另一个任务，**自己退队**、不再恢复。
+   *
+   * 典型：`mc_collect` 发现要的东西是合成品 → 插一个 `craft` 到队首，自己走人。
+   * 与 `yieldFor` 的区别只有一处：yield 之后自己还会回来，handOff 之后**永远不回来**。
+   */
+  handOff (job, spec = {}) {
+    if (!job || this.current !== job) return false
+    const child = this.makeJob(spec)
+    job.status = 'handed-off'
+    job.endedAt = Date.now()
+    job.error = `已转交 ${child.kind}`
+    this.current = null
+    this.archive(job)
+    this.queue.unshift(child)
+    this.state = 'running'
+    this.log(`任务 ${job.id} 转交给 ${child.id}（${child.summary}）`)
+    this.changed()
+    this.pump()
+    return true
+  }
+
+  /**
    * **介入**（用户第 ⑤ 条）：冻结队列 + 停队首 + 进入 intervening（宿主据此只留感知 + 这个原语）。
    * @returns {{stopped:Object|null, queued:number}}
    */

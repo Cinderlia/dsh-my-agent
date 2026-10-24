@@ -85,16 +85,17 @@ export function planCollect (self, args = {}) {
   const reg = b.registry ?? null
   const block = blockNameOf(name, reg)
   if (!creative && !block) {
+    /* 用户 2026-10-24：合成品不是错误 —— 状态机插入一个 craft 任务、自己退队。 */
     return {
-      ok: false,
-      needsCraft: true,
-      name, count,
-      why: `「${name}」不是能直接采集的方块（是合成品/加工品）—— 这个要交给 craft（还没实现，先占位）。`
-        + '\n现在能采集的是：自然方块（原木/石头/泥土/沙子/矿石…），或掉这些的物品名（如 diamond←diamond_ore）。',
+      ok: true,
+      craft: true,
+      name, count, mode, creative: false,
+      radius: COLLECT_RADIUS, reach: DIG_REACH,
+      why: `「${name}」是合成品/加工品，转交 craft`,
     }
   }
   return {
-    ok: true, name, block: block ?? null, count, mode, creative,
+    ok: true, craft: false, name, block: block ?? null, count, mode, creative,
     radius: COLLECT_RADIUS, reach: DIG_REACH,
     strategy: creative ? 'give' : 'dig',
   }
@@ -203,6 +204,19 @@ export async function runCollect (self, plan, ctx = {}) {
   if (!plan?.ok) throw new Error(plan?.why ?? '规划失败')
   const t0 = Number(job?.startedAt ?? Date.now())
 
+  /* ① 合成品 → 插 craft、自己退队（永远不再回来） */
+  if (plan.craft) {
+    if (!board || !job) throw new Error('内部错误：没有队列上下文，无法转交 craft')
+    const ok = board.handOff(job, {
+      kind: 'craft',
+      agentId: job.agentId,
+      summary: `制作 ${plan.name} ×${plan.count}`,
+      plan: { name: plan.name, count: plan.count },
+      run: async () => ({ ok: false, text: `craft 还没实现（占位）：要制作 ${plan.name} ×${plan.count}` }),
+    })
+    return { handedOff: ok, text: ok ? `🔀 已转交 craft（制作 ${plan.name} ×${plan.count}），collect 退队` : '转交 craft 失败' }
+  }
+
   /* 创造模式：一把干完 */
   if (plan.creative) {
     const got = await runCreative(b, plan)
@@ -219,13 +233,30 @@ export async function runCollect (self, plan, ctx = {}) {
     text: `✅ 收集到 ${plan.name} ×${st.got}（${((Date.now() - t0) / 1000).toFixed(1)} 秒，${steps.length} 步）`,
   })
 
+  /* 🔴 用户 2026-10-24 定的失败条件**只有两种**：
+   *    ① 一开始扫描就发现附近总量不够；
+   *    ② 挖到最后（附近的目标全挖完了）发现还不够。
+   *    掉落物被抢**不算失败** —— 继续挖下一个补上。 */
+  if (st.phase === 'find' && !st.scanned) {
+    st.scanned = true
+    const all = findTargets(b, plan.block, plan.radius, 64)
+    const loose = dropsNear(b, b.entity.position, plan.radius, plan.name).length
+    st.available = all.length + loose
+    if (st.available < plan.count) {
+      return fail(`附近 ${plan.radius} 格内只有 ${st.available} 个 ${plan.block}（含地上的掉落物），要 ${plan.count} 个 —— 不开始挖`)
+    }
+    log(`附近可用 ${st.available} 个（方块 ${all.length} + 掉落物 ${loose}），要 ${plan.count} 个`)
+  }
+
   for (let guard = 0; guard < 64; guard++) {
     if (signal?.aborted) throw new Error('被取消')
 
     if (st.phase === 'find') {
       if (st.got >= plan.count) return done()
       const targets = findTargets(b, plan.block, plan.radius, 1)
-      if (!targets.length) return fail(`附近 ${plan.radius} 格内没有 ${plan.block}`)
+      if (!targets.length) {
+        return fail(`附近的 ${plan.block} 都挖完了，只收到 ${st.got}/${plan.count}`)
+      }
       st.target = targets[0]
       st.phase = 'approach'
       log(`目标 ${plan.block} @ ${st.target.x},${st.target.y},${st.target.z}（${st.target.d.toFixed(1)} 格）`)
@@ -306,12 +337,12 @@ export async function runCollect (self, plan, ctx = {}) {
       const t = st.target
       const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.name)
       if (!drops.length) {
-        /* 🔴 用户 2026-10-24 定的：**任意流程失败就返回失败原因，不再补挖**。
-         *    上一版"捡不到就换目标继续挖"会让世界白白多损失方块
-         *    （实测：挖 5 个、只捡到 3 个，另外 2 个被玩家抢走 → 世界少了 5 个）。
-         *    所以这里直接判失败，把已经挖掉、已经收到的数量如实报出来。 */
-        return fail(`挖掉了但掉落物不见了（被抢走/掉进岩浆/没生成）—— 已停止，不再补挖；`
-          + `本次已收到 ${st.got}/${plan.count}`)
+        /* 掉落物没了（被抢/掉岩浆/没生成）：**不算失败** —— 回去挖下一个补上。
+         * 只有"附近全挖完还不够"才失败（见上面 find 阶段）。 */
+        st.lost = (st.lost ?? 0) + 1
+        steps.push(`掉落物不见了（第 ${st.lost} 个，继续挖下一个）`)
+        st.phase = 'find'
+        continue
       }
       const drop = drops[0]
       if (drop.unknown) steps.push('掉落物读不到物品 id，按位置去捡（可能捡错）')
