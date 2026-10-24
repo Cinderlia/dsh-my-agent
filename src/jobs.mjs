@@ -242,6 +242,26 @@ export class JobBoard {
     return true
   }
   /**
+   * **清空整个队列**（用户 2026-10-25）：「如果附近没有足够数量的方块，直接报错清空整个任务队列。」
+   * 条件根本不满足时继续排下去没有意义，全停比逐个失败更清楚。
+   * @returns {number} 清掉的任务数
+   */
+  abortAll (reason = '条件不满足') {
+    const n = this.queue.length
+    for (const j of this.queue) {
+      j.status = 'cancelled'
+      j.endedAt = Date.now()
+      j.error = String(reason)
+      this.archive(j)
+    }
+    this.queue = []
+    this.state = 'idle'
+    this.log(`清空整个队列：${n} 个任务（${reason}）`)
+    this.changed()
+    return n
+  }
+
+  /**
    * **介入**（用户第 ⑤ 条）：冻结队列 + 停队首 + 进入 intervening（宿主据此只留感知 + 这个原语）。
    * @returns {{stopped:Object|null, queued:number}}
    */

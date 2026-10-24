@@ -165,7 +165,10 @@ export async function runCraft (self, req, ctx = {}) {
         summary: `规划 ${req.itemName} ×${req.count} 的合成链`,
         plan: req,
         run: async () => {
-          const plan = planCraft(b, req.itemId, req.count, null)
+          /* 已经有工作台就按"有桌子"规划 —— 否则每一步都会重新报"缺 crafting_table"，
+           * 然后 table 阶段又把 phase 设回 craft，形成死循环（实测）。 */
+          const tableBlk = st.table ? b.blockAt(new Vec3(st.table.x, st.table.y, st.table.z)) : null
+          const plan = planCraft(b, req.itemId, req.count, tableBlk)
           st.lastPlan = {
             ok: plan.ok,
             steps: plan.steps?.length ?? 0,
@@ -193,7 +196,11 @@ export async function runCraft (self, req, ctx = {}) {
       if (lp.ok) { st.phase = 'craft'; continue }
       const missing = lp.missing ?? []
       log('缺料：' + missing.map((m) => `${m.name}(要${m.need}有${m.have})`).join('、'))
-      const tableMiss = missing.find((m) => m.name === 'crafting_table')
+      const tableMiss = st.table ? null : missing.find((m) => m.name === 'crafting_table')
+      /* 🔴 2026-10-25 用户："bot 在疯狂开箱，但是不拿原木" ——
+       *    工作台必须**最先**解决：后面所有合成都要它，先把桌子搞定再去收别的材料，
+       *    否则会一直在"熔炉→圆石"上打转，永远不会去拿原木。 */
+      if (tableMiss) { st.phase = 'table'; continue }
       /* 用户 2026-10-25：缺的是"能烧出来的东西"（铁锭/玻璃…）→ 插 smelt 子任务，
        * 而不是把它当"挖不到的材料"去 collect。 */
       const smeltable = missing.find((m) => m.name !== 'crafting_table' && smeltablesFor(b, m.name).length) ?? null
@@ -220,7 +227,6 @@ export async function runCraft (self, req, ctx = {}) {
         st.phase = 'gather'
         continue
       }
-      if (tableMiss) { st.phase = 'table'; continue }
       return fail(`缺料但说不清缺什么（${missing.map((m) => m.name).join('、') || '空'}）`)
     }
 

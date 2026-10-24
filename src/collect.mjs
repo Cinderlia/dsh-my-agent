@@ -41,6 +41,11 @@ export const ITEM_SOURCE = {
   raw_iron: ['iron_ore', 'deepslate_iron_ore'],
   raw_gold: ['gold_ore', 'deepslate_gold_ore'],
   raw_copper: ['copper_ore', 'deepslate_copper_ore'],
+  /* 🔴 2026-10-25 实机：craft 熔炉需要 8 个圆石，现场明明有 27 个石头，
+   *    collect 却报"附近 16 格内只有 0 个 cobblestone" —— 因为只按**方块名**找，
+   *    不知道"挖 stone 会掉 cobblestone"。这里补上常见方块→掉落物的映射。 */
+  cobblestone: ['stone', 'cobblestone', 'deepslate', 'cobbled_deepslate'],
+  stone: ['stone'],
   flint: ['gravel'],
   string: ['cobweb'],
   sugar_cane: ['sugar_cane'],
@@ -51,14 +56,28 @@ export const ITEM_SOURCE = {
   apple: ['oak_leaves', 'dark_oak_leaves'],
 }
 
-/** 这个名字是不是"能直接挖的方块"（返回方块名；不是就 null） */
-export function blockNameOf (name, registry) {
+/**
+ * 这个名字能靠挖哪些方块拿到（**返回候选列表**，按优先级）。
+ *
+ * 🔴 2026-10-25 实机：`cobblestone` 本身就是方块名，所以老逻辑直接返回 `cobblestone`，
+ *    现场明明有 27 个 stone 却报"附近 0 个 cobblestone" —— 因为**挖 stone 就掉 cobblestone**。
+ *    现在先放自己，再放映射里的替代来源。
+ */
+export function blockCandidates (name, registry) {
   const n = String(name ?? '').trim().toLowerCase()
-  if (!n) return null
-  if (registry?.blocksByName?.[n]) return n
+  if (!n) return []
+  const out = []
+  if (registry?.blocksByName?.[n]) out.push(n)
   const src = ITEM_SOURCE[n]
-  if (Array.isArray(src) && src.length) return src.find((s) => registry?.blocksByName?.[s]) ?? null
-  return null
+  if (Array.isArray(src)) {
+    for (const s of src) if (registry?.blocksByName?.[s] && !out.includes(s)) out.push(s)
+  }
+  return out
+}
+
+/** 兼容旧名字：取第一个候选 */
+export function blockNameOf (name, registry) {
+  return blockCandidates(name, registry)[0] ?? null
 }
 
 /** 判定：创造直接拿 / 生存挖方块 / 合成品转 craft */
@@ -71,7 +90,8 @@ export function planCollect (self, args = {}) {
   const mode = String(b.game?.gameMode ?? '').toLowerCase()
   const creative = mode === 'creative'
   const reg = b.registry ?? null
-  const block = blockNameOf(name, reg)
+  const candidates = blockCandidates(name, reg)
+  const block = candidates[0] ?? null
   const mobs = creative ? [] : mobsForDrop(name)
   if (!creative && !block && !mobs.length) {
     /* 用户 2026-10-24：合成品不是错误 —— 状态机插入一个 craft 任务、自己退队。 */
@@ -85,7 +105,7 @@ export function planCollect (self, args = {}) {
   }
   /* 生物掉落：物品不是方块、但能由某个生物掉落 → 走 attack（不是"合成品"） */
   return {
-    ok: true, craft: false, name, block: block ?? null, count, mode, creative,
+    ok: true, craft: false, name, block: block ?? null, blocks: candidates, count, mode, creative,
     radius: COLLECT_RADIUS, reach: DIG_REACH,
     ...(mobs.length ? { mobs } : {}),
     strategy: creative ? 'give' : block ? 'dig' : mobs.length ? 'attack' : 'dig',
@@ -218,6 +238,11 @@ export async function runCollect (self, plan, ctx = {}) {
     ? (job.state ??= { phase: 'find', got: 0, target: null, before: 0, tries: 0 })
     : { phase: 'find', got: 0, target: null, before: 0, tries: 0 }
   const steps = (st.steps ??= [])
+  /* 条件根本不满足（附近数量不够）→ 报错 **并清空整个队列**（用户 2026-10-25 定的） */
+  const fatalFail = (why) => {
+    try { board?.abortAll?.(why) } catch { /* 清不了也不影响报错 */ }
+    return fail(why)
+  }
   const fail = (why) => ({ ok: false, collected: st.got, name: plan.name, ms: Date.now() - t0, steps, why, text: `❌ 收集 ${plan.name} 失败：${why}` })
   const done = () => ({
     ok: true, collected: st.got, name: plan.name, ms: Date.now() - t0, steps,
@@ -228,17 +253,6 @@ export async function runCollect (self, plan, ctx = {}) {
    *    ① 一开始扫描就发现附近总量不够；
    *    ② 挖到最后（附近的目标全挖完了）发现还不够。
    *    掉落物被抢**不算失败** —— 继续挖下一个补上。 */
-  if (st.phase === 'find' && !st.scanned) {
-    st.scanned = true
-    const all = findTargets(b, plan.block, plan.radius, 64)
-    const loose = dropsNear(b, b.entity.position, plan.radius, plan.name).length
-    st.available = all.length + loose
-    if (st.available < plan.count) {
-      return fail(`附近 ${plan.radius} 格内只有 ${st.available} 个 ${plan.block}（含地上的掉落物），要 ${plan.count} 个 —— 不开始挖`)
-    }
-    log(`附近可用 ${st.available} 个（方块 ${all.length} + 掉落物 ${loose}），要 ${plan.count} 个`)
-  }
-
   for (let guard = 0; guard < 64; guard++) {
     if (signal?.aborted) throw new Error('被取消')
 
@@ -260,6 +274,14 @@ export async function runCollect (self, plan, ctx = {}) {
     /* ② 开箱阶段：逐个容器插 open_container */
     if (st.phase === 'storage') {
       const boxes = st.storageBoxes ?? []
+      /* 🔴 用户 2026-10-25："bot 在疯狂开箱" —— 每个 collect 都把所有容器重开一遍。
+       *    记住"这个容器里没有这个东西"（60 秒），期间直接跳过。 */
+      const lackKey = (bx) => `${bx.x},${bx.y},${bx.z}:${plan.name}`
+      const lacks = (b.__containerLacks ??= new Map())
+      while (st.storageIdx < boxes.length && lacks.has(lackKey(boxes[st.storageIdx]))
+        && Date.now() - lacks.get(lackKey(boxes[st.storageIdx])) < 60_000) {
+        st.storageIdx += 1
+      }
       const box = boxes[st.storageIdx]
       if (!box) {
         /* 箱子都翻完了，没拿到 → 回正常流程去挖/打 */
@@ -273,10 +295,25 @@ export async function runCollect (self, plan, ctx = {}) {
         item: plan.name, count: need, container: { x: box.x, y: box.y, z: box.z, name: box.name },
       }, { Goals: self?._pf?.goals ?? self?._pf?.Goals ?? null, log }))
       if (!inserted) return fail('插入开箱任务失败（队列状态不对）')
+      /* 开过就记一笔（不管有没有）—— 子任务失败回来时也不会重复开 */
+      lacks.set(lackKey(box), Date.now())
       st.storageIdx = (st.storageIdx ?? 0) + 1
       steps.push(`插入开箱 ${box.name}（${box.x},${box.y},${box.z}）`)
       return { yielded: true, text: `⏸ 已插入开箱任务（${box.name}），collect 挂起等待` }
     }
+
+  if (st.phase === 'find' && !st.scanned) {
+    st.scanned = true
+    const cands0 = Array.isArray(plan.blocks) && plan.blocks.length ? plan.blocks : [plan.block]
+    const all = []
+    for (const bn of cands0) all.push(...findTargets(b, bn, plan.radius, 64))
+    const loose = dropsNear(b, b.entity.position, plan.radius, plan.name).length
+    st.available = all.length + loose
+    if (st.available < plan.count) {
+      return fatalFail(`附近 ${plan.radius} 格内只有 ${st.available} 个 ${cands0.join('/')}（含地上的掉落物），要 ${plan.count} 个 —— 不开始挖`)
+    }
+    log(`附近可用 ${st.available} 个（方块 ${all.length} + 掉落物 ${loose}），要 ${plan.count} 个`)
+  }
 
     if (st.phase === 'find') {
       if (st.got >= plan.count) return done()
@@ -295,9 +332,12 @@ export async function runCollect (self, plan, ctx = {}) {
           st.before = invCount(b, plan.name)
           return { yielded: true, text: `⏸ 已插入攻击任务（打 ${mob}），collect 挂起等待掉落` }
       }
-      const targets = findTargets(b, plan.block, plan.radius, 1)
+      const cands = Array.isArray(plan.blocks) && plan.blocks.length ? plan.blocks : [plan.block]
+      const targets = []
+      for (const bn of cands) targets.push(...findTargets(b, bn, plan.radius, 1))
+      targets.sort((a, c) => a.d - c.d)
       if (!targets.length) {
-        return fail(`附近的 ${plan.block} 都挖完了，只收到 ${st.got}/${plan.count}`)
+        return fatalFail(`附近的 ${cands.join('/')} 都挖完了，只收到 ${st.got}/${plan.count}`)
       }
       st.target = targets[0]
       st.phase = 'approach'
@@ -330,7 +370,9 @@ export async function runCollect (self, plan, ctx = {}) {
     if (st.phase === 'dig') {
       const t = st.target
       const blk = t ? b.blockAt(new Vec3(t.x, t.y, t.z)) : null
-      if (!blk || isAir(blk.name) || blk.name !== plan.block) {
+      /* 挖的可能是**候选方块**（比如要 cobblestone 但挖的是 stone）—— 不能只认 plan.block */
+      const okNames = Array.isArray(plan.blocks) && plan.blocks.length ? plan.blocks : [plan.block]
+      if (!blk || isAir(blk.name) || !okNames.includes(blk.name)) {
         st.phase = 'find'
         continue
       }
@@ -339,11 +381,34 @@ export async function runCollect (self, plan, ctx = {}) {
       try {
         const need = blk.harvestTools
         if (need && typeof need === 'object') {
-          const have = new Set(b.inventory.items().map((it) => it.type))
-          const missing = Object.keys(need).filter((id) => !have.has(Number(id)))
+          const haveIds = new Set(b.inventory.items().map((it) => it.type))
+          const missing = Object.keys(need).filter((id) => !haveIds.has(Number(id)))
           if (missing.length && Object.keys(need).length) {
-            const names = missing.map((id) => b.registry?.items?.[id]?.name ?? id)
-            return fail(`挖 ${plan.block} 需要 ${names.join(' / ')} —— 现在没有，挖了也不会掉落，所以不挖`)
+            const names = missing.map((id) => b.registry?.items?.[id]?.name ?? String(id))
+            /* 🔴 用户 2026-10-25：「缺工具触发自动合成」。挖石头需要镐子，而铁镐本身
+             *    又需要圆石 —— 所以这里必须**插一个 craft 到自己前面**，而不是直接报错。
+             *    只补**石质及以下**（木/石工具），别递归到铁工具（那要熔炉，正是我们缺的）。 */
+            const LOW_TIER = ['wooden_pickaxe', 'stone_pickaxe', 'wooden_axe', 'stone_axe', 'wooden_shovel', 'stone_shovel', 'wooden_sword', 'stone_sword']
+            const tool = names.find((n) => LOW_TIER.includes(n))
+            if (tool && board && job && !st.toolRequested) {
+              st.toolRequested = true
+              const { resolveCraftRequest, runCraft } = await import('./craft.mjs')
+              const req = resolveCraftRequest(self, { name: tool, count: 1 })
+              if (req.ok) {
+                const inserted = board.yieldFor(job, {
+                  kind: 'craft', agentId: job.agentId,
+                  summary: `collect 缺工具：先合成 ${tool}`,
+                  plan: req,
+                  run: (sig, child) => runCraft(self, req, { signal: sig, movements, job: child, board, log }),
+                })
+                if (inserted) {
+                  st.phase = 'dig'
+                  steps.push(`缺工具 → 插 craft：${tool}`)
+                  return { yielded: true, text: `⏸ 挖 ${plan.block} 需要 ${tool}，已插合成，collect 挂起` }
+                }
+              }
+            }
+            return fail(`挖 ${plan.block} 需要 ${names.join(' / ')} —— 现在没有，自动合成也做不出来`)
           }
         }
       } catch { /* 读不到就照常挖 */ }
@@ -384,6 +449,7 @@ export async function runCollect (self, plan, ctx = {}) {
         steps.push(`背包 +${after - st.before}`)
         st.phase = 'find'
         st.tries = 0
+        st.toolRequested = false
         continue
       }
       st.phase = 'pickup'
