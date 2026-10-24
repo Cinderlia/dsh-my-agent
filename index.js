@@ -48,6 +48,7 @@ import { planCollect, runCollect } from './src/collect.mjs'
 import { buildTargets, checkRange, needsWalk, walkNear, runBatch, batchText } from './src/batch.mjs'
 import { resolveCraftRequest, runCraft, craftRequestText } from './src/craft.mjs'
 import { ensureScaffoldInHand, bagWarning } from './src/scaffold.mjs'
+import { startKilla } from './src/killa.mjs'
 import { movements as buildMovements } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -3578,6 +3579,19 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       // 记忆里的聊天记录（用户 2026-10-20）：进服就把钩子挂上，之后每条公屏都进 chat-log.md
       const chatLogRoot = attachChatLog(sess, exec?.agent)
       const ready = await sess.bot.waitForChunks()
+      /* 用户 2026-10-25：killa —— 敌对生物进入可触及范围就接管身体
+       * （有武器就跳劈，没武器/苦力怕就远离；接管时停掉队列并报告） */
+      try {
+        if (globalThis.__killaStop) { try { globalThis.__killaStop() } catch { /* ignore */ } }
+        const killa = startKilla({ bot: sess.bot?.bot, _pf: sess.bot?._pf ?? null }, {
+          board: jobBoard,
+          report: (t) => { try { jobBoard.inject(`killa-${Date.now()}`, t) } catch { /* ignore */ } },
+          log: (t) => logDebug('[killa] ' + t),
+        })
+        globalThis.__killaStop = () => killa.stop()
+      } catch (e) {
+        logLine('killa 启动失败（不影响连接）：' + (e?.message ?? e))
+      }
       // 进服自动挂看门狗（用户要求：进游戏自动打开）
       const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal, watchdogGate(sess))
       // 把自己的游戏名学进叫法（默认叫法里**没有**私人名字 —— 见 learnName 的注释）
