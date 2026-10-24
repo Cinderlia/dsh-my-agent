@@ -43,6 +43,7 @@ import { PRIORITY, DEFAULT_WAIT_MS } from './src/action-scheduler.mjs'
 import { buildPrimitives } from './src/primitives.mjs'
 import { JobBoard } from './src/jobs.mjs'
 import { buildNaviPlan, previewRoute, runNavi, naviReportText } from './src/navi.mjs'
+import { planCollect, runCollect } from './src/collect.mjs'
 import { movements as buildMovements } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -3191,6 +3192,53 @@ export function apply(ctx, rawConfig) {
         route,
         ...(routeError ? { routeError } : {}),
         text: naviReportText(plan, route, job.id, { started: queued.started, position: queued.position }) + (routeError ? `\n⚠️ ${routeError}` : ''),
+      }
+    },
+  }))
+
+  registerTool(asTool({
+    name: 'mc_collect',
+    description: '**收集物品**：给物品名，本地自己找 → 走过去 → 挖 → 确认捡到。\n'
+      + '· **创造模式**：直接拿（塞进背包）\n'
+      + '· **生存模式**：只在 16 格内找**自然方块**（原木/石头/泥土/沙子/矿石…）挖掉，\n'
+      + '  挖完**比对前后背包**确认掉落物被捡起；没捡起就走到掉落物上再确认\n'
+      + '· **合成品**（木棍/铁锭/工具…）不在这里做，会明确告诉你转 craft（还没实现，占位）\n'
+      + '· 异步：入队后立刻返回，完成/失败会主动报告（同 mc_navi）\n'
+      + '· 物品名可以是方块（oak_log）或掉它的物品（diamond ← diamond_ore）',
+    parameters: {
+      name: { type: 'string', required: true, description: '物品名（oak_log / stone / diamond / coal …）' },
+      count: { type: 'number', description: '要几个（默认 1，上限 64）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      sess.bot.requireBot()
+      const plan = planCollect(sess, args)
+      if (plan.needsCraft) {
+        return { ok: false, needsCraft: true, text: `🧩 ${plan.why}` }
+      }
+      if (!plan.ok) return { ok: false, ...plan, text: `❌ ${plan.why}` }
+      const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+      const queued = jobBoard.enqueue({
+        kind: 'collect',
+        agentId: agentIdOf(exec?.agent),
+        summary: `收集 ${plan.name} ×${plan.count}`,
+        plan,
+        run: (signal) => runCollect(sess, plan, { signal, movements: mv, log: (m) => logDebug('[collect] ' + m) }),
+      })
+      if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
+      const job = queued.job
+      const where = queued.started
+        ? `▶ 立刻开始（job ${job.id}）`
+        : `⏳ 已排队第 ${queued.position} 位（job ${job.id}）`
+      return {
+        ok: true,
+        jobId: job.id,
+        started: queued.started,
+        position: queued.position,
+        plan,
+        text: `📦 收集 ${plan.name} ×${plan.count}｜${plan.creative ? '创造：直接拿' : `生存：${plan.radius} 格内找 ${plan.block}`}
+${where}——走完会主动报告`,
       }
     },
   }))
