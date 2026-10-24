@@ -5889,6 +5889,23 @@ ${where}——走完会主动报告`,
 
     if (kind === 'other') {
       if (agent.id) { mcModeAgentIds.delete(String(agent.id)); mcPlusAgentIds.delete(String(agent.id)) }
+      /* 🔴 2026-10-25 用户：「你不是创造模式吗？更新一下会话级工具呗」——
+       *    `mcMode.unrestricted` 以前只放开 guard（能调），但没放开**可见性**：
+       *    非 MC 模式会话仍然把 mc_* 从工具面摘掉 ⇒ AI 根本看不到、也无法调用。
+       *    创造模式全权限 = 连可见性一起放开：直接 allow 全部自己注册的工具。 */
+      if (pluginConfig.mcUnrestricted === true) {
+        try {
+          const t = scopedTools(agent.ctx)
+          if (t) {
+            const release = t.restrict({ allow: [...ourToolNames] })
+            mcRestrictRelease.set(agent, release)
+            logLine(`🔓 创造模式全权限：非 MC 会话也暴露全部 ${ourToolNames.length} 个 mc_* 工具（${agent.id ?? '?'}）`)
+          }
+        } catch (e) {
+          logLine('创造模式放开工具可见性失败：' + String(e?.message).slice(0, 120))
+        }
+        return
+      }
       // 非 MC 模式：mc_* / mc_kit_* 从可见面摘掉；mc_admin_* 例外（它的用途就是在普通会话里管理）
       try {
         const t = scopedTools(agent.ctx)
