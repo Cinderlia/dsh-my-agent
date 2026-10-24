@@ -2805,7 +2805,12 @@ export function apply(ctx, rawConfig) {
       ? spec?.timeoutMs
       : Math.min(Number(spec?.timeoutMs) || CALL_MS + 1_000, CALL_MS + 1_000)
     const strictParams = spec?.parameters
-    return defineTool({
+    /* 🔴 一个工具的定义不合法不该让**整个插件**加载失败（2026-10-25 真事：
+     *    `mc_apply.look` 少写 additionalProperties → fiber failed → 所有 mc_* 消失，
+     *    而日志只停在"工具注册中…"，根本看不出是哪个工具）。
+     *    这里兜住：失败的记一行日志、跳过这个工具，其余照常注册。 */
+    try {
+      return defineTool({
       ...spec,
       ...(strictParams && typeof strictParams === 'object' ? { parameters: loosenNumberParams(strictParams) } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
@@ -2821,8 +2826,12 @@ export function apply(ctx, rawConfig) {
          * 拿不到工作区/记忆根（理论上不会）就让 `setTaskDir(null)` 退化成只在内存里记。 */
         try { sess.bot.setTaskDir(memoryRootFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent))) } catch { /* 记不了就不记 */ }
         return lossless(await perfWrap(spec.name, () => runScheduled(sess, spec.name, args, exec, spec.execute, null)))
-      },
-    })
+        },
+      })
+    } catch (e) {
+      logLine(`⚠️ 工具 ${spec?.name ?? '?'} 定义失败（已跳过，其余工具照常）：${e?.message ?? e}`)
+      return null
+    }
   }
 
   /**
@@ -2841,14 +2850,19 @@ export function apply(ctx, rawConfig) {
       // 任务执行器也要能调它们（同一条路，但不经调度器 —— 原语不占资源）
       TOOL_HANDLERS.set(spec.name, (args, exec) => spec.execute(args, exec))
     }
-    return defineTool({
-      ...spec,
-      timeoutMs: Math.min(Number(spec?.timeoutMs) || 2_000, 2_000),
-      async execute(rawArgs, exec) {
-        const args = coerceNumberArgs(spec.parameters, rawArgs ?? {})
-        return lossless(await spec.execute(args, exec))
-      },
-    })
+    try {
+      return defineTool({
+        ...spec,
+        timeoutMs: Math.min(Number(spec?.timeoutMs) || 2_000, 2_000),
+        async execute(rawArgs, exec) {
+          const args = coerceNumberArgs(spec.parameters, rawArgs ?? {})
+          return lossless(await spec.execute(args, exec))
+        },
+      })
+    } catch (e) {
+      logLine(`⚠️ 原语 ${spec?.name ?? '?'} 定义失败（已跳过）：${e?.message ?? e}`)
+      return null
+    }
   }
 
   /** 从 exec 里拿 agentId，再拿到当前会话的 McSession */
