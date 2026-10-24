@@ -2881,7 +2881,15 @@ export function apply(ctx, rawConfig) {
    */
   const registerTool = (tool) => {
     if (!tool) return () => {}
-    return ctx.tools.register(tool)
+    /* 宿主可能在 register 这一层才做严格校验（defineTool 只是构造）——
+     * 2026-10-25 实测：日志停在"工具注册中…"、没有任何"定义失败"，
+     * 说明抛错点在 register 而不是 defineTool。这里也兜住，并写明是哪个工具。 */
+    try {
+      return ctx.tools.register(tool)
+    } catch (e) {
+      logLine(`⚠️ 工具 ${tool?.name ?? '?'} 注册失败（已跳过，其余照常）：${e?.message ?? e}`)
+      return () => {}
+    }
   }
 
   /* ── 状态与开关 ── */
@@ -2993,6 +3001,8 @@ export function apply(ctx, rawConfig) {
       x2: numOf(args?.x2, 'x2'), y2: numOf(args?.y2, 'y2'), z2: numOf(args?.z2, 'z2'),
     }
   }
+  logLine('开始注册原语层…')
+
   /* ── 原语层（2026-10-24 架构重构）────────────────────────────────────────
    * 9 个原语：移动 4（look / look_at / input / swing）+ 感知 4（self / block / blocks / entities）
    * + 宏 1（apply）。它们只改本地状态、立即返回，不走调度器、不占 11 秒预算（见 asPrimitive）。
@@ -6256,6 +6266,8 @@ ${where}——走完会主动报告`,
       }
     },
   }))
+
+  logLine(`核心工具注册完成：${ourToolNames.length} 个（含原语/队列/批处理）`)
 
   /* ─────────── 扩展点：其他 Agent 往 extensions/ 丢文件就能加工具 ───────────
    * 需求 6 的另一半："其他 Agent 要保留为它做扩展、写 Agent 的能力"。
