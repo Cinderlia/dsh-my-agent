@@ -21,6 +21,7 @@ import {
 } from '../extensions/mc_craft.mjs'
 import { planCollect, runCollect } from './collect.mjs'
 import { buildNaviPlan, runNavi } from './navi.mjs'
+import { resolveSmeltRequest, runSmelt, smeltablesFor } from './smelt.mjs'
 
 /** 工作台查找半径（用户定的 16 格） */
 export const TABLE_RADIUS = 16
@@ -193,6 +194,26 @@ export async function runCraft (self, req, ctx = {}) {
       const missing = lp.missing ?? []
       log('缺料：' + missing.map((m) => `${m.name}(要${m.need}有${m.have})`).join('、'))
       const tableMiss = missing.find((m) => m.name === 'crafting_table')
+      /* 用户 2026-10-25：缺的是"能烧出来的东西"（铁锭/玻璃…）→ 插 smelt 子任务，
+       * 而不是把它当"挖不到的材料"去 collect。 */
+      const smeltable = missing.find((m) => m.name !== 'crafting_table' && smeltablesFor(b, m.name).length) ?? null
+      if (smeltable) {
+        const needN = Math.max(1, Number(smeltable.need) - Number(smeltable.have) - have(b, smeltable.id))
+        const req2 = resolveSmeltRequest(self, { name: smeltable.name, count: needN })
+        if (req2.ok) {
+          const inserted = board.yieldFor(job, {
+            kind: 'smelt', agentId: job.agentId,
+            summary: `craft 缺料：熔炼 ${req2.itemName} ×${req2.count}`,
+            plan: req2,
+            run: (sig, child) => runSmelt(self, req2, { signal: sig, movements, job: child, board, log }),
+          })
+          if (inserted) {
+            notes.push(`插 smelt：${req2.itemName} ×${req2.count}`)
+            st.phase = 'plan'
+            return { yielded: true, text: `⏸ 缺 ${req2.itemName}（要熔炼），已插 smelt，craft 挂起` }
+          }
+        }
+      }
       const other = missing.find((m) => m.name !== 'crafting_table')
       if (other) {
         st.gather = { name: other.name, count: Math.max(1, Number(other.need) - Number(other.have)) }
@@ -206,6 +227,16 @@ export async function runCraft (self, req, ctx = {}) {
     /* ── ② 缺普通材料 → 插 collect ── */
     if (st.phase === 'gather') {
       if (!board || !job) return fail('内部错误：没有队列上下文，无法插入收集任务')
+      /* 🔴 上一轮插的 collect 失败了？记一次、别原地重插（实测会死循环 235 个任务）。 */
+      if (st.__lastChildError) {
+        const e = st.__lastChildError
+        st.__lastChildError = null
+        st.gatherFails = (st.gatherFails ?? 0) + 1
+        notes.push(`收集失败（第 ${st.gatherFails} 次）：${e.error}`)
+        if (st.gatherFails >= 2) {
+          return fail(`收集 ${st.gather?.name ?? '材料'} 连续失败 ${st.gatherFails} 次：${e.error}`)
+        }
+      }
       const plan = planCollect(self, st.gather)
       if (!plan.ok) return fail(`收集 ${st.gather.name} 失败：${plan.why}`)
       const inserted = board.yieldFor(job, {

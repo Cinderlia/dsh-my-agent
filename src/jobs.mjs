@@ -143,6 +143,9 @@ export class JobBoard {
     if (!job || this.current !== job) return false
     if (this.state === 'frozen' || this.state === 'intervening') return false
     const child = this.makeJob(spec)
+    /* 让子任务记住父任务：它失败时把错误写回父任务的 state，
+     * 父任务恢复后就知道"刚才那步失败了"，不会无限重插（2026-10-25 实测死循环 235 个任务）。 */
+    child.parentJob = job
     job.status = 'waiting'
     job.waitingOn = child.id
     this.current = null
@@ -194,6 +197,15 @@ export class JobBoard {
     job.status = 'failed'
     job.endedAt = Date.now()
     job.error = String(err?.message ?? err ?? '未知错误')
+    /* 把失败回写给父任务（如果它是被 yieldFor 插进来的） */
+    try {
+      const parent = job.parentJob
+      if (parent?.state && typeof parent.state === 'object') {
+        parent.state.__lastChildError = {
+          kind: job.kind, summary: job.summary, error: job.error, at: Date.now(),
+        }
+      }
+    } catch { /* 回写失败不影响任务本身 */ }
     this.current = null
     this.archive(job)
     this.notify(job, `❌ ${job.summary} 失败：${job.error}`)
