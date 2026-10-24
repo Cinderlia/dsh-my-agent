@@ -50,6 +50,7 @@ const FLY_SPEED = 0.45
 
 /** 搭路用的方块：和 pathfinder 实际会用的那一套保持一致（`scaffoldingItemIds` 是唯一判据） */
 import { scaffoldingItemIds } from './place-items.mjs'
+import { scaffoldItemIds } from './scaffold.mjs'
 
 /** 当前游戏模式（读本地镜像；读不到按 survival 处理 —— 最保守的那档） */
 export function naviModeOf (b) {

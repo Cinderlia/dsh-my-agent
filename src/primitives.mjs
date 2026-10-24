@@ -15,6 +15,7 @@
  * 分工：`mc_act`（复合身体操作）与 `mc_move`（寻路）保持原样不动；
  *      原语是给 agent 补上"自己控制身体"的那一层，不是替换它们。
  * ========================================================================== */
+import { bagWarning } from './scaffold.mjs'
 import Vec3 from 'vec3'
 import { entitiesNear } from './world-scan.mjs'
 import { aimAt, lookAnglesTo } from './camera.mjs'
@@ -253,6 +254,9 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
       if (act.digging) lines.push(`⛏ 正在挖 ${act.digging.name} @ ${act.digging.position.x},${act.digging.position.y},${act.digging.position.z}`)
       if (act.usingItem) lines.push('🎯 正在用手上物品')
       if (stacks.length) lines.push('🎒 ' + stacks.map((s) => `${s.name}×${s.count}`).join(' · ') + (inv.stacks.length > stacks.length ? ` …（还有 ${inv.stacks.length - stacks.length} 叠，verbose:true 全看）` : ''))
+      /* 用户 2026-10-25：背包空格 <= 2 时预警，提醒清理背包，避免捡不起掉落物 */
+      const warn = bagWarning(b)
+      if (warn) lines.push(warn)
       return {
         position: posOf(p), yaw: round((b.entity?.yaw ?? 0) * 180 / Math.PI, 1), pitch: round((b.entity?.pitch ?? 0) * 180 / Math.PI, 1),
         health: Number.isFinite(hp) ? hp : null, food: Number.isFinite(food) ? food : null,

@@ -47,6 +47,7 @@ import { buildNaviPlan, previewRoute, runNavi, naviReportText } from './src/navi
 import { planCollect, runCollect } from './src/collect.mjs'
 import { buildTargets, checkRange, needsWalk, walkNear, runBatch, batchText } from './src/batch.mjs'
 import { resolveCraftRequest, runCraft, craftRequestText } from './src/craft.mjs'
+import { ensureScaffoldInHand, bagWarning } from './src/scaffold.mjs'
 import { movements as buildMovements } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -3165,6 +3166,11 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       }
       const deadline = Date.now() + Math.max(2000, CALL_MS - 800)
       const wantName = args.name ? String(args.name) : null
+      /* 用户 2026-10-25：垫/搭方块自动选一种并补到手上（三废石 → 地狱岩 → 多的一种） */
+      if (!wantName) {
+        const equipped = await ensureScaffoldInHand(b)
+        if (!equipped.ok) return { ok: false, text: `❌ ${equipped.why}` }
+      }
       const result = await runBatch(bt.targets, async (t) => {
         try {
           await sess.bot.placeBlock({ x: t.x, y: t.y, z: t.z, name: wantName })
