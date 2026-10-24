@@ -159,7 +159,7 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
   if (!blk) return { ok: false, text: `❌ ${x},${y},${z} 那格没加载` }
   let win = null
   try {
-    win = await b.openContainer(blk)
+    win = await b.openBlock(blk)
   } catch (e) {
     return { ok: false, text: `❌ 打不开 ${blk.name}（${x},${y},${z}）：${e.message}` }
   }
