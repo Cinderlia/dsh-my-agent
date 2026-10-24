@@ -334,6 +334,19 @@ export async function runCollect (self, plan, ctx = {}) {
         st.phase = 'find'
         continue
       }
+      /* 🔴 缺工具就别挖（用户 2026-10-24 实测）：石头/矿石没有对应镐子时**挖了不掉落**，
+       *    只会白白破坏世界。这里先查 `harvestTools`，缺就直接报，不开始挖。 */
+      try {
+        const need = blk.harvestTools
+        if (need && typeof need === 'object') {
+          const have = new Set(b.inventory.items().map((it) => it.type))
+          const missing = Object.keys(need).filter((id) => !have.has(Number(id)))
+          if (missing.length && Object.keys(need).length) {
+            const names = missing.map((id) => b.registry?.items?.[id]?.name ?? id)
+            return fail(`挖 ${plan.block} 需要 ${names.join(' / ')} —— 现在没有，挖了也不会掉落，所以不挖`)
+          }
+        }
+      } catch { /* 读不到就照常挖 */ }
       if (typeof b.canDigBlock === 'function' && !b.canDigBlock(blk)) {
         st.tries += 1
         if (st.tries >= 3) return fail(`挖不动 ${plan.block}（够不着或没有合适的工具）`)
@@ -342,7 +355,11 @@ export async function runCollect (self, plan, ctx = {}) {
       }
       st.before = invCount(b, plan.name)
       try {
-        await b.dig(blk)
+        /* 8 秒还没挖完 → 多半是服务端没回 blockUpdate（假死/被拒），别无限等 */
+        await Promise.race([
+          b.dig(blk),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('挖了 8 秒还没完成（服务端没回包？）')), 8000)),
+        ])
       } catch (e) {
         st.tries += 1
         if (st.tries >= 3) return fail(`挖 ${plan.block} 出错：${e.message}`)
