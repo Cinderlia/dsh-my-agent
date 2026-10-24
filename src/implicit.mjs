@@ -173,7 +173,6 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
     /* 🔴 用户 2026-10-25：「collect 从箱子里拿物品，不要小家子气，直接整组整组拿，
      *    优先拿不到堆叠上限的组，不够再拿满组。」 */
     const slots = win.slots ?? []
-    const stackMax = item.stackSize ?? 64
     const groups = []
     for (const it of slots) {
       if (!it || !wantIds.has(it.type)) continue
@@ -197,7 +196,7 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
       via: 'container',
       text: total > 0
         ? `📦 从 ${blk.name}（${x},${y},${z}）取出 ${wantNames[0]} ×${total}`
-        : `${blk.name}（${x},${y},${z}）里没有 ${wantNames.join('/')}`,
+        : `（${blk.name} ${x},${y},${z} 里没有 ${wantNames.join('/')}，继续找）`,
     }
   } catch (e) {
     return { ok: false, took: 0, text: `❌ 开箱取物失败：${e.message}` }

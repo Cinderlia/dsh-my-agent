@@ -140,14 +140,17 @@ export function planCollect (self, args = {}) {
   const candidates = blockCandidates(name, reg)
   const block = candidates[0] ?? null
   const mobs = creative ? [] : mobsForDrop(name)
-  if (!creative && !block && !mobs.length) {
-    /* 用户 2026-10-24：合成品不是错误 —— 状态机插入一个 craft 任务、自己退队。 */
+  /* 🔴 用户 2026-10-25："缺铁锭就 collect 铁锭；**合成品转交 craft**。"
+   *    铁锭虽然僵尸也会掉，但**优先走 craft**（合成/熔炼比打怪可靠）。
+   *    所以判据从"连 mob 掉落都没有才转 craft"改成"**不是方块就转 craft**"，
+   *    真的既没配方也没来源时，craft 那边会给出明确失败原因。 */
+  if (!creative && !block) {
     return {
       ok: true,
       craft: true,
       name, count, mode, creative: false,
       radius: COLLECT_RADIUS, reach: DIG_REACH,
-      why: `「${name}」是合成品/加工品，转交 craft`,
+      why: `「${name}」不是方块（合成品/加工品），转交 craft`,
     }
   }
   /* 生物掉落：物品不是方块、但能由某个生物掉落 → 走 attack（不是"合成品"） */
@@ -262,19 +265,6 @@ export async function runCollect (self, plan, ctx = {}) {
   if (!plan?.ok) throw new Error(plan?.why ?? '规划失败')
   const t0 = Number(job?.startedAt ?? Date.now())
 
-  /* ① 合成品 → 插 craft、自己退队（永远不再回来） */
-  if (plan.craft) {
-    if (!board || !job) throw new Error('内部错误：没有队列上下文，无法转交 craft')
-    const ok = board.handOff(job, {
-      kind: 'craft',
-      agentId: job.agentId,
-      summary: `制作 ${plan.name} ×${plan.count}`,
-      plan: { name: plan.name, count: plan.count },
-      run: async () => ({ ok: false, text: `craft 还没实现（占位）：要制作 ${plan.name} ×${plan.count}` }),
-    })
-    return { handedOff: ok, text: ok ? `🔀 已转交 craft（制作 ${plan.name} ×${plan.count}），collect 退队` : '转交 craft 失败' }
-  }
-
   /* 创造模式：一把干完 */
   if (plan.creative) {
     const got = await runCreative(b, plan)
@@ -352,6 +342,25 @@ export async function runCollect (self, plan, ctx = {}) {
       steps.push(`插入开箱 ${box.name}（${box.x},${box.y},${box.z}）`)
       return { yielded: true, text: `⏸ 已插入开箱任务（${box.name}），collect 挂起等待` }
     }
+
+  /* ①' 箱子也翻过了、还是找不到 → 合成品就转 craft（用户 2026-10-25：先箱子，没有不报错，再转 craft）
+   *    用户 2026-10-25："collect 铁锭 → 合成品，转交 craft 铁锭。" */
+  if (plan.craft) {
+    if (!board || !job) throw new Error('内部错误：没有队列上下文，无法转交 craft')
+    const { resolveCraftRequest, runCraft } = await import('./craft.mjs')
+    const req = resolveCraftRequest(self, { name: plan.name, count: plan.count })
+    if (!req.ok) {
+      return { ok: false, name: plan.name, why: req.why, text: `❌ 收集 ${plan.name}：${req.why}` }
+    }
+    const ok = board.handOff(job, {
+      kind: 'craft',
+      agentId: job.agentId,
+      summary: `制作 ${plan.name} ×${plan.count}`,
+      plan: req,
+      run: (sig, child) => runCraft(self, req, { signal: sig, movements, job: child, board, log }),
+    })
+    return { handedOff: ok, text: ok ? `🔀 已转交 craft（制作 ${plan.name} ×${plan.count}），collect 退队` : '转交 craft 失败' }
+  }
 
   if (st.phase === 'find' && !st.scanned) {
     st.scanned = true
@@ -480,10 +489,27 @@ export async function runCollect (self, plan, ctx = {}) {
     if (st.phase === 'verify') {
       let after = familyCount(b, plan.name)
       const deadline = Date.now() + PICKUP_WAIT_MS
+      const t0v = Date.now()
       while (Date.now() < deadline) {
         await sleep(200)
         after = familyCount(b, plan.name)
         if (after > st.before) break
+        /* 🔴 用户 2026-10-25："我怀疑其实 bot 捡起来了，但是它以为自己没捡起来"。
+         *    掉落物实体**消失**（被吸走/被捡）也该算捡到了 —— 背包同步常慢一两秒，
+         *    只盯背包会误判成"没捡到"，然后去挖下一个，结果多挖。 */
+        if (Date.now() - t0v > 1500) {
+          const t = st.target
+          const left = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6)
+          if (!left.length) {
+            st.got += 1
+            steps.push('掉落物实体已消失 → 视为已捡起')
+            st.phase = 'find'
+            st.toolRequested = false
+            st.before = familyCount(b, plan.name)
+            after = st.before
+            break
+          }
+        }
       }
       if (after > st.before) {
         st.got += after - st.before

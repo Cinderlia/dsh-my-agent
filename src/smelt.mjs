@@ -118,6 +118,12 @@ export async function runSmelt (self, req, ctx = {}) {
   const notes = (st.notes ??= [])
   const Goals = self?._pf?.goals ?? self?._pf?.Goals ?? null
 
+  /** findFurnaceBlock 返回的是 **Block**（坐标在 .position），统一转成 {x,y,z} */
+  const fpos = (f) => {
+    if (!f) return null
+    const p = f.position ?? f
+    return Number.isFinite(p.x) ? { x: p.x, y: p.y, z: p.z } : null
+  }
   const fail = (why) => ({
     ok: false, name: req.itemName, want: req.count, have: have(b, req.itemId), notes,
     ms: Date.now() - t0,
@@ -130,12 +136,17 @@ export async function runSmelt (self, req, ctx = {}) {
       + (notes.length ? '\n' + notes.join('\n') : ''),
   })
 
+  const trail = []
   for (let guard = 0; guard < 30; guard++) {
     if (signal?.aborted) throw new Error('被取消')
+    trail.push(st.phase)
+    if (trail.length > 8 && new Set(trail.slice(-6)).size === 1) {
+      return fail(`在同一步 (${st.phase}) 里空转：${trail.slice(-6).join(' → ')}`)
+    }
 
     /* ── ① 找熔炉（16 格内） ── */
     if (st.phase === 'find') {
-      const f = findFurnaceBlock(b, { radius: FURNACE_RADIUS })
+      const f = fpos(findFurnaceBlock(b, { radius: FURNACE_RADIUS }))
       if (f) {
         const me = b.entity.position
         const d = Math.hypot(me.x - (f.x + 0.5), me.y - f.y, me.z - (f.z + 0.5))
@@ -193,6 +204,12 @@ export async function runSmelt (self, req, ctx = {}) {
       const f = st.furnace
       const blk = f ? b.blockAt(new Vec3(f.x, f.y, f.z)) : null
       if (!blk || String(blk.name) !== 'furnace') {
+        st.badFurnace = (st.badFurnace ?? 0) + 1
+        notes.push(`装料前发现熔炉不在 ${f ? `${f.x},${f.y},${f.z}` : '?'}（${blk?.name ?? '未加载'}）`)
+        if (st.badFurnace > 2) {
+          return fail(`熔炉坐标反复对不上：${f ? `${f.x},${f.y},${f.z}` : '?'} 实际是 ${blk?.name ?? '未加载'}`)
+        }
+        st.furnace = null
         st.phase = 'find'
         continue
       }
@@ -219,8 +236,28 @@ export async function runSmelt (self, req, ctx = {}) {
       if (!fuel) {
         return fail('背包里没有可用燃料（需要煤/木炭/木头/木板/木棍）')
       }
+      /* 🔴 openContainer 要求够得着：远一点点就会报
+       *    "containerToOpen is neither a block nor an entity"（实测就是这个误导人的错）
+       *    所以装料前先确认距离，太远就插 navi 走过去。 */
+      const meL = b.entity.position
+      const dist = Math.hypot(meL.x - (f.x + 0.5), meL.y - (f.y + 0.5), meL.z - (f.z + 0.5))
+      if (dist > 4.0) {
+        if (!board || !job) return fail('内部错误：没有队列上下文')
+        const navPlan = buildNaviPlan(self, { x: f.x, y: f.y, z: f.z, radius: FURNACE_RADIUS })
+        if (!navPlan.ok) return fail(`去熔炉失败：${navPlan.why}（距离 ${dist.toFixed(1)}）`)
+        const inserted = board.yieldFor(job, {
+          kind: 'navi', agentId: job.agentId,
+          summary: `smelt 靠近熔炉 ${f.x},${f.y},${f.z}`,
+          plan: navPlan,
+          run: (sig) => runNavi(self, navPlan, { signal: sig, movements }),
+        })
+        if (!inserted) return fail('插 navi 失败（队列状态不对）')
+        notes.push(`距离熔炉 ${dist.toFixed(1)} 格，已插 navi 靠近`)
+        st.phase = 'load'
+        return { yielded: true, text: '⏸ 熔炉够不着，已插 navi，smelt 挂起' }
+      }
       try {
-        const win = await b.openContainer(blk)
+        const win = await b.openBlock(blk)
         try {
           const srcId = b.registry?.itemsByName?.[src]?.id
           await win.deposit(srcId, null, Math.min(need, 64))
@@ -230,7 +267,7 @@ export async function runSmelt (self, req, ctx = {}) {
           try { win.close?.() } catch { /* 已关 */ }
         }
       } catch (e) {
-        return fail(`装料失败：${e.message}`)
+        return fail(`装料失败：${e.message}（熔炉 ${f.x},${f.y},${f.z} 实际方块 ${blk?.name}，距离 ${dist.toFixed(1)} 格）`)
       }
       st.phase = 'wait'
       notes.push('等熔炉烧完')
@@ -253,7 +290,7 @@ export async function runSmelt (self, req, ctx = {}) {
       const blk = f ? b.blockAt(new Vec3(f.x, f.y, f.z)) : null
       if (!blk) { st.phase = 'find'; continue }
       try {
-        const win = await b.openContainer(blk)
+        const win = await b.openBlock(blk)
         try {
           const before = have(b, req.itemId)
           await win.withdraw(req.itemId, null, Math.min(req.count - before, 64))

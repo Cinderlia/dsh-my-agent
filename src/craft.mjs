@@ -23,6 +23,7 @@ import { planCollect, runCollect } from './collect.mjs'
 import { buildNaviPlan, runNavi } from './navi.mjs'
 import { resolveSmeltRequest, runSmelt, smeltablesFor } from './smelt.mjs'
 import { placeAt } from './place-util.mjs'
+import { findFurnaceBlock } from '../extensions/mc_furnace.mjs'
 
 /** 工作台查找半径（用户定的 16 格） */
 export const TABLE_RADIUS = 16
@@ -142,6 +143,17 @@ export async function runCraft (self, req, ctx = {}) {
     ? (job.state ??= { phase: 'plan', table: null, placedTable: null, gathers: 0, misses: 0 })
     : { phase: 'plan', table: null, placedTable: null, gathers: 0, misses: 0 }
   const notes = (st.notes ??= [])
+  /* 🔴 用户 2026-10-25："熔炉配方里，优先寻找配方里的其他方块，再合成熔炉。
+   *    因为铁往往比石头难找，提前失败就不用合成熔炉了。"
+   *    —— 要熔炉时先看附近 16 格有没有现成的；有就直接算"已有"。 */
+  if (req.itemName === 'furnace') {
+    const nearRaw = (() => { try { return findFurnaceBlock(b, { radius: 16 }) } catch { return null } })()
+    const near = nearRaw ? (nearRaw.position ?? nearRaw) : null
+    if (near && Number.isFinite(near.x)) {
+      notes.push(`附近已有熔炉 ${near.x},${near.y},${near.z}，不再合成`)
+      return { ok: true, name: 'furnace', want: req.count, have: 1, notes, text: `✅ 附近已有熔炉（${near.x},${near.y},${near.z}），直接用它` }
+    }
+  }
 
   const fail = (why) => ({
     ok: false, name: req.itemName, want: req.count, have: have(b, req.itemId),
@@ -157,6 +169,15 @@ export async function runCraft (self, req, ctx = {}) {
 
   for (let guard = 0; guard < 40; guard++) {
     if (signal?.aborted) throw new Error('被取消')
+
+    /* ── ⓪ 目标本身是"烧出来的"（铁锭/玻璃…）→ 熔炉配方 ──
+     * 用户 2026-10-25："生成合成链，铁块配方、铁粒配方和熔炉配方。检查附近方块，熔炉配方命中。"
+     * 这里简化成：能烧的目标直接插 smelt（smelt 内部会去 collect 铁原矿）。 */
+    if (st.phase === 'plan' && !st.smeltChecked) {
+      st.smeltChecked = true
+      const srcs = smeltablesFor(b, req.itemName)
+      if (srcs.length) { st.phase = 'melt'; continue }
+    }
 
     /* ── ① 算链 → **插入"规划"子任务**（用户 2026-10-25：没有规划就插规划工具） ── */
     if (st.phase === 'plan') {
@@ -204,21 +225,24 @@ export async function runCraft (self, req, ctx = {}) {
       if (tableMiss) { st.phase = 'table'; continue }
       /* 用户 2026-10-25：缺的是"能烧出来的东西"（铁锭/玻璃…）→ 插 smelt 子任务，
        * 而不是把它当"挖不到的材料"去 collect。 */
-      const smeltable = missing.find((m) => m.name !== 'crafting_table' && smeltablesFor(b, m.name).length) ?? null
-      if (smeltable) {
-        const needN = Math.max(1, Number(smeltable.need) - Number(smeltable.have) - have(b, smeltable.id))
-        const req2 = resolveSmeltRequest(self, { name: smeltable.name, count: needN })
-        if (req2.ok) {
+      /* 🔴 用户 2026-10-25："缺铁锭就 collect 铁锭；collect 发现是合成品，转交 craft 铁锭。"
+       *    所以这里**统一插 collect**，由 collect 决定"挖"还是"转 craft"——
+       *    craft 不再直接插 smelt（那是跳过了 collect 这一层）。 */
+      const craftableMiss = missing.find((m) => m.name !== 'crafting_table') ?? null
+      if (craftableMiss) {
+        const needN = Math.max(1, Number(craftableMiss.need) - Number(craftableMiss.have) - have(b, craftableMiss.id))
+        const cplan = planCollect(self, { name: craftableMiss.name, count: needN })
+        if (cplan.ok) {
           const inserted = board.yieldFor(job, {
-            kind: 'smelt', agentId: job.agentId,
-            summary: `craft 缺料：熔炼 ${req2.itemName} ×${req2.count}`,
-            plan: req2,
-            run: (sig, child) => runSmelt(self, req2, { signal: sig, movements, job: child, board, log }),
+            kind: 'collect', agentId: job.agentId,
+            summary: `craft 缺料：收集 ${craftableMiss.name} ×${needN}`,
+            plan: cplan,
+            run: (sig, child) => runCollect(self, cplan, { signal: sig, movements, job: child, board, log }),
           })
           if (inserted) {
-            notes.push(`插 smelt：${req2.itemName} ×${req2.count}`)
+            notes.push(`插 collect：${craftableMiss.name} ×${needN}`)
             st.phase = 'plan'
-            return { yielded: true, text: `⏸ 缺 ${req2.itemName}（要熔炼），已插 smelt，craft 挂起` }
+            return { yielded: true, text: `⏸ 缺 ${craftableMiss.name}，已插 collect（是合成品会转 craft），craft 挂起` }
           }
         }
       }
@@ -229,6 +253,31 @@ export async function runCraft (self, req, ctx = {}) {
         continue
       }
       return fail(`缺料但说不清缺什么（${missing.map((m) => m.name).join('、') || '空'}）`)
+    }
+
+    /* ── ①' 插 smelt（目标本身要烧） ── */
+    if (st.phase === 'melt') {
+      if (!board || !job) return fail('内部错误：没有队列上下文')
+      const needN = Math.max(1, req.count - have(b, req.itemId))
+      const req2 = resolveSmeltRequest(self, { name: req.itemName, count: needN })
+      if (!req2.ok) return fail(`熔炼 ${req.itemName} 不可行：${req2.why}`)
+      const inserted = board.yieldFor(job, {
+        kind: 'smelt', agentId: job.agentId,
+        summary: `craft 熔炉配方：${req2.itemName} ×${req2.count}`,
+        plan: req2,
+        run: (sig, child) => runSmelt(self, req2, { signal: sig, movements, job: child, board, log }),
+      })
+      if (!inserted) return fail('插 smelt 失败（队列状态不对）')
+      notes.push(`熔炉配方命中：${req2.itemName} ×${req2.count}（缺原料会插 collect 铁原矿）`)
+      st.phase = 'melt_done'
+      return { yielded: true, text: `⏸ 熔炉配方：已插熔炼 ${req2.itemName}，craft 挂起` }
+    }
+
+    /* ── ①'' 熔炼完成 ── */
+    if (st.phase === 'melt_done') {
+      if (have(b, req.itemId) >= req.count) return done()
+      st.phase = 'melt'
+      continue
     }
 
     /* ── ② 缺普通材料 → 插 collect ── */
