@@ -306,13 +306,12 @@ export async function runCollect (self, plan, ctx = {}) {
       const t = st.target
       const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.name)
       if (!drops.length) {
-        /* 掉落物不见了（被别人捡走 / 掉进岩浆 / 没生成）：**不立刻判死** ——
-         * 换下一个目标继续挖，连续 3 次都空手才报失败（用户在旁边抢掉落物就是这种场景）。 */
-        st.missed = (st.missed ?? 0) + 1
-        steps.push(`掉落物不见了（第 ${st.missed} 次）`)
-        if (st.missed >= 3) return fail(`连续 ${st.missed} 次挖到了却没捡到（掉落物被抢走/掉进岩浆/没生成）`)
-        st.phase = 'find'
-        continue
+        /* 🔴 用户 2026-10-24 定的：**任意流程失败就返回失败原因，不再补挖**。
+         *    上一版"捡不到就换目标继续挖"会让世界白白多损失方块
+         *    （实测：挖 5 个、只捡到 3 个，另外 2 个被玩家抢走 → 世界少了 5 个）。
+         *    所以这里直接判失败，把已经挖掉、已经收到的数量如实报出来。 */
+        return fail(`挖掉了但掉落物不见了（被抢走/掉进岩浆/没生成）—— 已停止，不再补挖；`
+          + `本次已收到 ${st.got}/${plan.count}`)
       }
       const drop = drops[0]
       if (drop.unknown) steps.push('掉落物读不到物品 id，按位置去捡（可能捡错）')
