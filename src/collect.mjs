@@ -18,6 +18,7 @@
 import Vec3 from 'vec3'
 import { isAir } from './block-names.mjs'
 import { buildNaviPlan, runNavi } from './navi.mjs'
+import { findContainers, implicitJob, mobsForDrop, MOB_DROPS } from './implicit.mjs'
 
 /** 采集半径（用户定的 16 格） */
 export const COLLECT_RADIUS = 16
@@ -42,19 +43,6 @@ export const ITEM_SOURCE = {
   raw_copper: ['copper_ore', 'deepslate_copper_ore'],
   flint: ['gravel'],
   string: ['cobweb'],
-  leather: ['cow', 'horse', 'donkey', 'mule', 'llama'],
-  feather: ['chicken'],
-  wool: ['sheep'],
-  egg: ['chicken'],
-  ink_sac: ['squid', 'glow_squid'],
-  glow_ink_sac: ['glow_squid'],
-  bone: ['skeleton', 'wither_skeleton'],
-  gunpowder: ['creeper', 'ghast'],
-  slime_ball: ['slime'],
-  ender_pearl: ['enderman'],
-  blaze_rod: ['blaze'],
-  zombie_flesh: ['zombie', 'husk', 'drowned'],
-  spider_eye: ['spider', 'cave_spider'],
   sugar_cane: ['sugar_cane'],
   wheat: ['wheat'],
   carrot: ['carrots'],
@@ -84,7 +72,8 @@ export function planCollect (self, args = {}) {
   const creative = mode === 'creative'
   const reg = b.registry ?? null
   const block = blockNameOf(name, reg)
-  if (!creative && !block) {
+  const mobs = creative ? [] : mobsForDrop(name)
+  if (!creative && !block && !mobs.length) {
     /* 用户 2026-10-24：合成品不是错误 —— 状态机插入一个 craft 任务、自己退队。 */
     return {
       ok: true,
@@ -94,10 +83,12 @@ export function planCollect (self, args = {}) {
       why: `「${name}」是合成品/加工品，转交 craft`,
     }
   }
+  /* 生物掉落：物品不是方块、但能由某个生物掉落 → 走 attack（不是"合成品"） */
   return {
     ok: true, craft: false, name, block: block ?? null, count, mode, creative,
     radius: COLLECT_RADIUS, reach: DIG_REACH,
-    strategy: creative ? 'give' : 'dig',
+    ...(mobs.length ? { mobs } : {}),
+    strategy: creative ? 'give' : block ? 'dig' : mobs.length ? 'attack' : 'dig',
   }
 }
 
@@ -251,8 +242,59 @@ export async function runCollect (self, plan, ctx = {}) {
   for (let guard = 0; guard < 64; guard++) {
     if (signal?.aborted) throw new Error('被取消')
 
+  /* ①·5 仓库优先（用户 2026-10-24）：先看 4.5 格内有没有箱子/木桶/熔炉，
+   *      有就插 open_container 去拿；拿到够数就直接完成，不再去挖。 */
+  if (st.phase === 'find' && !st.storageTried) {
+    st.storageTried = true
+    const boxes = findContainers(b, 4.5)
+    if (boxes.length) {
+      log(`4.5 格内发现 ${boxes.length} 个容器：${boxes.map((x) => x.name).join(',')}`)
+      st.storageBoxes = boxes
+      st.storageIdx = 0
+      st.phase = 'storage'
+      continue
+    }
+  }
+
+
+    /* ② 开箱阶段：逐个容器插 open_container */
+    if (st.phase === 'storage') {
+      const boxes = st.storageBoxes ?? []
+      const box = boxes[st.storageIdx]
+      if (!box) {
+        /* 箱子都翻完了，没拿到 → 回正常流程去挖/打 */
+        st.phase = 'find'
+        continue
+      }
+      const need = plan.count - st.got
+      if (need <= 0) return done()
+      if (!board || !job) return fail('内部错误：没有队列上下文，无法插入开箱任务')
+      const inserted = board.yieldFor(job, implicitJob(self, 'open_container', {
+        item: plan.name, count: need, container: { x: box.x, y: box.y, z: box.z, name: box.name },
+      }, { Goals: self?._pf?.goals ?? self?._pf?.Goals ?? null, log }))
+      if (!inserted) return fail('插入开箱任务失败（队列状态不对）')
+      st.storageIdx = (st.storageIdx ?? 0) + 1
+      steps.push(`插入开箱 ${box.name}（${box.x},${box.y},${box.z}）`)
+      return { yielded: true, text: `⏸ 已插入开箱任务（${box.name}），collect 挂起等待` }
+    }
+
     if (st.phase === 'find') {
       if (st.got >= plan.count) return done()
+      /* 目标来自生物（bone/gunpowder/leather…）：插 attack，打完再回来捡 */
+      if (!plan.block && plan.mobs?.length) {
+          if (!board || !job) return fail('内部错误：没有队列上下文，无法插入攻击任务')
+          const mob = plan.mobs.find((m) => Object.values(b.entities ?? {}).some((e) => String(e.name ?? '') === m))
+          if (!mob) return fail(`附近没有会掉 ${plan.name} 的生物（找过：${plan.mobs.join('/')}）`)
+          const need = plan.count - st.got
+          const inserted = board.yieldFor(job, implicitJob(self, 'attack_mob', { mob, count: Math.min(need, 2) }, {
+            Goals: self?._pf?.goals ?? self?._pf?.Goals ?? null, log,
+          }))
+          if (!inserted) return fail('插入攻击任务失败（队列状态不对）')
+          steps.push(`插入攻击 ${mob}`)
+          st.phase = 'verify'
+          st.before = invCount(b, plan.name)
+          return { yielded: true, text: `⏸ 已插入攻击任务（打 ${mob}），collect 挂起等待掉落` }
+      }
       const targets = findTargets(b, plan.block, plan.radius, 1)
       if (!targets.length) {
         return fail(`附近的 ${plan.block} 都挖完了，只收到 ${st.got}/${plan.count}`)
