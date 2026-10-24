@@ -22,6 +22,7 @@ import {
 import { planCollect, runCollect } from './collect.mjs'
 import { buildNaviPlan, runNavi } from './navi.mjs'
 import { resolveSmeltRequest, runSmelt, smeltablesFor } from './smelt.mjs'
+import { placeAt } from './place-util.mjs'
 
 /** 工作台查找半径（用户定的 16 格） */
 export const TABLE_RADIUS = 16
@@ -105,7 +106,7 @@ export async function placeTableNearby (self, st, notes = []) {
   const spot = findPlaceSpot(b, 4)
   if (spot) {
     try {
-      await b.placeBlock({ x: spot.x, y: spot.y, z: spot.z, name: 'crafting_table' })
+      await placeAt(b, spot.x, spot.y, spot.z, 'crafting_table')
       st.table = { x: spot.x, y: spot.y, z: spot.z }
       st.placedTable = { ...st.table }
       notes.push(`放了工作台 ${spot.x},${spot.y},${spot.z}（做完回收）`)
@@ -117,7 +118,7 @@ export async function placeTableNearby (self, st, notes = []) {
   // 兜底：垫脚下
   try {
     const me = b.entity.position.floored()
-    await b.placeBlock({ x: me.x, y: me.y - 1, z: me.z, name: 'crafting_table' })
+    await placeAt(b, me.x, me.y - 1, me.z, 'crafting_table')
     st.table = { x: me.x, y: me.y - 1, z: me.z }
     st.placedTable = { ...st.table }
     notes.push(`垫脚放了工作台 ${me.x},${me.y - 1},${me.z}（做完回收）`)

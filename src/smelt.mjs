@@ -17,6 +17,7 @@ import {
 import { planCollect, runCollect } from './collect.mjs'
 import { buildNaviPlan, runNavi } from './navi.mjs'
 import { resolveCraftRequest, runCraft } from './craft.mjs'
+import { placeAt } from './place-util.mjs'
 
 /** 熔炉查找半径 */
 export const FURNACE_RADIUS = 16
@@ -85,7 +86,7 @@ export async function placeFurnaceNearby (self, st, notes = []) {
   }
   cands.sort((a, c) => a.d - c.d)
   const tryPlace = async (pos) => {
-    await b.placeBlock({ x: pos.x, y: pos.y, z: pos.z, name: 'furnace' })
+    await placeAt(b, pos.x, pos.y, pos.z, 'furnace')
     st.furnace = { x: pos.x, y: pos.y, z: pos.z }
     st.placedFurnace = { ...st.furnace }
     notes.push(`放了熔炉 ${pos.x},${pos.y},${pos.z}（做完会回收）`)

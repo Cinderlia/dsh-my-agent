@@ -163,8 +163,11 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
   }
   const got = []
   try {
-    const item = b.registry?.itemsByName?.[plan.item]
-    if (!item) return { ok: false, text: `❌ 不认识的物品 ${plan.item}` }
+    /* 目标可以是**一组同族物品**（oak_log / cherry_log …），哪个有就拿哪个 */
+    const wantNames = Array.isArray(plan.items) && plan.items.length ? plan.items : [plan.item]
+    const wantIds = new Set(wantNames.map((n) => b.registry?.itemsByName?.[n]?.id).filter((v) => v != null))
+    const stackMaxOf = (id) => b.registry?.items?.[id]?.stackSize ?? 64
+    if (!wantIds.size) return { ok: false, text: `❌ 不认识的物品 ${wantNames.join('/')}` }
     let need = plan.count
     // 容器里的物品：按名字匹配（槽位里可能有多个同类）
     /* 🔴 用户 2026-10-25：「collect 从箱子里拿物品，不要小家子气，直接整组整组拿，
@@ -173,15 +176,15 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
     const stackMax = item.stackSize ?? 64
     const groups = []
     for (const it of slots) {
-      if (!it || it.type !== item.id) continue
-      groups.push({ count: it.count, full: it.count >= stackMax })
+      if (!it || !wantIds.has(it.type)) continue
+      groups.push({ id: it.type, count: it.count, full: it.count >= stackMaxOf(it.type) })
     }
     // 先零头（不满一组），再满组
     groups.sort((a, c) => Number(a.full) - Number(c.full) || a.count - c.count)
     for (const g of groups) {
       if (need <= 0) break
       const take = Math.min(need, g.count)
-      await win.withdraw(item.id, null, take)
+      await win.withdraw(g.id, null, take)
       got.push(take)
       need -= take
     }
@@ -193,8 +196,8 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
       ms: Date.now() - t0,
       via: 'container',
       text: total > 0
-        ? `📦 从 ${blk.name}（${x},${y},${z}）取出 ${plan.item} ×${total}`
-        : `${blk.name}（${x},${y},${z}）里没有 ${plan.item}`,
+        ? `📦 从 ${blk.name}（${x},${y},${z}）取出 ${wantNames[0]} ×${total}`
+        : `${blk.name}（${x},${y},${z}）里没有 ${wantNames.join('/')}`,
     }
   } catch (e) {
     return { ok: false, took: 0, text: `❌ 开箱取物失败：${e.message}` }

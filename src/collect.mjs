@@ -17,6 +17,7 @@
  * ========================================================================== */
 import Vec3 from 'vec3'
 import { isAir } from './block-names.mjs'
+import { ensureToolFor } from './tool-select.mjs'
 import { buildNaviPlan, runNavi } from './navi.mjs'
 import { findContainers, implicitJob, mobsForDrop, MOB_DROPS } from './implicit.mjs'
 
@@ -63,6 +64,45 @@ export const ITEM_SOURCE = {
  *    现场明明有 27 个 stone 却报"附近 0 个 cobblestone" —— 因为**挖 stone 就掉 cobblestone**。
  *    现在先放自己，再放映射里的替代来源。
  */
+/**
+ * 同族判定：`oak_log` / `cherry_log` / `birch_log` 都是一类"原木"。
+ * 🔴 用户 2026-10-25："合成木镐缺原木，打开箱子但是没拿原木" ——
+ *    craft 规划出来的是 `oak_log`，箱子里装的是 `cherry_log`，名字对不上就一个都不拿。
+ *    原木按族处理：挖/拿/校验都认整族。
+ */
+export function familyOf (name) {
+  const n = String(name ?? '').toLowerCase()
+  if (/_log$/.test(n)) return '_log'
+  if (/_planks$/.test(n)) return '_planks'
+  if (/_wood$/.test(n)) return '_wood'
+  return null
+}
+
+/** 目标名的"同族物品名"列表（含自己） */
+export function itemCandidates (name, registry) {
+  const n = String(name ?? '').trim().toLowerCase()
+  const out = []
+  if (registry?.itemsByName?.[n]) out.push(n)
+  const fam = familyOf(n)
+  if (fam) {
+    for (const k of Object.keys(registry?.itemsByName ?? {})) {
+      if (k.endsWith(fam) && !out.includes(k)) out.push(k)
+    }
+  }
+  return out
+}
+
+/** 背包里"这一族"一共有几个（原木按族算） */
+export function familyCount (b, name) {
+  const fam = familyOf(name)
+  if (!fam) return invCount(b, name)
+  let n = 0
+  try {
+    for (const it of b.inventory.items()) if (String(it.name).endsWith(fam)) n += it.count
+  } catch { /* 没背包 */ }
+  return n
+}
+
 export function blockCandidates (name, registry) {
   const n = String(name ?? '').trim().toLowerCase()
   if (!n) return []
@@ -71,6 +111,13 @@ export function blockCandidates (name, registry) {
   const src = ITEM_SOURCE[n]
   if (Array.isArray(src)) {
     for (const s of src) if (registry?.blocksByName?.[s] && !out.includes(s)) out.push(s)
+  }
+  /* 同族方块也都能挖（oak_log 找不到就挖 cherry_log） */
+  const fam = familyOf(n)
+  if (fam) {
+    for (const k of Object.keys(registry?.blocksByName ?? {})) {
+      if (k.endsWith(fam) && !out.includes(k)) out.push(k)
+    }
   }
   return out
 }
@@ -292,7 +339,11 @@ export async function runCollect (self, plan, ctx = {}) {
       if (need <= 0) return done()
       if (!board || !job) return fail('内部错误：没有队列上下文，无法插入开箱任务')
       const inserted = board.yieldFor(job, implicitJob(self, 'open_container', {
-        item: plan.name, count: need, container: { x: box.x, y: box.y, z: box.z, name: box.name },
+        /* 同族一起要（箱子里可能装的是 cherry_log 而不是 oak_log） */
+        items: itemCandidates(plan.name, b.registry),
+        item: plan.name,
+        count: need,
+        container: { x: box.x, y: box.y, z: box.z, name: box.name },
       }, { Goals: self?._pf?.goals ?? self?._pf?.Goals ?? null, log }))
       if (!inserted) return fail('插入开箱任务失败（队列状态不对）')
       /* 开过就记一笔（不管有没有）—— 子任务失败回来时也不会重复开 */
@@ -329,7 +380,7 @@ export async function runCollect (self, plan, ctx = {}) {
           if (!inserted) return fail('插入攻击任务失败（队列状态不对）')
           steps.push(`插入攻击 ${mob}`)
           st.phase = 'verify'
-          st.before = invCount(b, plan.name)
+          st.before = familyCount(b, plan.name)
           return { yielded: true, text: `⏸ 已插入攻击任务（打 ${mob}），collect 挂起等待掉落` }
       }
       const cands = Array.isArray(plan.blocks) && plan.blocks.length ? plan.blocks : [plan.block]
@@ -378,47 +429,37 @@ export async function runCollect (self, plan, ctx = {}) {
       }
       /* 🔴 缺工具就别挖（用户 2026-10-24 实测）：石头/矿石没有对应镐子时**挖了不掉落**，
        *    只会白白破坏世界。这里先查 `harvestTools`，缺就直接报，不开始挖。 */
-      try {
-        const need = blk.harvestTools
-        if (need && typeof need === 'object') {
-          const haveIds = new Set(b.inventory.items().map((it) => it.type))
-          const missing = Object.keys(need).filter((id) => !haveIds.has(Number(id)))
-          if (missing.length && Object.keys(need).length) {
-            const names = missing.map((id) => b.registry?.items?.[id]?.name ?? String(id))
-            /* 🔴 用户 2026-10-25：「缺工具触发自动合成」。挖石头需要镐子，而铁镐本身
-             *    又需要圆石 —— 所以这里必须**插一个 craft 到自己前面**，而不是直接报错。
-             *    只补**石质及以下**（木/石工具），别递归到铁工具（那要熔炉，正是我们缺的）。 */
-            const LOW_TIER = ['wooden_pickaxe', 'stone_pickaxe', 'wooden_axe', 'stone_axe', 'wooden_shovel', 'stone_shovel', 'wooden_sword', 'stone_sword']
-            const tool = names.find((n) => LOW_TIER.includes(n))
-            if (tool && board && job && !st.toolRequested) {
-              st.toolRequested = true
-              const { resolveCraftRequest, runCraft } = await import('./craft.mjs')
-              const req = resolveCraftRequest(self, { name: tool, count: 1 })
-              if (req.ok) {
-                const inserted = board.yieldFor(job, {
-                  kind: 'craft', agentId: job.agentId,
-                  summary: `collect 缺工具：先合成 ${tool}`,
-                  plan: req,
-                  run: (sig, child) => runCraft(self, req, { signal: sig, movements, job: child, board, log }),
-                })
-                if (inserted) {
-                  st.phase = 'dig'
-                  steps.push(`缺工具 → 插 craft：${tool}`)
-                  return { yielded: true, text: `⏸ 挖 ${plan.block} 需要 ${tool}，已插合成，collect 挂起` }
-                }
-              }
+      /* 🔴 用户 2026-10-25：挖之前**先自动换合适工具**（被动工具）。
+       *    没有工具就让 ensureToolFor 告诉我们该做什么，然后插一个 craft 到自己前面。 */
+      const toolRes = await ensureToolFor(b, blk)
+      if (!toolRes.ready) {
+        if (toolRes.needCraft && board && job && !st.toolRequested) {
+          st.toolRequested = true
+          const { resolveCraftRequest, runCraft } = await import('./craft.mjs')
+          const req = resolveCraftRequest(self, { name: toolRes.needCraft, count: 1 })
+          if (req.ok) {
+            const inserted = board.yieldFor(job, {
+              kind: 'craft', agentId: job.agentId,
+              summary: `collect 缺工具：先合成 ${toolRes.needCraft}`,
+              plan: req,
+              run: (sig, child) => runCraft(self, req, { signal: sig, movements, job: child, board, log }),
+            })
+            if (inserted) {
+              st.phase = 'dig'
+              steps.push(`缺工具 → 插 craft：${toolRes.needCraft}`)
+              return { yielded: true, text: `⏸ 挖 ${plan.block} 需要 ${toolRes.needCraft}，已插合成，collect 挂起` }
             }
-            return fail(`挖 ${plan.block} 需要 ${names.join(' / ')} —— 现在没有，自动合成也做不出来`)
           }
         }
-      } catch { /* 读不到就照常挖 */ }
+        return fail(`挖 ${plan.block} 缺工具：${toolRes.why ?? toolRes.needCraft ?? '做不出来'}`)
+      }
       if (typeof b.canDigBlock === 'function' && !b.canDigBlock(blk)) {
         st.tries += 1
         if (st.tries >= 3) return fail(`挖不动 ${plan.block}（够不着或没有合适的工具）`)
         st.phase = 'approach'
         continue
       }
-      st.before = invCount(b, plan.name)
+      st.before = familyCount(b, plan.name)
       try {
         /* 8 秒还没挖完 → 多半是服务端没回 blockUpdate（假死/被拒），别无限等 */
         await Promise.race([
@@ -437,11 +478,11 @@ export async function runCollect (self, plan, ctx = {}) {
     }
 
     if (st.phase === 'verify') {
-      let after = st.before
+      let after = familyCount(b, plan.name)
       const deadline = Date.now() + PICKUP_WAIT_MS
       while (Date.now() < deadline) {
         await sleep(200)
-        after = invCount(b, plan.name)
+        after = familyCount(b, plan.name)
         if (after > st.before) break
       }
       if (after > st.before) {
@@ -484,7 +525,7 @@ export async function runCollect (self, plan, ctx = {}) {
       if (!inserted) return fail('插入捡取任务失败（队列状态不对）')
       steps.push('插入导航去捡掉落物')
       st.phase = 'verify'
-      st.before = invCount(b, plan.name)
+      st.before = familyCount(b, plan.name)
       return { yielded: true, text: '⏸ 已插入 navi 去捡掉落物，collect 挂起等待' }
     }
 
