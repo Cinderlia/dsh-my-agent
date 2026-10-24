@@ -3087,7 +3087,10 @@ export function apply(ctx, rawConfig) {
     name: 'mc_stop',
     description: '**停止一切**（原语）：中断正在跑的动作（走路 / 挖掘 / 打怪 / 交互），**清空后台任务队列**，'
       + '并重置被动工具（台账、缓存这些不操作世界的）。之后可以重新下令。',
-    parameters: {},
+    parameters: {
+      offline: { type: 'boolean', description: 'true = 停完再**优雅下线**（退出游戏）；不给只停动作、不断开' },
+      reason: { type: 'string', description: '原因（写进日志）' },
+    },
     output: text(),
     async execute (args, exec) {
       const sess = getSession(exec)
@@ -3103,12 +3106,21 @@ export function apply(ctx, rawConfig) {
       } catch { /* 没连接 */ }
       try { sess.bot.actionScheduler?.()?.releaseAll?.('mc_stop'); done.push('释放动作锁') } catch { /* 没占 */ }
       const q = jobBoard.stopAll('被 mc_stop 停止')
+      let offline = null
+      if (args.offline === true) {
+        try {
+          const r = await sess.bot.disconnect(args.reason ? String(args.reason) : 'mc_stop offline')
+          offline = r
+          done.push('已下线')
+        } catch (e) { done.push('下线失败：' + e.message) }
+      }
       return {
         ok: true,
         actions: done,
         stoppedJob: q.stopped,
         droppedJobs: q.dropped,
         resets: q.resets,
+        ...(offline ? { offline } : {}),
         queue: jobBoard.snapshot(),
         text: `🛑 已停止：${done.length ? done.join(' / ') : '（本来就没在动）'}`
           + `｜队列：停掉 ${q.stopped ? q.stopped.id : '无'}、清掉 ${q.dropped} 个排队`
@@ -3315,7 +3327,10 @@ ${where}——走完会主动报告`,
         } catch (e) {
           return { ok: false, why: e?.message ?? String(e) }
         }
-      }, { deadline })
+      }, {
+        deadline,
+        ensureNear: async (t) => (needsWalk(b, t) ? walkNear(b, Goals, t.x, t.y, t.z) : { ok: true }),
+      })
       return { ok: result.failed.length === 0 && result.skipped.length === 0, ...result, text: batchText('🧱 放', result, bt.targets.length) }
     },
   }))
@@ -3610,28 +3625,6 @@ ${where}——走完会主动报告`,
       }
 
       throw new Error(`未知 action："${action}"（可用 list/search/use/refresh）`)
-    },
-  }))
-
-  registerTool(asTool({
-    name: 'mc_stop',
-    description: '停止本会话的 Minecraft：**先尝试优雅退出游戏，再清空本会话全部后台任务（看门狗在里面）**。\n'
-      + '⚠️ 它**不会中断你自己当前这一轮**（你正跑在这轮里，自我 abort 会表现为 "tool call aborted"）。'
-      + '所以它适合"我不想玩了，下线"——想停掉自己正在跑的动作，直接别再调工具就行。\n'
-      + '页面上标题旁只剩一个「强制停止」按钮，它比这个工具更狠：**先停 LLM → 再优雅退游戏 → '
-      + '再清后台任务 → 最后再停一次 LLM**（那是给人按的）。',
-    parameters: {
-      reason: { type: 'string', description: '原因（写进日志）' },
-    },
-    output: text(),
-    async execute(args, exec) {
-      const sessionId = exec?.agent?.id
-      if (!sessionId) throw new Error('拿不到当前会话')
-      // cancelTurn:false —— 工具就跑在被停的这一轮里，绝不能让 stop 把这一轮 abort 掉
-      return stopSession(sessionId, {
-        reason: args.reason ? String(args.reason) : 'AI 主动下线',
-        cancelTurn: false,
-      })
     },
   }))
 
@@ -4779,7 +4772,10 @@ ${where}——走完会主动报告`,
           const lines = await sess.bot.dig({ pos: new Vec3(t.x, t.y, t.z), count: 1, noDig: args.digThrough !== true, allowDangerous: args.allowDangerous === true })
           const text = (lines ?? []).join(' ')
           return { ok: !/失败|够不着|挖不动|没有|超时/.test(text), why: text.slice(0, 80) }
-        }, { deadline })
+        }, {
+          deadline,
+          ensureNear: async (t) => (needsWalk(b, t) ? walkNear(b, Goals, t.x, t.y, t.z) : { ok: true }),
+        })
         return { ok: result.failed.length === 0 && result.skipped.length === 0, ...result, text: batchText('⛏ 挖', result, bt.targets.length) }
       }
       const pos = (args.x !== undefined && args.y !== undefined && args.z !== undefined)

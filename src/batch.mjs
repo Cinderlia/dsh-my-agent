@@ -139,7 +139,7 @@ export function needsWalk (b, target) {
  * 逐格执行（挖或放）。到 deadline 就停，返回进度。
  * @param {(t) => Promise<any>} runOne 单个坐标的执行器（返回 {ok, why})
  */
-export async function runBatch (targets, runOne, { deadline = Date.now() + 10_000, signal = null, log = () => {} } = {}) {
+export async function runBatch (targets, runOne, { deadline = Date.now() + 10_000, signal = null, log = () => {}, ensureNear = null } = {}) {
   const done = []
   const failed = []
   const skipped = []
@@ -147,6 +147,18 @@ export async function runBatch (targets, runOne, { deadline = Date.now() + 10_00
     const t = targets[i]
     if (signal?.aborted) { skipped.push(...targets.slice(i)); break }
     if (Date.now() >= deadline) { skipped.push(...targets.slice(i)); break }
+    /* 🔴 每格之前都确认够得着：一行的后几格、一面墙的上层，光靠"开局走一次"到不了
+     *    （实测：放一行 4 格，第 4 格报"眼睛到方块中心 5.1 格，够不着"）。
+     *    `ensureNear` 由调用方给（内部用 pathfinder 走过去）。 */
+    if (typeof ensureNear === 'function') {
+      try {
+        const near = await ensureNear(t)
+        if (near && near.ok === false) { failed.push({ ...t, why: near.why ?? '走不过去' }); continue }
+      } catch (e) {
+        failed.push({ ...t, why: `走过去失败：${e?.message ?? e}` })
+        continue
+      }
+    }
     try {
       const r = await runOne(t)
       if (r && r.ok === false) failed.push({ ...t, why: r.why ?? '失败' })
