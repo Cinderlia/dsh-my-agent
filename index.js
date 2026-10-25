@@ -50,6 +50,7 @@ import { resolveCraftRequest, runCraft, craftRequestText } from './src/craft.mjs
 import { ensureScaffoldInHand, bagWarning } from './src/scaffold.mjs'
 import { startKilla } from './src/killa.mjs'
 import { startPassiveAlerts } from './src/passive-alerts.mjs'
+import { scanSurroundings } from './src/poi.mjs'
 import { movements as buildMovements } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -3393,6 +3394,28 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       return { ok: true, jobId: queued.job.id, started: queued.started, position: queued.position, ...req, text: craftRequestText(req) + '\n' + where + '\n\n' + jobBoard.snapshotText() }
     },
   }))
+  registerTool(asTool({
+    name: 'mc_scan_surroundings',
+    description: '🎯 **兴趣点雷达**（不返回全量方块，只回报"值得关注的"）：\n'
+      + '· 按类别分组（危险生物/岩浆/矿石/木材/石料/功能方块/食物），每类只给最近 N 个；\n'
+      + '· 只统计**暴露在空气中**的方块（埋着的不算）；\n'
+      + '· `focus` 决定加权：build（造房子）/ ore（挖矿）/ combat（打架）/ survival（生存）/ explore / farm / auto\n'
+      + '· 输出稳定在 ~200 字符，适合频繁调用；代价 ~100ms',
+    parameters: {
+      radius: { type: 'number', description: '扫描半径（默认 16，上限 32）' },
+      focus: { type: 'string', description: '焦点：auto（默认）/ build / ore / combat / survival / explore / farm' },
+      limit: { type: 'number', description: '每类最多几处（默认 3，上限 8）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      const b = sess.bot.requireBot()
+      const r = scanSurroundings({ bot: b, _pf: sess.bot?._pf ?? null }, args)
+      if (!r.ok) return { ok: false, text: `❌ ${r.why}` }
+      return { ok: true, focus: r.focus, radius: r.radius, groups: r.groups, elapsedMs: r.elapsedMs, text: r.text }
+    },
+  }))
+
   registerTool(asTool({
     name: 'mc_probe',
     description: '**入口路由**：查环境、连接、诊断、背包/方块扫描这类"偶尔查一次"的能力都从这里进（它们不再单独占工具名）。\n'
