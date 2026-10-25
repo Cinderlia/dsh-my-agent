@@ -75,7 +75,10 @@ phase: find → approach → dig → verify → pickup → …  → done
 - **合成 `mc_craft`**：只给"要什么 + 几个"，本地自己算合成链；缺料自动收集、缺工作台自动找/放/回收、缺中间产物自动补
 - **熔炼 `mc_smelt`**：找/放熔炉、精确放槽（输入/燃料分开）、按数量耐心等烧完、取出、回收熔炉
 - **收集 `mc_collect`**：优先翻箱子（整组拿），没有再挖；挖完等吸附、捡不到才插一次导航
-- **存取箱子 `mc_chest`**：先走到箱子再开关，整组拿/放
+- **存取箱子 `mc_chest`（两步）**：先 `action:"open"` 走到箱子旁、把**内容清单**回给你；
+  想好之后 `action:"take"/"put"` + `items:[{name,count}…]` 一次多组存取
+- **丢东西给玩家 `mc_toss_to`**：跟随到他身边、等他停下，再朝他丢（`mc_toss` 是朝方向的原语）
+- **跟随 `mc_navi {player, follow:true}`**：pathfinder 的 GoalFollow，一直跟到他停下
 - **导航 `mc_navi`**：寻路 + 兜底策略
 - **建造 `mc_build` / 放置 `mc_place`**：按图施工、批量铺设、自动选料（三废石优先）
 

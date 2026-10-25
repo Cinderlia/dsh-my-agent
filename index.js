@@ -43,7 +43,7 @@ import { PRIORITY, DEFAULT_WAIT_MS } from './src/action-scheduler.mjs'
 import Vec3 from 'vec3'
 import { buildPrimitives } from './src/primitives.mjs'
 import { JobBoard } from './src/jobs.mjs'
-import { buildNaviPlan, previewRoute, runNavi, naviReportText } from './src/navi.mjs'
+import { buildNaviPlan, previewRoute, runNavi, runFollow, naviReportText } from './src/navi.mjs'
 import { planCollect, runCollect } from './src/collect.mjs'
 import { buildTargets, checkRange, needsWalk, walkNear, runBatch, batchText } from './src/batch.mjs'
 import { resolveCraftRequest, runCraft, craftRequestText } from './src/craft.mjs'
@@ -3044,6 +3044,7 @@ export function apply(ctx, rawConfig) {
       y: { type: 'number', description: '目标 y' },
       z: { type: 'number', description: '目标 z' },
       player: { type: 'string', description: '玩家名（给了就忽略 x/y/z）' },
+      follow: { type: 'boolean', description: '跟随模式（配 player 用）：一直跟到他停下' },
       radius: { type: 'number', description: '最大允许距离（默认 16，上限 16）' },
       parkour: { type: 'boolean', description: '允许跑酷（默认 true）；false = 只走平路/搭方块' },
     },
@@ -3051,7 +3052,20 @@ export function apply(ctx, rawConfig) {
     async execute (args, exec) {
       const sess = getSession(exec)
       const b = sess.bot.requireBot()
-      const plan = buildNaviPlan(botView(sess), args)
+      const view = botView(sess)
+      if (args.follow === true && args.player) {
+        const mvF = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+        const queuedF = jobBoard.enqueue({
+          kind: 'follow', agentId: agentIdOf(exec?.agent),
+          summary: `跟随玩家 ${args.player}`,
+          plan: { player: args.player },
+          run: (signal) => runFollow(view, args.player, { signal, movements: mvF, timeoutMs: 60_000 }),
+        })
+        if (!queuedF.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queuedF.why}` }
+        return { ok: true, jobId: queuedF.job.id, started: queuedF.started, position: queuedF.position,
+          text: `🏃 跟随 ${args.player}：${queuedF.started ? '立刻开始' : '已排队'}` + NL + jobBoard.snapshotText() }
+      }
+      const plan = buildNaviPlan(view, args)
       if (!plan.ok) return { ok: false, ...plan, text: naviReportText(plan) }
       const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
       const { route, routeError } = previewRoute(sess, plan, { movements: mv })
@@ -3196,8 +3210,9 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       + '· 不给坐标就用附近 4.5 格的；给了 x/y/z 就走过去开那个\n'
       + '· 异步：入队后立刻返回，完成/失败会主动报告',
     parameters: {
-      action: { type: 'string', description: 'take（默认）/ put' },
-      name: { type: 'string', description: '物品名（英文 id）' },
+      action: { type: 'string', description: 'open（先看内容）/ take（默认）/ put' },
+      items: { type: 'json', description: 'take/put 时一次多组：[{name:"oak_log",count:64}, …]' },
+      name: { type: 'string', description: '单个物品名（英文 id，兼容旧用法）' },
       count: { type: 'number', description: '几个（默认整组/全放）' },
       x: { type: 'number', description: '箱子 x（可选）' },
       y: { type: 'number', description: '箱子 y（可选）' },
@@ -3214,7 +3229,11 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       const queued = jobBoard.enqueue({
         kind: 'chest', agentId: agentIdOf(exec?.agent),
         summary: `箱子${action === 'put' ? '存' : '取'} ${want ?? '全部'}`,
-        plan: { action, name: want, count: args.count, pos: (args.x != null && args.y != null && args.z != null) ? { x: args.x, y: args.y, z: args.z } : null },
+        plan: {
+          action, name: want, count: args.count,
+          items: Array.isArray(args.items) ? args.items : (want ? [{ name: want, count: args.count }] : []),
+          pos: (args.x != null && args.y != null && args.z != null) ? { x: args.x, y: args.y, z: args.z } : null,
+        },
         run: async (signal, job) => {
           const st = job.state ??= { phase: 'find' }
           for (let guard = 0; guard < 30; guard++) {
@@ -3253,31 +3272,66 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
               let win = null
               try { win = await b.openBlock(blk) } catch (e) { return { ok: false, text: `❌ 打不开箱子：${e.message}` } }
               try {
-                if (st.action === 'put') {
-                  const items = b.inventory.items()
-                  const picked = want ? items.filter((x) => x.name === want || x.name.endsWith(want)) : items
-                  if (!picked.length) return { ok: false, text: `❌ 背包里没有 ${want ?? '可放的东西'}` }
-                  let moved = 0
-                  for (const it of picked) {
-                    const n = Number(st.count) > 0 ? Math.min(Number(st.count), it.count) : it.count
-                    await win.deposit(it.type, null, n)
-                    moved += n
+                /* 用户 2026-10-25：第一步先把**内容清单**回给 LLM */
+                if (st.action === 'open') {
+                  const content = []
+                  const invStart = Number(win.inventoryStart ?? 9999)
+                  for (let i = 0; i < Math.min(invStart, win.slots?.length ?? 0); i++) {
+                    const sl = win.slots?.[i]
+                    if (sl && sl.count > 0) content.push({ name: sl.name, count: sl.count })
                   }
-                  return { ok: true, action: 'put', moved, text: `📦 存进箱子 ${moved} 个（${picked.map((x) => x.name).join(', ')}）` }
+                  const where = `${blk.name}（${bp.x},${bp.y},${bp.z}）`
+                  return {
+                    ok: true, action: 'open', content,
+                    text: content.length
+                      ? `📦 ${where} 里有：` + content.map((c) => `${c.name}×${c.count}`).join('、')
+                        + NL + '（想好要拿/存什么，再用 action:"take"/"put" + items:[{name,count}]）'
+                      : `📦 ${where} 是空的`,
+                  }
                 }
-                /* take：整组拿，拿够就走 */
-                const names = want ? [want] : []
-                const ids = new Set(names.map((n) => b.registry.itemsByName[n]?.id).filter((v) => v != null))
-                let got = 0
-                const need = Number(st.count) > 0 ? Number(st.count) : 64
-                for (let i = 0; i < (win.slots?.length ?? 0) && got < need; i++) {
-                  const sl = win.slots[i]
-                  if (!sl || (ids.size ? !ids.has(sl.type) : false)) continue
-                  const take = Math.min(need - got, sl.count)
-                  await win.withdraw(sl.type, null, take)
-                  got += take
+                if (st.action === 'put') {
+                  const todo = Array.isArray(st.items) && st.items.length ? st.items : (want ? [{ name: want, count: st.count }] : [])
+                  if (!todo.length) return { ok: false, text: '❌ 要给 items:[{name,count}]（或 name+count）' }
+                  const done = []
+                  for (const one of todo) {
+                    const nm = String(one.name ?? '').trim().toLowerCase()
+                    const id = b.registry?.itemsByName?.[nm]?.id
+                    if (id == null) { done.push(`${nm}（不认识）`); continue }
+                    const picked = b.inventory.items().filter((x) => x.type === id)
+                    if (!picked.length) { done.push(`${nm}（背包没有）`); continue }
+                    const limit = Number(one.count) > 0 ? Number(one.count) : null
+                    let moved = 0
+                    for (const slotItem of picked) {
+                      const n = limit == null ? slotItem.count : Math.min(limit - moved, slotItem.count)
+                      if (n <= 0) break
+                      await win.deposit(id, null, n)
+                      moved += n
+                    }
+                    done.push(`存 ${nm}×${moved}`)
+                  }
+                  return { ok: true, action: 'put', done, text: '📦 ' + done.join('；') }
                 }
-                return { ok: true, action: 'take', got, name: want, text: want ? `📦 从箱子取出 ${want} ×${got}` : `📦 从箱子取出 ${got} 个` }
+                /* take：多组、整组拿、拿够就走 */
+                const todo = Array.isArray(st.items) && st.items.length ? st.items : (want ? [{ name: want, count: st.count }] : [])
+                if (!todo.length) return { ok: false, text: '❌ 要给 items:[{name,count}]（或 name+count）' }
+                const invStart = Number(win.inventoryStart ?? 9999)
+                const done = []
+                for (const one of todo) {
+                  const nm = String(one.name ?? '').trim().toLowerCase()
+                  const id = b.registry?.itemsByName?.[nm]?.id
+                  if (id == null) { done.push(`${nm}（不认识）`); continue }
+                  const need = Number(one.count) > 0 ? Number(one.count) : 999
+                  let got = 0
+                  for (let i = 0; i < Math.min(invStart, win.slots?.length ?? 0) && got < need; i++) {
+                    const sl = win.slots[i]
+                    if (!sl || sl.type !== id) continue
+                    const take = Math.min(need - got, sl.count)
+                    await win.withdraw(id, null, take)
+                    got += take
+                  }
+                  done.push(`取 ${nm}×${got}`)
+                }
+                return { ok: true, action: 'take', done, text: '📦 ' + done.join('；') }
               } finally {
                 try { win.close?.() } catch { /* 已关 */ }
               }
@@ -3319,36 +3373,22 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       const queued = jobBoard.enqueue({
         kind: 'toss_to', agentId: agentIdOf(exec?.agent), summary: `把 ${it.name}×${count} 丢给 ${player}`,
         plan: { name: it.name, count, player },
-        run: async (signal, job) => {
-          const st = job.state ??= { phase: 'find' }
-          for (let guard = 0; guard < 20; guard++) {
-            if (signal?.aborted) throw new Error('被取消')
-            if (st.phase === 'find') {
-              const ent = Object.values(b.entities ?? {}).find((e) => e?.position && String(e.username ?? e.name ?? '') === player)
-              if (!ent) return { ok: false, text: `❌ 附近找不到玩家 ${player}` }
-              const p = ent.position
-              const navPlan = buildNaviPlan({ bot: b, _pf: sess.bot?._pf ?? null }, { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z), radius: 16 })
-              if (!navPlan.ok) return { ok: false, text: `❌ 走不到 ${player} 旁边：${navPlan.why}` }
-              const inserted = jobBoard.yieldFor(job, {
-                kind: 'navi', agentId: job.agentId, summary: `走向玩家 ${player}`, plan: navPlan,
-                run: (sig) => runNavi({ bot: b, _pf: sess.bot?._pf ?? null }, navPlan, { signal: sig, movements: mv }),
-              })
-              if (!inserted) return { ok: false, text: '❌ 插导航失败' }
-              st.phase = 'toss'
-              return { yielded: true, text: `⏸ 已插导航（去 ${player} 旁边）` }
-            }
-            if (st.phase === 'toss') {
-              const ent = Object.values(b.entities ?? {}).find((e) => e?.position && String(e.username ?? e.name ?? '') === player)
-              if (!ent) return { ok: false, text: `❌ ${player} 不见了` }
-              const me = b.entity.position
-              const dx = ent.position.x - me.x
-              const dz = ent.position.z - me.z
-              try { b.lookAt?.(ent.position.offset(0, 1.5, 0), false) } catch { /* 看不过去就按朝向 */ }
-              await b.toss(it.type, null, count)
-              return { ok: true, name: it.name, count, player, text: `🎁 把 ${it.name} ×${count} 丢给 ${player}（距离 ${Math.hypot(dx, dz).toFixed(1)} 格）` }
-            }
+        run: async (signal) => {
+          /* 用户 2026-10-25：「先 navi player follow，等到他停下了，再自动调整方向朝 player 丢弃。」 */
+          await runFollow({ bot: b, _pf: sess.bot?._pf ?? null }, player, {
+            signal, movements: mv, timeoutMs: 45_000,
+          })
+          const ent = Object.values(b.entities ?? {}).find((e) => e?.position && String(e.username ?? e.name ?? '') === player)
+          if (!ent) return { ok: false, text: `❌ 跟丢 ${player} 了` }
+          try { await b.lookAt(ent.position.offset(0, 1.4, 0), true) } catch { /* 看不过去就直接丢 */ }
+          await new Promise((r) => setTimeout(r, 150))
+          await b.toss(it.type, null, count)
+          const dist = b.entity.position.distanceTo(ent.position)
+          return {
+            ok: true, name: it.name, count, player,
+            distance: Math.round(dist * 10) / 10,
+            text: `🎁 跟到 ${player} 旁边（${dist.toFixed(1)} 格），丢出 ${it.name} ×${count}`,
           }
-          return { ok: false, text: '❌ 推进次数超限' }
         },
       })
       if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
