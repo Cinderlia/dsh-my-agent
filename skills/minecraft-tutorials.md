@@ -16,14 +16,22 @@ whenToUse: 查 MC 原版玩法、规划一条任务线、或者不确定"这件�
 ```
 kb/
 ├── agent-mapping.md        ★ 先读这个：玩家操作 ↔ 工具映射（含常见坑）
-├── tutorials/
-│   ├── 起步.md              第一天：木头→工作台→木镐→石镐→铁镐、庇护所
+├── tutorials/               15 篇
+│   ├── 起步.md              第一天：木头→工作台→木镐→石镐→铁镐
 │   ├── 矿道.md              挖矿路线、矿洞照明、岩浆规避
-│   ├── 农场.md              小麦田/动物圈/自动收割
+│   ├── 农场.md              小麦田/动物圈/繁殖/剪羊毛/挤奶
 │   ├── 刷怪塔.md            刷怪条件与简单塔
 │   ├── 附魔.md              附魔台/书架/青金石/等级
 │   ├── 下界.md              传送门、烈焰棒、末影珍珠
-│   └── 末地.md              末地门、末影龙、返回
+│   ├── 末地.md              末地门、末影龙、返回
+│   ├── 庇护所.md            选址/类型/尺寸（对应 Tutorial:Shelters）
+│   ├── 家具.md              用方块拼家具（Tutorial:Furniture）
+│   ├── 屋顶类型.md          平顶/双坡/四坡/尖顶（Tutorial:Roof_types）
+│   ├── 屋顶建造指南.md      坡度公式/施工顺序（Tutorial:Roof_construction_guidelines）
+│   ├── 建筑美化.md          配色/层次/细节（Tutorial:Adding_beauty_to_constructions）
+│   ├── 主线流程.md          完整主线顺序（Tutorial:Complete_main_adventure）
+│   ├── 原地长期生存.md      不跑远路的可持续循环（Tutorial:Surviving_in_a_single_area…）
+│   └── 无聊时做什么.md      建设/收藏/探索/挑战（Tutorial:Things_to_do_when_bored）
 └── meta/
     └── topics.md          按场景的主题导航
 ```
