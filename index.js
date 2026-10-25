@@ -51,6 +51,7 @@ import { ensureScaffoldInHand, bagWarning } from './src/scaffold.mjs'
 import { startKilla } from './src/killa.mjs'
 import { startPassiveAlerts } from './src/passive-alerts.mjs'
 import { scanSurroundings } from './src/poi.mjs'
+import { runInteract } from './src/interact.mjs'
 import { movements as buildMovements } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -3453,6 +3454,24 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       const r = scanSurroundings({ bot: b, _pf: sess.bot?._pf ?? null }, args)
       if (!r.ok) return { ok: false, text: `❌ ${r.why}` }
       return { ok: true, focus: r.focus, radius: r.radius, groups: r.groups, elapsedMs: r.elapsedMs, text: r.text }
+    },
+  }))
+
+  registerTool(asTool({
+    name: 'mc_interact',
+    description: '🤝 **通用交互**：上船/下车、锄地、播种、繁殖、剪羊毛、挤奶、开关门。统一流程是「找目标 → 走过去 → 换对该用的东西 → 右键」。',
+    parameters: {
+      action: { type: 'string', required: true, description: 'board（上船/矿车/马）/ dismount / hoe（锄地）/ plant（播种）/ breed（繁殖）/ shear（剪羊毛）/ milk（挤奶）/ open（门/按钮/箱子）/ toggle' },
+      who: { type: 'string', description: '实体名或动物种类（board/breed/shear/milk 用）' },
+      x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+      item: { type: 'string', description: '指定用背包里的哪个物品（不给就按 action 自动挑）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      const b = sess.bot.requireBot()
+      const r = await runInteract({ bot: b, _pf: sess.bot?._pf ?? null }, args)
+      return r
     },
   }))
 
