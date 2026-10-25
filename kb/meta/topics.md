@@ -2,6 +2,7 @@
 
 | 你想干什么 | 先读 |
 |---|---|
+| **要 wiki 原文细节** | `kb/wiki/`（9 篇，最权威；大文件先 grep） |
 | 不知道某个操作该用哪个工具 | `kb/agent-mapping.md` |
 | 第一天开局 | `kb/tutorials/起步.md` |
 | 盖房子/庇护所 | `kb/tutorials/庇护所.md` |

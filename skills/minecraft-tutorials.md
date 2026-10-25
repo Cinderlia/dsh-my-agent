@@ -16,6 +16,16 @@ whenToUse: 查 MC 原版玩法、规划一条任务线、或者不确定"这件�
 ```
 kb/
 ├── agent-mapping.md        ★ 先读这个：玩家操作 ↔ 工具映射（含常见坑）
+├── wiki/                    9 篇 **Minecraft Wiki 原文**（本地保存页面转换，最权威）
+│   ├── Your first 10 minutes.md
+│   ├── Shelters.md
+│   ├── Furniture.md
+│   ├── Roof construction guidelines.md
+│   ├── Adding beauty to constructions.md
+│   ├── Complete main adventure.md
+│   ├── Surviving in a single area for a long time.md
+│   ├── Things to do when bored.md
+│   └── 教程_最佳附魔指南.md（中文）
 ├── tutorials/               15 篇
 │   ├── 起步.md              第一天：木头→工作台→木镐→石镐→铁镐
 │   ├── 矿道.md              挖矿路线、矿洞照明、岩浆规避
@@ -39,7 +49,8 @@ kb/
 ## 2. 使用流程
 
 1. **先查映射**：读 `kb/agent-mapping.md` —— 大多数"怎么做"在里面能直接找到对应工具。
-2. **再看教程**：`kb/tutorials/*.md` 是玩法摘要（不是 wiki 全文），讲"顺序和要点"。
+2. **要细节读原文**：`kb/wiki/*.md` 是 Minecraft Wiki 原文（本地保存页面转的），最权威；文件大，用 grep 定位再局部读。
+3. **要"该调什么"读摘要**：`kb/tutorials/*.md` 是玩法摘要 + 工具对照，比原文短很多。
 3. **真不确定**：`kb/meta/topics.md` 按场景列了该读哪篇。
 
 ## 3. 两条原则
