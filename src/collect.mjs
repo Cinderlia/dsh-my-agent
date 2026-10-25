@@ -426,12 +426,36 @@ export async function runCollect (self, plan, ctx = {}) {
           return { yielded: true, text: `⏸ 已插入攻击任务（打 ${mob}），collect 挂起等待掉落` }
       }
       const cands = Array.isArray(plan.blocks) && plan.blocks.length ? plan.blocks : [plan.block]
-      const targets = []
+      let targets = []
       for (const bn of cands) targets.push(...findTargets(b, bn, plan.radius, 1))
-      targets.sort((a, c) => a.d - c.d)
-      if (!targets.length) {
-        return fatalFail(`附近的 ${cands.join('/')} 都挖完了，只收到 ${st.got}/${plan.count}`)
+      /* 用户 2026-10-25：**地下目标** —— 16 格没找到就扩大到 48 格（矿脉常在地下层，
+       * 走过去时 navi 会自己挖穿挡路的方块），还找不到就往下挖几格再找。 */
+      if (!targets.length && !st.wideTried) {
+        st.wideTried = true
+        for (const bn of cands) targets.push(...findTargets(b, bn, 48, 1))
+        if (targets.length) steps.push(`附近 16 格没有，扩大到 48 格找到 ${targets.length} 个`)
       }
+      if (!targets.length) {
+        /* 往脚底下挖（最多 3 格），挖完回到 find 再找一次 */
+        const dug = st.dugDown ?? 0
+        if (plan.digDown !== false && dug < 3) {
+          const base = b.entity.position.floored()
+          const below = b.blockAt(new Vec3(base.x, base.y - 1, base.z))
+          const bad = !below || below.name === 'bedrock' || /water|lava/.test(below.name)
+          if (!bad && below.boundingBox === 'block') {
+            try {
+              await b.dig(below)
+              st.dugDown = dug + 1
+              st.wideTried = false
+              steps.push(`往脚下挖了 1 格找矿（第 ${st.dugDown} 格）`)
+              st.phase = 'find'
+              continue
+            } catch { /* 挖不动就算了 */ }
+          }
+        }
+        return fatalFail(`附近 ${cands.join('/')} 都挖完了（含扩大搜索和下挖 ${st.dugDown ?? 0} 格），只收到 ${st.got}/${plan.count}`)
+      }
+      targets.sort((a, c) => a.d - c.d)
       st.target = targets[0]
       st.phase = 'approach'
       log(`目标 ${plan.block} @ ${st.target.x},${st.target.y},${st.target.z}（${st.target.d.toFixed(1)} 格）`)

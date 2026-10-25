@@ -82,7 +82,9 @@ export function scanSurroundings (self, opts = {}) {
   const t0 = Date.now()
   const b = self?.bot
   if (!b?.entity) return { ok: false, why: '还没进服（先 mc_connect）' }
-  const radius = Math.max(4, Math.min(Number(opts.radius ?? 16) || 16, 32))
+  /* 用户 2026-10-25：agent 主动调用时可以给到 128 格（＝矿物透视），
+   * 自动注入的那行雷达仍然只用 16 格。 */
+  const radius = Math.max(4, Math.min(Number(opts.radius ?? 16) || 16, 128))
   const focus = String(opts.focus ?? 'auto').toLowerCase()
   const perGroup = Math.max(1, Math.min(Number(opts.limit ?? 3) || 3, 8))
   const focusW = FOCUS_WEIGHTS[focus] ?? FOCUS_WEIGHTS.auto
@@ -108,7 +110,11 @@ export function scanSurroundings (self, opts = {}) {
   }
 
   /* ② 方块类别：一次 findBlocks 查所有候选 id，再按类别归组 */
-  const blockCats = POI_CATEGORIES.filter((c) => c.kind === 'block')
+  /* 大半径（>32）时只查"值得跑过去"的类别：矿石 / 功能方块 / 岩浆。
+   * 木材石料在 128 格里遍地都是，扫出来也没用，还慢。 */
+  const wide = radius > 32
+  const blockCats = POI_CATEGORIES.filter((c) => c.kind === 'block'
+    && (!wide || ['ore', 'functional', 'lava'].includes(c.key)))
   const allIds = []
   const idToCats = new Map()
   for (const cat of blockCats) {
@@ -123,7 +129,7 @@ export function scanSurroundings (self, opts = {}) {
   try {
     /* 🔴 性能：一次 findBlocks 最多取 96 个，先按距离排，**只对最近的做暴露检查**
      *    —— 全量 256 个逐个查 6 面会让扫描从 150ms 涨到 400ms+。 */
-    found = b.findBlocks({ matching: [...new Set(allIds)], maxDistance: radius, count: 96 }) ?? []
+    found = b.findBlocks({ matching: [...new Set(allIds)], maxDistance: radius, count: wide ? 256 : 96 }) ?? []
   } catch { found = [] }
   found.sort((a, c) => me.distanceTo(a) - me.distanceTo(c))
   const checkLimit = Math.min(found.length, Math.max(24, perGroup * 8))
