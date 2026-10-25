@@ -10,9 +10,22 @@
 
 /** 食物优先级（熟的先） */
 const FOOD_TIERS = [
-  { key: 'cooked', re: /^(cooked_|_cooked$|baked_potato|bread|cake|pumpkin_pie|golden_apple|golden_carrot|mushroom_stew|rabbit_stew|beetroot_soup|suspicious_stew|honey_bottle)/ },
-  { key: 'raw', re: /(beef|porkchop|chicken|mutton|rabbit|fish|salmon|cod|tropical_fish|potato|carrot|beetroot|apple|melon_slice|sweet_berries|glow_berries)/ },
-  { key: 'rotten', re: /^(rotten_flesh|spider_eye|poisonous_potato|pufferfish)/ },
+  {
+    key: 'cooked',
+    label: '熟食/加工',
+    /* 熟肉（cooked_beef 等）、烤马铃薯、面包蛋糕曲奇、金苹果金胡萝卜、各种煲汤、蜂蜜、干海带 */
+    re: /^(cooked_|baked_potato|bread|cake|cookie|pumpkin_pie|golden_apple|golden_carrot|mushroom_stew|rabbit_stew|beetroot_soup|suspicious_stew|honey_bottle|dried_kelp)/,
+  },
+  {
+    key: 'raw',
+    label: '生食/作物',
+    re: /(beef|porkchop|chicken|mutton|rabbit|tropical_fish|salmon|cod|potato|carrot|beetroot|apple|melon_slice|sweet_berries|glow_berries|chorus_fruit|kelp)/,
+  },
+  {
+    key: 'rotten',
+    label: '腐食/下策',
+    re: /^(rotten_flesh|spider_eye|poisonous_potato|pufferfish)/,
+  },
 ]
 
 function foodTier (name) {
