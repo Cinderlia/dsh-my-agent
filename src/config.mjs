@@ -379,6 +379,9 @@ export function disableShellInComposition (text) {
 export const MC_PRESET_TOOL_GROUPS = [
   { id: 'tool-fs', pkg: '@deepseek-ai/dsh-tool-fs', note: '文件工具（read/write/edit/read_image）' },
   { id: 'tool-jobs', pkg: '@deepseek-ai/dsh-tool-jobs', note: '后台任务 controller（看门狗要挂 job）' },
+  { id: 'tool-fs-search', pkg: '@deepseek-ai/dsh-tool-fs-search', note: '文件搜索（glob/grep：MC 模式读 kb 文档要用）' },
+  { id: 'skill-filesystem', pkg: '@deepseek-ai/dsh-skill-filesystem', note: '技能文件系统源（MC 模式也用技能树）' },
+  { id: 'tool-skill', pkg: '@deepseek-ai/dsh-tool-skill', note: '技能工具（list/load minecraft-tutorials）' },
   { id: 'present', pkg: '@deepseek-ai/dsh-tool-present', note: '显式文件交付（轮末文件卡片）' },
   {
     // 🔴 2026-09-24（PR #2 用户报的）：官方 `minimal` 也没有这一组 ⇒ 照 minimal 建的 MC 模式

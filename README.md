@@ -97,8 +97,9 @@ phase: find → approach → dig → verify → pickup → …  → done
 
 | 类型 | 工具 | 看什么 |
 |---|---|---|
-| 原语（0~6ms，本地镜像） | `mc_self` / `mc_block` / `mc_blocks` / `mc_entities` / `mc_look` / `mc_look_at` | 自身状态、一格/一片方块、周围实体、视角 |
-| 工具 | `mc_observe`（第一人称截图+三段式感知）/ `mc_map`（地形图/竖列图）/ `mc_probe`（折叠：背包/扫描/诊断）/ `mc_status` / `mc_events` / `mc_watch` | 画面、地形、背包、事件 |
+| 原语（0~6ms，本地镜像） | 常驻：`mc_self` / `mc_block` / `mc_blocks` / `mc_entities` / `mc_look_at`；**手动控制才放回**（MC 模式默认折叠）：`mc_look` / `mc_input` / `mc_apply` / `mc_swing` | 自身状态、一格/一片方块、周围实体、视角 |
+| 工具 | `mc_observe`（第一人称截图+三段式感知）/ `mc_map`（地形图/竖列图）/ `mc_status` / `mc_events` / `mc_watch` / `mc_probe`（**折叠入口**：背包 / 扫描 / 诊断 / 能力 / 会话 / 出发自查 / 探活 / 局域网 / 挖掘，外加 `jobs` 看后台任务队列） | 画面、地形、背包、事件 |
+| 技能树 | `skill`（先 list 再 load `minecraft-tutorials`；MC 与 MC+ 模式**都已接入**）→ 指向插件 `kb/` 文档（只读） | 玩法指南、玩家操作↔`mc_*` 工具映射 |
 
 ---
 

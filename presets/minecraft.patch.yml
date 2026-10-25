@@ -25,6 +25,17 @@
             name: '@deepseek-ai/dsh-tool-fs'
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
+          # ↓ 2026-10-25（用户）：MC 模式也要能用「技能树 / kb 知识库」，与 MC+ 对齐。
+          #   tool-fs-search 给 glob/grep（读 kb 文档）；skill-filesystem + tool-skill 挂出
+          #   skill 工具（list/load minecraft-tutorials）。运行时白名单与 guard 见 index.js。
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
           - id: present
             name: '@deepseek-ai/dsh-tool-present'
           - id: compaction

@@ -2593,6 +2593,15 @@ export function apply(ctx, rawConfig) {
   ]
   const MC_PRESENT_TOOL = 'present'
   /**
+   * MC 模式白名单里的【技能工具】（宿主 @deepseek-ai/dsh-tool-skill 注册的名字）。
+   *
+   * 🔴 2026-10-25（用户：让 MC 模式的 agent 也能像 MC+ 一样使用这个技能树）：
+   *    技能正文指向插件内 kb/ 知识库；MC 模式以前没挂技能工具、白名单也不认它。
+   *    这里把 skill 加进白名单（配合 preset 补挂 tool-skill、guard 放行 kb 只读）。
+   *    ⚠️ 是名字不是包名：宿主没挂同名工具时会被 applyAllow 过滤掉（不影响其它）。
+   */
+  const MC_SKILL_TOOLS = ['skill']
+  /**
    * 从一次工具调用里取"要碰的路径"：是文件工具才返回（不是 → null；是但没给路径 → 空串）。
    * 路径参数名按宿主用 `path`，也兼容 harness 的 `file_path`；glob/grep 的目录参数同样是 `path`。
    */
@@ -2978,7 +2987,7 @@ export function apply(ctx, rawConfig) {
   const QUEUE_KEEP = new Set([
     'mc_self', 'mc_block', 'mc_blocks', 'mc_entities', 'mc_look', 'mc_look_at',
     'mc_status', 'mc_observe', 'mc_events', 'mc_map', 'mc_probe',
-    ...MC_FILE_TOOLS, MC_PRESENT_TOOL, 'mc_kit_memory',
+    ...MC_FILE_TOOLS, MC_PRESENT_TOOL, ...MC_SKILL_TOOLS, 'mc_kit_memory',
     'mc_interrupt', 'mc_stop',
   ])
   /* 用户 2026-10-25：**操作型原语折叠** —— 默认不在工具面展示，LLM 明确要"直接控制身体"时才放出来。
@@ -6271,6 +6280,7 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         ...(hideAdminTools ? [] : adminNames),
         ...MC_FILE_TOOLS,
         MC_PRESENT_TOOL,
+        ...MC_SKILL_TOOLS,
         // 配套插件（ACP / billion-context 那族）默认放行 —— 用户 2026-10-19 要的"装完就能用"
         ...(allowCompanionTools === false ? [] : MC_COMPANION_TOOLS),
         ...allowOtherTools,
@@ -6411,6 +6421,19 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       //    `<工作区>/.dsh-mc-agent/` 之内；**没给路径也算越界**（glob/grep 不给路径 = 扫整个工作区）。
       const raw = fileToolPath(exec)
       if (raw !== null) {
+        /* 🔴 2026-10-25（用户：MC 模式也能用这个技能树）：技能正文指向插件内 kb/ 的【绝对路径】，
+         *    它在记忆根之外，会被下面只能在记忆文件夹一刀切拦掉。这里给【只读】文件工具开一个口子：
+         *    路径解析到 <插件根>/kb/ 之下就放行（写类工具 write/edit/ops_replace 与 mc_kit_memory
+         *    仍走记忆根限制，不许写 kb；kb 是插件自带的只读教程，放行读没有越权风险）。 */
+        if (/^(read|glob|grep|read_image|ls|cat)$/i.test(name)) {
+          const relKb = String(raw ?? '').trim()
+          if (relKb) {
+            const absKb = isAbsolute(relKb) ? resolve(relKb) : resolve(PLUGIN_ROOT, relKb)
+            const kbDir = join(PLUGIN_ROOT, 'kb')
+            const kbPrefix = kbDir.endsWith(sep) ? kbDir : kbDir + sep
+            if (absKb === kbDir || absKb.startsWith(kbPrefix)) return undefined
+          }
+        }
         const root = memoryRootFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent))
         const rel = String(raw ?? '').trim()
         if (!rel) {
