@@ -473,10 +473,27 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
       look: { type: 'object', additionalProperties: true, description: '{yaw,pitch} 或 {x,y,z} 或 {who}；不给就不动视角' },
       input: { type: 'object', additionalProperties: true, description: '{forward/back/left/right/jump/sneak/sprint} 布尔值' },
       releaseAll: { type: 'boolean', description: 'true = 先松开所有键' },
+      force: { type: 'boolean', description: '边缘预警时仍坚持执行（默认 false = 返回预警不执行）' },
     },
     output: text(),
     async execute (args, exec) {
       const b = needBot(getBot, exec)
+      /* 边缘保护（用户 2026-10-25）：mc_apply 带 forward 也算"绕过 navi 的移动"，一样要拦。
+       * 注意：如果这次同时给了 look，就按**新的朝向**判方向。 */
+      const inputArgs = args.input && typeof args.input === 'object' ? args.input : null
+      if (inputArgs?.forward === true && args.force !== true) {
+        let yaw = Number(b.entity?.yaw ?? 0)
+        const look = args.look && typeof args.look === 'object' ? args.look : null
+        if (look && num(look.yaw, null) !== null) yaw = num(look.yaw) * Math.PI / 180
+        const [dx, dz] = facingDelta(yaw)
+        const warn = edgeWarning(b, dx, dz)
+        if (warn) {
+          return {
+            ok: false, blocked: true, edge: { drop: warn.drop, at: warn.at, verdict: warn.verdict },
+            text: warn.text + '\n▶ 确认要走就带 `force:true` 再调一次；否则换方向或先 `mc_navi`。',
+          }
+        }
+      }
       const did = []
       if (args.releaseAll === true) { for (const k of CONTROL_KEYS) b.setControlState(k, false); did.push('松开全部键') }
       const look = args.look && typeof args.look === 'object' ? args.look : null
