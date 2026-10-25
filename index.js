@@ -51,6 +51,7 @@ import { resolveSmeltRequest, runSmelt } from './src/smelt.mjs'
 import { ensureScaffoldInHand, bagWarning } from './src/scaffold.mjs'
 import { startKilla } from './src/killa.mjs'
 import { startPassiveAlerts } from './src/passive-alerts.mjs'
+import { startWaterLanding } from './src/water-landing.mjs'
 import { scanSurroundings } from './src/poi.mjs'
 import { runInteract } from './src/interact.mjs'
 import { movements as buildMovements, pfWrite } from './src/plugins.mjs'
@@ -3871,6 +3872,18 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         globalThis.__alertsStop = () => alerts.stop()
       } catch (e) {
         logLine('killa 启动失败（不影响连接）：' + (e?.message ?? e))
+      }
+      /* 用户 2026-10-25：自动落地水（MLG 水桶）—— 背包有水桶且不在下界时，
+         跌落 >5 格且脚下到实地之间全是空气，就自动切水桶朝下放水缓冲、落地后收回。 */
+      try {
+        if (globalThis.__waterLandingStop) { try { globalThis.__waterLandingStop() } catch { /* ignore */ } }
+        const wl = startWaterLanding({ bot: sess.bot?.bot }, {
+          report: (t) => { try { jobBoard.inject(`water-landing-${Date.now()}`, t) } catch { /* ignore */ } },
+          log: (t) => logDebug('[water-landing] ' + t),
+        })
+        globalThis.__waterLandingStop = () => wl.stop()
+      } catch (e) {
+        logLine('自动落地水启动失败（不影响连接）：' + (e?.message ?? e))
       }
       // 进服自动挂看门狗（用户要求：进游戏自动打开）
       const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal, watchdogGate(sess))
