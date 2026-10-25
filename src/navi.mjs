@@ -222,13 +222,17 @@ export function previewRoute (self, plan, { movements: mv = null } = {}) {
       routeError: f?.why ?? '没有飞行规划结果',
     }
   }
+  /* 🔴 2026-10-25 实机：navi 执行得好好的（pathfinder.log 里 pfReady:true / goto:function），
+   *    但工具返回里一直挂着『⚠️ 没有可用的 pathfinder』—— 那是**预览**（getPathTo 缺失/失败）
+   *    给的提示，跟能不能走是两回事。预览只是"顺手算一下路线要不要垫方块"，
+   *    失败就不预览，别拿它冒充执行失败。 */
   if (!pf || typeof pf.getPathTo !== 'function') {
-    const diag = { botPathfinder: typeof b.pathfinder, goto: typeof b.pathfinder?.goto, pfModule: Boolean(self?._pf), pfReady: self?.pfReady ?? null }
-    return { route: null, routeError: '没有可用的 pathfinder（见 PATHFINDER.md）｜现场: ' + JSON.stringify(diag) }
+    const diag = { botPathfinder: typeof b.pathfinder, goto: typeof b.pathfinder?.goto, getPathTo: typeof b.pathfinder?.getPathTo, pfModule: Boolean(self?._pf), pfReady: self?.pfReady ?? null }
+    return { route: null, previewUnavailable: true, diag, routeError: null }
   }
-  if (!mv) return { route: null, routeError: '拿不到 Movements 配置（pathfinder 还没挂上？）' }
+  if (!mv) return { route: null, previewUnavailable: true, routeError: null }
   const goal = goalBlockOf(self, plan.target.x, plan.target.y, plan.target.z)
-  if (!goal) return { route: null, routeError: 'pathfinder 没挂上 Goals（先 mc_move 一次让它初始化）' }
+  if (!goal) return { route: null, previewUnavailable: true, routeError: null }
   const t0 = Date.now()
   try {
     const path = pf.getPathTo(mv, goal, 1500)
