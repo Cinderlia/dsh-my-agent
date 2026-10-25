@@ -395,6 +395,12 @@ export async function waitForOutput (win, target, { budgetMs = 60_000, refill = 
 
 export async function apply (api) {
   const { ctx, asTool, getSession, logLine } = api
+  /* 2026-10-25：熔炼改由 `mc_craft`（目标可熔炼时自动走熔炉配方）+ `mc_smelt`（队列状态机）接管。
+   * 这个老同步版默认停用；想回旧行为设 DSH_MC_AGENT_LEGACY_FURNACE=on。 */
+  if (process.env.DSH_MC_AGENT_LEGACY_FURNACE !== 'on') {
+    logLine('mc_furnace 老扩展已停用（改由 mc_craft / mc_smelt 接管；想用旧的设 DSH_MC_AGENT_LEGACY_FURNACE=on）')
+    return
+  }
 
   ctx.tools.register(asTool({
     name: 'mc_furnace',

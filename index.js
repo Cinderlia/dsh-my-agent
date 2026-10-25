@@ -47,6 +47,7 @@ import { buildNaviPlan, previewRoute, runNavi, runFollow, naviReportText } from 
 import { planCollect, runCollect } from './src/collect.mjs'
 import { buildTargets, checkRange, needsWalk, walkNear, runBatch, batchText } from './src/batch.mjs'
 import { resolveCraftRequest, runCraft, craftRequestText } from './src/craft.mjs'
+import { resolveSmeltRequest, runSmelt } from './src/smelt.mjs'
 import { ensureScaffoldInHand, bagWarning } from './src/scaffold.mjs'
 import { startKilla } from './src/killa.mjs'
 import { startPassiveAlerts } from './src/passive-alerts.mjs'
@@ -607,6 +608,8 @@ export function apply(ctx, rawConfig) {
    *    状态放这儿、函数留在下面（函数按请求重建无所谓，缓存必须跨请求）。
    * ------------------------------------------------------------------------ */
   const PLUGIN_ROOT = fileURLToPath(new URL('.', import.meta.url))
+  /** 本文件里拼多行文本用（避免手写 反斜杠n 被工具链转义吃掉） */
+  const NL = String.fromCharCode(10)
   /* ── 技能注册（2026-10-25 用户）：把 skills/ 下的 MC 玩法知识库挂成 runtime skill ──
    * 参考 dsh-plugin-dev-kb 的做法：skills/<name>.md 带 frontmatter，正文里的 {{KB_ROOT}}
    * 替换成插件内 kb/ 的实际路径。宿主没有 skills 服务时整段跳过，不影响插件加载。 */
@@ -3475,6 +3478,35 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       return {
         ok: true, jobId: queued.job.id, started: queued.started, position: queued.position,
         text: `🎁 把 ${it.name}×${count} 丢给 ${player}：${queued.started ? '立刻开始' : `排队第 ${queued.position} 位`}` + chr(10) + jobBoard.snapshotText(),
+      }
+    },
+  }))
+
+  registerTool(asTool({
+    name: 'mc_smelt',
+    description: '🔥 **熔炼**（状态机）：给产物名（iron_ingot / glass / charcoal…），自动找/放熔炉、'
+      + '精确放输入槽和燃料槽、等烧完、取成品、回收自己放的熔炉。缺原料会自动 collect。',
+    parameters: {
+      name: { type: 'string', required: true, description: '要烧出的物品（iron_ingot / gold_ingot / glass / charcoal…）' },
+      count: { type: 'number', description: '要几个（默认 1，上限 64）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      sess.bot.requireBot()
+      const req = resolveSmeltRequest(botView(sess), args)
+      if (!req.ok) return { ok: false, ...req, text: `❌ ${req.why}` }
+      const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+      const queued = jobBoard.enqueue({
+        kind: 'smelt', agentId: agentIdOf(exec?.agent),
+        summary: `熔炼 ${req.itemName} ×${req.count}`,
+        plan: req,
+        run: (signal, job) => runSmelt(botView(sess), req, { signal, movements: mv, job, board: jobBoard, log: (m) => logDebug('[smelt] ' + m) }),
+      })
+      if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
+      return {
+        ok: true, jobId: queued.job.id, started: queued.started, position: queued.position, ...req,
+        text: `🔥 熔炼 ${req.itemName} ×${req.count}：${queued.started ? '立刻开始' : `排队第 ${queued.position} 位`}` + NL + jobBoard.snapshotText(),
       }
     },
   }))

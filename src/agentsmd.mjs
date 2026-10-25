@@ -202,6 +202,22 @@ export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 - **账和现场对不上**（它说还差 3 个，背包里其实够了）：**以背包为准**，用 \`{action:"note"}\` 写清实际情况再继续。
 - **任务只报告结果**，要不要接着追由主线优先级决定 —— 别让任务自己决定战略。
 
+## 用工具，别用原语
+
+**这是最容易犯的错**：想看某样东西，用 \`mc_dig\`/\`mc_move\` 一步步做，而不是一条命令交给工具。
+
+| 你要做的事 | ❌ 别这样 | ✅ 这样 |
+|---|---|---|
+| 要 8 个圆石 | \`mc_dig\` 挖 8 次 | \`mc_collect {name:"cobblestone", count:8}\` |
+| 做一把铁镐 | 自己算木板→木棍→铁锭→熔炉 | \`mc_craft {name:"iron_pickaxe"}\` |
+| 走到 30 格外 | \`mc_move\` 分 3 次 / \`mc_input\` 自己走 | \`mc_navi {x,y,z}\`（异步，走完报告） |
+| 缺食物 | 一个个打动物 | \`mc_interact {action:"breed", who:"cow"}\` |
+| 背包满了 | 自己挑东西丢 | \`mc_chest {action:"open"}\` 看内容 → \`{action:"put", items:[…]}\` |
+| 找矿石 | \`mc_blocks\` 来回扫 | \`mc_collect {name:"iron_ore", count:3}\` 或 \`mc_scan_surroundings {focus:"ore"}\` |
+
+**判断标准**：如果一个动作需要**两步以上**或者**需要看中间结果**，它就是"长活"，交给工具；
+只有"转个视角、走一小步、跳一下"这种**一步动作**才用原语（而且原语默认还是折叠的）。
+
 ## 任务队列与身体
 
 **身体在任务队列手里，不在你手里。**
