@@ -128,8 +128,10 @@ export function checkEdge (b, dx, dz, { maxDrop = 2, reach = 3, depth = 40 } = {
 
 
 /** 检查后给出完整预警（含伤害） */
-export function edgeWarning (b, dx, dz) {
-  const r = checkEdge(b, dx, dz)
+export function edgeWarning (b, dx, dz, reach = 3) {
+  /* reach：看前方几格。逐格走（用户 2026-10-25）时传 1 —— 只看**下一格**的落差，
+   * 否则斜披上第一步就会因为 3 格外的深坑被拦下，永远走不动。 */
+  const r = checkEdge(b, dx, dz, { reach })
   if (!r.hazard) return null
   const mods = {
     armor: armorPoints(b),
