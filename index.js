@@ -2906,6 +2906,13 @@ export function apply(ctx, rawConfig) {
     ...MC_FILE_TOOLS, MC_PRESENT_TOOL, 'mc_kit_memory',
     'mc_interrupt', 'mc_stop',
   ])
+  /* 用户 2026-10-25：**操作型原语折叠** —— 默认不在工具面展示，LLM 明确要"直接控制身体"时才放出来。
+   * 感知类原语（mc_self / mc_blocks / mc_entities / mc_block / mc_look_at）始终保留。
+   * `mc_toss` 不折（用户要求它常驻，丢东西是个独立动作）。 */
+  const CONTROL_PRIMITIVES = ['mc_input', 'mc_apply', 'mc_look', 'mc_swing']
+  /** 哪些会话打开了"手动控制"（agentId 集合） */
+  const manualControl = new Set()
+
   /** agentId → restrict 的撤销手柄 */
   /* 用户 2026-10-24：「stop 原语必须常驻」—— 不论队列状态、不论哪种模式，它都不能被收掉。 */
   const ALWAYS_ON_TOOLS = ['mc_stop']
@@ -2936,6 +2943,33 @@ export function apply(ctx, rawConfig) {
       logLine('队列收窄工具面失败（guard 仍会拦）：' + String(e?.message).slice(0, 160))
     }
   }
+  registerTool(asPrimitive({
+    name: 'mc_control',
+    description: '🕹 **手动控制开关**：打开后才会把操作型原语（mc_input / mc_apply / mc_look / mc_swing）放回工具面；'
+      + '默认它们是折叠的（不鼓励直接接管身体，长活交给任务队列）。队列非空时即使打开也仍然隐藏。',
+    parameters: {
+      on: { type: 'boolean', description: 'true = 打开手动控制；false = 关掉（默认）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const agent = exec?.agent
+      const id = agent?.id
+      const on = args.on === true
+      if (!id) return { ok: false, text: '❌ 拿不到会话 id' }
+      if (on) manualControl.add(String(id))
+      else manualControl.delete(String(id))
+      /* 强制重算：删掉 kind 缓存，让 applyMcModePolicy 重新套白名单 */
+      try { mcPolicyKind.delete(agent) } catch { /* ignore */ }
+      try { applyMcModePolicy(agent) } catch (e) { logLine('重算工具面失败：' + (e?.message ?? e)) }
+      return {
+        ok: true, manual: on,
+        text: on
+          ? '🕹 手动控制已打开：mc_input / mc_apply / mc_look / mc_swing 回到工具面（队列非空时仍会被收走）'
+          : '🕹 手动控制已关闭：操作型原语已折叠，长活请用任务工具',
+      }
+    },
+  }))
+
   /* ── 队列原语：mc_stop / mc_interrupt ─────────────────────────────────── */
   registerTool(asPrimitive({
     name: 'mc_stop',
@@ -6063,8 +6097,10 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       if (!t) { mcPolicyKind.delete(agent); logLine('MC 模式：拿不到 scoped tools，跳过可见性限制（guard 仍会硬拒，下次再试）'); return }
       const { allowOtherTools, hideAdminTools, allowCompanionTools } = pluginConfig.mcMode
       const adminNames = ourToolNames.filter((n) => n.startsWith('mc_admin_'))
+      const manual = agent.id ? manualControl.has(String(agent.id)) : false
       const wanted = [
-        ...ourToolNames.filter((n) => !n.startsWith('mc_admin_')),
+        ...ourToolNames.filter((n) => !n.startsWith('mc_admin_')
+          && (manual || !CONTROL_PRIMITIVES.includes(n))),
         ...(hideAdminTools ? [] : adminNames),
         ...MC_FILE_TOOLS,
         MC_PRESENT_TOOL,
