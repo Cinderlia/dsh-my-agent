@@ -657,6 +657,27 @@ export function apply(ctx, rawConfig) {
     }
   }
   registerSkills()
+  /* 🔴 2026-10-25 实机崩溃：host 进程 8.6 分钟后 JS heap OOM（4GB，MarkCompactCollector
+   *    promotion failed）。mineflayer 的区块/世界缓存是主要嫌疑（跑几个位置就累积几百 MB~GB）。
+   *    这里每 10 秒记一次内存曲线到日志，下次崩溃前能看出是谁在涨；超过 2.5GB 主动告警。 */
+  const MEM_WARN_MB = 2500
+  let memTimer = null
+  try {
+    memTimer = setInterval(() => {
+      try {
+        const m = process.memoryUsage()
+        const mb = (n) => Math.round(n / 1024 / 1024)
+        const line = `[mem] heap ${mb(m.heapUsed)}MB / rss ${mb(m.rss)}MB / external ${mb(m.external)}MB / arrayBuffers ${mb(m.arrayBuffers ?? 0)}MB`
+        logDebug(line)
+        if (mb(m.heapUsed) > MEM_WARN_MB) {
+          logLine(`⚠️ [mem] JS heap 已到 ${mb(m.heapUsed)}MB（>${MEM_WARN_MB}MB）—— 再有增长就要爆，建议重启 DSH`)
+        }
+      } catch { /* 内存读不到不影响 */ }
+    }, 10_000)
+    if (memTimer.unref) memTimer.unref()
+  } catch { /* setInterval 失败就算了 */ }
+  try { ctx.effect?.(() => () => { if (memTimer) clearInterval(memTimer) }, 'dsh-mc-agent: 内存监控') } catch { /* ignore */ }
+
 
   const UPDATE_TTL_MS = 10 * 60 * 1000
   const updateCache = { at: 0, data: null }
