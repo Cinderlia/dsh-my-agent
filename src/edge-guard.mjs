@@ -101,31 +101,31 @@ export function fallVerdict (b, distance, mods = {}) {
  * 检查"往 (dx,dz) 方向走 1~2 格"有没有**超过 2 格**的缺口。
  * @returns {{hazard:boolean, drop?:number, at?:{x,y,z}, verdict?:object}}
  */
-export function checkEdge (b, dx, dz, { maxDrop = 2, reach = 2 } = {}) {
+export function checkEdge (b, dx, dz, { maxDrop = 2, reach = 3, depth = 40 } = {}) {
   const me = b?.entity?.position
   if (!me) return { hazard: false }
   const base = { x: Math.floor(me.x), y: Math.floor(me.y), z: Math.floor(me.z) }
+  /* 🔴 2026-10-25 实机两次摔死：原来**第一个超过 maxDrop 的就返回**，
+   *    前方第 1 格 4 格、第 2 格 15 格时只报了 4 格（预测 0.5 颗心，实际摔死）。
+   *    现在扫完 reach 格，取**最深**的那个。往下探 40 格（36 格落差也能报出来）。 */
+  let worst = null
   for (let step = 1; step <= reach; step++) {
     const x = base.x + dx * step
     const z = base.z + dz * step
-    /* 从脚下那一格往下找第一块实心 */
     let groundY = null
-    for (let dy = 0; dy >= -6; dy--) {
+    for (let dy = 0; dy >= -depth; dy--) {
       const blk = b.blockAt(new Vec3(x, base.y + dy, z))
       if (blk && blk.boundingBox === 'block') { groundY = base.y + dy; break }
     }
-    if (groundY == null) {
-      /* 完全悬空：按最深的缺口算 */
-      const drop = 99
-      return { hazard: true, drop, at: { x, y: base.y - 1, z } }
-    }
-    const drop = (base.y - 1) - groundY
-    if (drop > maxDrop) {
-      return { hazard: true, drop, at: { x, y: groundY + 1, z } }
+    const drop = groundY == null ? depth : (base.y - 1) - groundY
+    if (drop > maxDrop && (!worst || drop > worst.drop)) {
+      worst = { x, y: groundY == null ? base.y - depth : groundY + 1, z, drop }
     }
   }
-  return { hazard: false }
+  if (!worst) return { hazard: false }
+  return { hazard: true, drop: worst.drop, at: { x: worst.x, y: worst.y, z: worst.z } }
 }
+
 
 /** 检查后给出完整预警（含伤害） */
 export function edgeWarning (b, dx, dz) {
