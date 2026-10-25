@@ -223,7 +223,8 @@ export function previewRoute (self, plan, { movements: mv = null } = {}) {
     }
   }
   if (!pf || typeof pf.getPathTo !== 'function') {
-    return { route: null, routeError: '没有可用的 pathfinder（装 mineflayer-pathfinder，见 PATHFINDER.md）' }
+    const diag = { botPathfinder: typeof b.pathfinder, goto: typeof b.pathfinder?.goto, pfModule: Boolean(self?._pf), pfReady: self?.pfReady ?? null }
+    return { route: null, routeError: '没有可用的 pathfinder（见 PATHFINDER.md）｜现场: ' + JSON.stringify(diag) }
   }
   if (!mv) return { route: null, routeError: '拿不到 Movements 配置（pathfinder 还没挂上？）' }
   const goal = goalBlockOf(self, plan.target.x, plan.target.y, plan.target.z)
@@ -583,7 +584,17 @@ export async function runNavi (self, plan, { signal = null, onProgress = null, m
   }
   if (plan.strategy === 'path') {
     const pf = b.pathfinder
-    if (!pf || typeof pf.goto !== 'function') throw new Error('没有可用的 pathfinder')
+    if (!pf || typeof pf.goto !== 'function') {
+      /* 用户 2026-10-25：这个错要能定位 —— 把现场状态一起报出来（session 文件里能读） */
+      const diag = {
+        botPathfinder: typeof b.pathfinder,
+        goto: typeof b.pathfinder?.goto,
+        pfModule: Boolean(self?._pf),
+        goals: Boolean(self?._pf?.goals || self?._pf?.Goals),
+        pfReady: self?.pfReady ?? null,
+      }
+      throw new Error('没有可用的 pathfinder｜现场: ' + JSON.stringify(diag))
+    }
     const goal = goalBlockOf(self, plan.target.x, plan.target.y, plan.target.z)
     if (!goal) throw new Error('pathfinder 没挂上 Goals')
     /* 按游戏模式改寻路规则（本地自适应，不麻烦 LLM）：

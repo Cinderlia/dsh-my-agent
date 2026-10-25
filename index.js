@@ -6666,6 +6666,14 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         /* 统一动作调度器（阶段 P0：只记账）：谁在占什么、撞过几次车。
          * 排查"两个动作互相踩"（合成 / 熔炼 / 开箱子抢同一个窗口、走路被挖矿抢控制位）用。 */
         scheduler: sess.bot.actionSnapshot(),
+        /* 用户 2026-10-25：pathfinder 挂载诊断 —— 会话里直接能看到"模块找到没、bot.pathfinder 挂上没" */
+        pathfinder: sess.bot.pfDiag ?? {
+          moduleLoaded: Boolean(sess.bot._pf),
+          botPathfinder: typeof b.pathfinder,
+          goto: typeof b.pathfinder?.goto,
+          pfReady: sess.bot.pfReady ?? null,
+          note: '挂载时需要 setupPathfinder 跑过；这组是现算的兜底',
+        },
         watching: sess.watchdog?.status() ?? null,
         promptInjection: diagSlimInjection(injection),
         /* 2026-10-15：性能监测 —— `verdict` 里就是"哪个动作该搬 Worker"的中文结论 */

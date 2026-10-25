@@ -387,6 +387,7 @@ export async function setupPathfinder (self, { spec = null } = {}) {
   const mod = await loadPathfinder({ log: (m) => self.logDebug(m), logWarn: (m) => self.log(m), spec })
   if (!mod) {
     self.pfReady = false
+    self.pfDiag = { moduleLoaded: false, reason: 'loadMcDep 返回 null（候选模块形状不对/找不到）', at: new Date().toISOString() }
     self.log('没有可用的 mineflayer-pathfinder（见 dsh-mc-agent/PATHFINDER.md）→ 所有移动已停止，避免盲跳')
     return false
   }
@@ -398,6 +399,17 @@ export async function setupPathfinder (self, { spec = null } = {}) {
      * 它同时还在用已废弃的 `physicTick` 事件。这里把它的 tick 监听接过来：
      * ① 换到新事件 `physicsTick`（不再触发弃用警告）② `entity` 还没回来就跳过
      * ③ 抛错时只记日志并停住寻路，绝不让它冒到进程级。 */
+    /* 用户 2026-10-25：把挂载结果记到 self.pfDiag —— agent 用 mc_probe {what:"diag"} 就能看到，
+     * 会话文件里也读得到（不用翻插件日志）。 */
+    self.pfDiag = {
+      moduleLoaded: Boolean(mod),
+      loadPluginCalled: typeof b.pathfinder?.goto !== 'function',
+      botPathfinder: typeof b.pathfinder,
+      goto: typeof b.pathfinder?.goto,
+      goals: Boolean(mod?.goals || mod?.Goals),
+      movements: Boolean(mod?.Movements),
+      at: new Date().toISOString(),
+    }
     const guarded = guardPathfinderTicks(b, { log: (m) => self.log(m) })
     if (guarded) self.logDebug(`pathfinder tick 已接管（${guarded} 个监听）`)
     guardPathfinderRejections(b, { log: (m) => self.log(m) })
