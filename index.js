@@ -2687,6 +2687,9 @@ export function apply(ctx, rawConfig) {
     prep: 'mc_prep',
     ping: 'mc_ping',
     lan: 'mc_lan',
+    /* 用户 2026-10-25：mc_dig 和 mc_collect 重复（collect 会自动找、换工具、捡），
+     * 折叠进 mc_probe；只有"挖指定坐标"或批处理（column/line）时才用得到。 */
+    dig: 'mc_dig',
   }
   const FOLDED_TO_PROBE = new Set(Object.values(PROBE_ROUTES))
   const asTool = (spec) => {
@@ -4557,6 +4560,30 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
     async execute(args, exec) {
       const sess = getSession(exec)
       const mode = String(args.mode ?? '')
+      /* 🔴 用户 2026-10-25：**walk 模式折叠** —— 它和 mc_navi 完全重复，而且是一次 10 秒的同步版。
+       *    这里直接转交给 mc_navi（异步队列），只保留 fly / swim / boat / jump 四个特殊模式。 */
+      if (mode === '' || mode === 'walk' || mode === 'walk-nodig') {
+        const b = sess.bot.requireBot()
+        if (args.x === undefined && args.z === undefined) {
+          return { ok: false, text: '❌ 走路请给坐标；纯移动请用 mc_navi（异步队列版）' }
+        }
+        const navArgs = { x: args.x, z: args.z }
+        if (args.y !== undefined) navArgs.y = args.y
+        const plan = buildNaviPlan(botView(sess), { ...navArgs, radius: 16 })
+        if (!plan.ok) return { ok: false, ...plan, text: naviReportText(plan) }
+        const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+        const queued = jobBoard.enqueue({
+          kind: 'navi', agentId: agentIdOf(exec?.agent),
+          summary: `导航到 (${plan.target.x}, ${plan.target.y}, ${plan.target.z})`,
+          plan,
+          run: (signal) => runNavi(botView(sess), plan, { signal, movements: mv }),
+        })
+        if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
+        return {
+          ok: true, redirected: true, jobId: queued.job.id, started: queued.started,
+          text: `🚶 walk 已折叠 → 转交 mc_navi（${queued.started ? '立刻开始' : '已排队'}）` + NL + jobBoard.snapshotText(),
+        }
+      }
       /* 「不破坏方块的模式」= `mode:"walk-nodig"` 或 `noDig:true`（用户 2026-10-20）。
        * 只影响走路那一条：寻路的 `canDig` 关掉，卡住时"挖开台阶"的补救也关掉
        * （见 `src/movement.mjs` 的 `walkPathfinder`）。 */
