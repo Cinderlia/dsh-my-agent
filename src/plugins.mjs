@@ -13,9 +13,9 @@
  *      所以搬过来之后这条相对路径仍然对；但 junction / 符号链接安装时它会落到 `.pnpm` 深路径上，
  *      所以另有"按 `$DSH_HOME\profiles\<profile>\vendor\mc-deps` 绝对路径找"那条兜底。
  */
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, appendFileSync, mkdirSync } from 'node:fs'
 import Vec3 from 'vec3'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { resolveHarnessHome } from './format.mjs'
 import { scaffoldingItemIds } from './place-items.mjs'
@@ -45,6 +45,22 @@ import { DOOR_PRESS_COOL_MS, doorBaseKey, doorFaceOf, doorOpenStateOf } from './
  *   ① `DSH_MC_AGENT_MC_DEPS`（给"装依赖的目录"，可含 node_modules）② 插件包旁边的 vendor 树
  *   ③ 裸包名（宿主自己装了就能解析到）。找不到 = 那一项能力没有，其它照旧。
  */
+/**
+ * 把 pathfinder 相关的诊断**直接写进文件**（用户 2026-10-25）：
+ * `<DSH_HOME>/dsh-mc-agent/logs/pathfinder.log`。
+ * 为什么不能只靠 self.log：那是 info 级、混在几万行主日志里；出问题时 agent 也看不到。
+ * 这里独立一份、append、带时间戳，装没装上/卡在哪一步一眼能看出来。
+ */
+export function pfWrite (self, line) {
+  try {
+    const home = resolveHarnessHome()
+    const dir = join(home, 'dsh-mc-agent', 'logs')
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+    const f = join(dir, 'pathfinder.log')
+    appendFileSync(f, `[${new Date().toISOString()}] ${line}` + String.fromCharCode(10), 'utf8')
+  } catch { /* 写不了文件也不能影响寻路 */ }
+}
+
 export const MC_DEPS = {
   pathfinder: { pkg: 'mineflayer-pathfinder', entry: 'index.js', label: '寻路 mineflayer-pathfinder（A* + 挖穿 + 垫脚 + 卡住检测）' },
   collectBlock: { pkg: 'mineflayer-collectblock', entry: 'lib/index.js', label: '挖/捡 mineflayer-collectblock（走过去挖方块、捡掉落物）' },
@@ -384,13 +400,20 @@ export async function setupPathfinder (self, { spec = null } = {}) {
   const b = self.bot
   if (!b) return false
   if (self.cfg.pathfinder === false) { self.pfReady = false; return false }
-  const mod = await loadPathfinder({ log: (m) => self.logDebug(m), logWarn: (m) => self.log(m), spec })
+  pfWrite(self, '=== setupPathfinder 开始 ===')
+  const mod = await loadPathfinder({
+    log: (m) => { self.logDebug(m); pfWrite(self, 'OK  ' + m) },
+    logWarn: (m) => { self.log(m); pfWrite(self, 'WARN ' + m) },
+    spec,
+  })
   if (!mod) {
     self.pfReady = false
     self.pfDiag = { moduleLoaded: false, reason: 'loadMcDep 返回 null（候选模块形状不对/找不到）', at: new Date().toISOString() }
+    pfWrite(self, 'FAIL 模块没找到（见上面 WARN 的候选列表）')
     self.log('没有可用的 mineflayer-pathfinder（见 dsh-mc-agent/PATHFINDER.md）→ 所有移动已停止，避免盲跳')
     return false
   }
+  pfWrite(self, '模块已加载：' + JSON.stringify({ pathfinder: typeof mod.pathfinder, Movements: typeof mod.Movements, goals: typeof mod.goals }))
   try {
     if (typeof b.pathfinder?.goto !== 'function') b.loadPlugin(mod.pathfinder)
     /* 2026-10-18 真机崩溃：pathfinder 的 `monitorMovement` 挂在 tick 上，某次
@@ -401,6 +424,7 @@ export async function setupPathfinder (self, { spec = null } = {}) {
      * ③ 抛错时只记日志并停住寻路，绝不让它冒到进程级。 */
     /* 用户 2026-10-25：把挂载结果记到 self.pfDiag —— agent 用 mc_probe {what:"diag"} 就能看到，
      * 会话文件里也读得到（不用翻插件日志）。 */
+    pfWrite(self, 'loadPlugin 前 bot.pathfinder=' + typeof b.pathfinder + ' goto=' + typeof b.pathfinder?.goto)
     self.pfDiag = {
       moduleLoaded: Boolean(mod),
       loadPluginCalled: typeof b.pathfinder?.goto !== 'function',
@@ -410,6 +434,7 @@ export async function setupPathfinder (self, { spec = null } = {}) {
       movements: Boolean(mod?.Movements),
       at: new Date().toISOString(),
     }
+    pfWrite(self, 'loadPlugin 后 bot.pathfinder=' + typeof b.pathfinder + ' goto=' + typeof b.pathfinder?.goto)
     const guarded = guardPathfinderTicks(b, { log: (m) => self.log(m) })
     if (guarded) self.logDebug(`pathfinder tick 已接管（${guarded} 个监听）`)
     guardPathfinderRejections(b, { log: (m) => self.log(m) })
