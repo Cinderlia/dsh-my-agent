@@ -373,7 +373,7 @@ export function startSilenceWatch (self, b, { everyMs = SILENCE_CHECK_MS } = {})
     const stale = connectionStale(b)
     if (!stale) return
     clearSilenceWatch(self)
-    self.log(`🔌 连接假死：${stale.silenceSec} 秒没收到任何包 —— 主动断开，让自动重连接手`)
+    self.log(`🔌 连接静默超时：${stale.silenceSec} 秒未收到服务端任何包（非正常踢出）—— 主动断开重试`)
     self.lastError = `连接假死（${stale.silenceSec} 秒没收到包）`
     self.emit('silence', { silenceSec: stale.silenceSec, at: Date.now() })
     try { b.end?.() } catch { try { b.quit?.() } catch {} }

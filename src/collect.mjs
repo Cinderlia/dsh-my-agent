@@ -306,6 +306,8 @@ export async function runCollect (self, plan, ctx = {}) {
    *    掉落物被抢**不算失败** —— 继续挖下一个补上。 */
   for (let guard = 0; guard < 64; guard++) {
     if (signal?.aborted) throw new Error('被取消')
+    // 🔴 2026-10-26：断线前先校验连接状态，避免裸 await 卡死
+    if (!self.bot?._session?.sessionId) throw new Error('连接会话无效，可能已断')
 
   /* ①·5 仓库优先（用户 2026-10-24）：先看 4.5 格内有没有箱子/木桶/熔炉，
    *      有就插 open_container 去拿；拿到够数就直接完成，不再去挖。 */

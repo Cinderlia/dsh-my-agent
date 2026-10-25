@@ -418,7 +418,8 @@ async function flyWaypoints (b, waypoints, { signal = null, timeoutMs = NAVI_TIM
   const remaining = () => timeoutMs - (Date.now() - t0)
   for (const wp of waypoints) {
     if (signal?.aborted) throw new Error('被取消')
-    if (remaining() <= 0) throw new Error(`飞行超时（${Math.round(timeoutMs / 1000)} 秒）`)
+    // 🔴 2026-10-26：断线前先校验连接状态
+    if (!b.entity || !this.bot?._session?.sessionId) throw new Error('连接会话无效，可能已断')
     const dest = new Vec3(wp.x + 0.5, wp.y, wp.z + 0.5)
     const me = b.entity?.position
     if (!me) throw new Error('掉线了')
@@ -439,7 +440,8 @@ async function flyWaypoints (b, waypoints, { signal = null, timeoutMs = NAVI_TIM
       setFlyingAbilities(b, true)
       while (meNow(b).distanceTo(dest) > 1.1) {
         if (signal?.aborted) throw new Error('被取消')
-        if (remaining() <= 0) throw new Error('飞行超时')
+        // 🔴 2026-10-26：断线前先校验连接状态
+        if (!b.entity || !this.bot?._session?.sessionId) throw new Error('连接会话无效，可能已断')
         const p = meNow(b)
         const dx = dest.x - p.x; const dy = dest.y - p.y; const dz = dest.z - p.z
         b.look(Math.atan2(-dx, -dz), Math.atan2(dy, Math.hypot(dx, dz)), true)
