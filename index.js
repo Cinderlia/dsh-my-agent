@@ -608,6 +608,9 @@ export function apply(ctx, rawConfig) {
    *    状态放这儿、函数留在下面（函数按请求重建无所谓，缓存必须跨请求）。
    * ------------------------------------------------------------------------ */
   const PLUGIN_ROOT = fileURLToPath(new URL('.', import.meta.url))
+  /* 用户 2026-10-25：插件进程比源码旧 = 改的代码没生效（重启 DSH 才会加载）。
+   * 记下本进程的加载时刻，mc_diag 里和 index.js 的 mtime 比一比就能看出来。 */
+  const PLUGIN_START_AT = Date.now()
   /** 本文件里拼多行文本用（避免手写 反斜杠n 被工具链转义吃掉） */
   const NL = String.fromCharCode(10)
   /* ── 技能注册（2026-10-25 用户）：把 skills/ 下的 MC 玩法知识库挂成 runtime skill ──
@@ -6691,6 +6694,19 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
          * 排查"两个动作互相踩"（合成 / 熔炼 / 开箱子抢同一个窗口、走路被挖矿抢控制位）用。 */
         scheduler: sess.bot.actionSnapshot(),
         /* 用户 2026-10-25：pathfinder 挂载诊断 —— 会话里直接能看到"模块找到没、bot.pathfinder 挂上没" */
+        /* 代码是不是旧的：index.js 的 mtime 晚于本进程启动时刻 → 改的代码没加载 */
+        pluginBuild: (() => {
+          try {
+            const st = statSync(fileURLToPath(new URL('./index.js', import.meta.url)))
+            const stale = st.mtimeMs > PLUGIN_START_AT + 1000
+            return {
+              startedAt: new Date(PLUGIN_START_AT).toISOString(),
+              indexMtime: new Date(st.mtimeMs).toISOString(),
+              stale,
+              ...(stale ? { hint: '⚠️ 插件进程比源码旧 —— 改的代码没生效，要**重启 DSH 应用**（不是重连 MC）' } : {}),
+            }
+          } catch { return null }
+        })(),
         pathfinder: sess.bot.pfDiag ?? {
           moduleLoaded: Boolean(sess.bot._pf),
           botPathfinder: typeof b.pathfinder,
