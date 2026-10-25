@@ -53,7 +53,7 @@ import { startKilla } from './src/killa.mjs'
 import { startPassiveAlerts } from './src/passive-alerts.mjs'
 import { scanSurroundings } from './src/poi.mjs'
 import { runInteract } from './src/interact.mjs'
-import { movements as buildMovements } from './src/plugins.mjs'
+import { movements as buildMovements, pfWrite } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
   readVersionPrompt, writeVersionPrompt, resetVersionPrompt, syncVersionPrompt,
@@ -3147,14 +3147,29 @@ export function apply(ctx, rawConfig) {
        * 🔴 注意：view 必须在**补装之后**再取 —— 它是个快照（{bot, _pf}），
        *    先取再补装的话 `_pf` 还是补装前的 null（第一版就栽在这，session 现场照样报缺失）。 */
       let view = botView(sess)
+      /* 🔴 用户 2026-10-25：navi 报缺失但 pathfinder.log 显示 setup 成功 —— 把**现场身份**
+       * 都写进文件（agentId / 三个对象是否同一个 / _pf / bot.pathfinder），别再靠猜。 */
+      const snap = () => JSON.stringify({
+        agentId: sess.agentId,
+        sessBotIsMcBot: sess.bot?.constructor?.name,
+        bot: sess.bot?.bot === view.bot,
+        hasBot: Boolean(sess.bot?.bot?.entity),
+        pf: typeof view.bot?.pathfinder,
+        goto: typeof view.bot?.pathfinder?.goto,
+        _pf: Boolean(sess.bot?._pf),
+        pfReady: sess.bot?.pfReady ?? null,
+      })
+      pfWrite(null, '[navi] 进入: ' + snap())
       if (typeof view.bot?.pathfinder?.goto !== 'function') {
         try {
           await sess.bot.setupPathfinder()
           logDebug('mc_navi: pathfinder 缺失 → 已懒加载一次')
         } catch (e) {
           logLine('mc_navi: 懒加载 pathfinder 失败：' + (e?.message ?? e))
+          pfWrite(null, '[navi] 懒加载失败: ' + (e?.message ?? e))
         }
         view = botView(sess)      // 重新取快照
+        pfWrite(null, '[navi] 懒加载后: ' + snap())
       }
       if (args.follow === true && args.player) {
         const mvF = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
