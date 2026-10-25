@@ -88,7 +88,7 @@ import { ServerHistory } from './src/serverhistory.mjs'
 import { buildConnectPrompt } from './src/connect-prompt.mjs'
 import { waitForEvents } from './src/wait.mjs'
 export const name = 'dsh-mc-agent'
-export const inject = ['webServer', 'tools']
+export const inject = ['webServer', 'tools', 'skills']
 /** 插件版本（`mc_capabilities` 会报给他；读不到就 unknown） */
 const PLUGIN_VERSION = (() => {
   try { return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? 'unknown' } catch { return 'unknown' }
@@ -607,6 +607,51 @@ export function apply(ctx, rawConfig) {
    *    状态放这儿、函数留在下面（函数按请求重建无所谓，缓存必须跨请求）。
    * ------------------------------------------------------------------------ */
   const PLUGIN_ROOT = fileURLToPath(new URL('.', import.meta.url))
+  /* ── 技能注册（2026-10-25 用户）：把 skills/ 下的 MC 玩法知识库挂成 runtime skill ──
+   * 参考 dsh-plugin-dev-kb 的做法：skills/<name>.md 带 frontmatter，正文里的 {{KB_ROOT}}
+   * 替换成插件内 kb/ 的实际路径。宿主没有 skills 服务时整段跳过，不影响插件加载。 */
+  const registerSkills = () => {
+    try {
+      const skillsSvc = ctx.skills
+      if (!skillsSvc?.register) { logDebug('宿主没有 skills 服务，跳过技能注册'); return }
+      const dir = join(PLUGIN_ROOT, 'skills')
+      if (!existsSync(dir)) { logDebug('skills 目录不存在，跳过技能注册'); return }
+      const kbRoot = join(PLUGIN_ROOT, 'kb')
+      for (const file of readdirSync(dir)) {
+        if (!file.endsWith('.md')) continue
+        const raw = readFileSync(join(dir, file), 'utf8')
+        /* frontmatter 用 split('---') 解析，避免手写正则被转义坑 */
+        const parts = raw.split('---')
+        if (parts.length < 3) { logDebug(`技能 ${file} 缺少 frontmatter，跳过`); continue }
+        const fmText = parts[1]
+        const body = parts.slice(2).join('---')
+        const fm = {}
+        for (const line of fmText.split(String.fromCharCode(10))) {
+          const idx = line.indexOf(':')
+          if (idx <= 0) continue
+          const key = line.slice(0, idx).trim()
+          const val = line.slice(idx + 1).trim()
+          if (key && val) fm[key] = val
+        }
+        if (!fm.name || !fm.description) { logDebug(`技能 ${file} 缺少 name/description，跳过`); continue }
+        try {
+          ctx.skills.register({
+            name: fm.name,
+            description: fm.description,
+            ...(fm.whenToUse ? { whenToUse: fm.whenToUse } : {}),
+            content: body.replaceAll('{{KB_ROOT}}', kbRoot),
+          })
+          logLine(`技能已注册：${fm.name}（${file}）`)
+        } catch (e) {
+          logLine(`技能 ${fm.name} 注册失败（不影响插件）：${e?.message ?? e}`)
+        }
+      }
+    } catch (e) {
+      logLine('技能注册整段失败（不影响插件）：' + (e?.message ?? e))
+    }
+  }
+  registerSkills()
+
   const UPDATE_TTL_MS = 10 * 60 * 1000
   const updateCache = { at: 0, data: null }
   /** 启动后多久查第一次更新：别跟插件初始化抢资源，也别让首屏等它 */

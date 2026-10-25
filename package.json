@@ -47,7 +47,9 @@
     "插件说明.md",
     "开发说明.md",
     "踩坑档案.md",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "skills",
+    "kb"
   ],
   "dependencies": {
     "mineflayer": "^4.37.1",
