@@ -3139,6 +3139,17 @@ export function apply(ctx, rawConfig) {
       const sess = getSession(exec)
       const b = sess.bot.requireBot()
       const view = botView(sess)
+      /* 🔴 2026-10-25 实机（session 现场 pfModule:false / pfReady:null）：有些连接路径
+       * 没有跑过 setupPlugins ⇒ bot.pathfinder 根本没挂上。这里**懒加载一次**自愈，
+       * 而不是直接把"没有 pathfinder"甩给 AI（它只会退回原语硬走）。 */
+      if (typeof view.bot?.pathfinder?.goto !== 'function') {
+        try {
+          await sess.bot.setupPathfinder()
+          logDebug('mc_navi: pathfinder 缺失 → 已懒加载一次')
+        } catch (e) {
+          logLine('mc_navi: 懒加载 pathfinder 失败：' + (e?.message ?? e))
+        }
+      }
       if (args.follow === true && args.player) {
         const mvF = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
         const queuedF = jobBoard.enqueue({
@@ -3773,6 +3784,16 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         throw withUserHint(e, resolved.label)
       }
       sess.mode = 'active'
+      /* 🔴 2026-10-25：连接后确认插件真的装上了 —— 有的路径没跑到 setupPlugins，
+       * 结果是"日志说 pathfinder 就绪、实际 bot.pathfinder 是 undefined"。 */
+      if (sess.bot.pfReady !== true) {
+        try {
+          const out = await sess.bot.setupPlugins()
+          logLine('连接后补装插件：' + JSON.stringify(out))
+        } catch (e) {
+          logLine('连接后补装插件失败（不影响连接）：' + (e?.message ?? e))
+        }
+      }
       // 记忆里的聊天记录（用户 2026-10-20）：进服就把钩子挂上，之后每条公屏都进 chat-log.md
       const chatLogRoot = attachChatLog(sess, exec?.agent)
       const ready = await sess.bot.waitForChunks()
