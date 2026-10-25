@@ -5801,7 +5801,8 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
    */
   const poiLineOf = (agent) => {
     try {
-      if (!isMcModeAgent(agent)) return null
+      /* MC+ 也算（开放全部工具的变体）；两个判据任一成立就注入 */
+      if (!isMcModeAgent(agent) && !isMcPlusAgent(agent)) return null
       const id = agentIdOf(agent)
       const sess = id ? registry.peek(String(id)) : null
       const b = sess?.bot?.bot
