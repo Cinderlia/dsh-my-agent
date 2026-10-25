@@ -16,6 +16,7 @@
  *      原语是给 agent 补上"自己控制身体"的那一层，不是替换它们。
  * ========================================================================== */
 import { bagWarning } from './scaffold.mjs'
+import { facingDelta, edgeWarning } from './edge-guard.mjs'
 import Vec3 from 'vec3'
 import { entitiesNear } from './world-scan.mjs'
 import { aimAt, lookAnglesTo } from './camera.mjs'
@@ -184,10 +185,24 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
       sneak: { type: 'boolean', description: '潜行' },
       sprint: { type: 'boolean', description: '疾跑' },
       all: { type: 'boolean', description: 'true = 先把所有键松开，再按这次给的（默认 false = 只改给到的键）' },
+      force: { type: 'boolean', description: '边缘预警时仍坚持执行（默认 false = 返回预警不执行）' },
     },
     output: text(),
     async execute (args, exec) {
       const b = needBot(getBot, exec)
+      /* 用户 2026-10-25 边缘保护：绕过 navi 直接前进时，先看前方有没有 >2 格落差。
+       * 有就返回预警、不执行；LLM 确认后再带 force:true 调一次。 */
+      if (args.forward === true && args.force !== true) {
+        const yaw = Number(b.entity?.yaw ?? 0)
+        const [dx, dz] = facingDelta(yaw)
+        const warn = edgeWarning(b, dx, dz)
+        if (warn) {
+          return {
+            ok: false, blocked: true, edge: { drop: warn.drop, at: warn.at, verdict: warn.verdict },
+            text: warn.text + '\n▶ 确认要走就带 `force:true` 再调一次；否则换方向或先 `mc_navi`。',
+          }
+        }
+      }
       if (args.all === true) for (const k of CONTROL_KEYS) b.setControlState(k, false)
       const changed = {}
       for (const k of CONTROL_KEYS) {

@@ -49,6 +49,7 @@ import { buildTargets, checkRange, needsWalk, walkNear, runBatch, batchText } fr
 import { resolveCraftRequest, runCraft, craftRequestText } from './src/craft.mjs'
 import { ensureScaffoldInHand, bagWarning } from './src/scaffold.mjs'
 import { startKilla } from './src/killa.mjs'
+import { startPassiveAlerts } from './src/passive-alerts.mjs'
 import { movements as buildMovements } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
@@ -3589,6 +3590,17 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
           log: (t) => logDebug('[killa] ' + t),
         })
         globalThis.__killaStop = () => killa.stop()
+      } catch (e) {
+        logLine('killa 启动失败（不影响连接）：' + (e?.message ?? e))
+      }
+      /* 用户 2026-10-25：溺水 / 受伤 / 饥饿 三类预警 + auto_eat */
+      try {
+        if (globalThis.__alertsStop) { try { globalThis.__alertsStop() } catch { /* ignore */ } }
+        const alerts = startPassiveAlerts({ bot: sess.bot?.bot }, {
+          report: (t) => { try { jobBoard.inject(`alert-${Date.now()}`, t) } catch { /* ignore */ } },
+          log: (t) => logDebug('[alerts] ' + t),
+        })
+        globalThis.__alertsStop = () => alerts.stop()
       } catch (e) {
         logLine('killa 启动失败（不影响连接）：' + (e?.message ?? e))
       }
