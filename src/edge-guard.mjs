@@ -104,7 +104,7 @@ export function fallVerdict (b, distance, mods = {}) {
 export function checkEdge (b, dx, dz, { maxDrop = 2, reach = 2 } = {}) {
   const me = b?.entity?.position
   if (!me) return { hazard: false }
-  const base = me.floored()
+  const base = { x: Math.floor(me.x), y: Math.floor(me.y), z: Math.floor(me.z) }
   for (let step = 1; step <= reach; step++) {
     const x = base.x + dx * step
     const z = base.z + dz * step
