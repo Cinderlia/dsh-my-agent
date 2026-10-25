@@ -121,7 +121,21 @@ export async function connect (self, opts = {}, ctx = {}) {
     (liveOpts?.version ?? false) === version &&
     authKeyOf(liveOpts?.auth) === authKeyOf(auth)
   )
-  if (!force && sameAsLive) return self.bot
+  if (!force && sameAsLive) {
+    /* 🔴 2026-10-25 实机（用户：pathfinder.log 一条都没有，pfReady 一直是 null）：
+     *    已经连着的时候 mc_connect 会**早退**，直接 return 不跑下面的 setupPlugins ——
+     *    于是这个会话的 bot 永远没有 pathfinder，navi 一调就报"没有可用的 pathfinder"。
+     *    早退前补一次装配（幂等，装过就跳过）。 */
+    if (self.pfReady !== true) {
+      try {
+        const out = await self.setupPlugins()
+        self.log('已连着 → 补装插件：' + JSON.stringify(out))
+      } catch (e) {
+        self.log('已连着 → 补装插件失败：' + (e?.message ?? e))
+      }
+    }
+    return self.bot
+  }
   if (self.connecting) { await self.connecting.catch(() => {}); if (self.online) return self.bot }
 
   // 记录当前生效的连接参数（给 mc_status 用，**不含任何凭据**）
