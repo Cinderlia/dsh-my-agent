@@ -3138,10 +3138,12 @@ export function apply(ctx, rawConfig) {
     async execute (args, exec) {
       const sess = getSession(exec)
       const b = sess.bot.requireBot()
-      const view = botView(sess)
       /* 🔴 2026-10-25 实机（session 现场 pfModule:false / pfReady:null）：有些连接路径
        * 没有跑过 setupPlugins ⇒ bot.pathfinder 根本没挂上。这里**懒加载一次**自愈，
-       * 而不是直接把"没有 pathfinder"甩给 AI（它只会退回原语硬走）。 */
+       * 而不是直接把"没有 pathfinder"甩给 AI（它只会退回原语硬走）。
+       * 🔴 注意：view 必须在**补装之后**再取 —— 它是个快照（{bot, _pf}），
+       *    先取再补装的话 `_pf` 还是补装前的 null（第一版就栽在这，session 现场照样报缺失）。 */
+      let view = botView(sess)
       if (typeof view.bot?.pathfinder?.goto !== 'function') {
         try {
           await sess.bot.setupPathfinder()
@@ -3149,6 +3151,7 @@ export function apply(ctx, rawConfig) {
         } catch (e) {
           logLine('mc_navi: 懒加载 pathfinder 失败：' + (e?.message ?? e))
         }
+        view = botView(sess)      // 重新取快照
       }
       if (args.follow === true && args.player) {
         const mvF = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
