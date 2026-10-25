@@ -459,17 +459,31 @@ export function createInjector (deps) {
    * @param decision - 交棒拿回来的 `PreStepDecision`
    * @returns 改写后的 decision（不改就别返回新对象）
    */
+  /** 每轮一行兴趣点（由 index.js 提供；只在 MC 模式且已连接时返回非空） */
+  const poiLineGetter = (agent) => {
+    try { return deps.poiLineOf?.(agent) ?? null } catch { return null }
+  }
+
   const enterWithNotices = (agent, decision) => {
     try {
       if (!decision || decision.kind !== 'enter') return decision
       const r = reconcileNotices(agent)
-      if (!r.todo.length) return decision
+      /* 用户 2026-10-25：兴趣点**每轮**注入（MC 是实时更新的游戏），
+       * 只在 MC 模式 + 已连接时才有内容；它是临时消息，不进 AGENTS.md 台账。 */
+      const poi = poiLineGetter(agent)
+      if (!r.todo.length && !poi) return decision
       // 队列里若有残留的自家提示行，先摘掉：它们马上要作为**本步消息**送出去了，
       // 留着会让下一步再送一遍（重复注入）。
       try { withdrawAgentsMdNotices(agent) } catch { /* 摘不掉也不影响本步 */ }
-      markNoticesSent(agent, r.todo)
+      if (r.todo.length) markNoticesSent(agent, r.todo)
       const msgs = (decision.messages ?? []).filter((m) => !isOurNotice(m))
-      const out = { ...decision, messages: [...noticeMessagesFor(r.todo), ...msgs] }
+      const poiMsgs = poi
+        ? [userMessage({
+            content: [{ type: 'text', text: poi }],
+            source: { kind: 'plugin:dsh-mc-agent', form: 'notice', summary: '兴趣点雷达' },
+          })]
+        : []
+      const out = { ...decision, messages: [...noticeMessagesFor(r.todo), ...poiMsgs, ...msgs] }
       return out
     } catch (e) {
       // 绝不带崩这一轮：改写失败就用内层原样结果。

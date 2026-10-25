@@ -5794,6 +5794,42 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
    * 🔴 调用点必须在这儿：`agentPresetsSvc` / `isMcModeAgent` / `isMcPlusAgent` /
    *    `MC_PLUS_NOTICE_TEXT` 都在上面才声明（早于它们会 TDZ）。
    * ------------------------------------------------------------------ */
+  /**
+   * 每轮一行「附近兴趣点」（用户 2026-10-25）：只在 MC 模式 + 已连接时返回。
+   * 焦点跟着**当前队列任务**走：craft → build，collect 矿石 → ore，导航 → explore，
+   * killa 接管中 → combat。每轮现扫（MC 是实时更新的游戏），输出压到一行 ~80 字符。
+   */
+  const poiLineOf = (agent) => {
+    try {
+      if (!isMcModeAgent(agent)) return null
+      const id = agentIdOf(agent)
+      const sess = id ? registry.peek(String(id)) : null
+      const b = sess?.bot?.bot
+      if (!b?.entity) return null
+      const cur = jobBoard.current
+      let focus = 'auto'
+      if (cur) {
+        const s2 = String(cur.summary ?? '')
+        if (/(killa|攻击|战斗)/i.test(s2)) focus = 'combat'
+        else if (cur.kind === 'craft') focus = 'build'
+        else if (cur.kind === 'collect') {
+          if (/(ore|矿石|铁矿|金矿|钻石)/i.test(s2)) focus = 'ore'
+          else if (/(log|wood|原木|木板)/i.test(s2)) focus = 'wood'
+        } else if (cur.kind === 'smelt') focus = 'ore'
+        else if (cur.kind === 'navi') focus = 'explore'
+      }
+      const r = scanSurroundings({ bot: b, _pf: sess.bot?._pf ?? null }, { radius: 16, focus, limit: 2 })
+      if (!r.ok || !r.groups.length) return null
+      const parts = r.groups.slice(0, 4).map((g) => {
+        const it = g.items?.[0]
+        if (!it) return null
+        return g.key === 'hostile' ? `${g.label} ${it.name} ${it.d}格血${it.hp ?? '?'}` : `${g.label} ${it.name} ${it.d}格`
+      }).filter(Boolean)
+      if (!parts.length) return null
+      return `🎯 附近（焦点 ${focus}）：` + parts.join(' · ')
+    } catch { return null }
+  }
+
   const {
     SESSION_SEED_FILES, ensureMemoryRootForCwd, enterWithNotices,
     memoryIndexText, promptInjectionStatus, reconcileNotices,
@@ -5807,7 +5843,7 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         logOnce, mcPresetDir, memoryBaseFor,
         memoryFor, memoryRootFor, migrateLegacyAgentsMd,
         migrateWorkspaceConfig, noteAgent, pluginConfig,
-        pluginLoadNote, readAgentsMd, readVersionPrompt,
+        pluginLoadNote, readAgentsMd, readVersionPrompt, poiLineOf,
         syncRulesVersion, syncVersionPrompt, userMessage,
         versionPromptPath, versionPromptSource, versionPromptText,
         versionPromptTitle, workspaceConfigValues, workspaceOf,
