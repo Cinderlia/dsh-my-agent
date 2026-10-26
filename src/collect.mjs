@@ -27,6 +27,12 @@ export const COLLECT_RADIUS = 16
 export const DIG_REACH = 4.2
 /** 等掉落物进背包的最长时间 */
 const PICKUP_WAIT_MS = 2500
+/**
+ * 同一个掉落物最多插几次 navi 去捡（用户 2026-10-26：
+ * 「没捡到就重新再挖一个，直到附近没有对应方块」—— 所以这里只是"这一个掉落物的预算"，
+ *  用完就**放弃它、回去再挖一个**，而不是把整个 collect 判死）。
+ */
+const PICKUP_MAX_TRIES = 3
 
 /**
  * 物品名 → 它从哪种**方块**掉（只在"名字不是方块"时才用）。
@@ -227,6 +233,9 @@ function itemIdOfEntity (e) {
  */
 function dropsNear (b, pos, r = 6, wantName = null) {
   const out = []
+  /* wantName 可以写一个名字，也可以给一串（同族原木：挖的是 cherry_log、要的是 oak_log） */
+  const wants = wantName == null ? null : (Array.isArray(wantName) ? wantName : [wantName]).map((x) => String(x ?? '')).filter(Boolean)
+  const wantFams = new Set((wants ?? []).map((w) => familyOf(w)).filter(Boolean))
   for (const e of Object.values(b.entities ?? {})) {
     if (!e?.position) continue
     const nm = String(e.name ?? e.displayName ?? '')
@@ -242,12 +251,51 @@ function dropsNear (b, pos, r = 6, wantName = null) {
       const it = b.registry?.items?.[id] ?? null
       if (it?.name) {
         unknown = false
-        if (wantName && it.name !== wantName) continue
+        const nameOk = !wants || wants.includes(it.name) || wantFams.has(familyOf(it.name))
+        if (!nameOk) continue
       }
     }
     out.push({ x: e.position.x, y: e.position.y, z: e.position.z, d, itemId: id, unknown })
   }
   return out.sort((a, c) => a.d - c.d)
+}
+
+/**
+ * 掉落物 → navi 计划（用户 2026-10-26：「没捡到物品的时候，要用 navi 走过去捡」）。
+ *
+ * 🔴 掉落物实体的坐标**不一定是能站的格子**（在刚挖出来的洞里、贴着方块、半空里），
+ *    直接拿它算 navi 很容易 `ok:false`；以前这里一行 `return fail(...)` 就把整个 collect 判死，
+ *    "走过去捡"这一步等于没做。现在依次试：
+ *    实体那格 → 下面一格 → 上面一格 → 刚挖掉那块 → 它下面；全不行返回 ok:false，
+ *    调用方把它当成**一次尝试**（继续挖下一个），不再直接判死。
+ *
+ * @returns {{ok:false, why:string} | {ok:true, forDrop:{x:number,y:number,z:number}}}
+ */
+export function naviPlanToDrop (self, drop, dug = null, radius = COLLECT_RADIUS) {
+  const fx = Math.floor(Number(drop?.x) || 0)
+  const fy = Math.floor(Number(drop?.y) || 0)
+  const fz = Math.floor(Number(drop?.z) || 0)
+  const spots = [
+    { x: fx, y: fy, z: fz },
+    { x: fx, y: fy - 1, z: fz },
+    { x: fx, y: fy + 1, z: fz },
+  ]
+  if (dug && [dug.x, dug.y, dug.z].every(Number.isFinite)) {
+    spots.push({ x: dug.x, y: dug.y, z: dug.z })
+    spots.push({ x: dug.x, y: dug.y - 1, z: dug.z })
+  }
+  let firstWhy = null
+  for (const s of spots) {
+    let plan = null
+    try {
+      plan = buildNaviPlan(self, { ...s, radius })
+    } catch (e) {
+      plan = { ok: false, why: e?.message ?? String(e) }
+    }
+    if (plan?.ok) return { ...plan, forDrop: { x: Number(drop?.x), y: Number(drop?.y), z: Number(drop?.z) } }
+    if (!firstWhy) firstWhy = plan?.why ?? '规划失败'
+  }
+  return { ok: false, why: firstWhy ?? '掉落物附近没有能站的格子' }
 }
 
 /** 创造模式：直接拿（并回读背包确认） */
@@ -278,6 +326,9 @@ export async function runCollect (self, plan, ctx = {}) {
   if (!b?.entity) throw new Error('执行时已经掉线了')
   if (!plan?.ok) throw new Error(plan?.why ?? '规划失败')
   const t0 = Number(job?.startedAt ?? Date.now())
+  /* 背包里要数的名字（挖 iron_ore 掉 raw_iron 那种），以及它的同族候选（原木按族认） */
+  const product = plan.product ?? plan.name
+  const productNames = () => itemCandidates(product, b.registry)
 
   /* 创造模式：一把干完 */
   if (plan.creative) {
@@ -304,7 +355,10 @@ export async function runCollect (self, plan, ctx = {}) {
    *    ① 一开始扫描就发现附近总量不够；
    *    ② 挖到最后（附近的目标全挖完了）发现还不够。
    *    掉落物被抢**不算失败** —— 继续挖下一个补上。 */
-  for (let guard = 0; guard < 64; guard++) {
+  /* 推进次数上限：每个要挖的方块最多消耗"挖/确认/捡×N"这些步，按 count 放大，
+   * 免得"捡几次"之后整个 collect 被 `次数超限` 冤枉判死（用户 2026-10-26：要一直挖到附近没有方块）。 */
+  const maxSteps = 48 + Math.max(1, Number(plan.count) || 1) * (PICKUP_MAX_TRIES + 8)
+  for (let guard = 0; guard < maxSteps; guard++) {
     if (signal?.aborted) throw new Error('被取消')
 
   /* ①·5 仓库优先（用户 2026-10-24）：先看 4.5 格内有没有箱子/木桶/熔炉，
@@ -391,7 +445,7 @@ export async function runCollect (self, plan, ctx = {}) {
     const cands0 = Array.isArray(plan.blocks) && plan.blocks.length ? plan.blocks : [plan.block]
     const all = []
     for (const bn of cands0) all.push(...findTargets(b, bn, plan.radius, 64))
-    const loose = dropsNear(b, b.entity.position, plan.radius, plan.name).length
+    const loose = dropsNear(b, b.entity.position, plan.radius, productNames()).length
     st.available = all.length + loose
     if (st.available < plan.count) {
       return fatalFail(`附近 ${plan.radius} 格内只有 ${st.available} 个 ${cands0.join('/')}（含地上的掉落物），要 ${plan.count} 个 —— 不开始挖`)
@@ -424,6 +478,8 @@ export async function runCollect (self, plan, ctx = {}) {
         return fatalFail(`附近的 ${cands.join('/')} 都挖完了，只收到 ${st.got}/${plan.count}`)
       }
       st.target = targets[0]
+      /* 换目标 = 换一个掉落物预算（否则捡几次之后整个 collect 就再也捡不动了） */
+      st.pickupTries = 0
       st.phase = 'approach'
       log(`目标 ${plan.block} @ ${st.target.x},${st.target.y},${st.target.z}（${st.target.d.toFixed(1)} 格）`)
       continue
@@ -511,25 +567,26 @@ export async function runCollect (self, plan, ctx = {}) {
     }
 
     if (st.phase === 'verify') {
-      let after = familyCount(b, plan.product ?? plan.name)
+      let after = familyCount(b, product)
       const deadline = Date.now() + PICKUP_WAIT_MS
       const t0v = Date.now()
       while (Date.now() < deadline) {
         await sleep(200)
-        after = familyCount(b, plan.product ?? plan.name)
+        after = familyCount(b, product)
         if (after > st.before) break
         /* 🔴 用户 2026-10-25："我怀疑其实 bot 捡起来了，但是它以为自己没捡起来"。
          *    掉落物实体**消失**（被吸走/被捡）也该算捡到了 —— 背包同步常慢一两秒，
          *    只盯背包会误判成"没捡到"，然后去挖下一个，结果多挖。 */
         if (Date.now() - t0v > 1500) {
           const t = st.target
-          const left = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.product ?? plan.name)
+          const left = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, productNames())
           if (!left.length) {
             st.got += 1
             steps.push('掉落物实体已消失 → 视为已捡起')
             st.phase = 'find'
             st.toolRequested = false
-            st.before = familyCount(b, plan.product ?? plan.name)
+            st.pickupTries = 0
+            st.before = familyCount(b, product)
             after = st.before
             break
           }
@@ -541,6 +598,7 @@ export async function runCollect (self, plan, ctx = {}) {
         st.phase = 'find'
         st.tries = 0
         st.toolRequested = false
+        st.pickupTries = 0
         continue
       }
       st.phase = 'pickup'
@@ -548,23 +606,56 @@ export async function runCollect (self, plan, ctx = {}) {
     }
 
     if (st.phase === 'pickup') {
-      st.pickupTries = (st.pickupTries ?? 0) + 1
-      if (st.pickupTries > 4) return fail('挖掉了但一直捡不到（已试着去捡 4 次）')
       const t = st.target
-      const drops = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, plan.product ?? plan.name)
+      /* 背包其实已经够了 → 收工（别为了"确认捡到"再多跑一趟） */
+      const nowHave = familyCount(b, product)
+      if (nowHave >= plan.count) {
+        st.got = nowHave
+        return done()
+      }
+      /* 🔴 同一个掉落物怎么捡都捡不到（navi 插进去也白跑、走过去它还在）→ 放弃这一个，
+       *    **回去再挖一个补上**；只有"附近的目标全挖完了"才算失败（见 find 阶段）。
+       *    用户 2026-10-26：「如果没捡到，那就重新再挖一个，直到附近没有对应方块。」 */
+      if ((st.pickupTries ?? 0) > PICKUP_MAX_TRIES) {
+        st.lost = (st.lost ?? 0) + 1
+        steps.push(`这个掉落物怎么都捡不到（第 ${st.lost} 个），回去再挖一个补上`)
+        st.pickupTries = 0
+        st.phase = 'find'
+        continue
+      }
+      st.pickupTries = (st.pickupTries ?? 0) + 1
+      const drops = t
+        ? dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, productNames())
+        : []
       if (!drops.length) {
         /* 掉落物没了（被抢/掉岩浆/没生成）：**不算失败** —— 回去挖下一个补上。
          * 只有"附近全挖完还不够"才失败（见上面 find 阶段）。 */
         st.lost = (st.lost ?? 0) + 1
         steps.push(`掉落物不见了（第 ${st.lost} 个，继续挖下一个）`)
+        st.pickupTries = 0
         st.phase = 'find'
         continue
       }
       const drop = drops[0]
       if (drop.unknown) steps.push('掉落物读不到物品 id，按位置去捡（可能捡错）')
+      /* 🔴 用户 2026-10-26：「没捡到物品的时候，要用 navi 走过去捡。」
+       *    走不过去（掉落物在洞里/半空/半径外）**不算失败**：记一次尝试，
+       *    预算用完就放弃这个掉落物、回去再挖一个。 */
+      const navPlan = naviPlanToDrop(self, drop, t)
+      if (!navPlan.ok) {
+        steps.push(`去捡掉落物走不过去：${navPlan.why}`)
+        if (st.pickupTries >= PICKUP_MAX_TRIES) {
+          st.lost = (st.lost ?? 0) + 1
+          st.pickupTries = 0
+          steps.push(`这个掉落物捡不到（第 ${st.lost} 个），回去再挖一个补上`)
+          st.phase = 'find'
+          continue
+        }
+        await sleep(400)
+        st.phase = 'pickup'
+        continue
+      }
       if (!board || !job) return fail('内部错误：没有队列上下文，无法插入捡取任务')
-      const navPlan = buildNaviPlan(self, { x: Math.floor(drop.x), y: Math.floor(drop.y), z: Math.floor(drop.z), radius: COLLECT_RADIUS })
-      if (!navPlan.ok) return fail(`去捡掉落物失败：${navPlan.why}`)
       const inserted = board.yieldFor(job, {
         kind: 'navi',
         agentId: job.agentId,
@@ -573,13 +664,13 @@ export async function runCollect (self, plan, ctx = {}) {
         run: (sig) => runNavi(self, navPlan, { signal: sig, movements }),
       })
       if (!inserted) return fail('插入捡取任务失败（队列状态不对）')
-      steps.push('插入导航去捡掉落物')
+      steps.push(`插入导航去捡掉落物（第 ${st.pickupTries} 次）`)
       st.phase = 'verify'
-      st.before = familyCount(b, plan.product ?? plan.name)
-      return { yielded: true, text: '⏸ 已插入 navi 去捡掉落物，collect 挂起等待' }
+      st.before = familyCount(b, product)
+      return { yielded: true, text: `⏸ 已插入 navi 去捡掉落物（第 ${st.pickupTries} 次），collect 挂起等待` }
     }
 
     return fail(`未知阶段 ${st.phase}`)
   }
-  return fail('推进次数超限（可能卡在某个阶段）')
+  return fail(`推进次数超限（${maxSteps} 步，可能卡在某个阶段；已收到 ${st.got}/${plan.count}）`)
 }

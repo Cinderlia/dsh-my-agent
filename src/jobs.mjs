@@ -73,9 +73,12 @@ export class JobBoard {
     const lines = []
     const stateText = s.state === 'intervening' ? '已冻结（介入中）' : s.state === 'running' ? '执行中' : '空闲'
     lines.push(`📋 队列[${stateText}]`)
-    if (s.current) lines.push(`  ▶ ${s.current.id}（${s.current.summary}）`)
-    if (s.queue.length) lines.push('  ⏳ ' + s.queue.map((j) => `${j.id}（${j.summary}）`).join(' → '))
+    /* ★ = 初始任务（LLM 发布的那条）：它一结束就清空整个队列 —— 标出来，别让 agent 误以为后面还有活 */
+    const mark = (j) => `${j.id}${j.root ? '★' : ''}（${j.summary}）`
+    if (s.current) lines.push(`  ▶ ${mark(s.current)}`)
+    if (s.queue.length) lines.push('  ⏳ ' + s.queue.map(mark).join(' → '))
     if (!s.current && !s.queue.length) lines.push('  （空）')
+    else if (s.current?.root || s.queue.some((j) => j.root)) lines.push('  ★ = 初始任务（它结束/失败会清空整个队列）')
     return lines.join('\n')
   }
   /** 队列快照（给工具返回 / 宿主判据用） */
@@ -90,18 +93,22 @@ export class JobBoard {
     }
   }
   brief (j) {
-    return { id: j.id, kind: j.kind, summary: j.summary, status: j.status, startedAt: j.startedAt, endedAt: j.endedAt }
+    return { id: j.id, kind: j.kind, summary: j.summary, status: j.status, startedAt: j.startedAt, endedAt: j.endedAt, root: Boolean(j.root) }
   }
   /**
    * 入队并（可能）立刻开始。**立刻返回**，不等执行。
    * @param {Object} spec {kind, agentId, summary, plan, run(signal, job)=>Promise<{text,data}>}
    * @returns {{ok:true, job, position:number, started:boolean} | {ok:false, why:string, current:Object|null}}
    */
-  enqueue ({ kind, agentId, summary, plan = null, run }) {
+  enqueue ({ kind, agentId, summary, plan = null, run, initial = undefined }) {
     if (this.state === 'intervening') {
       return { ok: false, why: '队列正在被介入（agent 正在处理队首任务），先 mc_interrupt 选一个动作再继续', current: this.current ? this.brief(this.current) : null }
     }
-    const job = this.makeJob({ kind, agentId, summary, plan, run })
+    /* 🔴 用户 2026-10-26：「标记由 LLM 发布的那个初始任务。」
+     *    显式给 initial:true 就用它；没给就按「队列空着、我是第一条」自动认作初始任务
+     *    （enqueue 只被工具层调用 = 都是 LLM 发布的；插队/转交走 yieldFor/handOff，不经过这里）。 */
+    const root = initial === undefined ? (!this.current && this.queue.length === 0) : Boolean(initial)
+    const job = this.makeJob({ kind, agentId, summary, plan, run, root })
     this.queue.push(job)
     const wasIdle = !this.current && this.state === 'idle'
     this.log(`任务 ${job.id} 入队（第 ${this.queue.length} 位）：${job.summary}`)
@@ -110,13 +117,15 @@ export class JobBoard {
     return { ok: true, job, position: this.queue.indexOf(job) + (this.current ? 1 : 0), started: this.current === job }
   }
 /** 造一个任务对象（enqueue / yieldFor 共用） */
-  makeJob ({ kind, agentId, summary, plan = null, run = null, state = undefined }) {
+  makeJob ({ kind, agentId, summary, plan = null, run = null, state = undefined, root = false }) {
     return {
       id: nextId(),
       kind: String(kind ?? 'job'),
       agentId: agentId ? String(agentId) : null,
       summary: String(summary ?? ''),
       plan,
+      /** 初始任务（LLM 发布的那条）：它结束/失败就清空整个队列（见 clearAfterRoot） */
+      root: Boolean(root),
       status: 'queued',
       startedAt: null,
       endedAt: null,
@@ -199,7 +208,9 @@ export class JobBoard {
     if (!ok) this.handFailureToNext(job, job.report.text || '失败')
     this.current = null
     this.archive(job)
-    this.notify(job, `${ok ? '✅' : '❌'} ${job.summary}\n${job.report.text}`)
+    const cleared = this.clearAfterRoot(job, ok ? '完成' : '失败')
+    this.notify(job, `${ok ? '✅' : '❌'} ${job.summary}\n${job.report.text}`
+      + (cleared ? `\n（初始任务结束，已清空队列里剩下的 ${cleared} 个任务）` : ''))
     this.state = 'idle'
     this.pump()
     this.changed()
@@ -214,11 +225,25 @@ export class JobBoard {
     this.handFailureToNext(job, job.error)
     this.current = null
     this.archive(job)
-    this.notify(job, `❌ ${job.summary} 失败：${job.error}`)
+    const cleared = this.clearAfterRoot(job, '失败')
+    this.notify(job, `❌ ${job.summary} 失败：${job.error}`
+      + (cleared ? `\n（初始任务结束，已清空队列里剩下的 ${cleared} 个任务）` : ''))
     this.state = 'idle'
     this.pump()
     this.changed()
     return true
+  }
+  /**
+   * **初始任务结束时清空整个队列**（用户 2026-10-26）：
+   * 「当初始任务完成或者失败时，清空整个任务队列。」
+   *
+   * 初始任务 = LLM 发布的那条（`enqueue` 打的 `root`）。它一结束，这条工具调用链就到底了，
+   * 后面排着的东西（上一轮的残留、别的东西）继续跑没有意义 —— 全停比逐个失败清楚。
+   * @returns {number} 清掉的任务数（0 = 不是初始任务）
+   */
+  clearAfterRoot (job, why = '结束') {
+    if (!job?.root) return 0
+    return this.abortAll(`初始任务${why}（${job.summary}）→ 清空队列`)
   }
   /**
    * **转交**（用户 2026-10-24）：当前任务把活交给另一个任务，**自己退队**、不再恢复。
@@ -229,6 +254,8 @@ export class JobBoard {
   handOff (job, spec = {}) {
     if (!job || this.current !== job) return false
     const child = this.makeJob(spec)
+    /* 转交的是初始任务 → 接手的这条也算初始任务（否则链尾结束时不会清队列） */
+    if (job.root) child.root = true
     job.status = 'handed-off'
     job.endedAt = Date.now()
     job.error = `已转交 ${child.kind}`

@@ -3055,6 +3055,8 @@ export function apply(ctx, rawConfig) {
        * 队列非空时宿主会把主动工具收起来（见 applyQueueGate）。 */
       const queued = jobBoard.enqueue({
         kind: 'navi',
+        /* 用户 2026-10-26：LLM 发布的这条 = **初始任务**，它结束就清空整个队列 */
+        initial: true,
         agentId: agentIdOf(exec?.agent),
         summary: `导航到 (${plan.target.x}, ${plan.target.y}, ${plan.target.z})`,
         plan,
@@ -3101,6 +3103,8 @@ export function apply(ctx, rawConfig) {
       const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
       const queued = jobBoard.enqueue({
         kind: 'collect',
+        /* 用户 2026-10-26：LLM 发布的这条 = **初始任务**，它结束就清空整个队列 */
+        initial: true,
         agentId: agentIdOf(exec?.agent),
         summary: `收集 ${plan.name} ×${plan.count}`,
         plan,
@@ -3201,6 +3205,8 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
       const queued = jobBoard.enqueue({
         kind: 'craft',
+        /* 用户 2026-10-26：LLM 发布的这条 = **初始任务**，它结束就清空整个队列 */
+        initial: true,
         agentId: agentIdOf(exec?.agent),
         summary: `合成 ${req.itemName} ×${req.count}`,
         plan: req,

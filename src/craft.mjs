@@ -170,6 +170,32 @@ export async function runCraft (self, req, ctx = {}) {
   for (let guard = 0; guard < 40; guard++) {
     if (signal?.aborted) throw new Error('被取消')
 
+    /* 🔴 用户 2026-10-26：「collect 报告收集失败、没收到足够材料时，craft 要上报失败。」
+     *    以前 'decide' 插完 collect 就回 'plan'，collect 失败了也只看背包 → 再插一轮，
+     *    永远报不出失败。这里统一在**插出去的 collect 回来时**判一次：
+     *      · 它失败了（队列把错误写进 st.__lastError）→ craft 直接失败；
+     *      · 它说成功但背包还是不够 → 记一轮，同一材料最多两轮，还不行就报"材料不足"。 */
+    if (st.awaitingCollect) {
+      const wait = st.awaitingCollect
+      st.awaitingCollect = null
+      if (st.__lastError) {
+        const e = st.__lastError
+        st.__lastError = null
+        return fail(`材料不足：收集 ${wait.name} ×${wait.count} 失败 —— ${e.summary ? `${e.summary}：` : ''}${e.error ?? '未知原因'}`)
+      }
+      if (wait.id != null) {
+        const short = Number(wait.need) - have(b, wait.id)
+        if (short > 0) {
+          const key = String(wait.name)
+          st.collectRounds ??= {}
+          st.collectRounds[key] = (st.collectRounds[key] ?? 0) + 1
+          if (st.collectRounds[key] >= 2) {
+            return fail(`材料不足：${key} 收集了 ${st.collectRounds[key]} 轮，背包还差 ${short} 个（要 ${wait.need}，现有 ${have(b, wait.id)}）`)
+          }
+        }
+      }
+    }
+
     /* ── ⓪ 目标本身是"烧出来的"（铁锭/玻璃…）→ 熔炉配方 ──
      * 用户 2026-10-25："生成合成链，铁块配方、铁粒配方和熔炉配方。检查附近方块，熔炉配方命中。"
      * 这里简化成：能烧的目标直接插 smelt（smelt 内部会去 collect 铁原矿）。 */
@@ -241,6 +267,11 @@ export async function runCraft (self, req, ctx = {}) {
           })
           if (inserted) {
             notes.push(`插 collect：${craftableMiss.name} ×${needN}`)
+            /* 记下"我在等它"：它回来时先判成败（见循环开头） */
+            st.awaitingCollect = {
+              name: craftableMiss.name, id: craftableMiss.id ?? null,
+              need: Number(craftableMiss.need) || needN, count: needN,
+            }
             st.phase = 'plan'
             return { yielded: true, text: `⏸ 缺 ${craftableMiss.name}，已插 collect（是合成品会转 craft），craft 挂起` }
           }
@@ -248,7 +279,12 @@ export async function runCraft (self, req, ctx = {}) {
       }
       const other = missing.find((m) => m.name !== 'crafting_table')
       if (other) {
-        st.gather = { name: other.name, count: Math.max(1, Number(other.need) - Number(other.have)) }
+        st.gather = {
+          name: other.name,
+          id: other.id ?? null,
+          need: Number(other.need) || 1,
+          count: Math.max(1, Number(other.need) - Number(other.have)),
+        }
         st.phase = 'gather'
         continue
       }
@@ -276,6 +312,16 @@ export async function runCraft (self, req, ctx = {}) {
     /* ── ①'' 熔炼完成 ── */
     if (st.phase === 'melt_done') {
       if (have(b, req.itemId) >= req.count) return done()
+      /* 🔴 2026-10-26：熔炼子任务失败 / 两轮还是不够 → craft 直接报失败（别无限插 smelt） */
+      if (st.__lastError) {
+        const e = st.__lastError
+        st.__lastError = null
+        return fail(`熔炼 ${req.itemName} 失败：${e.error ?? '未知原因'}`)
+      }
+      st.meltRounds = (st.meltRounds ?? 0) + 1
+      if (st.meltRounds >= 2) {
+        return fail(`材料不足：熔炼 ${req.itemName} ${st.meltRounds} 轮后背包仍只有 ${have(b, req.itemId)}/${req.count}`)
+      }
       st.phase = 'melt'
       continue
     }
@@ -286,12 +332,8 @@ export async function runCraft (self, req, ctx = {}) {
       /* 🔴 用户 2026-10-25 定的队列语义：
        *    插到队首的任务**失败了 = 条件不满足 = 直接报错**，不重试、不计数。
        *    （插队成功后自己就挂起了，根本不存在"循环"——之前的重试计数是多余的，
-       *      真正的循环来自"失败了还回 plan 重来"。） */
-      if (st.__lastError) {
-        const e = st.__lastError
-        st.__lastError = null
-        return fail(`条件不满足：收集 ${st.gather?.name ?? '材料'} 失败 —— ${e.error}`)
-      }
+       *      真正的循环来自"失败了还回 plan 重来"。）
+       *    🔴 2026-10-26：失败判定统一挪到循环开头（st.awaitingCollect），这里不再单独判。 */
       const plan = planCollect(self, st.gather)
       if (!plan.ok) return fail(`收集 ${st.gather.name} 失败：${plan.why}`)
       const inserted = board.yieldFor(job, {
@@ -309,6 +351,11 @@ export async function runCraft (self, req, ctx = {}) {
       st.insertTries = 0
       st.gathers += 1
       notes.push(`插入 collect：${st.gather.name} ×${st.gather.count}`)
+      /* 记下"我在等它"：它回来时先判成败（见循环开头） */
+      st.awaitingCollect = {
+        name: st.gather.name, id: st.gather.id ?? null,
+        need: Number(st.gather.need) || Number(st.gather.count) || 1, count: st.gather.count,
+      }
       st.phase = 'plan'
       return { yielded: true, text: `⏸ 缺 ${st.gather.name}，已插入收集任务，craft 挂起等待` }
     }
@@ -385,7 +432,12 @@ export async function runCraft (self, req, ctx = {}) {
       }
       const need = (tablePlan.missing ?? [])[0]
       if (need) {
-        st.gather = { name: need.name, count: Math.max(1, Number(need.need) - Number(need.have)) }
+        st.gather = {
+          name: need.name,
+          id: need.id ?? null,
+          need: Number(need.need) || 1,
+          count: Math.max(1, Number(need.need) - Number(need.have)),
+        }
         st.phase = 'gather'
         notes.push(`做工作台的材料不够，先收 ${st.gather.name} ×${st.gather.count}`)
         continue
