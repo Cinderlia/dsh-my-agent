@@ -31,6 +31,9 @@ import { homedir, tmpdir } from 'node:os'
 import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
 import { debugLog, debugEnabled, setDebugEnabled, debugFile, readDebugTail } from './src/log.mjs'
 import { defineTool, toolDefKind, loosenNumberParams, coerceNumberArgs } from './src/tool-def.mjs'
+/* 工具的接口约定（用法/效果/注意）写在 src/tool-usage.mjs，注册时统一贴到 description 后面 ——
+ * 用户 2026-10-26：宁可让工具自己说清怎么用，也别让模型去翻 kb/ 文档。 */
+import { withUsage } from './src/tool-usage.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
 import { runText } from './src/task-exec.mjs'
@@ -2743,6 +2746,7 @@ export function apply(ctx, rawConfig) {
   }
   const FOLDED_TO_PROBE = new Set(Object.values(PROBE_ROUTES))
   const asTool = (spec) => {
+    spec = withUsage(spec)
     /* 折叠的工具：只留实现（给 mc_probe 路由），不注册、不进工具名清单 */
     if (spec?.name && FOLDED_TO_PROBE.has(spec.name)) {
       if (typeof spec.execute === 'function') TOOL_HANDLERS.set(spec.name, (args, exec) => spec.execute(args, exec))
@@ -2802,6 +2806,7 @@ export function apply(ctx, rawConfig) {
    * 原语的耗时统计混进工具表里只会污染 `mc_diag {only:perf}`。
    */
   const asPrimitive = (spec) => {
+    spec = withUsage(spec)
     if (spec?.name && !ourToolNames.includes(spec.name)) ourToolNames.push(spec.name)
     if (spec?.name && typeof spec.execute === 'function') {
       // 任务执行器也要能调它们（同一条路，但不经调度器 —— 原语不占资源）
