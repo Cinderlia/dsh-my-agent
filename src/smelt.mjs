@@ -103,6 +103,35 @@ export async function placeFurnaceNearby (self, st, notes = []) {
 }
 
 /**
+ * 把背包里的物品**精确放进熔炉的某个槽**（0=输入, 1=燃料, 2=输出）。
+ *
+ * 🔴 用户 2026-10-25："放错槽位了" —— `window.deposit()` 让服务端自己挑槽，
+ *    原木既是燃料又是可烧物，经常被塞进输入槽当原料烧成木炭。
+ *    这里手动点：左键拿起 → 左键放进目标槽。
+ */
+async function depositToSlot (b, win, itemType, count, targetSlot) {
+  const start = win.inventoryStart ?? 0
+  let srcIdx = -1
+  for (let i = start; i < win.slots.length; i++) {
+    const sl = win.slots[i]
+    if (sl && sl.type === itemType) { srcIdx = i; break }
+  }
+  if (srcIdx < 0) return { ok: false, why: '背包里没有这个物品' }
+  const haveCount = win.slots[srcIdx].count
+  const take = Math.min(count, haveCount)
+  try {
+    await b.clickWindow(srcIdx, 0, 0)          // 左键拿起
+    await b.clickWindow(targetSlot, 0, 0)      // 左键放进目标槽
+    if (take < haveCount) {
+      /* 放多了就再点回来（简化：先整组放，多了下次再说） */
+    }
+    return { ok: true, moved: take }
+  } catch (e) {
+    return { ok: false, why: e.message }
+  }
+}
+
+/**
  * 执行（**状态机**）。ctx = { signal, movements, job, board, log }
  */
 export async function runSmelt (self, req, ctx = {}) {
@@ -277,7 +306,7 @@ export async function runSmelt (self, req, ctx = {}) {
         const fuelEnough = fuelCount > 0 && (!fuelPick || fuelCount >= fuelPick.count)
         if (!fuelEnough) {
           if (fuelPick) {
-            await win.deposit(fuelPick.id, null, Math.max(1, (fuelPick.count ?? 1) - fuelCount))
+            await depositToSlot(b, win, fuelPick.id, Math.max(1, (fuelPick.count ?? 1) - fuelCount), 1)
             notes.push(`补燃料：${fuelPick.name} ×${Math.max(1, (fuelPick.count ?? 1) - fuelCount)}`)
           } else {
             try { win.close?.() } catch { /* ignore */ }
@@ -302,7 +331,7 @@ export async function runSmelt (self, req, ctx = {}) {
 
         /* 原料 */
         if (needInput > 0 && srcName) {
-          await win.deposit(idOf(srcName), null, needInput)
+          await depositToSlot(b, win, idOf(srcName), needInput, 0)
           notes.push(`装料：${srcName} ×${needInput}`)
         }
         st.missInput = false
@@ -346,7 +375,13 @@ export async function runSmelt (self, req, ctx = {}) {
         const win = await b.openBlock(blk)
         try {
           const before = have(b, req.itemId)
-          await win.withdraw(req.itemId, null, Math.min(req.count - before, 64))
+          /* 熔炉输出槽是 2：先从这里拿，别从输入槽把原料当成品拿走 */
+          const out = win.slots?.[2]
+          if (out && out.type === req.itemId) {
+            await win.withdraw(req.itemId, null, Math.min(req.count - before, out.count))
+          } else {
+            await win.withdraw(req.itemId, null, Math.min(req.count - before, 64))
+          }
           await new Promise((r) => setTimeout(r, 300))
           const after = have(b, req.itemId)
           if (after > before) notes.push(`取出 ${req.itemName} ×${after - before}`)

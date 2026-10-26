@@ -50,6 +50,7 @@ const FLY_SPEED = 0.45
 
 /** 搭路用的方块：和 pathfinder 实际会用的那一套保持一致（`scaffoldingItemIds` 是唯一判据） */
 import { scaffoldingItemIds } from './place-items.mjs'
+import { scaffoldItemIds } from './scaffold.mjs'
 
 /** 当前游戏模式（读本地镜像；读不到按 survival 处理 —— 最保守的那档） */
 export function naviModeOf (b) {
@@ -221,12 +222,17 @@ export function previewRoute (self, plan, { movements: mv = null } = {}) {
       routeError: f?.why ?? '没有飞行规划结果',
     }
   }
+  /* 🔴 2026-10-25 实机：navi 执行得好好的（pathfinder.log 里 pfReady:true / goto:function），
+   *    但工具返回里一直挂着『⚠️ 没有可用的 pathfinder』—— 那是**预览**（getPathTo 缺失/失败）
+   *    给的提示，跟能不能走是两回事。预览只是"顺手算一下路线要不要垫方块"，
+   *    失败就不预览，别拿它冒充执行失败。 */
   if (!pf || typeof pf.getPathTo !== 'function') {
-    return { route: null, routeError: '没有可用的 pathfinder（装 mineflayer-pathfinder，见 PATHFINDER.md）' }
+    const diag = { botPathfinder: typeof b.pathfinder, goto: typeof b.pathfinder?.goto, getPathTo: typeof b.pathfinder?.getPathTo, pfModule: Boolean(self?._pf), pfReady: self?.pfReady ?? null }
+    return { route: null, previewUnavailable: true, diag, routeError: null }
   }
-  if (!mv) return { route: null, routeError: '拿不到 Movements 配置（pathfinder 还没挂上？）' }
+  if (!mv) return { route: null, previewUnavailable: true, routeError: null }
   const goal = goalBlockOf(self, plan.target.x, plan.target.y, plan.target.z)
-  if (!goal) return { route: null, routeError: 'pathfinder 没挂上 Goals（先 mc_move 一次让它初始化）' }
+  if (!goal) return { route: null, previewUnavailable: true, routeError: null }
   const t0 = Date.now()
   try {
     const path = pf.getPathTo(mv, goal, 1500)
@@ -518,6 +524,59 @@ async function flyTo (b, target, { signal = null, timeoutMs = NAVI_TIMEOUT_MS, f
  * 执行（后台调用）。走完/失败都抛或返回结构化结果，由调用方注入报告。
  * @returns {Promise<{ok:boolean, moved:number, ms:number, text:string}>}
  */
+/**
+ * **跟随玩家**（pathfinder 的 GoalFollow）—— 直到目标**停下来**、或超时。
+ * 用户 2026-10-25：「navi player 新增 follow 模式，自动跟随」；
+ * 丢东西给玩家时也用它：先跟到人身边，等他停下，再朝他丢。
+ *
+ * @param {object} self  { bot, _pf }
+ * @param {string} who   玩家名
+ * @param {object} opts  { signal, movements, timeoutMs=30000, range=2, stillMs=1500 }
+ */
+export async function runFollow (self, who, opts = {}) {
+  const { signal = null, movements = null, timeoutMs = 30_000, range = 2, stillMs = 1500 } = opts
+  const b = self?.bot
+  if (!b?.entity) throw new Error('还没进服')
+  const name = String(who ?? '').trim()
+  if (!name) throw new Error('要跟随谁？给玩家名')
+  const findEnt = () => Object.values(b.entities ?? {}).find((e) => e?.position && String(e.username ?? e.name ?? '') === name)
+  const ent0 = findEnt()
+  if (!ent0) throw new Error(`附近找不到玩家 ${name}`)
+  const goals = self?._pf?.goals ?? self?._pf?.Goals
+  if (!goals?.GoalFollow) throw new Error('pathfinder 没挂上（没有 GoalFollow）')
+  if (movements) { try { b.pathfinder.setMovements(movements) } catch { /* 用默认 */ } }
+  const t0 = Date.now()
+  b.pathfinder.setGoal(new goals.GoalFollow(ent0, range), true)
+  let stillSince = 0
+  let lastPos = ent0.position.clone()
+  try {
+    while (Date.now() - t0 < timeoutMs) {
+      if (signal?.aborted) throw new Error('被取消')
+      await new Promise((r) => setTimeout(r, 200))
+      const ent = findEnt()
+      if (!ent) throw new Error(`${name} 不见了`)
+      const moved = ent.position.distanceTo(lastPos)
+      lastPos = ent.position.clone()
+      if (moved < 0.02) {
+        stillSince = stillSince || Date.now()
+        if (Date.now() - stillSince >= stillMs) break      // 目标停下超过 1.5 秒 → 跟到位置了
+      } else {
+        stillSince = 0
+      }
+    }
+  } finally {
+    try { b.pathfinder.setGoal(null) } catch { /* 停不掉也无妨 */ }
+  }
+  const me = b.entity.position
+  const ent = findEnt()
+  const dist = ent ? me.distanceTo(ent.position) : null
+  return {
+    ok: true, player: name, distance: dist == null ? null : Math.round(dist * 10) / 10,
+    ms: Date.now() - t0,
+    text: `🏃 跟到 ${name} 旁边（${dist == null ? '?' : dist.toFixed(1)} 格，${((Date.now() - t0) / 1000).toFixed(1)} 秒）`,
+  }
+}
+
 export async function runNavi (self, plan, { signal = null, onProgress = null, movements: mv = null } = {}) {
   const b = self?.bot
   const t0 = Date.now()
@@ -529,7 +588,17 @@ export async function runNavi (self, plan, { signal = null, onProgress = null, m
   }
   if (plan.strategy === 'path') {
     const pf = b.pathfinder
-    if (!pf || typeof pf.goto !== 'function') throw new Error('没有可用的 pathfinder')
+    if (!pf || typeof pf.goto !== 'function') {
+      /* 用户 2026-10-25：这个错要能定位 —— 把现场状态一起报出来（session 文件里能读） */
+      const diag = {
+        botPathfinder: typeof b.pathfinder,
+        goto: typeof b.pathfinder?.goto,
+        pfModule: Boolean(self?._pf),
+        goals: Boolean(self?._pf?.goals || self?._pf?.Goals),
+        pfReady: self?.pfReady ?? null,
+      }
+      throw new Error('没有可用的 pathfinder｜现场: ' + JSON.stringify(diag))
+    }
     const goal = goalBlockOf(self, plan.target.x, plan.target.y, plan.target.z)
     if (!goal) throw new Error('pathfinder 没挂上 Goals')
     /* 按游戏模式改寻路规则（本地自适应，不麻烦 LLM）：

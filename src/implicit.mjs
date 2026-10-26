@@ -159,7 +159,7 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
   if (!blk) return { ok: false, text: `❌ ${x},${y},${z} 那格没加载` }
   let win = null
   try {
-    win = await b.openContainer(blk)
+    win = await b.openBlock(blk)
   } catch (e) {
     return { ok: false, text: `❌ 打不开 ${blk.name}（${x},${y},${z}）：${e.message}` }
   }
@@ -172,6 +172,18 @@ async function runOpenContainer (self, plan, { signal = null, Goals = null, log 
     if (!wantIds.size) return { ok: false, text: `❌ 不认识的物品 ${wantNames.join('/')}` }
     let need = plan.count
     // 容器里的物品：按名字匹配（槽位里可能有多个同类）
+    /* 🔴 用户 2026-10-25：「检查熔炉的输出槽啊喂！如果有烧好的铁就可以直接拿走了，也是整组拿。」
+     *    熔炉窗口的槽位是 [输入, 燃料, 输出, ...玩家背包]，输出槽是 **2**。
+     *    先把输出槽里烧好的成品整组拿走，再去普通槽位里找。 */
+    const isFurnace = /furnace|smoker|blast/.test(String(win.type ?? ''))
+    if (isFurnace) {
+      const out = win.slots?.[2]
+      if (out && wantIds.has(out.type)) {
+        await win.withdraw(out.type, null, out.count)
+        got.push(out.count)
+        need -= out.count
+      }
+    }
     /* 🔴 用户 2026-10-25：「collect 从箱子里拿物品，不要小家子气，直接整组整组拿，
      *    优先拿不到堆叠上限的组，不够再拿满组。」 */
     const slots = win.slots ?? []

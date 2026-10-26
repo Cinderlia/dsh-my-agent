@@ -15,6 +15,8 @@
  * 分工：`mc_act`（复合身体操作）与 `mc_move`（寻路）保持原样不动；
  *      原语是给 agent 补上"自己控制身体"的那一层，不是替换它们。
  * ========================================================================== */
+import { bagWarning } from './scaffold.mjs'
+import { facingDelta, edgeWarning } from './edge-guard.mjs'
 import Vec3 from 'vec3'
 import { entitiesNear } from './world-scan.mjs'
 import { aimAt, lookAnglesTo } from './camera.mjs'
@@ -183,10 +185,24 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
       sneak: { type: 'boolean', description: '潜行' },
       sprint: { type: 'boolean', description: '疾跑' },
       all: { type: 'boolean', description: 'true = 先把所有键松开，再按这次给的（默认 false = 只改给到的键）' },
+      force: { type: 'boolean', description: '边缘预警时仍坚持执行（默认 false = 返回预警不执行）' },
     },
     output: text(),
     async execute (args, exec) {
       const b = needBot(getBot, exec)
+      /* 用户 2026-10-25 边缘保护：绕过 navi 直接前进时，先看前方有没有 >2 格落差。
+       * 有就返回预警、不执行；LLM 确认后再带 force:true 调一次。 */
+      if (args.forward === true && args.force !== true) {
+        const yaw = Number(b.entity?.yaw ?? 0)
+        const [dx, dz] = facingDelta(yaw)
+        const warn = edgeWarning(b, dx, dz)
+        if (warn) {
+          return {
+            ok: false, blocked: true, edge: { drop: warn.drop, at: warn.at, verdict: warn.verdict },
+            text: warn.text + '\n▶ 确认要走就带 `force:true` 再调一次；否则换方向或先 `mc_navi`。',
+          }
+        }
+      }
       if (args.all === true) for (const k of CONTROL_KEYS) b.setControlState(k, false)
       const changed = {}
       for (const k of CONTROL_KEYS) {
@@ -204,6 +220,45 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
         text: on.length
           ? `🕹 按住：${on.join(' + ')}（松开用 mc_input {all:true} 或把对应键设 false）`
           : '🕹 所有移动键都松开了（站住）',
+      }
+    },
+  }
+
+  /* ── 丢弃原语（用户 2026-10-25）：朝指定方向丢，立即返回 ── */
+  const mcToss = {
+    name: 'mc_toss',
+    description: '🗑 **丢弃物品**（原语，立即执行）：从背包丢出指定物品与数量。\n'
+      + '· 给 `dir` 就朝那个方向扔（north/south/east/west/up/down）；不给就朝当前视线\n'
+      + '· 要丢给**玩家**请用工具 `mc_toss_to`（它会先走过去）',
+    parameters: {
+      name: { type: 'string', required: true, description: '物品名（英文 id，如 cobblestone）' },
+      count: { type: 'number', description: '丢几个（默认 1）' },
+      dir: { type: 'string', description: '方向：north/south/east/west/up/down（不给=当前朝向）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const b = botOf(exec)
+      const want = String(args.name ?? '').trim().toLowerCase()
+      if (!want) return { ok: false, text: '❌ 要丢什么？给物品名' }
+      const items = b.inventory.items()
+      const it = items.find((x) => x.name === want) ?? items.find((x) => x.name.endsWith(want))
+      if (!it) {
+        return { ok: false, text: `❌ 背包里没有 ${want}（有：${items.slice(0, 10).map((x) => x.name).join(', ') || '空'}）` }
+      }
+      const count = Math.max(1, Math.min(Number(args.count ?? 1) || 1, it.count))
+      const dir = String(args.dir ?? '').toLowerCase()
+      const YAW = { south: 0, west: 90, north: 180, east: 270 }
+      try {
+        if (dir === 'up') b.look?.(b.entity.yaw, -Math.PI / 2, false)
+        else if (dir === 'down') b.look?.(b.entity.yaw, Math.PI / 2, false)
+        else if (YAW[dir] != null) b.look?.(YAW[dir] * Math.PI / 180, 0, false)
+        await b.toss(it.type, null, count)
+        return {
+          ok: true, name: it.name, count, dir: dir || null,
+          text: `🗑 丢出 ${it.name} ×${count}${dir ? `（朝 ${dir}）` : ''}，背包还剩 ${it.count - count}`,
+        }
+      } catch (e) {
+        return { ok: false, text: `❌ 丢失败：${e.message}` }
       }
     },
   }
@@ -253,6 +308,9 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
       if (act.digging) lines.push(`⛏ 正在挖 ${act.digging.name} @ ${act.digging.position.x},${act.digging.position.y},${act.digging.position.z}`)
       if (act.usingItem) lines.push('🎯 正在用手上物品')
       if (stacks.length) lines.push('🎒 ' + stacks.map((s) => `${s.name}×${s.count}`).join(' · ') + (inv.stacks.length > stacks.length ? ` …（还有 ${inv.stacks.length - stacks.length} 叠，verbose:true 全看）` : ''))
+      /* 用户 2026-10-25：背包空格 <= 2 时预警，提醒清理背包，避免捡不起掉落物 */
+      const warn = bagWarning(b)
+      if (warn) lines.push(warn)
       return {
         position: posOf(p), yaw: round((b.entity?.yaw ?? 0) * 180 / Math.PI, 1), pitch: round((b.entity?.pitch ?? 0) * 180 / Math.PI, 1),
         health: Number.isFinite(hp) ? hp : null, food: Number.isFinite(food) ? food : null,
@@ -415,10 +473,27 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
       look: { type: 'object', additionalProperties: true, description: '{yaw,pitch} 或 {x,y,z} 或 {who}；不给就不动视角' },
       input: { type: 'object', additionalProperties: true, description: '{forward/back/left/right/jump/sneak/sprint} 布尔值' },
       releaseAll: { type: 'boolean', description: 'true = 先松开所有键' },
+      force: { type: 'boolean', description: '边缘预警时仍坚持执行（默认 false = 返回预警不执行）' },
     },
     output: text(),
     async execute (args, exec) {
       const b = needBot(getBot, exec)
+      /* 边缘保护（用户 2026-10-25）：mc_apply 带 forward 也算"绕过 navi 的移动"，一样要拦。
+       * 注意：如果这次同时给了 look，就按**新的朝向**判方向。 */
+      const inputArgs = args.input && typeof args.input === 'object' ? args.input : null
+      if (inputArgs?.forward === true && args.force !== true) {
+        let yaw = Number(b.entity?.yaw ?? 0)
+        const look = args.look && typeof args.look === 'object' ? args.look : null
+        if (look && num(look.yaw, null) !== null) yaw = num(look.yaw) * Math.PI / 180
+        const [dx, dz] = facingDelta(yaw)
+        const warn = edgeWarning(b, dx, dz)
+        if (warn) {
+          return {
+            ok: false, blocked: true, edge: { drop: warn.drop, at: warn.at, verdict: warn.verdict },
+            text: warn.text + '\n▶ 确认要走就带 `force:true` 再调一次；否则换方向或先 `mc_navi`。',
+          }
+        }
+      }
       const did = []
       if (args.releaseAll === true) { for (const k of CONTROL_KEYS) b.setControlState(k, false); did.push('松开全部键') }
       const look = args.look && typeof args.look === 'object' ? args.look : null
@@ -454,11 +529,12 @@ export function buildPrimitives ({ getBot, getSession, text, afterInput = null }
     },
   }
 
-  return [mcLook, mcLookAt, mcInput, mcSwing, mcSelf, mcBlock, mcBlocks, mcEntities, mcApply]
+  return [mcLook, mcLookAt, mcInput, mcSwing, mcSelf, mcBlock, mcBlocks, mcEntities, mcApply, mcToss]
 }
 
 /** 原语名清单（index.js 用来把它们排除在"工具预算/调度器"之外） */
 export const PRIMITIVE_NAMES = [
+  'mc_toss',
   'mc_look', 'mc_look_at', 'mc_input', 'mc_swing',
   'mc_self', 'mc_block', 'mc_blocks', 'mc_entities',
   'mc_apply',

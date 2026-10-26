@@ -43,11 +43,18 @@ import { PRIORITY, DEFAULT_WAIT_MS } from './src/action-scheduler.mjs'
 import Vec3 from 'vec3'
 import { buildPrimitives } from './src/primitives.mjs'
 import { JobBoard } from './src/jobs.mjs'
-import { buildNaviPlan, previewRoute, runNavi, naviReportText } from './src/navi.mjs'
+import { buildNaviPlan, previewRoute, runNavi, runFollow, naviReportText } from './src/navi.mjs'
 import { planCollect, runCollect } from './src/collect.mjs'
 import { buildTargets, checkRange, needsWalk, walkNear, runBatch, batchText } from './src/batch.mjs'
 import { resolveCraftRequest, runCraft, craftRequestText } from './src/craft.mjs'
-import { movements as buildMovements } from './src/plugins.mjs'
+import { resolveSmeltRequest, runSmelt } from './src/smelt.mjs'
+import { ensureScaffoldInHand, bagWarning } from './src/scaffold.mjs'
+import { startKilla } from './src/killa.mjs'
+import { startPassiveAlerts } from './src/passive-alerts.mjs'
+import { startWaterLanding } from './src/water-landing.mjs'
+import { scanSurroundings } from './src/poi.mjs'
+import { runInteract } from './src/interact.mjs'
+import { movements as buildMovements, pfWrite } from './src/plugins.mjs'
 import {
   versionPromptText, versionPromptTitle, versionPromptSource, versionPromptPath, VERSION_PROMPT_FILE,
   readVersionPrompt, writeVersionPrompt, resetVersionPrompt, syncVersionPrompt,
@@ -83,7 +90,7 @@ import { ServerHistory } from './src/serverhistory.mjs'
 import { buildConnectPrompt } from './src/connect-prompt.mjs'
 import { waitForEvents } from './src/wait.mjs'
 export const name = 'dsh-mc-agent'
-export const inject = ['webServer', 'tools']
+export const inject = ['webServer', 'tools', 'skills']
 /** 插件版本（`mc_capabilities` 会报给他；读不到就 unknown） */
 const PLUGIN_VERSION = (() => {
   try { return JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version ?? 'unknown' } catch { return 'unknown' }
@@ -602,6 +609,77 @@ export function apply(ctx, rawConfig) {
    *    状态放这儿、函数留在下面（函数按请求重建无所谓，缓存必须跨请求）。
    * ------------------------------------------------------------------------ */
   const PLUGIN_ROOT = fileURLToPath(new URL('.', import.meta.url))
+  /* 用户 2026-10-25：插件进程比源码旧 = 改的代码没生效（重启 DSH 才会加载）。
+   * 记下本进程的加载时刻，mc_diag 里和 index.js 的 mtime 比一比就能看出来。 */
+  const PLUGIN_START_AT = Date.now()
+  /** 本文件里拼多行文本用（避免手写 反斜杠n 被工具链转义吃掉） */
+  const NL = String.fromCharCode(10)
+  /* ── 技能注册（2026-10-25 用户）：把 skills/ 下的 MC 玩法知识库挂成 runtime skill ──
+   * 参考 dsh-plugin-dev-kb 的做法：skills/<name>.md 带 frontmatter，正文里的 {{KB_ROOT}}
+   * 替换成插件内 kb/ 的实际路径。宿主没有 skills 服务时整段跳过，不影响插件加载。 */
+  const registerSkills = () => {
+    try {
+      const skillsSvc = ctx.skills
+      if (!skillsSvc?.register) { logDebug('宿主没有 skills 服务，跳过技能注册'); return }
+      const dir = join(PLUGIN_ROOT, 'skills')
+      if (!existsSync(dir)) { logDebug('skills 目录不存在，跳过技能注册'); return }
+      const kbRoot = join(PLUGIN_ROOT, 'kb')
+      for (const file of readdirSync(dir)) {
+        if (!file.endsWith('.md')) continue
+        const raw = readFileSync(join(dir, file), 'utf8')
+        /* frontmatter 用 split('---') 解析，避免手写正则被转义坑 */
+        const parts = raw.split('---')
+        if (parts.length < 3) { logDebug(`技能 ${file} 缺少 frontmatter，跳过`); continue }
+        const fmText = parts[1]
+        const body = parts.slice(2).join('---')
+        const fm = {}
+        for (const line of fmText.split(String.fromCharCode(10))) {
+          const idx = line.indexOf(':')
+          if (idx <= 0) continue
+          const key = line.slice(0, idx).trim()
+          const val = line.slice(idx + 1).trim()
+          if (key && val) fm[key] = val
+        }
+        if (!fm.name || !fm.description) { logDebug(`技能 ${file} 缺少 name/description，跳过`); continue }
+        try {
+          ctx.skills.register({
+            name: fm.name,
+            description: fm.description,
+            ...(fm.whenToUse ? { whenToUse: fm.whenToUse } : {}),
+            content: body.replaceAll('{{KB_ROOT}}', kbRoot),
+          })
+          logLine(`技能已注册：${fm.name}（${file}）`)
+        } catch (e) {
+          logLine(`技能 ${fm.name} 注册失败（不影响插件）：${e?.message ?? e}`)
+        }
+      }
+    } catch (e) {
+      logLine('技能注册整段失败（不影响插件）：' + (e?.message ?? e))
+    }
+  }
+  registerSkills()
+  /* 🔴 2026-10-25 实机崩溃：host 进程 8.6 分钟后 JS heap OOM（4GB，MarkCompactCollector
+   *    promotion failed）。mineflayer 的区块/世界缓存是主要嫌疑（跑几个位置就累积几百 MB~GB）。
+   *    这里每 10 秒记一次内存曲线到日志，下次崩溃前能看出是谁在涨；超过 2.5GB 主动告警。 */
+  const MEM_WARN_MB = 2500
+  let memTimer = null
+  try {
+    memTimer = setInterval(() => {
+      try {
+        const m = process.memoryUsage()
+        const mb = (n) => Math.round(n / 1024 / 1024)
+        const line = `[mem] heap ${mb(m.heapUsed)}MB / rss ${mb(m.rss)}MB / external ${mb(m.external)}MB / arrayBuffers ${mb(m.arrayBuffers ?? 0)}MB`
+        logDebug(line)
+        if (mb(m.heapUsed) > MEM_WARN_MB) {
+          logLine(`⚠️ [mem] JS heap 已到 ${mb(m.heapUsed)}MB（>${MEM_WARN_MB}MB）—— 再有增长就要爆，建议重启 DSH`)
+        }
+      } catch { /* 内存读不到不影响 */ }
+    }, 10_000)
+    if (memTimer.unref) memTimer.unref()
+  } catch { /* setInterval 失败就算了 */ }
+  try { ctx.effect?.(() => () => { if (memTimer) clearInterval(memTimer) }, 'dsh-mc-agent: 内存监控') } catch { /* ignore */ }
+
+
   const UPDATE_TTL_MS = 10 * 60 * 1000
   const updateCache = { at: 0, data: null }
   /** 启动后多久查第一次更新：别跟插件初始化抢资源，也别让首屏等它 */
@@ -2516,6 +2594,15 @@ export function apply(ctx, rawConfig) {
   ]
   const MC_PRESENT_TOOL = 'present'
   /**
+   * MC 模式白名单里的【技能工具】（宿主 @deepseek-ai/dsh-tool-skill 注册的名字）。
+   *
+   * 🔴 2026-10-25（用户：让 MC 模式的 agent 也能像 MC+ 一样使用这个技能树）：
+   *    技能正文指向插件内 kb/ 知识库；MC 模式以前没挂技能工具、白名单也不认它。
+   *    这里把 skill 加进白名单（配合 preset 补挂 tool-skill、guard 放行 kb 只读）。
+   *    ⚠️ 是名字不是包名：宿主没挂同名工具时会被 applyAllow 过滤掉（不影响其它）。
+   */
+  const MC_SKILL_TOOLS = ['skill']
+  /**
    * 从一次工具调用里取"要碰的路径"：是文件工具才返回（不是 → null；是但没给路径 → 空串）。
    * 路径参数名按宿主用 `path`，也兼容 harness 的 `file_path`；glob/grep 的目录参数同样是 `path`。
    */
@@ -2634,6 +2721,9 @@ export function apply(ctx, rawConfig) {
     prep: 'mc_prep',
     ping: 'mc_ping',
     lan: 'mc_lan',
+    /* 用户 2026-10-25：mc_dig 和 mc_collect 重复（collect 会自动找、换工具、捡），
+     * 折叠进 mc_probe；只有"挖指定坐标"或批处理（column/line）时才用得到。 */
+    dig: 'mc_dig',
   }
   const FOLDED_TO_PROBE = new Set(Object.values(PROBE_ROUTES))
   const asTool = (spec) => {
@@ -2898,9 +2988,16 @@ export function apply(ctx, rawConfig) {
   const QUEUE_KEEP = new Set([
     'mc_self', 'mc_block', 'mc_blocks', 'mc_entities', 'mc_look', 'mc_look_at',
     'mc_status', 'mc_observe', 'mc_events', 'mc_map', 'mc_probe',
-    ...MC_FILE_TOOLS, MC_PRESENT_TOOL, 'mc_kit_memory',
+    ...MC_FILE_TOOLS, MC_PRESENT_TOOL, ...MC_SKILL_TOOLS, 'mc_kit_memory',
     'mc_interrupt', 'mc_stop',
   ])
+  /* 用户 2026-10-25：**操作型原语折叠** —— 默认不在工具面展示，LLM 明确要"直接控制身体"时才放出来。
+   * 感知类原语（mc_self / mc_blocks / mc_entities / mc_block / mc_look_at）始终保留。
+   * `mc_toss` 不折（用户要求它常驻，丢东西是个独立动作）。 */
+  const CONTROL_PRIMITIVES = ['mc_input', 'mc_apply', 'mc_look', 'mc_swing']
+  /** 哪些会话打开了"手动控制"（agentId 集合） */
+  const manualControl = new Set()
+
   /** agentId → restrict 的撤销手柄 */
   /* 用户 2026-10-24：「stop 原语必须常驻」—— 不论队列状态、不论哪种模式，它都不能被收掉。 */
   const ALWAYS_ON_TOOLS = ['mc_stop']
@@ -2931,6 +3028,33 @@ export function apply(ctx, rawConfig) {
       logLine('队列收窄工具面失败（guard 仍会拦）：' + String(e?.message).slice(0, 160))
     }
   }
+  registerTool(asPrimitive({
+    name: 'mc_control',
+    description: '🕹 **手动控制开关**：打开后才会把操作型原语（mc_input / mc_apply / mc_look / mc_swing）放回工具面；'
+      + '默认它们是折叠的（不鼓励直接接管身体，长活交给任务队列）。队列非空时即使打开也仍然隐藏。',
+    parameters: {
+      on: { type: 'boolean', description: 'true = 打开手动控制；false = 关掉（默认）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const agent = exec?.agent
+      const id = agent?.id
+      const on = args.on === true
+      if (!id) return { ok: false, text: '❌ 拿不到会话 id' }
+      if (on) manualControl.add(String(id))
+      else manualControl.delete(String(id))
+      /* 强制重算：删掉 kind 缓存，让 applyMcModePolicy 重新套白名单 */
+      try { mcPolicyKind.delete(agent) } catch { /* ignore */ }
+      try { applyMcModePolicy(agent) } catch (e) { logLine('重算工具面失败：' + (e?.message ?? e)) }
+      return {
+        ok: true, manual: on,
+        text: on
+          ? '🕹 手动控制已打开：mc_input / mc_apply / mc_look / mc_swing 回到工具面（队列非空时仍会被收走）'
+          : '🕹 手动控制已关闭：操作型原语已折叠，长活请用任务工具',
+      }
+    },
+  }))
+
   /* ── 队列原语：mc_stop / mc_interrupt ─────────────────────────────────── */
   registerTool(asPrimitive({
     name: 'mc_stop',
@@ -3040,6 +3164,7 @@ export function apply(ctx, rawConfig) {
       y: { type: 'number', description: '目标 y' },
       z: { type: 'number', description: '目标 z' },
       player: { type: 'string', description: '玩家名（给了就忽略 x/y/z）' },
+      follow: { type: 'boolean', description: '跟随模式（配 player 用）：一直跟到他停下' },
       radius: { type: 'number', description: '最大允许距离（默认 16，上限 16）' },
       parkour: { type: 'boolean', description: '允许跑酷（默认 true）；false = 只走平路/搭方块' },
     },
@@ -3047,7 +3172,49 @@ export function apply(ctx, rawConfig) {
     async execute (args, exec) {
       const sess = getSession(exec)
       const b = sess.bot.requireBot()
-      const plan = buildNaviPlan(botView(sess), args)
+      /* 🔴 2026-10-25 实机（session 现场 pfModule:false / pfReady:null）：有些连接路径
+       * 没有跑过 setupPlugins ⇒ bot.pathfinder 根本没挂上。这里**懒加载一次**自愈，
+       * 而不是直接把"没有 pathfinder"甩给 AI（它只会退回原语硬走）。
+       * 🔴 注意：view 必须在**补装之后**再取 —— 它是个快照（{bot, _pf}），
+       *    先取再补装的话 `_pf` 还是补装前的 null（第一版就栽在这，session 现场照样报缺失）。 */
+      let view = botView(sess)
+      /* 🔴 用户 2026-10-25：navi 报缺失但 pathfinder.log 显示 setup 成功 —— 把**现场身份**
+       * 都写进文件（agentId / 三个对象是否同一个 / _pf / bot.pathfinder），别再靠猜。 */
+      const snap = () => JSON.stringify({
+        agentId: sess.agentId,
+        sessBotIsMcBot: sess.bot?.constructor?.name,
+        bot: sess.bot?.bot === view.bot,
+        hasBot: Boolean(sess.bot?.bot?.entity),
+        pf: typeof view.bot?.pathfinder,
+        goto: typeof view.bot?.pathfinder?.goto,
+        _pf: Boolean(sess.bot?._pf),
+        pfReady: sess.bot?.pfReady ?? null,
+      })
+      pfWrite(null, '[navi] 进入: ' + snap())
+      if (typeof view.bot?.pathfinder?.goto !== 'function') {
+        try {
+          await sess.bot.setupPathfinder()
+          logDebug('mc_navi: pathfinder 缺失 → 已懒加载一次')
+        } catch (e) {
+          logLine('mc_navi: 懒加载 pathfinder 失败：' + (e?.message ?? e))
+          pfWrite(null, '[navi] 懒加载失败: ' + (e?.message ?? e))
+        }
+        view = botView(sess)      // 重新取快照
+        pfWrite(null, '[navi] 懒加载后: ' + snap())
+      }
+      if (args.follow === true && args.player) {
+        const mvF = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+        const queuedF = jobBoard.enqueue({
+          kind: 'follow', agentId: agentIdOf(exec?.agent),
+          summary: `跟随玩家 ${args.player}`,
+          plan: { player: args.player },
+          run: (signal) => runFollow(view, args.player, { signal, movements: mvF, timeoutMs: 60_000 }),
+        })
+        if (!queuedF.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queuedF.why}` }
+        return { ok: true, jobId: queuedF.job.id, started: queuedF.started, position: queuedF.position,
+          text: `🏃 跟随 ${args.player}：${queuedF.started ? '立刻开始' : '已排队'}` + NL + jobBoard.snapshotText() }
+      }
+      const plan = buildNaviPlan(view, args)
       if (!plan.ok) return { ok: false, ...plan, text: naviReportText(plan) }
       const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
       const { route, routeError } = previewRoute(sess, plan, { movements: mv })
@@ -3169,6 +3336,11 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       }
       const deadline = Date.now() + Math.max(2000, CALL_MS - 800)
       const wantName = args.name ? String(args.name) : null
+      /* 用户 2026-10-25：垫/搭方块自动选一种并补到手上（三废石 → 地狱岩 → 多的一种） */
+      if (!wantName) {
+        const equipped = await ensureScaffoldInHand(b)
+        if (!equipped.ok) return { ok: false, text: `❌ ${equipped.why}` }
+      }
       const result = await runBatch(bt.targets, async (t) => {
         try {
           await sess.bot.placeBlock({ x: t.x, y: t.y, z: t.z, name: wantName })
@@ -3183,6 +3355,232 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       return { ok: result.failed.length === 0 && result.skipped.length === 0, ...result, text: batchText('🧱 放', result, bt.targets.length) }
     },
   }))
+  registerTool(asTool({
+    name: 'mc_chest',
+    description: '📦 **存取箱子**（工具，先走过去）：\n'
+      + '· `action:"take"` + `name`/`count`：从箱子/木桶/熔炉里取（整组拿，拿够就走）\n'
+      + '· `action:"put"` + `name`/`count`（或不给=全放）：放进箱子\n'
+      + '· 不给坐标就用附近 4.5 格的；给了 x/y/z 就走过去开那个\n'
+      + '· 异步：入队后立刻返回，完成/失败会主动报告',
+    parameters: {
+      action: { type: 'string', description: 'open（先看内容）/ take（默认）/ put' },
+      items: { type: 'json', description: 'take/put 时一次多组：[{name:"oak_log",count:64}, …]' },
+      name: { type: 'string', description: '单个物品名（英文 id，兼容旧用法）' },
+      count: { type: 'number', description: '几个（默认整组/全放）' },
+      x: { type: 'number', description: '箱子 x（可选）' },
+      y: { type: 'number', description: '箱子 y（可选）' },
+      z: { type: 'number', description: '箱子 z（可选）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      const b = sess.bot.requireBot()
+      const action = String(args.action ?? 'take').toLowerCase()
+      const want = args.name ? String(args.name).trim().toLowerCase() : null
+      const view = { bot: b, _pf: sess.bot?._pf ?? null }
+      const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+      const queued = jobBoard.enqueue({
+        kind: 'chest', agentId: agentIdOf(exec?.agent),
+        summary: `箱子${action === 'put' ? '存' : '取'} ${want ?? '全部'}`,
+        plan: {
+          action, name: want, count: args.count,
+          items: Array.isArray(args.items) ? args.items : (want ? [{ name: want, count: args.count }] : []),
+          pos: (args.x != null && args.y != null && args.z != null) ? { x: args.x, y: args.y, z: args.z } : null,
+        },
+        run: async (signal, job) => {
+          const st = job.state ??= { phase: 'find' }
+          for (let guard = 0; guard < 30; guard++) {
+            if (signal?.aborted) throw new Error('被取消')
+            if (st.phase === 'find') {
+              let box = null
+              if (st.pos) {
+                const blk = b.blockAt(new Vec3(st.pos.x, st.pos.y, st.pos.z))
+                if (blk && CONTAINER_NAMES.includes(blk.name)) box = blk
+                if (!box) return { ok: false, text: `❌ ${st.pos.x},${st.pos.y},${st.pos.z} 不是箱子（${blk?.name ?? '未加载'}）` }
+              } else {
+                const found = b.findBlock({ matching: CONTAINER_NAMES.map((n) => b.registry.blocksByName[n]?.id).filter(Boolean), maxDistance: 16 })
+                if (!found) return { ok: false, text: '❌ 16 格内没有箱子/木桶/熔炉' }
+                box = found
+              }
+              st.boxPos = box ? { x: box.position.x, y: box.position.y, z: box.position.z } : null
+              const dist = b.entity.position.distanceTo(box.position)
+              if (dist > 4.0) {
+                const navPlan = buildNaviPlan(view, { x: box.position.x, y: box.position.y, z: box.position.z, radius: 16 })
+                if (!navPlan.ok) return { ok: false, text: `❌ 走不到箱子：${navPlan.why}` }
+                const inserted = jobBoard.yieldFor(job, {
+                  kind: 'navi', agentId: job.agentId, summary: `走向箱子 ${box.position.x},${box.position.y},${box.position.z}`, plan: navPlan,
+                  run: (sig) => runNavi(view, navPlan, { signal: sig, movements: mv }),
+                })
+                if (!inserted) return { ok: false, text: '❌ 插导航失败' }
+                st.phase = 'open'
+                return { yielded: true, text: `⏸ 箱子在 ${dist.toFixed(1)} 格外，已插导航` }
+              }
+              st.phase = 'open'
+              continue
+            }
+            if (st.phase === 'open') {
+              const bp = st.boxPos
+              const blk = bp ? b.blockAt(new Vec3(bp.x, bp.y, bp.z)) : null
+              if (!blk) return { ok: false, text: '❌ 箱子不见了' }
+              let win = null
+              try { win = await b.openBlock(blk) } catch (e) { return { ok: false, text: `❌ 打不开箱子：${e.message}` } }
+              try {
+                /* 用户 2026-10-25：第一步先把**内容清单**回给 LLM */
+                if (st.action === 'open') {
+                  const content = []
+                  const invStart = Number(win.inventoryStart ?? 9999)
+                  for (let i = 0; i < Math.min(invStart, win.slots?.length ?? 0); i++) {
+                    const sl = win.slots?.[i]
+                    if (sl && sl.count > 0) content.push({ name: sl.name, count: sl.count })
+                  }
+                  const where = `${blk.name}（${bp.x},${bp.y},${bp.z}）`
+                  return {
+                    ok: true, action: 'open', content,
+                    text: content.length
+                      ? `📦 ${where} 里有：` + content.map((c) => `${c.name}×${c.count}`).join('、')
+                        + NL + '（想好要拿/存什么，再用 action:"take"/"put" + items:[{name,count}]）'
+                      : `📦 ${where} 是空的`,
+                  }
+                }
+                if (st.action === 'put') {
+                  const todo = Array.isArray(st.items) && st.items.length ? st.items : (want ? [{ name: want, count: st.count }] : [])
+                  if (!todo.length) return { ok: false, text: '❌ 要给 items:[{name,count}]（或 name+count）' }
+                  const done = []
+                  for (const one of todo) {
+                    const nm = String(one.name ?? '').trim().toLowerCase()
+                    const id = b.registry?.itemsByName?.[nm]?.id
+                    if (id == null) { done.push(`${nm}（不认识）`); continue }
+                    const picked = b.inventory.items().filter((x) => x.type === id)
+                    if (!picked.length) { done.push(`${nm}（背包没有）`); continue }
+                    const limit = Number(one.count) > 0 ? Number(one.count) : null
+                    let moved = 0
+                    for (const slotItem of picked) {
+                      const n = limit == null ? slotItem.count : Math.min(limit - moved, slotItem.count)
+                      if (n <= 0) break
+                      await win.deposit(id, null, n)
+                      moved += n
+                    }
+                    done.push(`存 ${nm}×${moved}`)
+                  }
+                  return { ok: true, action: 'put', done, text: '📦 ' + done.join('；') }
+                }
+                /* take：多组、整组拿、拿够就走 */
+                const todo = Array.isArray(st.items) && st.items.length ? st.items : (want ? [{ name: want, count: st.count }] : [])
+                if (!todo.length) return { ok: false, text: '❌ 要给 items:[{name,count}]（或 name+count）' }
+                const invStart = Number(win.inventoryStart ?? 9999)
+                const done = []
+                for (const one of todo) {
+                  const nm = String(one.name ?? '').trim().toLowerCase()
+                  const id = b.registry?.itemsByName?.[nm]?.id
+                  if (id == null) { done.push(`${nm}（不认识）`); continue }
+                  const need = Number(one.count) > 0 ? Number(one.count) : 999
+                  let got = 0
+                  for (let i = 0; i < Math.min(invStart, win.slots?.length ?? 0) && got < need; i++) {
+                    const sl = win.slots[i]
+                    if (!sl || sl.type !== id) continue
+                    const take = Math.min(need - got, sl.count)
+                    await win.withdraw(id, null, take)
+                    got += take
+                  }
+                  done.push(`取 ${nm}×${got}`)
+                }
+                return { ok: true, action: 'take', done, text: '📦 ' + done.join('；') }
+              } finally {
+                try { win.close?.() } catch { /* 已关 */ }
+              }
+            }
+          }
+          return { ok: false, text: '❌ 推进次数超限' }
+        },
+      })
+      if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
+      return {
+        ok: true, jobId: queued.job.id, started: queued.started, position: queued.position,
+        text: `📦 ${action === 'put' ? '存' : '取'} ${want ?? '全部'}：${queued.started ? '立刻开始' : `排队第 ${queued.position} 位`}` + NL + jobBoard.snapshotText(),
+      }
+    },
+  }))
+
+  registerTool(asTool({
+    name: 'mc_toss_to',
+    description: '🎁 **丢东西给玩家**（工具）：先走到玩家身边，再朝他丢出指定物品与数量。\n'
+      + '· 只要方向、不要走过去，请用原语 `mc_toss {dir}`\n'
+      + '· 异步：入队后立刻返回，走完/失败会主动报告',
+    parameters: {
+      name: { type: 'string', required: true, description: '物品名（英文 id）' },
+      count: { type: 'number', description: '丢几个（默认 1）' },
+      player: { type: 'string', required: true, description: '玩家名' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      const b = sess.bot.requireBot()
+      const want = String(args.name ?? '').trim().toLowerCase()
+      const player = String(args.player ?? '').trim()
+      if (!want || !player) return { ok: false, text: '❌ 要同时给 name 和 player' }
+      const items = b.inventory.items()
+      const it = items.find((x) => x.name === want) ?? items.find((x) => x.name.endsWith(want))
+      if (!it) return { ok: false, text: `❌ 背包里没有 ${want}` }
+      const count = Math.max(1, Math.min(Number(args.count ?? 1) || 1, it.count))
+      const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+      const queued = jobBoard.enqueue({
+        kind: 'toss_to', agentId: agentIdOf(exec?.agent), summary: `把 ${it.name}×${count} 丢给 ${player}`,
+        plan: { name: it.name, count, player },
+        run: async (signal) => {
+          /* 用户 2026-10-25：「先 navi player follow，等到他停下了，再自动调整方向朝 player 丢弃。」 */
+          await runFollow({ bot: b, _pf: sess.bot?._pf ?? null }, player, {
+            signal, movements: mv, timeoutMs: 45_000,
+          })
+          const ent = Object.values(b.entities ?? {}).find((e) => e?.position && String(e.username ?? e.name ?? '') === player)
+          if (!ent) return { ok: false, text: `❌ 跟丢 ${player} 了` }
+          try { await b.lookAt(ent.position.offset(0, 1.4, 0), true) } catch { /* 看不过去就直接丢 */ }
+          await new Promise((r) => setTimeout(r, 150))
+          await b.toss(it.type, null, count)
+          const dist = b.entity.position.distanceTo(ent.position)
+          return {
+            ok: true, name: it.name, count, player,
+            distance: Math.round(dist * 10) / 10,
+            text: `🎁 跟到 ${player} 旁边（${dist.toFixed(1)} 格），丢出 ${it.name} ×${count}`,
+          }
+        },
+      })
+      if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
+      return {
+        ok: true, jobId: queued.job.id, started: queued.started, position: queued.position,
+        text: `🎁 把 ${it.name}×${count} 丢给 ${player}：${queued.started ? '立刻开始' : `排队第 ${queued.position} 位`}` + chr(10) + jobBoard.snapshotText(),
+      }
+    },
+  }))
+
+  registerTool(asTool({
+    name: 'mc_smelt',
+    description: '🔥 **熔炼**（状态机）：给产物名（iron_ingot / glass / charcoal…），自动找/放熔炉、'
+      + '精确放输入槽和燃料槽、等烧完、取成品、回收自己放的熔炉。缺原料会自动 collect。',
+    parameters: {
+      name: { type: 'string', required: true, description: '要烧出的物品（iron_ingot / gold_ingot / glass / charcoal…）' },
+      count: { type: 'number', description: '要几个（默认 1，上限 64）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      sess.bot.requireBot()
+      const req = resolveSmeltRequest(botView(sess), args)
+      if (!req.ok) return { ok: false, ...req, text: `❌ ${req.why}` }
+      const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+      const queued = jobBoard.enqueue({
+        kind: 'smelt', agentId: agentIdOf(exec?.agent),
+        summary: `熔炼 ${req.itemName} ×${req.count}`,
+        plan: req,
+        run: (signal, job) => runSmelt(botView(sess), req, { signal, movements: mv, job, board: jobBoard, log: (m) => logDebug('[smelt] ' + m) }),
+      })
+      if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
+      return {
+        ok: true, jobId: queued.job.id, started: queued.started, position: queued.position, ...req,
+        text: `🔥 熔炼 ${req.itemName} ×${req.count}：${queued.started ? '立刻开始' : `排队第 ${queued.position} 位`}` + NL + jobBoard.snapshotText(),
+      }
+    },
+  }))
+
   registerTool(asTool({
     name: 'mc_craft',
     description: '🧱 **合成物品**（状态机）：只给"要什么 + 几个"，**不用先看背包**。\n'
@@ -3220,6 +3618,46 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       return { ok: true, jobId: queued.job.id, started: queued.started, position: queued.position, ...req, text: craftRequestText(req) + '\n' + where + '\n\n' + jobBoard.snapshotText() }
     },
   }))
+  registerTool(asTool({
+    name: 'mc_scan_surroundings',
+    description: '🎯 **兴趣点雷达**（不返回全量方块，只回报"值得关注的"）：\n'
+      + '· 按类别分组（危险生物/岩浆/矿石/木材/石料/功能方块/食物），每类只给最近 N 个；\n'
+      + '· 只统计**暴露在空气中**的方块（埋着的不算）；\n'
+      + '· `focus` 决定加权：build（造房子）/ ore（挖矿）/ combat（打架）/ survival（生存）/ explore / farm / auto\n'
+      + '· 输出稳定在 ~200 字符，适合频繁调用；代价 ~100ms',
+    parameters: {
+      radius: { type: 'number', description: '扫描半径（默认 16，上限 32）' },
+      focus: { type: 'string', description: '焦点：auto（默认）/ build / ore / combat / survival / explore / farm' },
+      limit: { type: 'number', description: '每类最多几处（默认 3，上限 8）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      const b = sess.bot.requireBot()
+      const r = scanSurroundings({ bot: b, _pf: sess.bot?._pf ?? null }, args)
+      if (!r.ok) return { ok: false, text: `❌ ${r.why}` }
+      return { ok: true, focus: r.focus, radius: r.radius, groups: r.groups, elapsedMs: r.elapsedMs, text: r.text }
+    },
+  }))
+
+  registerTool(asTool({
+    name: 'mc_interact',
+    description: '🤝 **通用交互**：上船/下车、锄地、播种、繁殖、剪羊毛、挤奶、开关门。统一流程是「找目标 → 走过去 → 换对该用的东西 → 右键」。',
+    parameters: {
+      action: { type: 'string', required: true, description: 'board（上船/矿车/马）/ dismount / hoe（锄地）/ plant（播种）/ breed（繁殖）/ shear（剪羊毛）/ milk（挤奶）/ open（门/按钮/箱子）/ toggle' },
+      who: { type: 'string', description: '实体名或动物种类（board/breed/shear/milk 用）' },
+      x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+      item: { type: 'string', description: '指定用背包里的哪个物品（不给就按 action 自动挑）' },
+    },
+    output: text(),
+    async execute (args, exec) {
+      const sess = getSession(exec)
+      const b = sess.bot.requireBot()
+      const r = await runInteract({ bot: b, _pf: sess.bot?._pf ?? null }, args)
+      return r
+    },
+  }))
+
   registerTool(asTool({
     name: 'mc_probe',
     description: '**入口路由**：查环境、连接、诊断、背包/方块扫描这类"偶尔查一次"的能力都从这里进（它们不再单独占工具名）。\n'
@@ -3404,9 +3842,55 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         throw withUserHint(e, resolved.label)
       }
       sess.mode = 'active'
+      /* 🔴 2026-10-25：连接后确认插件真的装上了 —— 有的路径没跑到 setupPlugins，
+       * 结果是"日志说 pathfinder 就绪、实际 bot.pathfinder 是 undefined"。 */
+      if (sess.bot.pfReady !== true) {
+        try {
+          const out = await sess.bot.setupPlugins()
+          logLine('连接后补装插件：' + JSON.stringify(out))
+        } catch (e) {
+          logLine('连接后补装插件失败（不影响连接）：' + (e?.message ?? e))
+        }
+      }
       // 记忆里的聊天记录（用户 2026-10-20）：进服就把钩子挂上，之后每条公屏都进 chat-log.md
       const chatLogRoot = attachChatLog(sess, exec?.agent)
       const ready = await sess.bot.waitForChunks()
+      /* 用户 2026-10-25：killa —— 敌对生物进入可触及范围就接管身体
+       * （有武器就跳劈，没武器/苦力怕就远离；接管时停掉队列并报告） */
+      try {
+        if (globalThis.__killaStop) { try { globalThis.__killaStop() } catch { /* ignore */ } }
+        const killa = startKilla({ bot: sess.bot?.bot, _pf: sess.bot?._pf ?? null }, {
+          board: jobBoard,
+          report: (t) => { try { jobBoard.inject(`killa-${Date.now()}`, t) } catch { /* ignore */ } },
+          log: (t) => logDebug('[killa] ' + t),
+        })
+        globalThis.__killaStop = () => killa.stop()
+      } catch (e) {
+        logLine('killa 启动失败（不影响连接）：' + (e?.message ?? e))
+      }
+      /* 用户 2026-10-25：溺水 / 受伤 / 饥饿 三类预警 + auto_eat */
+      try {
+        if (globalThis.__alertsStop) { try { globalThis.__alertsStop() } catch { /* ignore */ } }
+        const alerts = startPassiveAlerts({ bot: sess.bot?.bot }, {
+          report: (t) => { try { jobBoard.inject(`alert-${Date.now()}`, t) } catch { /* ignore */ } },
+          log: (t) => logDebug('[alerts] ' + t),
+        })
+        globalThis.__alertsStop = () => alerts.stop()
+      } catch (e) {
+        logLine('killa 启动失败（不影响连接）：' + (e?.message ?? e))
+      }
+      /* 用户 2026-10-25：自动落地水（MLG 水桶）—— 背包有水桶且不在下界时，
+         跌落 >5 格且脚下到实地之间全是空气，就自动切水桶朝下放水缓冲、落地后收回。 */
+      try {
+        if (globalThis.__waterLandingStop) { try { globalThis.__waterLandingStop() } catch { /* ignore */ } }
+        const wl = startWaterLanding({ bot: sess.bot?.bot }, {
+          report: (t) => { try { jobBoard.inject(`water-landing-${Date.now()}`, t) } catch { /* ignore */ } },
+          log: (t) => logDebug('[water-landing] ' + t),
+        })
+        globalThis.__waterLandingStop = () => wl.stop()
+      } catch (e) {
+        logLine('自动落地水启动失败（不影响连接）：' + (e?.message ?? e))
+      }
       // 进服自动挂看门狗（用户要求：进游戏自动打开）
       const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal, watchdogGate(sess))
       // 把自己的游戏名学进叫法（默认叫法里**没有**私人名字 —— 见 learnName 的注释）
@@ -4167,6 +4651,30 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
     async execute(args, exec) {
       const sess = getSession(exec)
       const mode = String(args.mode ?? '')
+      /* 🔴 用户 2026-10-25：**walk 模式折叠** —— 它和 mc_navi 完全重复，而且是一次 10 秒的同步版。
+       *    这里直接转交给 mc_navi（异步队列），只保留 fly / swim / boat / jump 四个特殊模式。 */
+      if (mode === '' || mode === 'walk' || mode === 'walk-nodig') {
+        const b = sess.bot.requireBot()
+        if (args.x === undefined && args.z === undefined) {
+          return { ok: false, text: '❌ 走路请给坐标；纯移动请用 mc_navi（异步队列版）' }
+        }
+        const navArgs = { x: args.x, z: args.z }
+        if (args.y !== undefined) navArgs.y = args.y
+        const plan = buildNaviPlan(botView(sess), { ...navArgs, radius: 16 })
+        if (!plan.ok) return { ok: false, ...plan, text: naviReportText(plan) }
+        const mv = (() => { try { return buildMovements(sess.bot, { terrain: null }) } catch { return null } })()
+        const queued = jobBoard.enqueue({
+          kind: 'navi', agentId: agentIdOf(exec?.agent),
+          summary: `导航到 (${plan.target.x}, ${plan.target.y}, ${plan.target.z})`,
+          plan,
+          run: (signal) => runNavi(botView(sess), plan, { signal, movements: mv }),
+        })
+        if (!queued.ok) return { ok: false, queue: jobBoard.snapshot(), text: `⛔ ${queued.why}` }
+        return {
+          ok: true, redirected: true, jobId: queued.job.id, started: queued.started,
+          text: `🚶 walk 已折叠 → 转交 mc_navi（${queued.started ? '立刻开始' : '已排队'}）` + NL + jobBoard.snapshotText(),
+        }
+      }
       /* 「不破坏方块的模式」= `mode:"walk-nodig"` 或 `noDig:true`（用户 2026-10-20）。
        * 只影响走路那一条：寻路的 `canDig` 关掉，卡住时"挖开台阶"的补救也关掉
        * （见 `src/movement.mjs` 的 `walkPathfinder`）。 */
@@ -5574,6 +6082,43 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
    * 🔴 调用点必须在这儿：`agentPresetsSvc` / `isMcModeAgent` / `isMcPlusAgent` /
    *    `MC_PLUS_NOTICE_TEXT` 都在上面才声明（早于它们会 TDZ）。
    * ------------------------------------------------------------------ */
+  /**
+   * 每轮一行「附近兴趣点」（用户 2026-10-25）：只在 MC 模式 + 已连接时返回。
+   * 焦点跟着**当前队列任务**走：craft → build，collect 矿石 → ore，导航 → explore，
+   * killa 接管中 → combat。每轮现扫（MC 是实时更新的游戏），输出压到一行 ~80 字符。
+   */
+  const poiLineOf = (agent) => {
+    try {
+      /* MC+ 也算（开放全部工具的变体）；两个判据任一成立就注入 */
+      if (!isMcModeAgent(agent) && !isMcPlusAgent(agent)) return null
+      const id = agentIdOf(agent)
+      const sess = id ? registry.peek(String(id)) : null
+      const b = sess?.bot?.bot
+      if (!b?.entity) return null
+      const cur = jobBoard.current
+      let focus = 'auto'
+      if (cur) {
+        const s2 = String(cur.summary ?? '')
+        if (/(killa|攻击|战斗)/i.test(s2)) focus = 'combat'
+        else if (cur.kind === 'craft') focus = 'build'
+        else if (cur.kind === 'collect') {
+          if (/(ore|矿石|铁矿|金矿|钻石)/i.test(s2)) focus = 'ore'
+          else if (/(log|wood|原木|木板)/i.test(s2)) focus = 'wood'
+        } else if (cur.kind === 'smelt') focus = 'ore'
+        else if (cur.kind === 'navi') focus = 'explore'
+      }
+      const r = scanSurroundings({ bot: b, _pf: sess.bot?._pf ?? null }, { radius: 16, focus, limit: 2 })
+      if (!r.ok || !r.groups.length) return null
+      const parts = r.groups.slice(0, 4).map((g) => {
+        const it = g.items?.[0]
+        if (!it) return null
+        return g.key === 'hostile' ? `${g.label} ${it.name} ${it.d}格血${it.hp ?? '?'}` : `${g.label} ${it.name} ${it.d}格`
+      }).filter(Boolean)
+      if (!parts.length) return null
+      return `🎯 附近（焦点 ${focus}）：` + parts.join(' · ')
+    } catch { return null }
+  }
+
   const {
     SESSION_SEED_FILES, ensureMemoryRootForCwd, enterWithNotices,
     memoryIndexText, promptInjectionStatus, reconcileNotices,
@@ -5587,7 +6132,7 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         logOnce, mcPresetDir, memoryBaseFor,
         memoryFor, memoryRootFor, migrateLegacyAgentsMd,
         migrateWorkspaceConfig, noteAgent, pluginConfig,
-        pluginLoadNote, readAgentsMd, readVersionPrompt,
+        pluginLoadNote, readAgentsMd, readVersionPrompt, poiLineOf,
         syncRulesVersion, syncVersionPrompt, userMessage,
         versionPromptPath, versionPromptSource, versionPromptText,
         versionPromptTitle, workspaceConfigValues, workspaceOf,
@@ -5747,11 +6292,14 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       if (!t) { mcPolicyKind.delete(agent); logLine('MC 模式：拿不到 scoped tools，跳过可见性限制（guard 仍会硬拒，下次再试）'); return }
       const { allowOtherTools, hideAdminTools, allowCompanionTools } = pluginConfig.mcMode
       const adminNames = ourToolNames.filter((n) => n.startsWith('mc_admin_'))
+      const manual = agent.id ? manualControl.has(String(agent.id)) : false
       const wanted = [
-        ...ourToolNames.filter((n) => !n.startsWith('mc_admin_')),
+        ...ourToolNames.filter((n) => !n.startsWith('mc_admin_')
+          && (manual || !CONTROL_PRIMITIVES.includes(n))),
         ...(hideAdminTools ? [] : adminNames),
         ...MC_FILE_TOOLS,
         MC_PRESENT_TOOL,
+        ...MC_SKILL_TOOLS,
         // 配套插件（ACP / billion-context 那族）默认放行 —— 用户 2026-10-19 要的"装完就能用"
         ...(allowCompanionTools === false ? [] : MC_COMPANION_TOOLS),
         ...allowOtherTools,
@@ -5892,6 +6440,19 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       //    `<工作区>/.dsh-mc-agent/` 之内；**没给路径也算越界**（glob/grep 不给路径 = 扫整个工作区）。
       const raw = fileToolPath(exec)
       if (raw !== null) {
+        /* 🔴 2026-10-25（用户：MC 模式也能用这个技能树）：技能正文指向插件内 kb/ 的【绝对路径】，
+         *    它在记忆根之外，会被下面只能在记忆文件夹一刀切拦掉。这里给【只读】文件工具开一个口子：
+         *    路径解析到 <插件根>/kb/ 之下就放行（写类工具 write/edit/ops_replace 与 mc_kit_memory
+         *    仍走记忆根限制，不许写 kb；kb 是插件自带的只读教程，放行读没有越权风险）。 */
+        if (/^(read|glob|grep|read_image|ls|cat)$/i.test(name)) {
+          const relKb = String(raw ?? '').trim()
+          if (relKb) {
+            const absKb = isAbsolute(relKb) ? resolve(relKb) : resolve(PLUGIN_ROOT, relKb)
+            const kbDir = join(PLUGIN_ROOT, 'kb')
+            const kbPrefix = kbDir.endsWith(sep) ? kbDir : kbDir + sep
+            if (absKb === kbDir || absKb.startsWith(kbPrefix)) return undefined
+          }
+        }
         const root = memoryRootFor(workspaceOf(exec?.agent), agentIdOf(exec?.agent))
         const rel = String(raw ?? '').trim()
         if (!rel) {
@@ -6210,6 +6771,27 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         /* 统一动作调度器（阶段 P0：只记账）：谁在占什么、撞过几次车。
          * 排查"两个动作互相踩"（合成 / 熔炼 / 开箱子抢同一个窗口、走路被挖矿抢控制位）用。 */
         scheduler: sess.bot.actionSnapshot(),
+        /* 用户 2026-10-25：pathfinder 挂载诊断 —— 会话里直接能看到"模块找到没、bot.pathfinder 挂上没" */
+        /* 代码是不是旧的：index.js 的 mtime 晚于本进程启动时刻 → 改的代码没加载 */
+        pluginBuild: (() => {
+          try {
+            const st = statSync(fileURLToPath(new URL('./index.js', import.meta.url)))
+            const stale = st.mtimeMs > PLUGIN_START_AT + 1000
+            return {
+              startedAt: new Date(PLUGIN_START_AT).toISOString(),
+              indexMtime: new Date(st.mtimeMs).toISOString(),
+              stale,
+              ...(stale ? { hint: '⚠️ 插件进程比源码旧 —— 改的代码没生效，要**重启 DSH 应用**（不是重连 MC）' } : {}),
+            }
+          } catch { return null }
+        })(),
+        pathfinder: sess.bot.pfDiag ?? {
+          moduleLoaded: Boolean(sess.bot._pf),
+          botPathfinder: typeof b.pathfinder,
+          goto: typeof b.pathfinder?.goto,
+          pfReady: sess.bot.pfReady ?? null,
+          note: '挂载时需要 setupPathfinder 跑过；这组是现算的兜底',
+        },
         watching: sess.watchdog?.status() ?? null,
         promptInjection: diagSlimInjection(injection),
         /* 2026-10-15：性能监测 —— `verdict` 里就是"哪个动作该搬 Worker"的中文结论 */

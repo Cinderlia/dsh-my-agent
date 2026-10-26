@@ -414,6 +414,15 @@ export async function runCollect (self, plan, ctx = {}) {
   /* ①' 箱子也翻过了、还是找不到 → 合成品就转 craft（用户 2026-10-25：先箱子，没有不报错，再转 craft）
    *    用户 2026-10-25："collect 铁锭 → 合成品，转交 craft 铁锭。" */
   if (plan.craft) {
+    /* 🔴 先看背包：已经有足够的量就直接完成，不要又去开一炉。
+     *    （实测：背包里已有 9 个铁锭，collect 还是转 craft 又烧了一炉。） */
+    const haveNow = familyCount(b, plan.name)
+    if (haveNow >= plan.count) {
+      return {
+        ok: true, collected: haveNow, name: plan.name, ms: Date.now() - t0, via: 'inventory',
+        text: `✅ 背包里已经有 ${plan.name} ×${haveNow}（要 ${plan.count}），不用再收集/合成`,
+      }
+    }
     if (!board || !job) throw new Error('内部错误：没有队列上下文，无法转交 craft')
     const { resolveCraftRequest, runCraft } = await import('./craft.mjs')
     const req = resolveCraftRequest(self, { name: plan.name, count: plan.count })
@@ -471,12 +480,36 @@ export async function runCollect (self, plan, ctx = {}) {
           return { yielded: true, text: `⏸ 已插入攻击任务（打 ${mob}），collect 挂起等待掉落` }
       }
       const cands = Array.isArray(plan.blocks) && plan.blocks.length ? plan.blocks : [plan.block]
-      const targets = []
+      let targets = []
       for (const bn of cands) targets.push(...findTargets(b, bn, plan.radius, 1))
-      targets.sort((a, c) => a.d - c.d)
-      if (!targets.length) {
-        return fatalFail(`附近的 ${cands.join('/')} 都挖完了，只收到 ${st.got}/${plan.count}`)
+      /* 用户 2026-10-25：**地下目标** —— 16 格没找到就扩大到 48 格（矿脉常在地下层，
+       * 走过去时 navi 会自己挖穿挡路的方块），还找不到就往下挖几格再找。 */
+      if (!targets.length && !st.wideTried) {
+        st.wideTried = true
+        for (const bn of cands) targets.push(...findTargets(b, bn, 48, 1))
+        if (targets.length) steps.push(`附近 16 格没有，扩大到 48 格找到 ${targets.length} 个`)
       }
+      if (!targets.length) {
+        /* 往脚底下挖（最多 3 格），挖完回到 find 再找一次 */
+        const dug = st.dugDown ?? 0
+        if (plan.digDown !== false && dug < 3) {
+          const base = b.entity.position.floored()
+          const below = b.blockAt(new Vec3(base.x, base.y - 1, base.z))
+          const bad = !below || below.name === 'bedrock' || /water|lava/.test(below.name)
+          if (!bad && below.boundingBox === 'block') {
+            try {
+              await b.dig(below)
+              st.dugDown = dug + 1
+              st.wideTried = false
+              steps.push(`往脚下挖了 1 格找矿（第 ${st.dugDown} 格）`)
+              st.phase = 'find'
+              continue
+            } catch { /* 挖不动就算了 */ }
+          }
+        }
+        return fatalFail(`附近 ${cands.join('/')} 都挖完了（含扩大搜索和下挖 ${st.dugDown ?? 0} 格），只收到 ${st.got}/${plan.count}`)
+      }
+      targets.sort((a, c) => a.d - c.d)
       st.target = targets[0]
       /* 换目标 = 换一个掉落物预算（否则捡几次之后整个 collect 就再也捡不动了） */
       st.pickupTries = 0
@@ -567,34 +600,20 @@ export async function runCollect (self, plan, ctx = {}) {
     }
 
     if (st.phase === 'verify') {
+      /* 用户 2026-10-25：「collect 以物品进背包为准。」
+       * 挖完先等背包涨（vanilla 吸附 1~2 秒）；涨了就继续挖下一个，
+       * 没涨才进 pickup 去把掉落物捡回来（见下面 pickup 阶段）。 */
+      const before = st.before
       let after = familyCount(b, product)
       const deadline = Date.now() + PICKUP_WAIT_MS
-      const t0v = Date.now()
       while (Date.now() < deadline) {
-        await sleep(200)
+        await sleep(300)
         after = familyCount(b, product)
-        if (after > st.before) break
-        /* 🔴 用户 2026-10-25："我怀疑其实 bot 捡起来了，但是它以为自己没捡起来"。
-         *    掉落物实体**消失**（被吸走/被捡）也该算捡到了 —— 背包同步常慢一两秒，
-         *    只盯背包会误判成"没捡到"，然后去挖下一个，结果多挖。 */
-        if (Date.now() - t0v > 1500) {
-          const t = st.target
-          const left = dropsNear(b, { x: t.x + 0.5, y: t.y + 0.5, z: t.z + 0.5 }, 6, productNames())
-          if (!left.length) {
-            st.got += 1
-            steps.push('掉落物实体已消失 → 视为已捡起')
-            st.phase = 'find'
-            st.toolRequested = false
-            st.pickupTries = 0
-            st.before = familyCount(b, product)
-            after = st.before
-            break
-          }
-        }
+        if (after > before) break
       }
-      if (after > st.before) {
-        st.got += after - st.before
-        steps.push(`背包 +${after - st.before}`)
+      if (after > before) {
+        st.got += after - before
+        steps.push(`背包 +${after - before}`)
         st.phase = 'find'
         st.tries = 0
         st.toolRequested = false
@@ -657,8 +676,7 @@ export async function runCollect (self, plan, ctx = {}) {
       }
       if (!board || !job) return fail('内部错误：没有队列上下文，无法插入捡取任务')
       const inserted = board.yieldFor(job, {
-        kind: 'navi',
-        agentId: job.agentId,
+        kind: 'navi', agentId: job.agentId,
         summary: `collect: 去捡掉落物 ${Math.floor(drop.x)},${Math.floor(drop.y)},${Math.floor(drop.z)}`,
         plan: navPlan,
         run: (sig) => runNavi(self, navPlan, { signal: sig, movements }),

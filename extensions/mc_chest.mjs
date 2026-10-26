@@ -187,6 +187,12 @@ export function hintFor (name) {
 /* ───────────────────────── 工具 ───────────────────────── */
 
 export async function apply (api) {
+  /* 2026-10-25：存取箱子改由 index.js 的队列工具（先 navi 再存取）接管；
+   * 想回到旧的同步版设 DSH_MC_AGENT_LEGACY_CHEST=on。 */
+  if (process.env.DSH_MC_AGENT_LEGACY_CHEST !== 'on') {
+    api.logLine?.('mc_chest 老扩展已停用（改由队列工具接管；想用旧的设 DSH_MC_AGENT_LEGACY_CHEST=on）')
+    return
+  }
   const { ctx, asTool, getSession, logLine } = api
 
   ctx.tools.register(asTool({

@@ -362,6 +362,7 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
     let chaseGiveUp = false
     let grewSince = 0
     let lastDist = distOf(target)
+    let lastJumpAt = 0
     const hpStart = Number(b.health)
     try {
       await b.pvp.attack(target)
@@ -387,7 +388,17 @@ export async function attack (b, { who = null, budget = 20_000, kite = false, pr
           chaseGiveUp = true
           break
         }
-        /* ③ 举盾：只在"等它打过来"的窗口举 0.3 秒，挡完立刻放（举着不能攻击，会拖慢输出） */
+        /* ③ 跳劈（用户 2026-10-25）：手持剑/斧打**单个**目标时周期性跳，
+         *    pvp 会在下落段出手 = 暴击；节奏 1.1 秒，别连跳（跳起来就打不到贴脸的）。 */
+        const held = String(b.heldItem?.name ?? '')
+        if (/(_sword|_axe)$/.test(held) && Date.now() - lastJumpAt > 1100) {
+          lastJumpAt = Date.now()
+          try {
+            b.setControlState('jump', true)
+            setTimeout(() => { try { b.setControlState('jump', false) } catch { /* 掉线 */ } }, 130)
+          } catch { /* 跳不了就算了 */ }
+        }
+        /* ③' 举盾：只在"等它打过来"的窗口举 0.3 秒，挡完立刻放（举着不能攻击，会拖慢输出） */
         if (opts.shield && (++ticks % 8) === 0) {
           try { b.activateItem(true); shields++ } catch { /* 没有副手盾 / 插件不支持就跳过 */ }
           await sleep(320)
