@@ -117,6 +117,10 @@ export class JobBoard {
   brief (j) {
     return {
       id: j.id, kind: j.kind, summary: j.summary, status: j.status, startedAt: j.startedAt, endedAt: j.endedAt, root: Boolean(j.root),
+      /* 🔴 2026-10-26：`agentId` 必须带上 —— 宿主的队列闸门（队列忙就收起操作工具）
+       *    是拿 `snap.current.agentId` 去找 agent 的，少这个字段闸门就永远不触发
+       *    （症状：队列在跑，但工具面一点没变、debug 日志里也没有 🔒 那一行）。 */
+      agentId: j.agentId ? String(j.agentId) : null,
       /* 挂起中的任务：它正等谁、走到哪一步 —— 排查"卡住不动"全靠这两个字段 */
       waitingOn: j.waitingOn ?? null,
       phase: j.state && typeof j.state === 'object' ? (j.state.phase ?? null) : null,
