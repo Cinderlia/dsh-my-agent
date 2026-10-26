@@ -102,8 +102,8 @@ function cmdSplit (dir) {
   const text = unescapeLiteral(readLiteral().body)
   const sections = splitSections(text)
   if (existsSync(dir)) {
-    // 只清 md，别把用户放的草稿一起删
-    for (const f of readdirSync(dir)) if (f.endsWith('.md')) rmSync(join(dir, f))
+    // 只清「数字-」开头的分节文件，别把 `_怎么用.md`、草稿一起删掉
+    for (const f of readdirSync(dir)) if (/^\d{2}-.*\.md$/.test(f)) rmSync(join(dir, f))
   }
   mkdirSync(dir, { recursive: true })
   sections.forEach((s, i) => {
