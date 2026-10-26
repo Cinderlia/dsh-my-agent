@@ -348,7 +348,7 @@ export async function runCollect (self, plan, ctx = {}) {
   const fail = (why) => ({ ok: false, collected: st.got, name: plan.name, ms: Date.now() - t0, steps, why, text: `❌ 收集 ${plan.name} 失败：${why}` })
   const done = () => ({
     ok: true, collected: st.got, name: plan.name, ms: Date.now() - t0, steps,
-    text: `✅ 收集到 ${plan.name} ×${st.got}（${((Date.now() - t0) / 1000).toFixed(1)} 秒，${steps.length} 步）`,
+    text: `✅ ${plan.name} 够了：背包现有 ${st.got} 个（${((Date.now() - t0) / 1000).toFixed(1)} 秒，${steps.length} 步）`,
   })
 
   /* 🔴 用户 2026-10-24 定的失败条件**只有两种**：

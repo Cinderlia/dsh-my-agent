@@ -60,6 +60,20 @@ const have = (b, id) => {
 }
 
 /**
+ * 插 collect 时该传**多少**：`collect` 的 count 语义是「背包最后至少要有这么多个」，
+ * 不是「还差几个」。
+ *
+ * 🔴 2026-10-26 实测踩过：要 3 个 cobblestone、背包已有 2 个 → 传"缺 1 个"，
+ *    collect 一看背包有 2 ≥ 1，立刻报"收集到 cobblestone ×2"成功返回；
+ *    craft 复查还差 1 个，转两轮就报「材料不足」，一个字都没挖。
+ */
+const collectTarget = (need, haveN) => {
+  const n = Number(need)
+  if (Number.isFinite(n) && n >= 1) return Math.trunc(n)
+  return Math.max(1, Math.trunc(Number(haveN) || 0) + 1)
+}
+
+/**
  * 找一个"能放工作台"的位置（4 格内）：要空气、且相邻有实心方块可依附。
  * 找不到返回 null（调用方再试垫脚）。
  */
@@ -256,7 +270,8 @@ export async function runCraft (self, req, ctx = {}) {
        *    craft 不再直接插 smelt（那是跳过了 collect 这一层）。 */
       const craftableMiss = missing.find((m) => m.name !== 'crafting_table') ?? null
       if (craftableMiss) {
-        const needN = Math.max(1, Number(craftableMiss.need) - Number(craftableMiss.have) - have(b, craftableMiss.id))
+        /* 🔴 传「背包最终要有的总数」，不是「还差几个」（见 collectTarget 的注释） */
+        const needN = collectTarget(craftableMiss.need, craftableMiss.have)
         const cplan = planCollect(self, { name: craftableMiss.name, count: needN })
         if (cplan.ok) {
           const inserted = board.yieldFor(job, {
@@ -283,7 +298,7 @@ export async function runCraft (self, req, ctx = {}) {
           name: other.name,
           id: other.id ?? null,
           need: Number(other.need) || 1,
-          count: Math.max(1, Number(other.need) - Number(other.have)),
+          count: collectTarget(other.need, other.have ?? have(b, other.id)),
         }
         st.phase = 'gather'
         continue
@@ -436,7 +451,7 @@ export async function runCraft (self, req, ctx = {}) {
           name: need.name,
           id: need.id ?? null,
           need: Number(need.need) || 1,
-          count: Math.max(1, Number(need.need) - Number(need.have)),
+          count: collectTarget(need.need, need.have ?? have(b, need.id)),
         }
         st.phase = 'gather'
         notes.push(`做工作台的材料不够，先收 ${st.gather.name} ×${st.gather.count}`)
