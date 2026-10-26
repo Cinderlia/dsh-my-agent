@@ -270,20 +270,21 @@ export function renderTerrain (b, opts = {}) {
     } catch { return null }
   }
 
-  /** 找这一列的地面高度（绝对 y），找不到 → null */
-  const groundY = (x, z) => {
+  /** 找这一列的地面高度（绝对 y）：`{ y }` / `{ unloaded:true }` / `{ blocked:true }` */
+  const groundOf = (x, z) => {
     /* 从自己脚下往上 2 格开始往下扫 10 格：地面必须在"头顶有两格空气"的前提下 */
     for (let y = feet.y + 2; y >= feet.y - 10; y--) {
       const s = solidAt(x, y, z)
-      if (s === null) return null
+      if (s === null) return { unloaded: true }
       if (!s) continue
       const a1 = solidAt(x, y + 1, z)
       const a2 = solidAt(x, y + 2, z)
-      if (a1 === null || a2 === null) return null
-      if (!a1 && !a2) return y
+      if (a1 === null || a2 === null) return { unloaded: true }
+      if (!a1 && !a2) return { y }
       /* 上方被堵（天花板 / 半格）→ 继续往下找，不把天花板当地面 */
     }
-    return null
+    /* 整列都没找到"能站的地面"：这一列是墙/天花板压顶（不是没加载，用户要能分清） */
+    return { blocked: true }
   }
 
   const lines = []
@@ -295,11 +296,11 @@ export function renderTerrain (b, opts = {}) {
       const x = feet.x + fx * depth + rx * lat
       const z = feet.z + fz * depth + rz * lat
       if (i === RADAR_DEPTH - 1 && j === RADAR_SIDE) { row.push('P'); continue }
-      const gy = groundY(x, z)
-      row.push(gy == null ? '?' : String(gy - base))
+      const g = groundOf(x, z)
+      row.push(g.y != null ? String(g.y - base) : (g.unloaded ? '?' : '^'))
     }
     lines.push(row.join(' '))
   }
-  const head = `🗺 地形（前=${dir}，相对你脚下那一层；0=同高，P=你）`
+  const head = `🗺 地形（前=${dir}，相对你脚下那一层；0=同高，P=你，^=这一列被墙/天花板堵住，?=没加载）`
   return { ok: true, dir, lines: [head, ...lines], text: [head, ...lines].join('\n') }
 }
