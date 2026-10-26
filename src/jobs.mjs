@@ -138,10 +138,21 @@ export class JobBoard {
   /**
    * 常驻 prompt 里的那几行。**空队列也给一行** —— 用户要的是"永远知道现在能不能发活"。
    */
-  liveText () {
+  liveText (opts = {}) {
     const s = this.snapshot()
     const busy = Boolean(s.current) || s.queue.length > 0
     const lines = []
+    /* 🔴 用户 2026-10-26：**第三种态 = 没进服**。以前这里不管在线与否都说"可以发活"，
+     *    于是一边念着 mc_collect 一边调它 unknown tool —— 提示词和现实打脸。
+     *    `online` 由宿主传进来（JobBoard 不碰 bot）。 */
+    /* 忙的时候，提示词里那行「能发活的工具」不再列清单 —— 一行字就够。
+     * 用户 2026-10-26：「队列忙的时候能不能精简一下操作类工具描述？反正 agent 不能调用。」 */
+    if (opts.online === false) {
+      lines.push('🧱 还没进服 —— 身体不在游戏里，任何发活的工具都会被拒。')
+      lines.push('   先去 `mc_connect`（或 `mc_accounts` 选账户）；连上之后再发活。')
+      if (busy) lines.push('   （队列里还留着上次的 ' + (s.current ? 1 + s.queue.length : s.queue.length) + ' 件事，进服后会接着跑）')
+      return lines.join('\n')
+    }
     if (!busy) {
       lines.push('📋 任务队列：空 —— 身体闲着，现在可以发活。')
       lines.push('   能发活的工具：`mc_collect`（收集）、`mc_craft`（合成/熔炼）、`mc_smelt`（烧）、'
