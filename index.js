@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { resolve, sep, join, isAbsolute, dirname, basename } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
-import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
+import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath, toolTrace, startCanaryHeartbeat } from './src/core.mjs'
 import { defineTool, toolDefKind, loosenNumberParams, coerceNumberArgs } from './src/tool-def.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
@@ -599,6 +599,7 @@ export function apply(ctx, rawConfig) {
     + `｜工具定义 ${toolDefKind() === 'host' ? '宿主 @deepseek-ai/dsh-tools' : '自带兜底'}`
     + `｜Config ${Config ? 'schema（宿主 schemastery）' : '无（宿主 schemastery 不可用）'}`
     + `｜日志 ${['quiet', 'info', 'debug'][logLevel()] ?? 'info'}（MC_LOG_LEVEL 可调）`)
+  startCanaryHeartbeat()   // 🔴 2026-10-26：冻结哨兵，独立 heartbeat.log
   /* ─────────── 发布区（`.dsh-mc-agent/.express/`）：地址用**工作区 uuid** ───────────
    * 用户 2026-09-17 定稿：`<base>/api/dsh-mc-agent/express/<工作区 uuid>/<剩余路径>`。
    * uuid 直接从宿主的工作区注册表拿（`ctx.workspaceRegistry.list()` 是**同步**的，`path` 已 realpath 规范化）——
@@ -2831,8 +2832,29 @@ export function apply(ctx, rawConfig) {
    * 工具注册的唯一出口（原来是 `ctx.tools.register(asTool(...))` 的 36 处直接调用）。
    * `asTool` 对被折叠的工具返回 `null` —— 这里跳过，于是"折叠"不需要改 36 个调用点。
    */
+  /** 冻结诊断：只取几个关键字段，短、可定位（绝不打敏感/长文本）。 */
+  const traceArgs = (o) => {
+    try {
+      if (!o || typeof o !== 'object') return ''
+      const ks = ['name', 'count', 'mode', 'action', 'who', 'x', 'y', 'z', 'for', 'host', 'path']
+      return ks.filter((k) => o[k] !== undefined && o[k] !== null && typeof o[k] !== 'object')
+        .map((k) => `${k}=${String(o[k]).slice(0, 28)}`).join(' ')
+    } catch { return '' }
+  }
   const registerTool = (tool) => {
     if (!tool) return () => {}
+    // 🔴 2026-10-26 用户（连两次卡死排查）：把 execute 包一层，进入/返回同步写 tool-trace.log。
+    //   主循环被**同步卡死**（连 graceful 断线日志都写不出那类）时，最后一条只有 ▶ 进入、没有 ◀ 返回的
+    //   工具就是元凶；配合 heartbeat.log 能定位到具体那一秒。诊断写盘失败绝不拖垮主流程。
+    if (typeof tool.execute === 'function' && tool.__traced !== true) {
+      const orig = tool.execute.bind(tool)
+      const nm = String(tool.name ?? '?')
+      tool.execute = async function traced (args, exec) {
+        toolTrace('▶', nm, traceArgs(args))
+        try { const r = await orig(args, exec); toolTrace('◀', nm); return r } catch (e) { toolTrace('✖', nm, String(e?.message ?? e).slice(0, 120)); throw e }
+      }
+      tool.__traced = true
+    }
     /* 宿主可能在 register 这一层才做严格校验（defineTool 只是构造）——
      * 2026-10-25 实测：日志停在"工具注册中…"、没有任何"定义失败"，
      * 说明抛错点在 register 而不是 defineTool。这里也兜住，并写明是哪个工具。 */

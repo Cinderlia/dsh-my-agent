@@ -247,7 +247,7 @@ export function createInjector (deps) {
    * @param agent - 宿主 Agent
    * @returns {{removed: number, delivered: boolean}} 摘掉的条数 / 之前是否真的投递过
    */
-  const withdrawAgentsMdNotices = (agent) => {
+  const withdrawAgentsMdNotices = (agent, opts = {}) => {
     const inbox = agent?.inbox
     let removed = 0
     if (inbox && Array.isArray(inbox.nextStep)) {
@@ -281,7 +281,9 @@ export function createInjector (deps) {
     } catch { /* 拿不到日志下标就算了（退化：只信台账） */ }
     // 队列本来就干净 ⇒ 说明那几条**已经进过对话**（载入时从日志认出来的）
     const delivered = removed === 0 && Boolean(ledgerOf(agent).fp)
-    if (removed || delivered) {
+    // 🔴 2026-10-26：enterWithNotices（留在 MC 模式、只是重发前清残留）也走这里，以前会误报
+    //   "已退出 MC 模式"刷屏。加 silent 位：留在模式内的清理不再打这条；真正切出（index.js）才打。
+    if (!opts.silent && (removed || delivered)) {
       logLine(`已退出 MC 模式：清掉待投递提示行 ${removed} 条${delivered ? '（之前投过的那几条仍在对话历史里）' : ''}`)
     }
     return { removed, delivered }
@@ -474,7 +476,7 @@ export function createInjector (deps) {
       if (!r.todo.length && !poi) return decision
       // 队列里若有残留的自家提示行，先摘掉：它们马上要作为**本步消息**送出去了，
       // 留着会让下一步再送一遍（重复注入）。
-      try { withdrawAgentsMdNotices(agent) } catch { /* 摘不掉也不影响本步 */ }
+      try { withdrawAgentsMdNotices(agent, { silent: true }) } catch { /* 摘不掉也不影响本步 */ }
       if (r.todo.length) markNoticesSent(agent, r.todo)
       const msgs = (decision.messages ?? []).filter((m) => !isOurNotice(m))
       const poiMsgs = poi

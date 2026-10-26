@@ -16,7 +16,7 @@
  * （`logLine`/`logDebug`/`logOnce`/`logLevel`/`stamp` 被 index.js、4 个扩展、8 个套件从 core.mjs import）。
  */
 import {
-  existsSync, statSync, mkdirSync, appendFileSync, renameSync, readdirSync, unlinkSync,
+  existsSync, statSync, mkdirSync, appendFileSync, renameSync, readdirSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { join, dirname, basename } from 'node:path'
 
@@ -120,6 +120,42 @@ export function logDebug (...args) {
   const line = `[dsh-mc-agent ${stamp()}] ${args.join(' ')}`
   if (logLevel() >= LOG_LEVELS.debug) appendLog(defaultLogFile, line)
   return line
+}
+
+/** 🔴 2026-10-26：冻结诊断专用文件（主日志同级，独立、不污染）。
+ *  - `tool-trace.log`：每次工具 execute 的「▶ 进入 / ◀ 返回 / ✖ 抛错」同步落盘。
+ *    主循环被**同步卡死**时，最后一条只有「▶ 进入」没有「◀ 返回」的工具 = 元凶（连它自己的
+ *    graceful 断线日志都写不出，就是因为卡在这里）；超过 4MB 自动清一次。
+ *  - `heartbeat.log`：每 1s 盖一个时间戳。卡死后它会"停在某一秒"，那一秒≈冻结起点，
+ *    用来和 server 端 `Timed out`、scheduler 最后一行对齐。 */
+export function getLogFile () { return defaultLogFile }
+function traceDir () {
+  const f = defaultLogFile
+  if (!f) return null
+  try { return dirname(f) } catch { return null }
+}
+export function toolTrace (mark, name, extra) {
+  const d = traceDir()
+  if (!d) return
+  const f = join(d, 'tool-trace.log')
+  try {
+    try { if (existsSync(f) && statSync(f).size > 4 * 1024 * 1024) writeFileSync(f, '') } catch { /* 还没建 */ }
+    appendFileSync(f, `[${stamp()}] ${mark} ${name}${extra ? ' ' + extra : ''}` + String.fromCharCode(10))
+  } catch { /* 诊断写盘失败绝不拖垮主流程 */ }
+}
+export function startCanaryHeartbeat () {
+  if (typeof setInterval !== 'function') return
+  const g = (globalThis.__dshMcAgentCanary ??= { on: false })
+  if (g.on) return
+  g.on = true
+  const beat = () => {
+    const d = traceDir()
+    if (!d) return
+    try { appendFileSync(join(d, 'heartbeat.log'), stamp() + String.fromCharCode(10)) } catch { /* 忽略 */ }
+  }
+  beat()
+  const t = setInterval(beat, 1000)
+  try { t.unref?.() } catch { /* 不阻塞退出 */ }
 }
 
 /**

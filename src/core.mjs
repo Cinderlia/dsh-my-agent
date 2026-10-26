@@ -211,7 +211,7 @@ export { glyphOf } from './block-names.mjs'
 /** 异步小工具已搬到 `src/async-util.mjs`（路线图第 ④ 条第三刀）；这里保留同名导出 */
 export { withTimeout, raceAbort } from './async-util.mjs'
 /** 日志基建已搬到 `src/log.mjs`（路线图第 ④ 条第五刀）；这里保留同名导出 */
-export { logLine, logDebug, logOnce, logLevel, stamp } from './log.mjs'
+export { logLine, logDebug, logOnce, logLevel, stamp, toolTrace, startCanaryHeartbeat, getLogFile } from './log.mjs'
 /** 挑方块/垫脚料已搬到 src/place-items.mjs（路线图第 ④ 条第六刀）；这里保留同名导出 */
 export { isFullBlockItem, scaffoldingItemIds, pickPlaceItem } from './place-items.mjs'
 export { TIMEOUTS, CALL_MS, CALL_BUDGET_MS, callBudget, callDeadline, callSecText, budgetSecText } from './budget.mjs'
