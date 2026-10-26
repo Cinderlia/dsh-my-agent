@@ -107,6 +107,9 @@
     "dev:stop": "node tools/dev.mjs stop",
     "prepublishOnly": "npm run check:all",
     "postinstall": "node tools/fix-mc-deps.mjs --auto",
-    "fix:deps": "node tools/fix-mc-deps.mjs"
+    "fix:deps": "node tools/fix-mc-deps.mjs",
+    "prompt:split": "node tools/prompt-files.mjs split",
+    "prompt:check": "node tools/prompt-files.mjs check",
+    "prompt:join": "node tools/prompt-files.mjs join"
   }
 }

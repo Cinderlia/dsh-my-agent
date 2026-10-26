@@ -54,6 +54,7 @@ const MAX_BYTES = 128 * 1024
  * 参数名/默认值/上限全部交给工具自己的 description（那里与代码同源，不会像常驻文档一样漂移）。
  * 第十一版把 39 个工具的参数抄了进来，重复且每轮多花约 1K token（用户 2026-10-20 已定过"减少 token 消耗"的调子）。
  */
+/* >>> PROMPT-LITERAL-START —— 这一段由 `node tools/prompt-files.mjs join` 覆盖，别手改 */
 export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 
 ## 宗旨
@@ -433,6 +434,7 @@ export const DEFAULT_AGENTS_MD = `# dsh-mc-agent 行事准则
 - **不动别人的东西**（见「多人服」）。
 - **工具出问题及时说清**，别默默卡住；然后继续玩。
 `
+/* <<< PROMPT-LITERAL-END */
 
 export function agentsMdPath (dir) { return join(dir, FILE) }
 
