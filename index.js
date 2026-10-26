@@ -251,12 +251,24 @@ class McSession {
      * `events` 里写。用 `on()` 统一登记，`#unwire()` 里摘。 */
     const on = (ev, fn) => { this.bot.on(ev, fn); this._wiredHandlers.push([ev, fn]) }
     on('log', (line) => pluginCtx.logger?.info?.(`[${self.agentId}] ${line}`))
-    on('spawn', (e) => self.#pushEvent('lifecycle', `已上线 ${e.sub} @ ${JSON.stringify(e.position)}`))
+    /* 🔴 用户 2026-10-26：**上线/离线要翻转工具面** —— 没上线只留连接相关，上线才放出操作工具。
+     *    刷新函数在后面才定义（模块初始化早于任何连接），这里只在事件真正触发时调用。 */
+    const gate = () => { try { refreshOnlineGate(self.agentId) } catch { /* 拿不到 agent 就算了 */ } }
+    on('spawn', (e) => {
+      self.#pushEvent('lifecycle', `已上线 ${e.sub} @ ${JSON.stringify(e.position)}`)
+      gate()
+    })
     on('death', (e) => self.#pushEvent('lifecycle', `我死了 @ ${JSON.stringify(e.position)}`))
-    on('reconnect', (e) => self.#pushEvent('lifecycle', `已重连 ${e.sub}`))
+    on('reconnect', (e) => {
+      self.#pushEvent('lifecycle', `已重连 ${e.sub}`)
+      gate()
+    })
     // 🔴 断线也要进事件队列（2026-09-19）：`mc_events` 里看得见，AI 才不会以为"一直在线"。
-    on('offline', (e) => self.#pushEvent('lifecycle',
-      `连接断开：${e?.reason ?? '连接结束'}${e?.willReconnect ? '（正在自动重连）' : '（不会自动重连）'}`))
+    on('offline', (e) => {
+      self.#pushEvent('lifecycle',
+        `连接断开：${e?.reason ?? '连接结束'}${e?.willReconnect ? '（正在自动重连）' : '（不会自动重连）'}`)
+      gate()
+    })
     on('chat', ({ who, text }) => self.#pushEvent('chat', `<${who}> ${text}`, { who }))
     on('system', ({ text }) => self.#pushEvent('system', text))
     on('damage', (e) => self.#pushEvent('damage', `血量降到 ${e.health} @ ${JSON.stringify(e.position)}`))
@@ -3001,35 +3013,116 @@ export function apply(ctx, rawConfig) {
   /** 哪些会话打开了"手动控制"（agentId 集合） */
   const manualControl = new Set()
 
-  /** agentId → restrict 的撤销手柄 */
-  /* 用户 2026-10-24：「stop 原语必须常驻」—— 不论队列状态、不论哪种模式，它都不能被收掉。 */
-  const ALWAYS_ON_TOOLS = ['mc_stop']
+  /* 用户 2026-10-24 / 2026-10-26：「stop 和介入原语都必须常驻」——
+   * 不论队列状态、不论哪种模式、不论在不在线，这两个都不能被收掉。 */
+  const ALWAYS_ON_TOOLS = ['mc_stop', 'mc_interrupt']
+  /**
+   * 套一层 `allow` 收窄。名字里有宿主不认识的（它拿 restrictableNames 校验）就在报错里
+   * 读出"它认识的"，过滤一次再试 —— 否则某个会话没挂 skill/present 时每次翻新都会抛一次。
+   */
+  const restrictAllow = (t, want, label) => {
+    try {
+      return t.restrict({ allow: want })
+    } catch (e) {
+      const knownPart = /known global tools:\s*([\s\S]*)$/.exec(String(e?.message ?? ''))
+      const known = new Set((knownPart?.[1] ?? '').split(',').map((s) => s.trim()).filter(Boolean))
+      const usable = want.filter((n) => known.has(n))
+      if (!known.size || !usable.length) throw e
+      logDebug(`${label}：白名单里有宿主不认识的名字（${want.filter((n) => !known.has(n)).join(', ')}）→ 已按在场的工具过滤`)
+      return t.restrict({ allow: usable })
+    }
+  }
   const queueGateRelease = new Map()
+  /** agentId → 当前是否已经把操作工具收起来了（true=已隐藏） */
+  const queueGateOn = new Map()
+  /** 🔴 用户 2026-10-26 定的架构：工具面只在**状态翻转**时重载 ——
+   *    ① 第一个操作任务发布（空闲→忙）：隐藏所有操作类工具，只留感知类 + mc_stop / mc_interrupt；
+   *    ② 初始任务完成/失败 → 队列清空（忙→空闲）：恢复操作工具。
+   *    队列忙期间链内子任务反复 changed() 一律**不重算**（没翻转就直接 return）——
+   *    否则每次重算整张白名单会把共享事件循环压死（真机表现：看门狗停不掉、session/cancel
+   *    gateway/internal）。观察类工具本就不进队列，忙的时候照样能直接并发执行。 */
   const queueStateChanged = (snap) => {
     const agentId = snap?.current?.agentId ?? snap?.queue?.[0]?.agentId
     if (!agentId) return
     const agent = safeAgentById(agentId)
     if (!agent?.ctx) return
-    const prev = queueGateRelease.get(agentId)
     const shouldGate = Boolean(snap.busy) || snap.state === 'intervening'
+    const wasGated = queueGateOn.get(agentId) === true
+    if (shouldGate === wasGated) return          // 关键：没翻转 ⇒ 不重载（省掉 restrict 风暴）
     if (!shouldGate) {
-      if (prev) {
-        try { prev() } catch { /* 已经撤过 */ }
-        queueGateRelease.delete(agentId)
-        logDebug('队列空了：主动工具已恢复')
-      }
+      const prev = queueGateRelease.get(agentId)
+      queueGateRelease.delete(agentId)
+      queueGateOn.set(agentId, false)
+      if (prev) { try { prev() } catch { /* 已经撤过 */ } }
+      logDebug('队列排空：操作工具已恢复')
+      debugLog('🔓 队列排空：操作工具已恢复')
       return
     }
+    const t = scopedTools(agent.ctx)
+    if (!t) return
     try {
-      if (prev) prev()
-      const t = scopedTools(agent.ctx)
-      if (!t) return
-      const allow = [...new Set([...QUEUE_KEEP, ...ALWAYS_ON_TOOLS])]
-      queueGateRelease.set(agentId, t.restrict({ allow }))
-      logDebug(`队列非空（${snap.state}）：已隐藏主动工具，只留感知类 + mc_interrupt / mc_stop`)
+      queueGateRelease.set(agentId, restrictAllow(t, [...new Set([...QUEUE_KEEP, ...ALWAYS_ON_TOOLS])], '队列闸门'))
+      queueGateOn.set(agentId, true)
+      logDebug(`队列非空（${snap.state}）：已隐藏操作工具，只留感知类 + mc_stop / mc_interrupt`)
+      debugLog('🔒 队列非空：操作工具已隐藏（只留感知类 + mc_stop / mc_interrupt）')
     } catch (e) {
       logLine('队列收窄工具面失败（guard 仍会拦）：' + String(e?.message).slice(0, 160))
     }
+  }
+  /* ── 离线闸门（用户 2026-10-26）────────────────────────────────────────────
+   * 「bot 没上线的时候隐藏所有 mc 相关的工具，除了连接相关；bot 在线期间才能展示。」
+   * 和队列闸门一样是**叠一层 restrict**，并且只在**在线/离线翻转**时重载。 */
+  /** 没上线时仍然可见的：连接/账户（含状态/诊断）+ 文件·记忆·技能 + 两个常驻原语。
+   *  🔴 用户 2026-10-26 的原话是"隐藏所有 mc 相关的工具，除了连接相关"——所以游戏内的感知类
+   *     也一起收（没进服时它们只会报"不在线"，占着工具面纯属噪音）。 */
+  const OFFLINE_KEEP = new Set([
+    'mc_connect', 'mc_accounts', 'mc_status', 'mc_probe', 'mc_disconnect',
+    ...MC_FILE_TOOLS, MC_PRESENT_TOOL, ...MC_SKILL_TOOLS,
+    'mc_kit_memory', 'mc_kit_image', 'mc_kit_express',
+    ...ALWAYS_ON_TOOLS,
+  ])
+  const offlineGateRelease = new Map()
+  /** agentId → 当前是否已经按"离线"收窄过 */
+  const offlineGateOn = new Map()
+  /**
+   * 机器人**没上线** ⇒ 把 mc 工具收成"只有连接相关"（见 OFFLINE_KEEP）。
+   * @param agent 宿主 Agent（要用它 ctx 上的 scoped tools）
+   */
+  const applyOnlineGate = (agent) => {
+    if (!agent?.ctx || !agent.id) return
+    const agentId = String(agent.id)
+    let online = false
+    try { online = Boolean(registry.peek(agentId)?.bot?.online) } catch { online = false }
+    const shouldGate = !online
+    const wasGated = offlineGateOn.get(agentId) === true
+    if (shouldGate === wasGated) return
+    const t = scopedTools(agent.ctx)
+    if (!t) return
+    const prev = offlineGateRelease.get(agentId)
+    if (!shouldGate) {
+      offlineGateRelease.delete(agentId)
+      offlineGateOn.set(agentId, false)
+      if (prev) { try { prev() } catch { /* 已经撤过 */ } }
+      logDebug('已上线：mc 工具面已恢复')
+      debugLog('🟢 已上线：mc 工具面已恢复')
+      return
+    }
+    try {
+      offlineGateRelease.set(agentId, restrictAllow(t, [...OFFLINE_KEEP], '离线闸门'))
+      offlineGateOn.set(agentId, true)
+      logDebug('没上线：mc 工具已收起，只留连接相关 + 感知 + 常驻原语')
+      debugLog('⚪ 没上线：mc 工具已收起（只留连接相关 + 感知 + mc_stop / mc_interrupt）')
+    } catch (e) {
+      logLine('离线收窄工具面失败（guard 仍会拦）：' + String(e?.message).slice(0, 160))
+    }
+  }
+  /** 会话上线/下线时刷新离线闸门（bot 事件里没有 agent 对象，只能按会话 id 找回来） */
+  const refreshOnlineGate = (sessionId) => {
+    if (!sessionId) return
+    try {
+      const agent = safeAgentById(String(sessionId))
+      if (agent) applyOnlineGate(agent)
+    } catch (e) { logDebug('离线闸门刷新失败：' + (e?.message ?? e)) }
   }
   registerTool(asPrimitive({
     name: 'mc_control',
@@ -3088,6 +3181,7 @@ export function apply(ctx, rawConfig) {
           const r = await sess.bot.disconnect(args.reason ? String(args.reason) : 'mc_stop offline')
           offline = r
           done.push('已下线')
+          refreshOnlineGate(exec?.agent?.id)     // 下线 ⇒ 工具面收成"只有连接相关"
         } catch (e) { done.push('下线失败：' + e.message) }
       }
       return {
@@ -3929,6 +4023,8 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       const accView = accounts.view(accounts.get(resolved.innerID))
       const st = sess.bot.status()
       const armed = wd.status().armed
+      // 上线 ⇒ 把离线闸门撤掉，操作类工具重新可见（用户 2026-10-26）
+      refreshOnlineGate(exec?.agent?.id)
       return {
         connected: true,
         account: accView ? { innerID: accView.innerID, name: accView.name, type: accView.type } : null,
@@ -4033,6 +4129,7 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
        * 只在真的下线了才切 standby；还在线就如实留着原模式。 */
       const stillOnline = Boolean(sess.bot.online)
       if (!stillOnline) sess.mode = 'standby'
+      refreshOnlineGate(exec?.agent?.id)   // 下线 ⇒ 工具面收成"只有连接相关"
       return {
         online: stillOnline, quit,
         watchdog: watchErr ? `关不掉（${watchErr}）` : watchOff ? '已关闭并已提醒' : '本来就没挂',
@@ -6299,10 +6396,14 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
     //    因为模式在第一次请求之前还可能被改（宿主允许空白期反复切 preset）。
     //    这条日志只是"模式已生效"的标记；真投出去时 `reconcileNotices` 自己会记一行。
     logLine(`${isPlus ? 'MC+ 模式' : isUnrestricted ? 'MC 模式（创造模式全权限）' : 'MC 模式'}生效（preset=${id ?? '?'}，${agent.id}）提示词将在首次请求组装前投递`)
+    // 🔴 用户 2026-10-26：模式这一层定完，再把**离线层**叠上去（没上线就只留连接相关）。
+    //    三层是**相交**的：MC 模式白名单 ∩ 离线闸门 ∩ 队列闸门。
+    const gateOffline = () => { try { applyOnlineGate(agent) } catch (e) { logDebug('离线闸门套用失败：' + (e?.message ?? e)) } }
     // MC+ / 全权限：不套白名单（见上面注释）；guard 对 MC+ 只保留凭据路径拒绝、对全权限什么都不留
-    if (isPlus) return
+    if (isPlus) { gateOffline(); return }
     if (isUnrestricted) {
       logLine('🔓 mcMode.unrestricted 已开：MC 模式不套工具白名单（全部工具可用、文件不限记忆根、mc_admin_* 可调）')
+      gateOffline()
       return
     }
     // ② 工具可见性：**白名单**（用户 2026-09-16 真机投诉："这个 agent 怎么还能用 pwsh！不是只暴露我们指定的工具吗！"）
@@ -6356,6 +6457,7 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       mcPolicyKind.delete(agent)
       logLine(`MC 模式工具白名单**没生效**（${String(e?.message).slice(0, 160)}）—— 管理工具与文件越界仍由 guard 兜底，下次再试`)
     }
+    gateOffline()
   }
   /**
    * 退出 MC 模式（切回普通模式）：**撤回提示行 + 把工具策略换成"非 MC"档**。

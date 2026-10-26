@@ -95,7 +95,12 @@ export class JobBoard {
     if (s.current) lines.push(`  ▶ ${mark(s.current)}`)
     if (s.queue.length) lines.push('  ⏳ ' + s.queue.map(mark).join(' → '))
     if (!s.current && !s.queue.length) lines.push('  （空）')
-    else if (s.current?.root || s.queue.some((j) => j.root)) lines.push('  ★ = 初始任务（它结束/失败会清空整个队列）')
+    else {
+      if (s.current?.root || s.queue.some((j) => j.root)) lines.push('  ★ = 初始任务（它结束/失败会清空整个队列）')
+      /* 🔴 用户 2026-10-26：队列非空时宿主要把**操作类工具**收起来 —— 先说一句，
+       *    免得 agent 发现工具不见了还以为"坏了"。感知类照常可用、直接并发执行。 */
+      lines.push('  🔒 队列忙期间操作类工具已收起（感知类照常可用，直接问就行；mc_stop / mc_interrupt 常驻）')
+    }
     return lines.join('\n')
   }
   /** 队列快照（给工具返回 / 宿主判据用） */
