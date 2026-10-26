@@ -173,7 +173,10 @@ export function buildNaviPlan (self, args = {}) {
   if (mode === 'creative') strategy = 'fly'
   else if (mode === 'spectator') strategy = 'fly-through'
   const canPlace = mode === 'survival' && stock > 0
-  const canDig = mode === 'survival'
+  /* 🔴 用户 2026-10-26：「collect 的 navi 最好包含方块破坏」——
+   *    去捡掉落物时，掉落物常常在**刚挖出来的洞里 / 被一两格挡住**，
+   *    A* 只绕不挖就常常规划不出来或走不过去。这里允许调用方显式 `dig:true` 强制开挖。 */
+  const canDig = args.dig === true || mode === 'survival'
   /* 飞行模式：真的算一条 3D 路线（用户 2026-10-24：「没规划，就是笔直飞」）
    * —— 创造模式不能穿方块，直线撞墙会卡住；这里按方块世界绕行/爬升。 */
   let flight = null
@@ -614,6 +617,8 @@ export async function runNavi (self, plan, { signal = null, onProgress = null, m
        *   跑酷默认开，`parkour:false` 时只走搭路。 */
       if (!plan.canPlace) mv.scafoldingBlocks = []
       if (!plan.canDig) { mv.canDig = false; mv.canPlace = false }
+    /* 反过来也要显式打开：movements 是复用的单例，上一次（比如冒险模式）关过就一直是 false */
+    else mv.canDig = true
       mv.allowParkour = plan.parkour !== false
       try { pf.setMovements(mv) } catch { /* 老版本没有 setMovements 就用默认 */ }
     }

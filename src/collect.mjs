@@ -288,7 +288,7 @@ export function naviPlanToDrop (self, drop, dug = null, radius = COLLECT_RADIUS)
   for (const s of spots) {
     let plan = null
     try {
-      plan = buildNaviPlan(self, { ...s, radius })
+      plan = buildNaviPlan(self, { ...s, radius, dig: true })
     } catch (e) {
       plan = { ok: false, why: e?.message ?? String(e) }
     }
