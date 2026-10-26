@@ -24,6 +24,7 @@ import { isAir, isLiquid, canPlaceInto, isEntityItem } from './block-names.mjs'
 import { pickPlaceItem, isFullBlockItem } from './place-items.mjs'
 import { heldText } from './inventory.mjs'
 import { standableY } from './movement.mjs'
+import { notePlaced } from './bot-placed.mjs'
 
 /* 🔴 2026-10-23 实机（同一段时间里一条 `mc_move` 挂了 208 秒）：`b.placeBlock` 要等服务端
  *    把方块放进去才 settle，服务端不理（拒绝/失步/延迟）就**永不 settle** ——
@@ -282,6 +283,8 @@ export async function placeBlock (self, { x, y, z, name = null } = {}, ctx = {})
    *    **判成功要认变体，别认字面**。 */
   const normName = (s) => String(s ?? '').replace(/wall_/g, '')
   const ok = Boolean(now) && (now === item.name || normName(now) === normName(item.name))
+  /* 用户 2026-10-26：雷达图里「自己放的方块」永远单独给字符、不被折成 O —— 这里记账。 */
+  if (ok) { try { notePlaced(b, pos.x, pos.y, pos.z, now) } catch { /* 记账失败不影响放置 */ } }
   return {
     placed: ok ? item.name : false,
     requested: item.name,

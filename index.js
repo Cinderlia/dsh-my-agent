@@ -43,6 +43,8 @@ import { sleepInBed, wakeUp, farmArea } from './src/farm.mjs'
 import { PRIORITY, DEFAULT_WAIT_MS } from './src/action-scheduler.mjs'
 import Vec3 from 'vec3'
 import { buildPrimitives } from './src/primitives.mjs'
+import { renderRadar, renderTerrain, facingOf, RADAR_LAYERS, RADAR_DEPTH, RADAR_SIDE } from './src/radar.mjs'
+import { tick as poiTick, startFocus as poiStartFocus, stopFocus as poiStopFocus, focusLeftMs as poiFocusLeftMs, FOCUS_MS, RADAR_EVERY_OPEN, RADAR_EVERY_TIGHT, OPEN_SKY_RATIO } from './src/poi-mode.mjs'
 import { JobBoard } from './src/jobs.mjs'
 import { buildNaviPlan, previewRoute, runNavi, runFollow, naviReportText } from './src/navi.mjs'
 import { planCollect, runCollect } from './src/collect.mjs'
@@ -3769,9 +3771,10 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       + '· `lan` — 听局域网里的 MC 公告\n'
       + '· `jobs` — 看后台任务（`args:{id:"job-…"}` 看一个；`args:{cancel:"job-…"}` 取消）\n'
       + '· `debug` — 任务队列调试日志（`args:{on:true|false}` 开关；`args:{tail:60}` 看最近几行）\n'
+      + '· `poi` — 雷达图 / 地形图的节奏：`args:{action:"focus"|"auto"|"now"|"status"}`（focus = 专注模式，默认 5 分钟）\n'
       + '`args` 原样转给被路由的那个实现（参数名和以前一样）。要地形图用 `mc_map`（没折叠）。',
     parameters: {
-      what: { type: 'string', required: true, description: 'inventory / scan / diag / caps / sessions / prep / ping / lan / jobs / debug' },
+      what: { type: 'string', required: true, description: 'inventory / scan / diag / caps / sessions / prep / ping / lan / jobs / debug / poi' },
       args: { type: 'object', additionalProperties: true, description: '转给该能力的参数（如 {name:"oak_log",radius:16} / {address:"host:port"} / {only:"perf"}）' },
     },
     output: text(),
@@ -3815,6 +3818,49 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
           lines.push(tail.length ? `—— 最近 ${tail.length} 行 ——\n${tail.join('\n')}` : '（还没有内容）')
         }
         return { ok: true, enabled: debugEnabled(), file: debugFile(), text: lines.join('\n') }
+      }
+      /* 雷达图 / 地形图 / 专注模式（用户 2026-10-26）——**感知类**原语，队列忙时照样能用。
+       *   action = status（默认）/ focus（开或续，默认 5 分钟）/ auto（退出）/ now（立刻渲染一次） */
+      if (what === 'poi') {
+        const agent = exec?.agent
+        if (!agent?.id) throw new Error('拿不到当前会话（exec.agent 不可用）')
+        const id = String(agent.id)
+        const action = String(a.action ?? 'status').trim().toLowerCase()
+        if (action === 'focus' || action === 'on') {
+          const min = Number(a.minutes ?? a.min ?? 5)
+          const span = (Number.isFinite(min) && min > 0 ? Math.min(min, 60) : 5) * 60_000
+          poiStartFocus(id, span)
+          return {
+            ok: true,
+            focus: true,
+            ms: span,
+            text: `🎯 专注模式已开（${Math.round(span / 60000)} 分钟）：**每轮都给雷达图、不给地形图**；`
+              + '到期会自动退出并提醒一次（不报倒计时）。想提前退：`mc_probe{what:"poi",args:{action:"auto"}}`',
+          }
+        }
+        if (action === 'auto' || action === 'off' || action === 'exit') {
+          poiStopFocus(id)
+          return { ok: true, focus: false, text: '🎯 已退出专注模式，恢复自动节奏（地形图按空气占比给、雷达图每 9/4 轮）' }
+        }
+        const sess = getSession(exec)
+        const bb = sess?.bot?.bot
+        if (!bb?.entity) throw new Error('还没进服（先 mc_connect）')
+        const dir = facingOf(bb.entity.yaw)
+        const left = poiFocusLeftMs(id)
+        const head = `🎯 POI 节奏：${left > 0 ? `专注模式（还剩 ${Math.ceil(left / 1000)}s）` : '自动'}`
+          + `｜雷达图 ${RADAR_DEPTH}排×${RADAR_SIDE * 2 + 1}列×${RADAR_LAYERS}层`
+          + `，${left > 0 ? '每轮都给' : `每 ${RADAR_EVERY_OPEN}/${RADAR_EVERY_TIGHT} 轮（看空气占比）`}`
+          + `｜地形图${left > 0 ? '关' : `空气>${Math.round(OPEN_SKY_RATIO * 100)}% 时给`}`
+        const parts = [head]
+        let extra = {}
+        if (action === 'now' || action === 'show') {
+          const t = renderTerrain(bb, { dir })
+          const rd = renderRadar(bb, { dir })
+          if (t.ok) parts.push(t.text)
+          if (rd.ok) parts.push(rd.text)
+          extra = { airRatio: rd.ok ? rd.airRatio : null, dir }
+        }
+        return { ok: true, focusLeftMs: left, ...(extra.dir ? extra : {}), text: parts.join('\n') }
       }
       const target = PROBE_ROUTES[what]
       if (!target) throw new Error(`未知的 what="${what}"；可用：${[...Object.keys(PROBE_ROUTES), 'jobs', 'debug'].join(' / ')}`)
@@ -6221,6 +6267,11 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
    * 每轮一行「附近兴趣点」（用户 2026-10-25）：只在 MC 模式 + 已连接时返回。
    * 焦点跟着**当前队列任务**走：craft → build，collect 矿石 → ore，导航 → explore，
    * killa 接管中 → combat。每轮现扫（MC 是实时更新的游戏），输出压到一行 ~80 字符。
+   *
+   * 🔴 2026-10-26 用户加了「分层雷达图 + 地形图 + 专注模式」（见 `src/radar.mjs` 头注释）：
+   *    雷达图 = 5(前后) × 9(左右) × 5(层) 的 ASCII；地形图 = 5×9 的相对高度（只算地面）。
+   *    节奏由 `src/poi-mode.mjs` 定：空气 > 50% ⇒ 地形图常驻 + 雷达图每 9 轮；
+   *    否则地形图不给 + 雷达图每 4 轮；专注模式 ⇒ 雷达图常驻、不给地形图。
    */
   const poiLineOf = (agent) => {
     try {
@@ -6242,15 +6293,43 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         } else if (cur.kind === 'smelt') focus = 'ore'
         else if (cur.kind === 'navi') focus = 'explore'
       }
+      const dir = facingOf(b.entity?.yaw)
+      /* 雷达图先渲染一次：它的"空气占比"决定这一轮要不要给地形图（同一份数据，不重复扫） */
+      const radar = renderRadar(b, { dir, focus })
+      const openSky = radar.ok ? radar.airRatio > OPEN_SKY_RATIO : false
+      const pace = poiTick(id, openSky)
+
+      const lines = []
+      /* ① 专注模式到期提醒（只提醒一次；不报还剩多久，让 agent 自己续） */
+      if (pace.expired) {
+        lines.push(`⏳ 专注模式已到期（${Math.round(FOCUS_MS / 60000)} 分钟）——已恢复自动节奏；`
+          + '要接着专注就 `mc_probe{what:"poi",args:{action:"focus"}}`')
+      }
+
+      /* ② 原来那行"附近兴趣点"（16 格，压缩到一行） —— 保留 */
       const r = scanSurroundings({ bot: b, _pf: sess.bot?._pf ?? null }, { radius: 16, focus, limit: 2 })
-      if (!r.ok || !r.groups.length) return null
-      const parts = r.groups.slice(0, 4).map((g) => {
-        const it = g.items?.[0]
-        if (!it) return null
-        return g.key === 'hostile' ? `${g.label} ${it.name} ${it.d}格血${it.hp ?? '?'}` : `${g.label} ${it.name} ${it.d}格`
-      }).filter(Boolean)
-      if (!parts.length) return null
-      return `🎯 附近（焦点 ${focus}）：` + parts.join(' · ')
+      if (r.ok && r.groups.length) {
+        const parts = r.groups.slice(0, 4).map((g) => {
+          const it = g.items?.[0]
+          if (!it) return null
+          return g.key === 'hostile' ? `${g.label} ${it.name} ${it.d}格血${it.hp ?? '?'}` : `${g.label} ${it.name} ${it.d}格`
+        }).filter(Boolean)
+        if (parts.length) {
+          lines.push(`🎯 附近（焦点 ${focus}${pace.focus ? '，专注模式' : ''}）：` + parts.join(' · '))
+        }
+      } else if (pace.focus) {
+        lines.push(`🎯 附近（焦点 ${focus}，专注模式）：（这一带没有值得关注的兴趣点）`)
+      }
+
+      /* ③ 地形图（头顶开阔 / 非专注模式时常驻） */
+      if (pace.showTerrain) {
+        const t = renderTerrain(b, { dir })
+        if (t.ok) lines.push(t.text)
+      }
+      /* ④ 雷达图（按节奏来；专注模式每轮都有） */
+      if (pace.showRadar && radar.ok) lines.push(radar.text)
+
+      return lines.length ? lines.join('\n') : null
     } catch { return null }
   }
 

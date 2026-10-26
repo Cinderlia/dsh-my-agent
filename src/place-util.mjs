@@ -1,4 +1,5 @@
 import Vec3 from 'vec3'
+import { notePlaced } from './bot-placed.mjs'
 
 /**
  * 放一个方块（裸 mineflayer 版）。
@@ -32,6 +33,8 @@ export async function placeAt (b, x, y, z, name) {
     const ref = b.blockAt(pos.offset(r.d[0], r.d[1], r.d[2]))
     if (ref && ref.boundingBox === 'block') {
       await b.placeBlock(ref, new Vec3(r.f[0], r.f[1], r.f[2]))
+      /* 用户 2026-10-26：记一笔「自己放的」，雷达图里它永远不折叠。 */
+      try { notePlaced(b, pos.x, pos.y, pos.z, name ?? b.blockAt(pos)?.name ?? null) } catch { /* 记账失败不影响放置 */ }
       return { ok: true, x: pos.x, y: pos.y, z: pos.z }
     }
   }
