@@ -53,6 +53,7 @@ import { ensureScaffoldInHand, bagWarning } from './src/scaffold.mjs'
 import { startKilla } from './src/killa.mjs'
 import { startPassiveAlerts } from './src/passive-alerts.mjs'
 import { startWaterLanding } from './src/water-landing.mjs'
+import { startStuckGuard } from './src/stuck-guard.mjs'
 import { scanSurroundings } from './src/poi.mjs'
 import { runInteract } from './src/interact.mjs'
 import { movements as buildMovements, pfWrite } from './src/plugins.mjs'
@@ -4009,6 +4010,18 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         globalThis.__waterLandingStop = () => wl.stop()
       } catch (e) {
         logLine('自动落地水启动失败（不影响连接）：' + (e?.message ?? e))
+      }
+      /* 用户 2026-10-26：被卡进方块（头部那一格是实心方块）就自动 tp 到上方最近的可站位置，
+         触发/成功/失败各发一条通知。 */
+      try {
+        if (globalThis.__stuckGuardStop) { try { globalThis.__stuckGuardStop() } catch { /* ignore */ } }
+        const sg = startStuckGuard({ bot: sess.bot?.bot }, {
+          report: (t) => { try { jobBoard.inject(`stuck-guard-${Date.now()}`, t) } catch { /* ignore */ } },
+          log: (t) => logDebug('[stuck-guard] ' + t),
+        })
+        globalThis.__stuckGuardStop = () => sg.stop()
+      } catch (e) {
+        logLine('卡方块自救启动失败（不影响连接）：' + (e?.message ?? e))
       }
       // 进服自动挂看门狗（用户要求：进游戏自动打开）
       const wd = ensureWatchdog(ctx, sess, exec?.agent, promptAbort.signal, watchdogGate(sess))
