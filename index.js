@@ -489,6 +489,8 @@ export function apply(ctx, rawConfig) {
    *    （显式传了 agentId 的调用点不受影响）。
    */
   const lastAgentByCwd = new Map()
+  /** agentId 集合 —— 队列推状态行时要标脏所有在用的 agent（同一局通常只有一个） */
+  const knownAgents = () => [...new Set(lastAgentByCwd.values())]
   const noteAgent = (agent) => {
     const id = agentIdOf(agent)
     const cwd = workspaceOf(agent)
@@ -3001,6 +3003,11 @@ export function apply(ctx, rawConfig) {
     log: (m) => { logDebug(m); debugLog('    ·', m) },
     /* 队列状态一变就调宿主去收窄/恢复工具面（用户：任务板非空就隐藏所有主动工具） */
     onStateChange: (snap) => queueStateChanged(snap),
+    /* 用户 2026-10-26：「把实时任务队列送进常驻 prompt」——队列每个生命周期节点都推一次，
+     * 不 steer（会打断它手上的活），只是标脏，下一轮 pre-step 重投时自然带上最新状态。 */
+    onProgress: (text) => {
+      try { for (const a of knownAgents()) markStatusDirty(a, text) } catch { /* 推送失败不影响队列 */ }
+    },
   })
   /* ── 队列闸门（用户 2026-10-24）───────────────────────────────────────────
    * 「任务板非空就隐藏所有主动工具，不让 agent 操作。」
@@ -6261,6 +6268,35 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
   const isMcModeAgent = (agent) => pluginConfig.isMcModePreset(mcPresetIdOf(agent))
   /** MC+ 变体判据（MC 模式基础上开放标准模式全部工具）；名单与语义见 src/config.mjs isMcPlusPreset */
   const isMcPlusAgent = (agent) => pluginConfig.isMcPlusPreset(mcPresetIdOf(agent))
+  /* ── 实时状态行（用户 2026-10-26）───────────────────────────────────────
+   * 「把实时任务队列送进常驻 prompt，让 LLM 知道自己在做什么。」
+   * 顺序刻意是「我在干什么 → 我看到什么」：队列状态在前，环境情报在后。
+   */
+  const statusDirty = new Set()
+  const markStatusDirty = (agentId, text) => {
+    if (!agentId || !text) return
+    statusDirty.add(String(agentId))
+    /* 身体忙/闲翻转 → 看门狗心跳跟着降频/恢复（用户 2026-10-26） */
+    try {
+      const sess = registry.peek(String(agentId))
+      const wd = sess?.watchdog
+      if (wd && typeof wd.setBodyBusy === 'function') wd.setBodyBusy(jobBoard.snapshot().busy)
+    } catch { /* 调不了就按原样 */ }
+  }
+  /** 每轮注入前的实时状态：永远非空（队列空也给一行，告诉它现在能发什么活） */
+  const statusLineOf = (agent) => {
+    if (!isMcModeAgent(agent) && !isMcPlusAgent(agent)) return null
+    const id = agentIdOf(agent)
+    if (!id) return null
+    const queued = jobBoard.liveText()
+    const env = poiLineOf(agent)
+    const parts = []
+    if (queued) parts.push(queued)
+    if (env) parts.push(env)
+    if (!parts.length) return null
+    statusDirty.delete(String(id))
+    return parts.join(String.fromCharCode(10, 10))
+  }
   /* ── 提示词注入 / 通知台账 / 记忆根播种 ─────────────────────────────────
    * 原来这几摊子就写在这儿（666 行），2026-10-20 搬进了 `src/inject.mjs`：
    * 它和"工具"没关系，讲的是"该不该塞提示词 / 哪些指令发过了 / 新会话播种哪些文件"。
@@ -6351,7 +6387,7 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         logOnce, mcPresetDir, memoryBaseFor,
         memoryFor, memoryRootFor, migrateLegacyAgentsMd,
         migrateWorkspaceConfig, noteAgent, pluginConfig,
-        pluginLoadNote, readAgentsMd, readVersionPrompt, poiLineOf,
+        pluginLoadNote, readAgentsMd, readVersionPrompt, poiLineOf, statusLineOf,
         syncRulesVersion, syncVersionPrompt, userMessage,
         versionPromptPath, versionPromptSource, versionPromptText,
         versionPromptTitle, workspaceConfigValues, workspaceOf,

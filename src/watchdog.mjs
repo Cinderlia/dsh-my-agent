@@ -88,6 +88,9 @@ export const WATCH_DEFAULTS = {  /** 进服自动挂载（用户要求：进游�
 
   /** 心跳间隔（秒）；wakeOn.heartbeat 打开才生效 */
   heartbeatSec: 300,
+  /** 身体忙着执行任务时，心跳间隔**乘这个倍数**（用户 2026-10-26：「队列满的时候可以适当降低看门狗频率」）。
+   *  此时 agent 本来就在盯队列，没必要再按原频率叫它起来看一圈。1 = 不降频。 */
+  busyHeartbeatFactor: 3,
 
   /** 观察窗口（毫秒）：首次命中后先攒这么久，把连珠炮合并成一次唤醒 */
   observeWindowMs: 2000,
@@ -170,6 +173,8 @@ export class Watchdog {
      */
     this.promptSignal = promptSignal ?? new AbortController().signal
     this.config = clone(WATCH_DEFAULTS)
+    /** 身体是否在跑队列任务（由宿主按队列状态翻转设置，用户 2026-10-26） */
+    this.bodyBusy = false
     this.config.mentionPatterns = [...WATCH_DEFAULTS.mentionPatterns]
 
     this.jobId = null
@@ -296,6 +301,29 @@ export class Watchdog {
     this.tickTimer.unref?.()
     this.#record('lifecycle', `看门狗已挂载（${this.config.wakeOn.heartbeat ? `心跳 ${this.config.heartbeatSec}s` : '无心跳'}）`)
     return this.status()
+  }
+
+  /**
+   * 通知看门狗「身体正忙 / 闲了」—— 忙时心跳间隔乘 `busyHeartbeatFactor`。
+   * 只在**翻转**时有意义，重复调用是幂等的。
+   */
+  setBodyBusy (busy) {
+    const next = Boolean(busy)
+    if (next === this.bodyBusy) return { busy: next, changed: false }
+    this.bodyBusy = next
+    this.#record('lifecycle', next
+      ? `身体开始执行任务：心跳间隔降到 1/${this.busyHeartbeatFactorOf()}（${this.effectiveHeartbeatSec()}s）`
+      : `身体闲下来了：心跳间隔恢复（${this.effectiveHeartbeatSec()}s）`)
+    return { busy: next, changed: true, heartbeatSec: this.effectiveHeartbeatSec() }
+  }
+  busyHeartbeatFactorOf () {
+    const f = Number(this.config.busyHeartbeatFactor)
+    return Number.isFinite(f) && f > 1 ? f : 1
+  }
+  /** 当前**实际生效**的心跳间隔（秒） —— 忙的时候是 heartbeatSec × busyHeartbeatFactor */
+  effectiveHeartbeatSec () {
+    const base = Number(this.config.heartbeatSec) || 0
+    return base > 0 ? Math.round(base * (this.bodyBusy ? this.busyHeartbeatFactorOf() : 1)) : 0
   }
 
   /**
@@ -576,9 +604,12 @@ export class Watchdog {
     }
 
     // 心跳（⚠️ 只在**真在线**时发：断了还喊"我还在游戏里"就是撒谎，2026-09-19 顺手堵掉）
-    if (this.config.wakeOn.heartbeat && this.config.heartbeatSec > 0 && this.sess.bot.online) {
+    /* 🔴 用户 2026-10-26：身体忙着干活时，心跳跟着变慢（`busyHeartbeatFactor`）——
+     *    此时它本来就在盯队列，按原频率叫醒纯属打扰。 */
+    const hbSec = this.effectiveHeartbeatSec()
+    if (this.config.wakeOn.heartbeat && hbSec > 0 && this.sess.bot.online) {
       const since = now - (this.lastWakeAt || this.startedAt)
-      if (since >= this.config.heartbeatSec * 1000) {
+      if (since >= hbSec * 1000) {
         this.#inject(`【心跳｜已挂机 ${Math.round(since / 1000)}s】我还在 ${this.sess.bot.sub ?? '游戏'} 里，`
           + '没出什么事。你可以选择继续挂机（重新挂 mc_watch 或什么都不做），或主动做点什么。', 'heartbeat')
         this.lastWakeAt = now

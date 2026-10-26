@@ -463,6 +463,11 @@ export function createInjector (deps) {
   const poiLineGetter = (agent) => {
     try { return deps.poiLineOf?.(agent) ?? null } catch { return null }
   }
+  /** 实时状态行（用户 2026-10-26：「把实时任务队列送进常驻 prompt，让 LLM 知道自己在做什么」）——
+   *  永远放在最前面：它在干什么，决定了后面那些环境情报该怎么用。 */
+  const statusGetter = (agent) => {
+    try { return deps.statusLineOf?.(agent) ?? null } catch { return null }
+  }
 
   const enterWithNotices = (agent, decision) => {
     try {
@@ -471,7 +476,8 @@ export function createInjector (deps) {
       /* 用户 2026-10-25：兴趣点**每轮**注入（MC 是实时更新的游戏），
        * 只在 MC 模式 + 已连接时才有内容；它是临时消息，不进 AGENTS.md 台账。 */
       const poi = poiLineGetter(agent)
-      if (!r.todo.length && !poi) return decision
+      const status = statusGetter(agent)
+      if (!r.todo.length && !poi && !status) return decision
       // 队列里若有残留的自家提示行，先摘掉：它们马上要作为**本步消息**送出去了，
       // 留着会让下一步再送一遍（重复注入）。
       try { withdrawAgentsMdNotices(agent) } catch { /* 摘不掉也不影响本步 */ }
@@ -483,7 +489,13 @@ export function createInjector (deps) {
             source: { kind: 'plugin:dsh-mc-agent', form: 'notice', summary: '兴趣点雷达' },
           })]
         : []
-      const out = { ...decision, messages: [...noticeMessagesFor(r.todo), ...poiMsgs, ...msgs] }
+      const statusMsgs = status
+        ? [userMessage({
+            content: [{ type: 'text', text: status }],
+            source: { kind: 'plugin:dsh-mc-agent', form: 'notice', summary: '任务队列' },
+          })]
+        : []
+      const out = { ...decision, messages: [...noticeMessagesFor(r.todo), ...statusMsgs, ...poiMsgs, ...msgs] }
       return out
     } catch (e) {
       // 绝不带崩这一轮：改写失败就用内层原样结果。

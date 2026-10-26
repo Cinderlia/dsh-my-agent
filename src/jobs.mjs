@@ -31,7 +31,7 @@ export class JobBoard {
    * @param {Function} [deps.onStateChange] (snapshot) => void  队列状态变了（宿主据此收窄/恢复工具面）
    * @param {number}   [deps.keep]
    */
-  constructor ({ inject, log = null, onStateChange = null, keep = 20, interruptCooldownMs = INTERRUPT_COOLDOWN_MS } = {}) {
+  constructor ({ inject, log = null, onStateChange = null, keep = 20, interruptCooldownMs = INTERRUPT_COOLDOWN_MS, onProgress = null } = {}) {
     this.inject = typeof inject === 'function' ? inject : () => false
     this.log = typeof log === 'function' ? log : () => {}
     this.onStateChange = typeof onStateChange === 'function' ? onStateChange : () => {}
@@ -51,6 +51,28 @@ export class JobBoard {
     /** 上次介入 / 上次结束介入的时刻（两者取晚的算冷却） */
     this.lastInterruptAt = 0
     this.lastResolvedAt = 0
+    /** 🔴 用户 2026-10-26：「把实时任务队列送进常驻 prompt」—— 队列一变就回调，
+     *    让宿主那一轮就能看到"身体在干什么"（不用它自己去查 mc_probe）。
+     *    只在**文案真的变了**时触发（同一秒里反复 flush 不至于刷屏）。 */
+    this.onProgress = typeof onProgress === 'function' ? onProgress : () => {}
+    this.lastLiveText = ''
+  }
+  /**
+   * 任务自己报进度（"挖到 3/8""走到一半"…）。同一秒内重复调用只留最后一条。
+   * 任务想让人知道它在干什么就调它 —— 报告也就一句，别写小作文。
+   */
+  progress (text) {
+    /**
+     * ⚠️ 任务里没把 board 传进来的情况：`run(signal, job)` 的 job 上有 `report`，
+     * 它调回这里。但 `progress()` 只认 `this.current` —— yieldFor 期间 current 会被置空，
+     * 那是"我挂起等别人"，此刻的 progress 应该由**插到前面的那个任务**来报，所以这里不兜。
+     */
+    const job = this.current
+    if (!job) return false
+    job.progress = oneLine(text, 120)
+    job.progressAt = Date.now()
+    this.pushLive()
+    return true
   }
   /**
    * 调试日志（用户 2026-10-26）：「把每个任务的开始、结束和结束原因（成功或失败原因），
@@ -97,11 +119,58 @@ export class JobBoard {
     if (!s.current && !s.queue.length) lines.push('  （空）')
     else {
       if (s.current?.root || s.queue.some((j) => j.root)) lines.push('  ★ = 初始任务（它结束/失败会清空整个队列）')
-      /* 🔴 用户 2026-10-26：队列非空时宿主要把**操作类工具**收起来 —— 先说一句，
-       *    免得 agent 发现工具不见了还以为"坏了"。感知类照常可用、直接并发执行。 */
-      lines.push('  🔒 队列忙期间操作类工具已收起（感知类照常可用，直接问就行；mc_stop / mc_interrupt 常驻）')
     }
     return lines.join('\n')
+  }
+
+  /* ── 实时状态（用户 2026-10-26：「把实时任务队列送进常驻 prompt，让 LLM 知道自己在做什么」）──
+   * 每轮由宿主的注入通道调 `liveText()`；文案变了宿主才置脏、下一轮重投。 */
+  /** 跑了多久，人话版：37s / 4m12s */
+  elapsedText (job, now = Date.now()) {
+    const a = Number(job?.startedAt ?? 0)
+    if (!a) return ''
+    const sec = Math.max(0, Math.round((now - a) / 1000))
+    if (sec < 60) return `${sec}s`
+    const m = Math.floor(sec / 60)
+    const s = sec % 60
+    return m < 60 ? `${m}m${String(s).padStart(2, '0')}s` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
+  }
+  /**
+   * 常驻 prompt 里的那几行。**空队列也给一行** —— 用户要的是"永远知道现在能不能发活"。
+   */
+  liveText () {
+    const s = this.snapshot()
+    const busy = Boolean(s.current) || s.queue.length > 0
+    const lines = []
+    if (!busy) {
+      lines.push('📋 任务队列：空 —— 身体闲着，现在可以发活。')
+      lines.push('   能发活的工具：`mc_collect`（收集）、`mc_craft`（合成/熔炼）、`mc_smelt`（烧）、'
+        + '`mc_build`（盖）、`mc_chest`（存取）、`mc_trade`（交易）、`mc_station`（附魔/铁砧）、'
+        + '`mc_toss_to`（给人东西）、`mc_navi`（走过去/跟人）。')
+      lines.push('   发布后**立刻返回**、身体在后台干；干完/失败会主动报告 —— 不用等在这儿反复查。')
+      return lines.join('\n')
+    }
+    const stateText = s.state === 'intervening' ? '已冻结（介入中）' : '执行中'
+    const now = Date.now()
+    const head = s.current
+      ? `▶ ${s.current.id}${s.current.root ? '★' : ''}（${s.current.summary}）· ${this.elapsedText(s.current, now)}`
+      : '（没有正在跑的）'
+    lines.push(`📋 任务队列[${stateText}]：` + head)
+    if (s.current?.progress) lines.push(`   进度：${s.current.progress}`)
+    if (s.queue.length) lines.push('   ⏳ 排队：' + s.queue.map((j) => `${j.summary}`).join(' → '))
+    if (s.current?.root || s.queue.some((j) => j.root)) lines.push('   ★ = 初始任务，它一结束（成或败）整个队列就清空')
+    lines.push('   ⏸ 身体正在干，暂时别硬操控它。你能做的：读环境（`mc_self`/`mc_map`/`mc_scan_surroundings`/`mc_observe`）、'
+      + '想下一步；**只有发现它走歪了**才 `mc_interrupt`（冷却 60 秒）或 `mc_stop`。')
+    lines.push('   🔒 操作类工具这会儿是收起的 —— 队列一空就自动回来。')
+    return lines.join('\n')
+  }
+  /** 文案变了就通知宿主（置脏 → 下一轮重投）。队列的每个生命周期节点都该调。 */
+  pushLive () {
+    let text = ''
+    try { text = this.liveText() } catch { return }
+    if (text === this.lastLiveText) return
+    this.lastLiveText = text
+    try { this.onProgress(text) } catch { /* 通知失败不影响队列 */ }
   }
   /** 队列快照（给工具返回 / 宿主判据用） */
   snapshot () {
@@ -167,6 +236,11 @@ export class JobBoard {
       state,
       run: typeof run === 'function' ? run : null,
       controller: typeof AbortController === 'function' ? new AbortController() : null,
+      /** 最近一次自报的进度（"挖到 3/8"）—— 常驻 prompt 里那行"进度："就是它 */
+      progress: null,
+      progressAt: 0,
+      /** 任务可以调它自报进度；绑到 board 上，这样 run 里不用额外拿 ctx */
+      report: (text) => { try { this.progress(String(text ?? '')) } catch { /* 报不了不影响干活 */ } },
     }
   }
   /**
@@ -434,5 +508,8 @@ export class JobBoard {
   }
   changed () {
     try { this.onStateChange(this.snapshot()) } catch (e) { this.log(`队列状态回调失败：${e?.message ?? e}`) }
+    /* 实时状态：每个生命周期节点（入队/开始/结束/清空/冻结）都推一次 ——
+     * 文案没变 pushLive 自己会吞掉，所以这里无脑调就行。 */
+    this.pushLive()
   }
 }
