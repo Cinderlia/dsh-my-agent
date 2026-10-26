@@ -29,6 +29,7 @@ import { createRequire } from 'node:module'
 import { resolve, sep, join, isAbsolute, dirname, basename } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { McBot, lossless, logLine, logDebug, logOnce, logLevel, libraryInfo, CALL_MS, callBudget, redactPath } from './src/core.mjs'
+import { debugLog, debugEnabled, setDebugEnabled, debugFile, readDebugTail } from './src/log.mjs'
 import { defineTool, toolDefKind, loosenNumberParams, coerceNumberArgs } from './src/tool-def.mjs'
 /* 路线图第 ⑥ 条：把每个动作的结局说清（已确认成功 / 动作失败 / 结果未知）。纯函数，不碰游戏状态。 */
 import { outcomeOf, verdictText } from './src/task-runner.mjs'
@@ -2975,7 +2976,9 @@ export function apply(ctx, rawConfig) {
         return true
       } catch { return false }
     },
-    log: (m) => logDebug(m),
+    /* 🔴 用户 2026-10-26：任务级进度（collect 的目标、craft 的缺口…）也要进调试日志 ——
+     *    只有队列的开始/结束不够，卡住的时候要看它**走到哪一步**。 */
+    log: (m) => { logDebug(m); debugLog('    ·', m) },
     /* 队列状态一变就调宿主去收窄/恢复工具面（用户：任务板非空就隐藏所有主动工具） */
     onStateChange: (snap) => queueStateChanged(snap),
   })
@@ -3670,9 +3673,10 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
       + '· `ping` — 探一个地址通不通/什么版本（`args.address`）\n'
       + '· `lan` — 听局域网里的 MC 公告\n'
       + '· `jobs` — 看后台任务（`args:{id:"job-…"}` 看一个；`args:{cancel:"job-…"}` 取消）\n'
+      + '· `debug` — 任务队列调试日志（`args:{on:true|false}` 开关；`args:{tail:60}` 看最近几行）\n'
       + '`args` 原样转给被路由的那个实现（参数名和以前一样）。要地形图用 `mc_map`（没折叠）。',
     parameters: {
-      what: { type: 'string', required: true, description: 'inventory / scan / diag / caps / sessions / prep / ping / lan / jobs' },
+      what: { type: 'string', required: true, description: 'inventory / scan / diag / caps / sessions / prep / ping / lan / jobs / debug' },
       args: { type: 'object', additionalProperties: true, description: '转给该能力的参数（如 {name:"oak_log",radius:16} / {address:"host:port"} / {only:"perf"}）' },
     },
     output: text(),
@@ -3687,6 +3691,8 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         const one = a.id ? [snap.current, ...snap.queue, ...snap.done].find((j) => j?.id === String(a.id)) : null
         if (a.id && !one) return { ok: false, text: `没有这个任务：${a.id}` }
         const fmt = (j) => `· ${j.id} [${j.status}] ${j.summary}`
+          + (j.phase ? `｜阶段 ${j.phase}` : '')
+          + (j.waitingOn ? `｜在等 ${j.waitingOn}` : '')
           + (j.endedAt && j.startedAt ? `（${Math.round((j.endedAt - j.startedAt) / 1000)}s）` : '')
         const lines = []
         lines.push(`状态：${snap.state}${snap.frozen ? '（已冻结）' : ''}`)
@@ -3694,10 +3700,29 @@ ${where}——走完会主动报告\n\n${jobBoard.snapshotText()}`,
         if (snap.queue.length) lines.push(`⏳ 排队：${snap.queue.map(fmt).join(' / ')}`)
         if (!snap.current && !snap.queue.length) lines.push('（队列是空的）')
         if (a.cancel) lines.push('）取消任务请用 `mc_stop`（停一切）或 `mc_interrupt`（冻结/重试/跳过/清空）')
-        return { ok: true, queue: snap, ...(one ? { job: one } : {}), text: `📋 后台队列：${bs}n${lines.join(bs + 'n')}` }
+        return { ok: true, queue: snap, ...(one ? { job: one } : {}), text: `📋 后台队列：\n${lines.join('\n')}` }
+      }
+      /* 任务队列调试日志（用户 2026-10-26）：
+       *   `args.on` 开/关；`args.tail` 看最近几行（默认 30）；不给参数只报状态。 */
+      if (what === 'debug') {
+        const lines = []
+        if (a.on !== undefined) {
+          const want = a.on === true || ['1', 'true', 'on', 'yes'].includes(String(a.on).toLowerCase())
+          const now = setDebugEnabled(want)
+          lines.push(now ? '🟢 调试日志：已开启' : '⚪ 调试日志：已关闭')
+        } else {
+          lines.push(debugEnabled() ? '🟢 调试日志：开着' : '⚪ 调试日志：关着（`args:{on:true}` 开）')
+        }
+        lines.push(`文件：${debugFile()}`)
+        const tailN = Number(a.tail ?? (a.on === undefined ? 20 : 0))
+        if (tailN > 0) {
+          const tail = readDebugTail(tailN)
+          lines.push(tail.length ? `—— 最近 ${tail.length} 行 ——\n${tail.join('\n')}` : '（还没有内容）')
+        }
+        return { ok: true, enabled: debugEnabled(), file: debugFile(), text: lines.join('\n') }
       }
       const target = PROBE_ROUTES[what]
-      if (!target) throw new Error(`未知的 what="${what}"；可用：${[...Object.keys(PROBE_ROUTES), 'jobs'].join(' / ')}`)
+      if (!target) throw new Error(`未知的 what="${what}"；可用：${[...Object.keys(PROBE_ROUTES), 'jobs', 'debug'].join(' / ')}`)
       const handler = TOOL_HANDLERS.get(target)
       if (!handler) throw new Error(`「${what}」的实现没挂上（${target} 未注册）—— 这是插件内部问题`)
       return await handler(a, exec)

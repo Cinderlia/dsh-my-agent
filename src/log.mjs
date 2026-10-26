@@ -16,7 +16,7 @@
  * （`logLine`/`logDebug`/`logOnce`/`logLevel`/`stamp` 被 index.js、4 个扩展、8 个套件从 core.mjs import）。
  */
 import {
-  existsSync, statSync, mkdirSync, appendFileSync, renameSync, readdirSync, unlinkSync,
+  existsSync, statSync, mkdirSync, appendFileSync, renameSync, readdirSync, unlinkSync, readFileSync,
 } from 'node:fs'
 import { join, dirname, basename } from 'node:path'
 
@@ -133,4 +133,62 @@ export function logOnce (key, ...args) {
   g.add(key)
   logLine(...args)
   return true
+}
+
+/* ── 调试日志（任务队列专用）─────────────────────────────────────────────────
+ * 用户 2026-10-26：「加个调试模式，把每个任务的开始、结束和结束原因（成功或失败原因），
+ * 都带上时间戳记录进 debug 日志文件。」
+ *
+ * 为什么要**另一个文件**：主日志 95% 是"提示词已投递 N 条"这类噪声，队列的流转淹在里面
+ * 根本看不出来（实测：翻完整个 dsh-mc-agent.log 找不到一行 JobBoard 的）。
+ * 这里每行带**毫秒**时间戳，只写队列事件 + 任务自己的进度日志。
+ *
+ * 开关：
+ *   · 进程启动时：`MC_DEBUG=1`（或 `MC_LOG_LEVEL=debug`）默认就开；
+ *   · 运行时：`mc_probe {what:"debug", args:{on:true|false}}` / `args:{tail:60}` 看最近几行。
+ * 状态挂 **globalThis**：每个连接都会重新 import 一份这个模块，模块级变量拦不住。
+ */
+const DEBUG_STATE = '__dshMcAgentDebug'
+function debugState () {
+  const env = String(process.env.MC_DEBUG ?? '').trim().toLowerCase()
+  const on = env === '1' || env === 'true' || env === 'on' || logLevel() >= LOG_LEVELS.debug
+  const g = (globalThis[DEBUG_STATE] ??= { on, file: null })
+  return g
+}
+/** 调试日志文件（默认与主日志同目录的 `dsh-mc-agent-debug.log`） */
+export function debugFile () {
+  const g = debugState()
+  if (g.file) return g.file
+  const base = defaultLogFile ? dirname(defaultLogFile) : process.cwd()
+  g.file = join(base, 'dsh-mc-agent-debug.log')
+  return g.file
+}
+export function debugEnabled () { return debugState().on }
+/** 开关调试日志；返回改完后的状态 */
+export function setDebugEnabled (on) {
+  const g = debugState()
+  g.on = Boolean(on)
+  if (g.on) debugLog(`调试日志已开启 → ${debugFile()}`)
+  return g.on
+}
+/** 毫秒级时间戳 `MM-DD HH:MM:SS.mmm` */
+export function stampMs (d = new Date()) {
+  const p = (n, w = 2) => String(n).padStart(w, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`
+}
+/** 写一行调试日志（开关关着就什么都不做，返回 null） */
+export function debugLog (...args) {
+  if (!debugEnabled()) return null
+  const line = `[${stampMs()}] ${args.join(' ')}`
+  appendLog(debugFile(), line)
+  return line
+}
+/** 读调试日志的最后 n 行（给 `mc_probe {what:"debug"}` 用） */
+export function readDebugTail (n = 40) {
+  const k = Math.max(1, Math.min(500, Number(n) || 40))
+  try {
+    const text = readFileSync(debugFile(), 'utf8')
+    const lines = text.split('\n').filter((l) => l.trim())
+    return lines.slice(-k)
+  } catch { return [] }
 }

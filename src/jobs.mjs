@@ -16,10 +16,13 @@
  *                        ▲
  *                     interrupt
  * ========================================================================== */
+import { debugLog } from './log.mjs'
 /** 介入冷却：两次介入之间至少要隔这么久（用户 2026-10-24：「介入模式加个冷却时间」） */
 export const INTERRUPT_COOLDOWN_MS = 60_000
 let seq = 0
 const nextId = () => `job-${Date.now().toString(36)}-${(++seq).toString(36)}`
+/** 把多行报告压成一行（调试日志一行一条，别让一个失败原因撑成十行） */
+const oneLine = (s, n = 400) => String(s ?? '').replace(/\s*\n+\s*/g, ' ⏎ ').slice(0, n)
 export class JobBoard {
   /**
    * @param {Object} deps
@@ -48,6 +51,20 @@ export class JobBoard {
     /** 上次介入 / 上次结束介入的时刻（两者取晚的算冷却） */
     this.lastInterruptAt = 0
     this.lastResolvedAt = 0
+  }
+  /**
+   * 调试日志（用户 2026-10-26）：「把每个任务的开始、结束和结束原因（成功或失败原因），
+   * 都带上时间戳记录进 debug 日志文件。」—— 开关/文件路径都在 `src/log.mjs`，
+   * 这边只管写；写失败绝不影响队列本身。
+   */
+  dbg (...args) {
+    try { debugLog(...args) } catch { /* 日志不重要，队列重要 */ }
+  }
+  /** 这个任务从开始到结束用了多久（毫秒；没开始过就算 0） */
+  msOf (job) {
+    const a = Number(job?.startedAt ?? 0)
+    const b = Number(job?.endedAt ?? Date.now())
+    return a && b ? Math.max(0, b - a) : 0
   }
   /**
    * 现在能不能介入？冷却期内一律不行 —— 用户要求「加个冷却时间，同时不鼓励 agent 介入」：
@@ -93,7 +110,12 @@ export class JobBoard {
     }
   }
   brief (j) {
-    return { id: j.id, kind: j.kind, summary: j.summary, status: j.status, startedAt: j.startedAt, endedAt: j.endedAt, root: Boolean(j.root) }
+    return {
+      id: j.id, kind: j.kind, summary: j.summary, status: j.status, startedAt: j.startedAt, endedAt: j.endedAt, root: Boolean(j.root),
+      /* 挂起中的任务：它正等谁、走到哪一步 —— 排查"卡住不动"全靠这两个字段 */
+      waitingOn: j.waitingOn ?? null,
+      phase: j.state && typeof j.state === 'object' ? (j.state.phase ?? null) : null,
+    }
   }
   /**
    * 入队并（可能）立刻开始。**立刻返回**，不等执行。
@@ -112,6 +134,8 @@ export class JobBoard {
     this.queue.push(job)
     const wasIdle = !this.current && this.state === 'idle'
     this.log(`任务 ${job.id} 入队（第 ${this.queue.length} 位）：${job.summary}`)
+    this.dbg('＋入队', job.id, `[${job.kind}]`, root ? '★初始任务' : '（插队）', job.summary,
+      `第 ${this.queue.length} 位`, this.current ? `｜正在跑 ${this.current.id}` : '｜队列本来空闲')
     if (wasIdle) this.pump()
     this.changed()
     return { ok: true, job, position: this.queue.indexOf(job) + (this.current ? 1 : 0), started: this.current === job }
@@ -162,6 +186,7 @@ export class JobBoard {
     this.queue.unshift(child)
     this.state = 'running'
     this.log(`任务 ${job.id} 挂起，插入子任务 ${child.id}（${child.summary}）`)
+    this.dbg('⏸ 挂起', job.id, `[${job.kind}]`, job.summary, '→ 插入', child.id, `[${child.kind}]`, child.summary)
     this.changed()
     this.pump()
     return true
@@ -170,7 +195,7 @@ export class JobBoard {
   pump () {
     if (this.current || this.state === 'frozen' || this.state === 'intervening') return
     const job = this.queue.shift()
-    if (!job) { this.state = 'idle'; this.changed(); return }
+    if (!job) { this.state = 'idle'; this.dbg('· 空闲（队列空）'); this.changed(); return }
     this.current = job
     this.state = 'running'
     job.status = 'running'
@@ -179,6 +204,8 @@ export class JobBoard {
     if (!job.startedAt) job.startedAt = Date.now()
     this.changed()
     this.log(`任务 ${job.id} 开始：${job.summary}`)
+    this.dbg('▶ 开始', job.id, `[${job.kind}]`, job.summary, job.root ? '★初始任务' : '',
+      `｜队列剩 ${this.queue.length} 个`, job.startedAt && job.status === 'running' && job.startedAt < Date.now() - 50 ? '（恢复执行）' : '')
     Promise.resolve()
       .then(() => (job.run ?? (() => { throw new Error('没有可执行体') }))(job.controller?.signal, job))
       .then((r) => this.finish(job.id, { ...(r ?? {}), ok: r?.ok !== false }))
@@ -208,6 +235,8 @@ export class JobBoard {
     if (!ok) this.handFailureToNext(job, job.report.text || '失败')
     this.current = null
     this.archive(job)
+    this.dbg(ok ? '✅ 结束' : '❌ 结束（失败）', job.id, `[${job.kind}]`, job.summary,
+      `${this.msOf(job)}ms`, `｜${ok ? '成功' : '失败'}原因：${oneLine(job.report.text) || '（空）'}`)
     const cleared = this.clearAfterRoot(job, ok ? '完成' : '失败')
     this.notify(job, `${ok ? '✅' : '❌'} ${job.summary}\n${job.report.text}`
       + (cleared ? `\n（初始任务结束，已清空队列里剩下的 ${cleared} 个任务）` : ''))
@@ -225,9 +254,11 @@ export class JobBoard {
     this.handFailureToNext(job, job.error)
     this.current = null
     this.archive(job)
-    const cleared = this.clearAfterRoot(job, '失败')
+    this.dbg('❌ 结束（异常）', job.id, `[${job.kind}]`, job.summary, `${this.msOf(job)}ms`,
+      `｜异常：${oneLine(job.error)}`)
+    const clearedFail = this.clearAfterRoot(job, '失败')
     this.notify(job, `❌ ${job.summary} 失败：${job.error}`
-      + (cleared ? `\n（初始任务结束，已清空队列里剩下的 ${cleared} 个任务）` : ''))
+      + (clearedFail ? `\n（初始任务结束，已清空队列里剩下的 ${clearedFail} 个任务）` : ''))
     this.state = 'idle'
     this.pump()
     this.changed()
@@ -264,6 +295,7 @@ export class JobBoard {
     this.queue.unshift(child)
     this.state = 'running'
     this.log(`任务 ${job.id} 转交给 ${child.id}（${child.summary}）`)
+    this.dbg('🔀 转交', job.id, `[${job.kind}]`, job.summary, '→', child.id, `[${child.kind}]`, child.summary)
     this.changed()
     this.pump()
     return true
@@ -275,6 +307,7 @@ export class JobBoard {
    */
   abortAll (reason = '条件不满足') {
     const n = this.queue.length
+    const dropped = this.queue.map((j) => `${j.id}[${j.kind}]`)
     for (const j of this.queue) {
       j.status = 'cancelled'
       j.endedAt = Date.now()
@@ -284,6 +317,7 @@ export class JobBoard {
     this.queue = []
     this.state = 'idle'
     this.log(`清空整个队列：${n} 个任务（${reason}）`)
+    this.dbg('🧹 清空队列', `${n} 个`, `｜原因：${oneLine(reason)}`, dropped.length ? `｜丢掉：${dropped.join(' / ')}` : '')
     this.changed()
     return n
   }
@@ -307,6 +341,7 @@ export class JobBoard {
       this.archive(stopped)
       this.log(`介入：停掉队首 ${stopped.id}（${stopped.summary}）`)
     }
+    this.dbg('⛔ 介入（冻结队列）', stopped ? `停掉 ${stopped.id} [${stopped.kind}] ${stopped.summary}｜${this.msOf(stopped)}ms` : '（没有在跑的）', `｜排队 ${this.queue.length} 个`)
     this.changed()
     return { ok: true, stopped: stopped ? this.brief(stopped) : null, queued: this.queue.length }
   }
@@ -338,6 +373,7 @@ export class JobBoard {
       return { ok: false, why: `未知动作 "${action}"；只能 resume / retry / skip / cancel` }
     }
     this.lastResolvedAt = Date.now()
+    this.dbg('介入处理完毕', act, `｜${oneLine(detail)}`)
     this.state = 'idle'
     this.pump()
     this.changed()
@@ -367,6 +403,8 @@ export class JobBoard {
     this.state = 'idle'
     this.changed()
     this.log(`stop：停了 ${stopped?.id ?? '无'}，清掉 ${dropped} 个排队，重置 ${resets.length} 个被动工具`)
+    this.dbg('⏹ mc_stop', `停掉 ${stopped ? `${stopped.id} [${stopped.kind}] ${stopped.summary}` : '（没有在跑的）'}`,
+      `｜清掉排队 ${dropped} 个`, `｜重置被动工具 ${resets.length} 个`)
     return { stopped: stopped ? this.brief(stopped) : null, dropped, resets }
   }
   /** 给 agent 的完成报告（唯一推送口） */
@@ -378,6 +416,7 @@ export class JobBoard {
     ].join('\n')
     let ok = false
     try { ok = Boolean(this.inject(job.agentId, body)) } catch (e) { this.log(`注入任务报告失败：${e?.message ?? e}`) }
+    this.dbg('🔔 报告', job.id, ok ? '已投给 agent' : '**没投出去**（会话不在了？）', `｜${oneLine(text)}`)
     if (!ok) this.log(`任务 ${job.id} 的报告没能投给 agent（会话不在了？）：${text.slice(0, 80)}`)
   }
   archive (job) {
