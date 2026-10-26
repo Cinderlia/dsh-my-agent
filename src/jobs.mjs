@@ -48,6 +48,10 @@ export class JobBoard {
     /** 上次介入 / 上次结束介入的时刻（两者取晚的算冷却） */
     this.lastInterruptAt = 0
     this.lastResolvedAt = 0
+    /** 2026-10-26 用户：防突发同类任务把队列撑爆、把宿主 restrict 打成风暴 → 卡死。上限 + 去重 + 积压告警。 */
+    this.maxQueue = Math.max(4, Number(process.env.MC_JOB_MAX_QUEUE) || 32)
+    this._lastBacklogWarnAt = 0
+    this._lastBacklogSize = 0
   }
   /**
    * 现在能不能介入？冷却期内一律不行 —— 用户要求「加个冷却时间，同时不鼓励 agent 介入」：
@@ -101,9 +105,29 @@ export class JobBoard {
     if (this.state === 'intervening') {
       return { ok: false, why: '队列正在被介入（agent 正在处理队首任务），先 mc_interrupt 选一个动作再继续', current: this.current ? this.brief(this.current) : null }
     }
+    // 2026-10-26：同 kind+summary 的排队任务合并，别把同类连点堆成队列炸弹
+    const sameKind = String(kind ?? 'job')
+    const sameSummary = String(summary ?? '')
+    const dup = this.queue.find((j) => j.status === 'queued' && j.kind === sameKind && j.summary === sameSummary)
+    if (dup) {
+      this.log('任务合并：「' + sameSummary + '」已在队列（' + dup.id + '），不重复入队')
+      return { ok: true, job: dup, position: this.queue.indexOf(dup) + (this.current ? 1 : 0), started: false, deduped: true }
+    }
+    // 队列上限：超了直接拒（避免无限堆积拖垮宿主），提示先停一停
+    if (this.queue.length >= this.maxQueue) {
+      this.log('队列已满（' + this.queue.length + '/' + this.maxQueue + '），拒入队：' + sameSummary)
+      return { ok: false, why: '后台任务过多（' + this.queue.length + '/' + this.maxQueue + '）。等前面的跑完或先 mc_stop 清队列，再试这个。', current: this.current ? this.brief(this.current) : null }
+    }
     const job = this.makeJob({ kind, agentId, summary, plan, run })
     this.queue.push(job)
     const wasIdle = !this.current && this.state === 'idle'
+    // 积压告警：队列跨过阈值时记一行，方便事后从日志看出是不是堆爆了
+    if (this.queue.length > this._lastBacklogSize && this.queue.length >= Math.ceil(this.maxQueue / 2)
+        && Date.now() - this._lastBacklogWarnAt > 5000) {
+      this._lastBacklogWarnAt = Date.now()
+      this.log('队列积压 ' + this.queue.length + '/' + this.maxQueue + '（最近 5 秒内首次越线）')
+    }
+    this._lastBacklogSize = this.queue.length
     this.log(`任务 ${job.id} 入队（第 ${this.queue.length} 位）：${job.summary}`)
     if (wasIdle) this.pump()
     this.changed()

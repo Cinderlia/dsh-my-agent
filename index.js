@@ -3006,9 +3006,29 @@ export function apply(ctx, rawConfig) {
   /* 用户 2026-10-24：「stop 原语必须常驻」—— 不论队列状态、不论哪种模式，它都不能被收掉。 */
   const ALWAYS_ON_TOOLS = ['mc_stop']
   const queueGateRelease = new Map()
+  /** 🔴 2026-10-26：合并 restrict 调用。突发同类任务（mc_craft 连点）会让队列每进/出一个子任务都
+   *   changed() 一次；以前每次都同步调宿主 restrict({allow}) 重算整张工具面（50 个 mc_* + 配套 + 技能），
+   *   几十次连打能把共享的事件循环压死——表现就是：看门狗停不掉、session/cancel 报 gateway/internal、
+   *   连插件自己的日志都写不出来（因为跑在同一个卡住的进程里）。这里按 agent 合并成每 ~80ms 最多一次。 */
+  const queueGatePending = new Map()   // agentId → 最新那个 snap
+  const queueGateTimer = new Map()     // agentId → 合并用的 setTimeout 句柄
+  const GATE_COALESCE_MS = 80
   const queueStateChanged = (snap) => {
     const agentId = snap?.current?.agentId ?? snap?.queue?.[0]?.agentId
     if (!agentId) return
+    queueGatePending.set(agentId, snap)
+    if (queueGateTimer.get(agentId)) return     // 已有待跑的合并窗口，直接复用（保留最新 snap）
+    const timer = setTimeout(() => {
+      queueGateTimer.delete(agentId)
+      const s = queueGatePending.get(agentId)
+      queueGatePending.delete(agentId)
+      if (s) applyQueueGate(agentId, s)
+    }, GATE_COALESCE_MS)
+    try { timer.unref?.() } catch { /* 不阻塞退出 */ }
+    queueGateTimer.set(agentId, timer)
+  }
+  /** 真正套/撤队列闸门（被合并后的 queueStateChanged 调用一次）。 */
+  const applyQueueGate = (agentId, snap) => {
     const agent = safeAgentById(agentId)
     if (!agent?.ctx) return
     const prev = queueGateRelease.get(agentId)
@@ -3025,8 +3045,22 @@ export function apply(ctx, rawConfig) {
       if (prev) prev()
       const t = scopedTools(agent.ctx)
       if (!t) return
-      const allow = [...new Set([...QUEUE_KEEP, ...ALWAYS_ON_TOOLS])]
-      queueGateRelease.set(agentId, t.restrict({ allow }))
+      const want = [...new Set([...QUEUE_KEEP, ...ALWAYS_ON_TOOLS])]
+      // 🔴 restrict 对不认识的名字会抛（宿主拿 restrictableNames 校验）。MC 模式白名单那侧
+      //   用 applyAllow 先过滤过；这里同样先试全量、炸了就按宿主"认识的名字"过滤一次再试，
+      //   免得一加新工具名（如 skill/present 没挂载的会话）每次队列变化都抛一次、白白烧 CPU。
+      let release
+      try {
+        release = t.restrict({ allow: want })
+      } catch (e) {
+        const knownPart = /known global tools:\s*([\s\S]*)$/.exec(String(e?.message ?? ''))
+        const known = new Set((knownPart?.[1] ?? '').split(',').map((s) => s.trim()).filter(Boolean))
+        const usable = want.filter((n) => known.has(n))
+        if (!known.size || !usable.length) throw e
+        release = t.restrict({ allow: usable })
+        logDebug(`队列闸门：白名单含宿主不认识的名字（${want.filter((n) => !known.has(n)).join(', ')}）→ 已过滤`)
+      }
+      queueGateRelease.set(agentId, release)
       logDebug(`队列非空（${snap.state}）：已隐藏主动工具，只留感知类 + mc_interrupt / mc_stop`)
     } catch (e) {
       logLine('队列收窄工具面失败（guard 仍会拦）：' + String(e?.message).slice(0, 160))
