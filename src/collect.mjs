@@ -657,6 +657,21 @@ export async function runCollect (self, plan, ctx = {}) {
       }
       const drop = drops[0]
       if (drop.unknown) steps.push('掉落物读不到物品 id，按位置去捡（可能捡错）')
+      /* 🔴 用户 2026-10-26 实测：「刚挖到铁，但没走过去捡起」。
+       *    掉落物就在脚边（≤4 格）时，navi 的寻路目标常常停在 1 格开外
+       *    （pathfinder 的到达容差 + 掉落物格子本身不一定"能站"），人到了、东西还在原地 ——
+       *    近距就别绕弯子：**直接踩上去**（walkTo 的目标就是掉落物那格，容差 0.7）。 */
+      const meNow = b.entity?.position
+      const dDrop = meNow ? Math.hypot(meNow.x - drop.x, (meNow.y + 0.9) - drop.y, meNow.z - drop.z) : 99
+      if (dDrop <= 4 && typeof self?.walkTo === 'function') {
+        try {
+          await self.walkTo({ x: drop.x, y: drop.y, z: drop.z }, { arrive: 0.7, budget: 2500 })
+        } catch { /* 踩不过去就交给下面的 navi */ }
+        await sleep(350)
+        steps.push(`掉落物在 ${dDrop.toFixed(1)} 格，直接踩过去（第 ${st.pickupTries} 次）`)
+        st.phase = 'verify'
+        continue
+      }
       /* 🔴 用户 2026-10-26：「没捡到物品的时候，要用 navi 走过去捡。」
        *    走不过去（掉落物在洞里/半空/半径外）**不算失败**：记一次尝试，
        *    预算用完就放弃这个掉落物、回去再挖一个。 */
