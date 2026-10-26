@@ -91,8 +91,26 @@ function onlyProducing (list, id) {
   return (list ?? []).filter((r) => Number(r?.result?.id) === want)
 }
 
+/* 🔴 2026-10-26 用户（连两次卡死排查）：`bot.recipesAll` 是**全配方表 native 扫描**。
+ *   以前 ensure→pickRecipe→reachOf 对**同一个 id 反复扫**（reachOf 递归 depth3、每个候选配方每个原料都要扫一遍），
+ *   在 Fabric 这种配方表上千条的服上，planCraft 一次就能扫几百次、把主事件循环**同步钉死**（表现：连
+ *   graceful 断线日志都写不出、服务器按 Timed out 踢掉假死客户端）。配方可用性跟背包无关（第三参只是
+ *   requiresTable 布尔），所以按 (bot,id,需不需要工作台) 记忆化完全安全；bot 换代（重连）时 WeakMap 自然失效。 */
+const recipeCache = new WeakMap()
 function recipesAllOf (bot, id, table) {
-  try { return onlyProducing(bot.recipesAll(id, null, table), id) } catch { return [] }
+  let byId = recipeCache.get(bot)
+  if (!byId) { byId = new Map(); recipeCache.set(bot, byId) }
+  const needsTable = table ? 1 : 0
+  const key = `${id}|${needsTable}`
+  let v = byId.get(key)
+  if (v !== undefined) return v
+  try { v = onlyProducing(bot.recipesAll(id, null, needsTable), id) } catch { v = [] }
+  byId.set(key, v)
+  return v
+}
+/** 背包/配方表变了（如刚合成消耗、刚 collect 回来）时清掉某个 bot 的配方缓存，下次重新扫。 */
+export function invalidateRecipeCache (bot) {
+  try { recipeCache.delete(bot) } catch { /* 忽略 */ }
 }
 
 function recipesReady (bot, id, table, minCount) {
